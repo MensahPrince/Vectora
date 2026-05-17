@@ -8,8 +8,10 @@ fn main() {
         )
         .init();
 
-    decoder::log_name();
+    match decoder::ffmpeg_version() {
+        Ok(v) => info!(ffmpeg = %v, "decoder"),
+        Err(e) => info!(?e, "decoder (ffmpeg version unavailable)"),
+    }
     renderer::log_name();
-    engine::log_name();
     info!("app");
 }
