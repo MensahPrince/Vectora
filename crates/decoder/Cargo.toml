@@ -6,5 +6,6 @@ description = "Cutlass video demux + decode (CPU, ffmpeg-next)"
 
 [dependencies]
 ffmpeg-next = "8.1.0"
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 tracing.workspace = true

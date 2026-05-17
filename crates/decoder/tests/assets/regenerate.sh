@@ -8,6 +8,9 @@ ffmpeg -y -f lavfi -i testsrc=duration=5:size=320x240:rate=30 \
 ffmpeg -y -f lavfi -i testsrc=duration=5:size=320x240:rate=30 \
   -c:v libx264 -g 30 -bf 3 -pix_fmt yuv420p testsrc_bframes.mp4
 
+# Note: H.264 (libx264) output is tagged YUV420P in FFmpeg; NV12 in the renderer is covered
+# by synthetic frames in `tests/gpu_integration.rs` and unit tests.
+
 # Audio-only (negative: no video stream)
 ffmpeg -y -f lavfi -i sine=frequency=440:sample_rate=48000:duration=2 \
   -c:a aac audio_only.m4a

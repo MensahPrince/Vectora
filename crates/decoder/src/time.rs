@@ -8,7 +8,7 @@ use std::fmt;
 ///
 /// - **Invariant:** `den != 0` (enforced by constructors).
 /// - **PTS / duration:** See [`Rational::from_stream_ticks`] for converting decoder ticks × FFmpeg `time_base`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct Rational {
     /// Numerator (signed). For time in seconds, this is the “top” of the second fraction after normalization or construction.
     pub num: i64,

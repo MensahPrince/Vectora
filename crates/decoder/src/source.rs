@@ -1,7 +1,7 @@
 use crate::{pixel::PixelFormat, time::Rational};
 
 /// Snapshot from the demuxer / decoder after [`crate::Decoder::open`]: geometry, timebase, optional duration, negotiated pixel format.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SourceInfo {
     /// Decoded picture width in pixels.
     pub width: u32,

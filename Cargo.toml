@@ -1,5 +1,11 @@
 [workspace]
-members = ["crates/decoder", "crates/renderer", "crates/engine", "crates/app"]
+members = [
+    "crates/decoder",
+    "crates/renderer",
+    "crates/engine",
+    "crates/timeline",
+    "crates/app",
+]
 resolver = "3"
 
 [workspace.package]
@@ -9,3 +15,6 @@ edition = "2024"
 [workspace.dependencies]
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+wgpu = "29.0.3"
+pollster = "0.4"
+thiserror = "2"

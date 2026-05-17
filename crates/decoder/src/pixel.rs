@@ -1,7 +1,7 @@
 //! Pixel formats supported for **v1 CPU** decode output.
 //! Other FFmpeg pixel formats return [`crate::DecoderError::Unsupported`] at open time.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
 pub enum PixelFormat {
     /// Planar YUV 4:2:0, 8-bit (`Y`, `U`, `V`).
