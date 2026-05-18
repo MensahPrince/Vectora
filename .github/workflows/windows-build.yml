@@ -1,0 +1,40 @@
+name: Windows Build
+
+on:
+  workflow_dispatch:  # run manually from GitHub UI
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download FFmpeg
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl-shared.zip" -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath C:\ffmpeg-extract
+          $inner = (Get-ChildItem C:\ffmpeg-extract | Select-Object -First 1).FullName
+          echo "FFMPEG_DIR=$inner" >> $env:GITHUB_ENV
+          echo "$inner\bin" >> $env:GITHUB_PATH
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Bundle exe + DLLs
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path cutlass-win64
+          Copy-Item target/release/app.exe cutlass-win64/cutlass.exe
+          Copy-Item "$env:FFMPEG_DIR/bin/*.dll" cutlass-win64/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cutlass-win64
+          path: cutlass-win64

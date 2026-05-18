@@ -5,7 +5,9 @@ use std::sync::OnceLock;
 
 use ffmpeg_next::Error as FfmpegError;
 use ffmpeg_next::Rational as FfmpegRational;
-use ffmpeg_next::codec::Context;
+use ffmpeg_next::codec::discard::Discard;
+
+use ffmpeg_next::codec::{Context, threading};
 use ffmpeg_next::error::EAGAIN;
 use ffmpeg_next::format::{self, context::Input};
 use ffmpeg_next::media::Type;
@@ -69,7 +71,13 @@ impl Decoder {
         let stream_index = stream.index();
         let stream_timebase = stream.time_base();
 
-        let ctx = Context::from_parameters(stream.parameters()).map_err(DecoderError::Open)?;
+        let mut ctx = Context::from_parameters(stream.parameters()).map_err(DecoderError::Open)?;
+
+        ctx.set_threading(threading::Config {
+            kind: threading::Type::Frame,
+            count: 0,
+        });
+
         let decoder = ctx.decoder().video().map_err(DecoderError::Open)?;
 
         let pixel_format = PixelFormat::from_ffmpeg(decoder.format())
@@ -296,4 +304,30 @@ impl Decoder {
 pub fn ffmpeg_version() -> Result<String, DecoderError> {
     ensure_ffmpeg_init()?;
     Ok(format!("avutil {:#08x}", ffmpeg_next::util::version()))
+}
+
+impl Decoder {
+    // ... existing methods
+
+    /// Aggressive decode shortcuts for fast scrubbing.
+    ///
+    /// `true`: drop B-frames + skip deblocking. ~2× faster GOP walk, slightly
+    /// softer frames. Call when scrub becomes active.
+    ///
+    /// `false`: full-quality decode. Call when scrub stops, then re-run
+    /// [`Decoder::seek_exact`] at the final position for the clean display frame.
+    pub fn set_fast_scrub(&mut self, enabled: bool) {
+        let (filter, frame) = if enabled {
+            (Discard::All, Discard::NonReference)
+        } else {
+            (Discard::Default, Discard::Default)
+        };
+        // SAFETY: skip_loop_filter / skip_frame are documented as runtime-mutable
+        // on AVCodecContext. Threading workers pick up the new value on next packet.
+        unsafe {
+            let ctx = self.decoder.as_mut_ptr();
+            (*ctx).skip_loop_filter = filter.into();
+            (*ctx).skip_frame = frame.into();
+        }
+    }
 }
