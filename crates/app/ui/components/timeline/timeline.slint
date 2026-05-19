@@ -51,7 +51,7 @@ export component TimelinePanel inherits Rectangle {
                 }
             }
 
-            area := Rectangle {
+            Rectangle {
                 clip: true;
                 width: 100%;
                 height: 100%;
@@ -60,13 +60,12 @@ export component TimelinePanel inherits Rectangle {
                     Ruler {
                         height: TimelineState.ruler-height;
                         width: 100%;
-                        x: TimelineState.scroll-x;
+                        x: tracks.viewport-x;
                     }
 
                     tracks := Flickable {
                         vertical-stretch: 1;
                         horizontal-stretch: 1;
-                        viewport-x <=> TimelineState.scroll-x;
                         viewport-y <=> TimelineState.scroll-y;
 
                         viewport-width: 10000000px;
@@ -92,44 +91,10 @@ export component TimelinePanel inherits Rectangle {
                     }
                 }
 
-                playhead := PlayHead {
+                PlayHead {
                     y: 0;
                     height: parent.height;
-                    line-pos <=> TimelineState.playhead-x;
-                    content-width: tracks.viewport-width;
-                }
-
-                scrub := TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    mouse-cursor: MouseCursor.ew-resize;
-
-                    property <length> pointer-panel-x: self.absolute-position.x + self.mouse-x - area.absolute-position.x;
-
-                    function apply-scrub() {
-                        TimelineState.scrub-to-panel-x(
-                            self.pointer-panel-x,
-                            tracks.width,
-                            tracks.viewport-width,
-                            playhead.line-x,
-                            playhead.head-width,
-                            playhead.clamp-min-x,
-                            playhead.clamp-max-x,
-                        );
-                    }
-
-                    pointer-event(event) => {
-                        if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                            self.apply-scrub();
-                        }
-                    }
-
-                    moved() => {
-                        if (!self.pressed) {
-                            return;
-                        }
-                        self.apply-scrub();
-                    }
+                    x <=> TimelineState.playhead-x;
                 }
             }
         }

@@ -29,4 +29,12 @@ export component Ruler inherits Rectangle {
         font-weight: 700;
     }
 
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+
+        clicked => {
+            debug("ruler clicked", self.mouse-x);
+        }
+    }
 }
