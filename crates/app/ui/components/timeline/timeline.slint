@@ -64,9 +64,12 @@ export component TimelinePanel inherits Rectangle {
                     }
 
                     tracks := Flickable {
+
                         vertical-stretch: 1;
                         horizontal-stretch: 1;
+
                         viewport-y <=> TimelineState.scroll-y;
+                        viewport-x <=> TimelineState.scroll-x;
 
                         viewport-width: 10000000px;
                         viewport-height: 10000000px;
