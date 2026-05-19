@@ -15,18 +15,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .require_wgpu_28(WGPUConfiguration::default())
         .select()?;
 
-    let app = AppWindow::new()?;
-
-    app.on_preview_playback_changed(|playing| {
-        tracing::info!(playing, "preview playback");
-    });
-
+    let mut app = AppWindow::new()?;
+    create_project(&mut app);
     app.run()?;
     Ok(())
 }
 
-fn create_project() -> UiProject {
-    UiProject {
+fn create_project(app: &mut AppWindow) {
+    let project = UiProject {
         id: "1".into(),
         name: "Project 1".into(),
         file_path: "project.cutlass".into(),
@@ -35,5 +31,7 @@ fn create_project() -> UiProject {
         media_bin: todo!(),
         active_sequence_id: todo!(),
         is_dirty: todo!(),
-    }
+    };
+
+    app.global::<AppState>().set_project(project);
 }

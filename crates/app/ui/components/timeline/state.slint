@@ -1,3 +1,5 @@
+import { UiSequence } from "../../models/project.slint";
+
 export global TimelineState {
     in-out property <length> ruler-offset: 10px;
     in-out property <int> zoom-step: 1;
@@ -11,4 +13,6 @@ export global TimelineState {
 
     in-out property <length> viewport-width: 10300px;
     in-out property <length> viewport-height: 400px;
+
+    in-out property <UiSequence> sequence;
 }
