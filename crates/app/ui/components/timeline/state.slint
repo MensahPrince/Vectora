@@ -6,4 +6,21 @@ export global TimelineState {
     in-out property <length> scroll-y: 0px;
     in-out property <length> ruler-height: 24px;
     in-out property <length> playhead-x: 160px;
+
+    public function ensure-playhead-visible(view-w: length, content-w: length, line-x-off: length, head-w: length) {
+        if (playhead-x - line-x-off + scroll-x + head-w > view-w) {
+            scroll-x = view-w - playhead-x + line-x-off - head-w;
+        } else if (playhead-x - line-x-off + scroll-x < 0) {
+            scroll-x = -playhead-x + line-x-off;
+        }
+        scroll-x = scroll-x < -(content-w - view-w) ? -(content-w - view-w) : scroll-x;
+        scroll-x = scroll-x > 0 ? 0 : scroll-x;
+    }
+
+    public function scrub-to-panel-x(panel-x: length, view-w: length, content-w: length, line-x-off: length, head-w: length, clamp-min: length, clamp-max: length) {
+        playhead-x = panel-x + line-x-off - scroll-x;
+        playhead-x = playhead-x < clamp-min ? clamp-min : playhead-x;
+        playhead-x = playhead-x > clamp-max ? clamp-max : playhead-x;
+        ensure-playhead-visible(view-w, content-w, line-x-off, head-w);
+    }
 }

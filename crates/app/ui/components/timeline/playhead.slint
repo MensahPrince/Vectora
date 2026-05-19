@@ -10,16 +10,15 @@ export component PlayHead inherits Rectangle {
     in property <length> line-width: 1.2px;
     in property <brush> playhead-color: #ffffff;
     in property <length> content-width: 1000000px;
-    in property <length> viewport-x: 0px;
     in-out property <length> line-pos: 0px;
     width: head-width;
     background: transparent;
 
-    property <length> line-x: (self.width - stroke-width) / 2;
+    out property <length> line-x: (self.width - stroke-width) / 2;
     out property <length> clamp-min-x: 0px;
     out property <length> clamp-max-x: content-width - head-width + line-x;
 
-    x: line-pos - line-x + viewport-x;
+    x: line-pos - line-x + TimelineState.scroll-x;
 
     head := Rectangle {
         y: 0;
@@ -43,28 +42,4 @@ export component PlayHead inherits Rectangle {
         background: root.playhead-color;
     }
 
-    ta := TouchArea {
-        width: 100%;
-        height: 100%;
-        mouse-cursor: MouseCursor.ew-resize;
-
-        property <length> drag-start-playhead-x;
-        property <length> drag-origin-root-x;
-
-        pointer-event(event) => {
-            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                self.drag-start-playhead-x = root.line-pos;
-                self.drag-origin-root-x = self.absolute-position.x + self.mouse-x;
-            }
-        }
-
-        moved() => {
-            if (!self.pressed) {
-                return;
-            }
-            root.line-pos = self.drag-start-playhead-x + self.absolute-position.x + self.mouse-x - self.drag-origin-root-x;
-            root.line-pos = root.line-pos < root.clamp-min-x ? root.clamp-min-x : root.line-pos;
-            root.line-pos = root.line-pos > root.clamp-max-x ? root.clamp-max-x : root.line-pos;
-        }
-    }
 }

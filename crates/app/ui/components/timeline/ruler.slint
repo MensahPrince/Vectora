@@ -1,10 +1,6 @@
 // Timeline time ruler — tick marks + sparse labels (full geometry via UiRulerTick later).
 
-import { TimelineState } from "./state.slint";
-
 export component Ruler inherits Rectangle {
-    in property <length> clamp-min-x: 0px;
-    in property <length> clamp-max-x: 1000000px;
     height: 24px;
     horizontal-stretch: 1;
     background: #28282a;
@@ -33,28 +29,4 @@ export component Ruler inherits Rectangle {
         font-weight: 700;
     }
 
-    ta := TouchArea {
-        width: 100%;
-        height: 100%;
-        mouse-cursor: MouseCursor.ew-resize;
-
-        pointer-event(event) => {
-            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                root.scrub-to(self.mouse-x);
-            }
-        }
-
-        moved() => {
-            if (!self.pressed) {
-                return;
-            }
-            root.scrub-to(self.mouse-x);
-        }
-    }
-
-    function scrub-to(mouse-x: length) {
-        TimelineState.playhead-x = mouse-x;
-        TimelineState.playhead-x = TimelineState.playhead-x < root.clamp-min-x ? root.clamp-min-x : TimelineState.playhead-x;
-        TimelineState.playhead-x = TimelineState.playhead-x > root.clamp-max-x ? root.clamp-max-x : TimelineState.playhead-x;
-    }
 }
