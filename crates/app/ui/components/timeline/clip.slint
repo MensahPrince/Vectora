@@ -1,0 +1,80 @@
+// A single clip pill on a track. Position and width are derived from the
+// clip's `start-sec` / `duration-sec` (precomputed in Rust from RationalTime)
+// multiplied by the timeline's current px-per-second zoom.
+
+import { Clip } from "../../models/project.slint";
+import { TimelineState } from "./state.slint";
+
+export component ClipView inherits Rectangle {
+    in property <Clip> info;
+
+    // The owning track row's height (in `length`). Pushed in by `TrackRow`
+    // because Slint disallows `parent` from a component's root and `100%`
+    // (a percent type) can't be subtracted from a `length`.
+    in property <length> row-height: 60px;
+
+    // Vertical inset inside the track row so adjacent rows visually breathe.
+    in property <length> row-padding: 4px;
+
+    // Width floor: clips shorter than 1px still get a visible sliver so the
+    // user can grab and re-trim them. Without this, very-trimmed clips
+    // vanish at low zoom.
+    property <length> raw-width: info.duration-sec * TimelineState.zoom * 1px;
+
+    x: info.start-sec * TimelineState.zoom * 1px;
+    y: row-padding;
+    width: max(2px, raw-width);
+    height: row-height - 2 * row-padding;
+
+    border-radius: 4px;
+    background: info.color;
+    opacity: info.enabled ? 1.0 : 0.45;
+
+    // Selection ring drawn as a border so it stays crisp at any zoom.
+    border-width: info.selected ? 2px : 0px;
+    border-color: #ffffff;
+
+    // Subtle top accent so disabled vs enabled is visible even without colour.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 2px;
+        background: info.enabled ? #ffffff40 : transparent;
+        border-top-left-radius: parent.border-radius;
+        border-top-right-radius: parent.border-radius;
+    }
+
+    label-area := Rectangle {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        // `clip: true` is the Rectangle.clip prop (not the Clip struct) — it
+        // prevents the name from spilling out of narrow pills.
+        clip: true;
+
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-top: 4px;
+            padding-bottom: 4px;
+
+            Text {
+                text: info.name;
+                color: #ffffff;
+                font-size: 11px;
+                font-weight: 600;
+                vertical-alignment: TextVerticalAlignment.center;
+                horizontal-alignment: TextHorizontalAlignment.left;
+                overflow: TextOverflow.clip;
+            }
+        }
+    }
+
+    TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        // Selection callback wiring is a follow-up — Rust needs to mutate
+        // the DTO's `selected` flag (or maintain a separate selection set).
+    }
+}

@@ -31,11 +31,21 @@ export global TimelineState {
     // a wall. 400px is roughly one screen at default zoom.
     in property <length> tail-padding: 400px;
 
-    // Scrollable content width derived from the active sequence's duration
-    // and the current zoom. When zoom changes the viewport grows/shrinks
-    // immediately (no Rust round trip needed) because both are properties.
+    // Actual width of the tracks viewport on screen, fed in from the
+    // timeline panel via a `changed width` callback. Initial fallback is
+    // a sane non-zero value so the very first frame doesn't render at 0.
+    in property <length> available-width: 600px;
+
+    // Scrollable content width. Two contributors:
+    //   * Sequence content extent: `duration-sec × zoom × 1px + tail-padding`.
+    //   * Visible panel width — track lanes must always fill the screen
+    //     (real editors don't show a hard "end of track" before the panel
+    //     edge; the area past the last clip is just empty drop space).
+    // Taking the max of both makes lanes feel infinite while still scaling
+    // the scroll extent up when zoomed in past the panel.
     out property <length> viewport-width:
-        max(AppState.project.sequence.duration-sec * zoom * 1px + tail-padding, 0px);
+        max(AppState.project.sequence.duration-sec * zoom * 1px + tail-padding,
+            available-width);
 
     // ---- Adaptive ruler scale ("nice numbers") --------------------------------
     //

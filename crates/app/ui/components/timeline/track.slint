@@ -1,0 +1,104 @@
+// One row in the timeline. Renders the track's clips positioned by their
+// `start-sec` × `TimelineState.zoom`. The track's own height comes from the
+// DTO (`info.height-px`) so video tracks (typically taller, with thumbnails)
+// and audio tracks (shorter) coexist naturally.
+
+import { Track, TrackKind } from "../../models/project.slint";
+import { ClipView } from "./clip.slint";
+
+export component TrackRow inherits Rectangle {
+    in property <Track> info;
+
+    height: info.height-px * 1px;
+    width: 100%;
+    // Muted tracks dim toward black so they read as "off" without losing
+    // their structure.
+    background: info.muted ? #131315 : #1b1b1b;
+    border-radius: 2px;
+
+    // Lane separator between video lanes (lighter) and audio lanes (slight
+    // green tint). Subtle — lets users orient at a glance.
+    Rectangle {
+        x: 0;
+        y: 0;
+        width: 2px;
+        height: 100%;
+        background: info.kind == TrackKind.video ? #4a90e2 : #5cb09b;
+        opacity: 0.35;
+    }
+
+    for clip in info.clips: ClipView {
+        info: clip;
+        row-height: info.height-px * 1px;
+    }
+}
+
+// The matching left-column header. Same height so each clip row lines up
+// with its label across the gutter.
+export component TrackHeader inherits Rectangle {
+    in property <Track> info;
+
+    height: info.height-px * 1px;
+    width: 100%;
+    background: #1b1b1b;
+    border-radius: 2px;
+
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 6px;
+        alignment: LayoutAlignment.start;
+
+        Text {
+            text: info.name;
+            color: #e5e5e7;
+            font-size: 12px;
+            font-weight: 700;
+            vertical-alignment: TextVerticalAlignment.center;
+            horizontal-stretch: 0;
+        }
+
+        // Spacer pushes the badges to the right edge.
+        Rectangle {
+            horizontal-stretch: 1;
+            background: transparent;
+        }
+
+        // Lightweight badges. Each toggles visibility on the matching flag
+        // — placeholder for the per-track action buttons we'll wire to Rust.
+        Text {
+            visible: info.muted;
+            text: "M";
+            color: #ef4444;
+            font-size: 11px;
+            font-weight: 800;
+            vertical-alignment: TextVerticalAlignment.center;
+        }
+        Text {
+            visible: info.solo;
+            text: "S";
+            color: #fbbf24;
+            font-size: 11px;
+            font-weight: 800;
+            vertical-alignment: TextVerticalAlignment.center;
+        }
+        Text {
+            visible: info.locked;
+            text: "L";
+            color: #94a3b8;
+            font-size: 11px;
+            font-weight: 800;
+            vertical-alignment: TextVerticalAlignment.center;
+        }
+        Text {
+            // Video-track eye-toggle indicator (only shown when hidden, so
+            // visible tracks don't display a redundant badge).
+            visible: info.kind == TrackKind.video && !info.visible;
+            text: "·";
+            color: #94a3b8;
+            font-size: 14px;
+            font-weight: 800;
+            vertical-alignment: TextVerticalAlignment.center;
+        }
+    }
+}
