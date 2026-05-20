@@ -1,22 +1,16 @@
+import { AppState } from "../../models/app_state.slint";
 import { RationalTime } from "../../models/project.slint";
 
 export global TimelineState {
-    // Display-only RationalTime → seconds helper. Kept around for one-off
-    // formatting (e.g. tooltips) but **not** used for geometry: anything
-    // that scales with project-length × zoom is pre-multiplied in Rust at
-    // f64 precision and fed in via `sequence-duration-px` and the per-clip
-    // `start-px` / `duration-px` companions on the DTO. See
-    // `convert::recompute_pixel_geometry` and the `geometry-dirty`
-    // callback below.
+    // RationalTime → seconds. Strings on the DTO carry the i64 numerator;
+    // `.to-float()` parses them once, and Slint memoizes this expression so
+    // re-evaluation only happens when the underlying RT changes (not on
+    // every zoom tick). f32 precision is sub-frame for typical project
+    // lengths; promote to a pre-multiplied pixel position in Rust if we
+    // ever care about multi-hour timelines.
     public pure function rt-sec(rt: RationalTime) -> float {
         rt.num.to-float() / rt.den.to-float()
     }
-
-    // Fired by Slint sites that mutate `zoom` (the toolbar slider today;
-    // future: keyboard zoom, pinch). Rust handler walks `AppState.project`
-    // and re-pushes `Clip.start-px` / `Clip.duration-px` /
-    // `sequence-duration-px` so all geometry stays at f64 precision.
-    callback geometry-dirty();
 
     in-out property <length> ruler-offset: 10px;
     in-out property <int> zoom-step: 1;
@@ -53,22 +47,20 @@ export global TimelineState {
     // a sane non-zero value so the very first frame doesn't render at 0.
     in property <length> available-width: 600px;
 
-    // Sequence content extent in pixels (= sequence-duration × zoom),
-    // pre-multiplied in Rust at f64 precision. Re-pushed whenever zoom or
-    // the project changes via `geometry-dirty`. Until that first push the
-    // panel still falls back to `available-width` below, so the very
-    // first frame doesn't render at 0.
-    in property <float> sequence-duration-px;
+    // Sequence duration in seconds, cached so the multi-step parse in
+    // `rt-sec` runs once per sequence change, not on every zoom tick.
+    out property <float> sequence-duration-sec:
+        rt-sec(AppState.project.sequence.duration);
 
     // Scrollable content width. Two contributors:
-    //   * Sequence content extent (pre-multiplied) + tail padding.
+    //   * Sequence content extent: `duration_sec × zoom × 1px + tail-padding`.
     //   * Visible panel width — track lanes must always fill the screen
     //     (real editors don't show a hard "end of track" before the panel
     //     edge; the area past the last clip is just empty drop space).
     // Taking the max of both makes lanes feel infinite while still scaling
     // the scroll extent up when zoomed in past the panel.
     out property <length> viewport-width:
-        max(sequence-duration-px * 1px + tail-padding, available-width);
+        max(sequence-duration-sec * zoom * 1px + tail-padding, available-width);
 
     // ---- Adaptive ruler scale ("nice numbers") --------------------------------
     //
@@ -94,45 +86,18 @@ export global TimelineState {
     // Time-mode picker: seconds per major. Range covers sub-second zoom
     // through multi-hour overview ticks.
     out property <float> sec-per-major:
-        zoom *     0.1 * 1px >= target-major-px ?     0.1 :
-        zoom *     0.2 * 1px >= target-major-px ?     0.2 :
-        zoom *     0.5 * 1px >= target-major-px ?     0.5 :
-        zoom *     1.0 * 1px >= target-major-px ?     1.0 :
-        zoom *     2.0 * 1px >= target-major-px ?     2.0 :
-        zoom *     5.0 * 1px >= target-major-px ?     5.0 :
-        zoom *    10.0 * 1px >= target-major-px ?    10.0 :
-        zoom *    30.0 * 1px >= target-major-px ?    30.0 :
-        zoom *    60.0 * 1px >= target-major-px ?    60.0 :
-        zoom *   300.0 * 1px >= target-major-px ?   300.0 :
-        zoom *   600.0 * 1px >= target-major-px ?   600.0 :
-        zoom *  1800.0 * 1px >= target-major-px ?  1800.0 :
-        zoom *  3600.0 * 1px >= target-major-px ?  3600.0 :
-        zoom *  7200.0 * 1px >= target-major-px ?  7200.0 :
-        zoom * 21600.0 * 1px >= target-major-px ? 21600.0 :
-        86400.0;
+        zoom * 0.1 * 1px >= target-major-px ? 0.1 : zoom * 0.2 * 1px >= target-major-px ? 0.2 : zoom * 0.5 * 1px >= target-major-px ? 0.5 : zoom * 1.0 * 1px >= target-major-px ? 1.0 : zoom * 2.0 * 1px >= target-major-px ? 2.0 : zoom * 5.0 * 1px >= target-major-px ? 5.0 : zoom * 10.0 * 1px >= target-major-px ? 10.0 : zoom * 30.0 * 1px >= target-major-px ? 30.0 : zoom * 60.0 * 1px >= target-major-px ? 60.0 : zoom * 300.0 * 1px >= target-major-px ? 300.0 : zoom * 600.0 * 1px >= target-major-px ? 600.0 : zoom * 1800.0 * 1px >= target-major-px ? 1800.0 : zoom * 3600.0 * 1px >= target-major-px ? 3600.0 : zoom * 7200.0 * 1px >= target-major-px ? 7200.0 : zoom * 21600.0 * 1px >= target-major-px ? 21600.0 : 86400.0;
 
     // Frame-mode picker: frames per major. Discrete nice frame counts so that
     // minor ticks always land on integer frame boundaries.
     out property <int> frames-per-major:
-        px-per-frame *   1 * 1px >= target-major-px ?   1 :
-        px-per-frame *   2 * 1px >= target-major-px ?   2 :
-        px-per-frame *   5 * 1px >= target-major-px ?   5 :
-        px-per-frame *  10 * 1px >= target-major-px ?  10 :
-        px-per-frame *  15 * 1px >= target-major-px ?  15 :
-        px-per-frame *  30 * 1px >= target-major-px ?  30 :
-        px-per-frame *  60 * 1px >= target-major-px ?  60 :
-        px-per-frame * 120 * 1px >= target-major-px ? 120 :
-        300;
+        px-per-frame * 1 * 1px >= target-major-px ? 1 : px-per-frame * 2 * 1px >= target-major-px ? 2 : px-per-frame * 5 * 1px >= target-major-px ? 5 : px-per-frame * 10 * 1px >= target-major-px ? 10 : px-per-frame * 15 * 1px >= target-major-px ? 15 : px-per-frame * 30 * 1px >= target-major-px ? 30 : px-per-frame * 60 * 1px >= target-major-px ? 60 : px-per-frame * 120 * 1px >= target-major-px ? 120 : 300;
 
     // Unified spacings. major-every adapts in deep frame mode so that we don't
     // generate sub-frame minor ticks (would be visual noise).
     out property <length> major-spacing:
-        frame-mode
-            ? frames-per-major * px-per-frame * 1px
-            : sec-per-major * zoom * 1px;
+        frame-mode ? frames-per-major * px-per-frame * 1px : sec-per-major * zoom * 1px;
     out property <int> major-every:
-        frame-mode && frames-per-major <= 1 ? 1
-        : frame-mode && frames-per-major <= 2 ? 2
-        : 5;
+        frame-mode && frames-per-major <= 1 ? 1 : frame-mode && frames-per-major <= 2 ? 2 : 5;
     out property <length> minor-spacing: major-spacing / major-every;
 }

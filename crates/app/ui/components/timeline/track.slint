@@ -1,7 +1,6 @@
 // One row in the timeline. Renders the track's clips positioned by their
-// pre-multiplied `info.start-px` / `info.duration-px` (RationalTime × zoom
-// done in Rust at f64). The track's own height comes from the DTO
-// (`info.height-px`) so video tracks (typically taller, with thumbnails)
+// `start-sec` × `TimelineState.zoom`. The track's own height comes from the
+// DTO (`info.height-px`) so video tracks (typically taller, with thumbnails)
 // and audio tracks (shorter) coexist naturally.
 
 import { Track, TrackKind } from "../../models/project.slint";
@@ -75,6 +74,7 @@ export component TrackHeader inherits Rectangle {
             font-weight: 800;
             vertical-alignment: TextVerticalAlignment.center;
         }
+
         Text {
             visible: info.solo;
             text: "S";
@@ -83,6 +83,7 @@ export component TrackHeader inherits Rectangle {
             font-weight: 800;
             vertical-alignment: TextVerticalAlignment.center;
         }
+
         Text {
             visible: info.locked;
             text: "L";
@@ -91,6 +92,7 @@ export component TrackHeader inherits Rectangle {
             font-weight: 800;
             vertical-alignment: TextVerticalAlignment.center;
         }
+
         Text {
             // Video-track eye-toggle indicator (only shown when hidden, so
             // visible tracks don't display a redundant badge).
