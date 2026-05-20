@@ -1,4 +1,4 @@
-//! Media import: file picker → engine probe → append to `AppState.project.media-bin`.
+//! Media import: file picker → engine probe → `Session::add_media`.
 //!
 //! Flow on `AppState::import_media`:
 //!   1. Open a native file picker via `rfd` (sync). The Slint event loop is
@@ -13,23 +13,26 @@
 //!      `is_supported: false` with an error message on failure — the UI
 //!      renders that as a red-bordered tile so the user can still see the
 //!      file landed).
-//!   4. Push the DTO straight onto the existing `VecModel` backing
-//!      `project.media-bin`. This avoids a full project DTO round-trip
-//!      (which would clobber ephemeral UI state like `zoom`/`playhead`).
+//!   4. Hand it to [`Session::add_media`], which appends to the
+//!      authoritative `Project.media_bin`, sets `is_dirty`, and refreshes
+//!      the Slint DTO via the session's `on_changed` callback.
 //!
 //! The Slint callback is registered once, in `install`, and lives for the
-//! lifetime of the editor window via the weak handle inside the closure.
+//! lifetime of the editor window. The `Rc<RefCell<Session>>` is the
+//! single source of truth for project state.
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use models::{
     AudioStreamInfo, MediaId, MediaKind, MediaSource, Rational, RationalTime, VideoStreamInfo,
 };
-use slint::{ComponentHandle, Model, VecModel};
+use slint::ComponentHandle;
 use tracing::{info, warn};
 
-use crate::ui::{self, AppState, EditorWindow};
+use crate::session::Session;
+use crate::ui::{AppState, EditorWindow};
 
 /// File extensions exposed in the picker's "Media" filter. The probe doesn't
 /// care about extensions (ffmpeg sniffs the container), but the dialog needs
@@ -44,24 +47,25 @@ const MEDIA_EXTENSIONS: &[&str] = &[
     "bmp", "gif", "jpeg", "jpg", "png", "tif", "tiff", "webp",
 ];
 
-pub fn install(editor: &EditorWindow) {
-    let weak = editor.as_weak();
+pub fn install(editor: &EditorWindow, session: Rc<RefCell<Session>>) {
     editor.global::<AppState>().on_import_media(move || {
-        let Some(editor) = weak.upgrade() else {
-            return;
-        };
-
         let paths = pick_paths();
         if paths.is_empty() {
             return;
         }
         info!(count = paths.len(), "import: probing");
 
+        // One borrow for the whole batch is simpler than re-borrowing
+        // per file. NOTE: `add_media` notifies after every append, so a
+        // 10-file import currently triggers 10 full-DTO refreshes. If
+        // that becomes visible jank, add `Session::batch(|s| { … })`
+        // that suppresses notify until the closure ends and rebuild
+        // once at the end. Realistic batches are small enough today
+        // that it isn't worth the API surface.
+        let mut session = session.borrow_mut();
         for path in paths {
             let source = build_media_source(path);
-            if let Err(reason) = append_to_bin(&editor, source) {
-                warn!(reason, "import: failed to append to library");
-            }
+            session.add_media(source);
         }
     });
 }
@@ -172,53 +176,11 @@ fn kind_from_extension() -> MediaKind {
     MediaKind::Video
 }
 
-/// Push the DTO into the existing `VecModel` so the grid updates
-/// incrementally. Falls back to a project replacement if the backing
-/// model isn't a `VecModel` — which shouldn't happen in practice since the
-/// only producer is `convert::vec_model`, but the fallback keeps imports
-/// from silently failing if someone swaps the backing model later.
-fn append_to_bin(editor: &EditorWindow, source: MediaSource) -> Result<(), &'static str> {
-    let state = editor.global::<AppState>();
-    let project = state.get_project();
-    let dto: ui::MediaSource = (&source).into();
-
-    if let Some(vm) = project
-        .media_bin
-        .as_any()
-        .downcast_ref::<VecModel<ui::MediaSource>>()
-    {
-        vm.push(dto);
-        // is-dirty is part of the Project value itself (not the inner model),
-        // so we still need a `set_project` to propagate that flag. media_bin
-        // is the same `ModelRc` we just pushed to, so the grid does NOT
-        // re-render — only the title's dirty indicator updates.
-        if !project.is_dirty {
-            let mut p = project;
-            p.is_dirty = true;
-            state.set_project(p);
-        }
-        Ok(())
-    } else {
-        // Fallback: rebuild the model. This loses ephemeral DTO defaults
-        // (selection, zoom) so we only hit it if the producer changed shape.
-        let bin: Vec<ui::MediaSource> = project
-            .media_bin
-            .iter()
-            .chain(std::iter::once(dto))
-            .collect();
-        let mut p = project;
-        p.media_bin = slint::ModelRc::from(Rc::new(VecModel::from(bin)));
-        p.is_dirty = true;
-        state.set_project(p);
-        Err("media-bin VecModel downcast failed; rebuilt model in place")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     //! Pure-helper coverage. The rfd-driven flow (`pick_paths`) and the
-    //! Slint-bound `append_to_bin` need a real `EditorWindow` + event loop;
-    //! those paths are exercised end-to-end manually.
+    //! Slint-bound `on_import_media` callback need a real `EditorWindow`
+    //! + event loop; those paths are exercised end-to-end manually.
 
     use super::*;
 

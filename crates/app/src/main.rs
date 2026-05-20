@@ -12,6 +12,8 @@ mod convert;
 mod demo;
 mod import;
 mod preview;
+mod session;
+mod timeline_ui;
 
 pub mod ui {
     //! Slint-generated types live here so they don't collide with the
@@ -33,6 +35,8 @@ use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 use crate::preview::PreviewSession;
+use crate::session::Session;
+use crate::timeline_ui::Selection;
 use crate::ui::{AppState, AppWindow, EditorWindow, TimelineState};
 
 /// Canonical ticks-per-second for an empty sequence. 90 000 is the standard
@@ -41,10 +45,17 @@ use crate::ui::{AppState, AppWindow, EditorWindow, TimelineState};
 const DEFAULT_TIMEBASE: u32 = 90_000;
 
 /// Owns everything that has to outlive a single editor session: the editor
-/// window itself plus the engine/preview drain thread.
+/// window, the engine/preview drain thread, and the [`Session`] that owns
+/// the authoritative `Project`.
+///
+/// Drop order matters — `Rc<RefCell<Session>>` is captured by Slint
+/// callbacks held on `_window`, so the window must drop first to release
+/// those references before the Session is dropped. Field declaration order
+/// in this struct is the drop order Rust applies.
 struct EditorSession {
     _window: EditorWindow,
     _preview: PreviewSession,
+    _session: Rc<RefCell<Session>>,
 }
 
 fn setup_tracing() {
@@ -95,11 +106,26 @@ fn run_launcher() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Open the editor on `project`. Wires preview/import and quits the event loop
 /// when the user closes the window.
+///
+/// Project ownership lives on [`Session`]; the Slint `AppState.project`
+/// is a derived view refreshed by the `on_changed` callback installed at
+/// construction. Every mutation path (timeline commands today, more
+/// later) goes through the Session.
 fn open_editor(project: Project) -> Result<EditorSession, Box<dyn std::error::Error>> {
     let editor = EditorWindow::new()?;
-    seed_project(&editor, project);
+
+    // Ephemeral UI state (ruler fps) is one-shot at seed time. fps is
+    // a sequence-level setting and there's no `Command` to change it
+    // mid-edit, so we don't need to re-sync this on every project change.
+    let fps = project.sequence.fps.as_f32().max(1.0);
+    editor.global::<TimelineState>().set_fps(fps);
+
+    let selection = timeline_ui::new_selection();
+    let session = build_session(&editor, project, selection.clone());
+
     let preview = preview::install(&editor);
-    import::install(&editor);
+    import::install(&editor, session.clone());
+    timeline_ui::install(&editor, session.clone(), selection);
 
     editor.window().on_close_requested(|| {
         let _ = slint::quit_event_loop();
@@ -110,17 +136,31 @@ fn open_editor(project: Project) -> Result<EditorSession, Box<dyn std::error::Er
     Ok(EditorSession {
         _window: editor,
         _preview: preview,
+        _session: session,
     })
 }
 
-/// Push a domain `Project` into the editor's Slint state. Mirrors the FPS
-/// onto `TimelineState` so the ruler's frame-mode labelling stays correct.
-fn seed_project(editor: &EditorWindow, project: Project) {
-    let fps = project.sequence.fps.as_f32().max(1.0);
-    editor.global::<TimelineState>().set_fps(fps);
-
-    let dto: ui::Project = (&project).into();
-    editor.global::<AppState>().set_project(dto);
+/// Build a `Session` whose `on_changed` callback rebuilds the Slint
+/// `AppState.project` DTO and pushes it onto the editor window.
+///
+/// The callback runs synchronously inside `Session::submit` /
+/// `Session::add_media`, so it MUST NOT re-enter the Session (e.g. by
+/// reading from `AppState` and trying to mutate the project from another
+/// callback). `set_project` is just a property write — Slint won't fire
+/// further Rust callbacks synchronously from it.
+fn build_session(
+    editor: &EditorWindow,
+    project: Project,
+    selection: Selection,
+) -> Rc<RefCell<Session>> {
+    let weak = editor.as_weak();
+    Rc::new(RefCell::new(Session::new(project, move |project| {
+        if let Some(editor) = weak.upgrade() {
+            let selected = *selection.borrow();
+            let dto = convert::project_to_ui(project, selected);
+            editor.global::<AppState>().set_project(dto);
+        }
+    })))
 }
 
 /// A blank project: 1920×1080 / 30 fps sequence, empty media bin and tracks.

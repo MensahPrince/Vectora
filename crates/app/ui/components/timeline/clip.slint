@@ -4,6 +4,7 @@
 
 import { Clip } from "../../models/project.slint";
 import { TimelineState } from "./state.slint";
+import { TimelineInteraction } from "../../models/timeline_interaction.slint";
 
 export component ClipView inherits Rectangle {
     in property <Clip> info;
@@ -12,6 +13,9 @@ export component ClipView inherits Rectangle {
     // because Slint disallows `parent` from a component's root and `100%`
     // (a percent type) can't be subtracted from a `length`.
     in property <length> row-height: 60px;
+
+    // When true, the clip cannot be moved (track lock).
+    in property <bool> track-locked: false;
 
     // Vertical inset inside the track row so adjacent rows visually breathe.
     in property <length> row-padding: 4px;
@@ -23,12 +27,16 @@ export component ClipView inherits Rectangle {
     property <float> start-sec: TimelineState.rt-sec(info.start);
     property <float> duration-sec: TimelineState.rt-sec(info.duration);
 
+    property <bool> is-dragging: TimelineInteraction.dragging-clip-id == info.id;
+    property <float> display-start-sec:
+        is-dragging ? TimelineInteraction.drag-preview-start-sec : start-sec;
+
     // Width floor: clips shorter than 1px still get a visible sliver so the
     // user can grab and re-trim them. Without this, very-trimmed clips
     // vanish at low zoom.
     property <length> raw-width: duration-sec * TimelineState.zoom * 1px;
 
-    x: start-sec * TimelineState.zoom * 1px;
+    x: display-start-sec * TimelineState.zoom * 1px;
     y: row-padding;
     width: max(2px, raw-width);
     height: row-height - 2 * row-padding;
@@ -79,9 +87,47 @@ export component ClipView inherits Rectangle {
         }
     }
 
-    TouchArea {
-        mouse-cursor: MouseCursor.pointer;
-        // Selection callback wiring is a follow-up — Rust needs to mutate
-        // the DTO's `selected` flag (or maintain a separate selection set).
+    clip-ta := TouchArea {
+        mouse-cursor: track-locked ? MouseCursor.not-allowed : MouseCursor.pointer;
+
+        property <length> press-root-x;
+        property <length> press-root-y;
+        property <bool> did-drag;
+
+        pointer-event(event) => {
+            if (track-locked) {
+                return;
+            }
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                self.press-root-x = self.absolute-position.x + self.mouse-x;
+                self.press-root-y = self.absolute-position.y + self.mouse-y;
+                self.did-drag = false;
+            }
+            if (event.kind != PointerEventKind.up || event.button != PointerEventButton.left) {
+                return;
+            }
+            // Drag commit is handled by the full-window grab in `editor.slint`.
+            if (!TimelineInteraction.clip-drag-active && !self.did-drag) {
+                TimelineInteraction.select-clip(info.id);
+            }
+        }
+
+        moved => {
+            if (track-locked || !self.pressed) {
+                return;
+            }
+            let root-x = self.absolute-position.x + self.mouse-x;
+            let root-y = self.absolute-position.y + self.mouse-y;
+            let adx = abs(root-x - self.press-root-x);
+            let ady = abs(root-y - self.press-root-y);
+            if (!TimelineInteraction.clip-drag-active && (adx > 6px || ady > 6px)) {
+                TimelineInteraction.clip-drag-active = true;
+                TimelineInteraction.dragging-clip-id = info.id;
+                TimelineInteraction.drag-start-sec = root.start-sec;
+                TimelineInteraction.drag-preview-start-sec = root.start-sec;
+                TimelineInteraction.drag-origin-root-x = self.absolute-position.x + self.mouse-x;
+                self.did-drag = true;
+            }
+        }
     }
 }
