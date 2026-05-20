@@ -31,6 +31,17 @@ export component TimelinePanel inherits Rectangle {
     // header column and the right content column stay vertically aligned.
     property <length> row-gap: 10px;
 
+    // Mirror of the global playhead so we can hang a `changed` handler off
+    // it — Slint `changed` handlers must live on a local property, not on a
+    // global one. Each time the user drags the playhead or clicks the ruler
+    // this fires `AppState.request-preview` with the time in seconds, which
+    // Rust forwards to `engine::Engine::seek_scrub` (a non-blocking,
+    // latest-wins slot so we can spam this on every pointer move).
+    property <length> playhead-tracker: TimelineState.playhead-x;
+    changed playhead-tracker => {
+        AppState.request-preview(playhead-tracker / TimelineState.zoom / 1px);
+    }
+
     VerticalLayout {
         width: 100%;
         height: 100%;

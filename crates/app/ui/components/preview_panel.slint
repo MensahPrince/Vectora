@@ -1,9 +1,8 @@
+import { AppState } from "../models/app_state.slint";
+
 export component PreviewPanel inherits Rectangle {
     horizontal-stretch: 1;
     vertical-stretch: 1;
-    // background: #0c0c0e;
-
-    in property <image> gpu-frame;
 
     Rectangle {
         vertical-stretch: 1;
@@ -12,8 +11,7 @@ export component PreviewPanel inherits Rectangle {
         Image {
             width: 100%;
             height: 100%;
-                // source: root.gpu-frame;
-                source: @image-url("../../../renderer/assets/texture.png");
+            source: AppState.preview-frame;
             image-fit: contain;
             horizontal-alignment: center;
             vertical-alignment: center;

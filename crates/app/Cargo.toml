@@ -8,6 +8,7 @@ build = "build.rs"
 
 [dependencies]
 decoder = { path = "../decoder" }
+engine = { path = "../engine" }
 models = { path = "../models" }
 renderer = { path = "../renderer" }
 slint = { version = "1.16", features = ["unstable-wgpu-28", "renderer-femtovg-wgpu"] }

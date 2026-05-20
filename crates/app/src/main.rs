@@ -4,10 +4,13 @@
 //!   1. Init tracing + WGPU-backed Slint backend.
 //!   2. Build the in-memory `models::Project` (domain types).
 //!   3. Convert it into the Slint `ui::Project` DTO and seed `AppState`.
-//!   4. Run the event loop.
+//!   4. Spawn the `engine` worker, open the demo video, and wire
+//!      playhead drag → `engine.seek_scrub`, decoded frame → `preview-frame`.
+//!   5. Run the event loop.
 
 mod convert;
 mod demo;
+mod preview;
 
 pub mod ui {
     //! Slint-generated types live here so they don't collide with the
@@ -38,6 +41,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = AppWindow::new()?;
     seed_demo_project(&app);
+    let _engine = preview::install(&app);
     app.run()?;
     Ok(())
 }

@@ -2,4 +2,13 @@ import { Project } from "./project.slint";
 
 export global AppState {
     in-out property <Project> project;
+
+    // Latest decoded preview frame, pushed from the engine worker through
+    // `slint::invoke_from_event_loop`. Bound by `PreviewPanel`.
+    in-out property <image> preview-frame;
+
+    // Fired from the timeline whenever the playhead moves. Payload is the
+    // timeline time in **seconds** (float). Rust connects this to
+    // `engine::Engine::seek_scrub`.
+    callback request-preview(float);
 }

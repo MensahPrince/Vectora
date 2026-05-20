@@ -5,3 +5,7 @@ edition.workspace = true
 description = "Cutlass editing engine: timeline, playback, and editor command execution"
 
 [dependencies]
+decoder = { path = "../decoder" }
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

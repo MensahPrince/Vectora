@@ -20,3 +20,4 @@ wgpu = "29.0.3"
 pollster = "0.4"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+crossbeam-channel = "0.5"
