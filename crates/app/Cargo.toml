@@ -11,6 +11,7 @@ decoder = { path = "../decoder" }
 engine = { path = "../engine" }
 models = { path = "../models" }
 renderer = { path = "../renderer" }
+rfd = "0.17"
 slint = { version = "1.16", features = ["unstable-wgpu-28", "renderer-femtovg-wgpu"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true

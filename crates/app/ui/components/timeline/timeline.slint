@@ -82,9 +82,10 @@ export component TimelinePanel inherits Rectangle {
                 }
             }
 
+            VerticalDivider { }
             // ── Right: ruler + scrollable track content ─────────────────
             Rectangle {
-                clip: true;
+                // clip: true; // TODO: uncomment this
                 horizontal-stretch: 1;
                 height: 100%;
 

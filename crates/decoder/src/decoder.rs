@@ -23,7 +23,7 @@ use crate::time::Rational;
 
 static FFMPEG_INIT: OnceLock<Result<(), ffmpeg_next::Error>> = OnceLock::new();
 
-fn ensure_ffmpeg_init() -> Result<(), DecoderError> {
+pub(crate) fn ensure_ffmpeg_init() -> Result<(), DecoderError> {
     match FFMPEG_INIT.get_or_init(ffmpeg_next::init) {
         Ok(()) => Ok(()),
         Err(e) => Err(DecoderError::Open(*e)),

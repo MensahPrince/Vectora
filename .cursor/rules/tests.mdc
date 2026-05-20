@@ -7,9 +7,7 @@ alwaysApply: true
 
 Cutlass treats tests as **production code**: write them deliberately and review them with the same skepticism as feature code.
 
-## Subagents
 
-- **Delegate test authoring** to a subagent (e.g. Task/explore or general-purpose agent scoped to “write tests for X”) so implementation stays focused and test code gets dedicated attention.
 
 ## Critical review
 

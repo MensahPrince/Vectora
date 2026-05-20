@@ -17,6 +17,7 @@ mod error;
 mod frame;
 mod outcome;
 mod pixel;
+mod probe;
 mod source;
 mod time;
 
@@ -25,6 +26,7 @@ pub use error::DecoderError;
 pub use frame::{CpuFrame, DecodedVideoFrame, FrameData, Plane};
 pub use outcome::DecodeOutcome;
 pub use pixel::PixelFormat;
+pub use probe::{ProbedAudio, ProbedKind, ProbedSource, ProbedVideo, probe};
 pub use source::SourceInfo;
 pub use time::Rational;
 

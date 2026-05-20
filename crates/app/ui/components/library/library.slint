@@ -1,0 +1,150 @@
+import { AppState } from "../../models/app_state.slint";
+import { MediaKind, MediaSource } from "../../models/project.slint";
+
+// One cell in the library grid. Renders the source's thumbnail when one
+// is attached, falling back to a kind-tinted placeholder so the user can
+// still tell video/audio/image apart while the engine is still probing.
+component LibraryTile inherits Rectangle {
+    in property <MediaSource> source;
+
+    background: #38383a;
+    border-radius: 4px;
+    border-width: source.is-missing ? 1px : 0px;
+    border-color: #c2453a;
+    clip: true;
+    opacity: source.is-loading ? 0.55 : 1.0;
+
+    vertical-stretch: 1;
+    VerticalLayout {
+        spacing: 0px;
+
+        Rectangle {
+            vertical-stretch: 1;
+            background: source.kind == MediaKind.video ? #2a3a4a : source.kind == MediaKind.audio ? #3a2a3e : #3a3a2a;
+
+            if source.thumbnail.width > 0: Image {
+                source: source.thumbnail;
+                image-fit: cover;
+                width: 100%;
+                height: 100%;
+            }
+        }
+
+        Rectangle {
+            height: 22px;
+            background: #00000055;
+
+            Text {
+                text: source.name;
+                color: source.is-missing ? #ff8a80 : #e6e6ec;
+                font-size: 11px;
+                overflow: elide;
+                horizontal-alignment: left;
+                vertical-alignment: center;
+                x: 6px;
+                width: parent.width - 12px;
+            }
+        }
+    }
+}
+
+// Small "+" affordance in the pane header. Mirrors the import action of the
+// empty-state region so the user can always trigger import without first
+// clearing the bin.
+component AddMediaButton inherits Rectangle {
+    width: 22px;
+    height: 22px;
+    border-radius: 4px;
+    background: ta.pressed ? #5b6eff : ta.has-hover ? #4a4a55 : #38383a;
+    animate background {
+        duration: 80ms;
+        easing: ease-out;
+    }
+
+    Text {
+        text: "+";
+        color: #d0d0da;
+        font-size: 18px;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            AppState.import-media()
+        }
+    }
+}
+
+export component LibraryPane inherits Rectangle {
+    background: #28282a;
+    clip: true;
+    in property <int> columns: 3;
+
+    VerticalLayout {
+        padding: 10px;
+        spacing: 8px;
+
+        HorizontalLayout {
+            spacing: 6px;
+
+            Text {
+                text: "Library";
+                color: #8e8e98;
+                font-size: 12px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+
+            AddMediaButton { }
+        }
+
+        // Empty-state. Doubles as a click target so a fresh project can
+        // start an import without hunting for the small `+` glyph above.
+        if AppState.project.media-bin.length == 0: TouchArea {
+            vertical-stretch: 1;
+            mouse-cursor: pointer;
+            clicked => {
+                AppState.import-media()
+            }
+
+            VerticalLayout {
+                alignment: center;
+                spacing: 4px;
+
+                Text {
+                    text: "No media yet";
+                    color: #5a5a64;
+                    font-size: 12px;
+                    horizontal-alignment: center;
+                }
+
+                Text {
+                    text: "Click to import";
+                    color: #7a7a8a;
+                    font-size: 11px;
+                    horizontal-alignment: center;
+                }
+            }
+        }
+
+        if AppState.project.media-bin.length > 0: Flickable {
+            vertical-stretch: 1;
+            horizontal-stretch: 1;
+
+            GridLayout {
+                spacing: 10px;
+
+                for source[i] in AppState.project.media-bin: LibraryTile {
+                    row: floor(i / root.columns);
+                    col: mod(i, root.columns);
+                    width: 100px;
+                    height: 100px;
+                    source: source;
+                }
+            }
+        }
+    }
+}

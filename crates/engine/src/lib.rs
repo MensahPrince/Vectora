@@ -19,4 +19,4 @@ mod playback;
 
 pub use crate::error::EngineError;
 pub use crate::playback::{Engine, EngineEvent, EventReceiver, PreviewFrame};
-pub use decoder::Rational;
+pub use decoder::{ProbedAudio, ProbedKind, ProbedSource, ProbedVideo, Rational, probe};

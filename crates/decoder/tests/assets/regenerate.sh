@@ -26,3 +26,9 @@ ffmpeg -y -f lavfi -i testsrc=duration=0.5:size=64x48:rate=12 \
 
 # Invalid / tiny file — demuxer open should fail
 printf 'not ffmpeg data' > corrupt_truncated.mp4
+
+# Single still-image fixture for probe's image-kind path. 2×2 red PNG
+# (~94 bytes). Demuxer reports `format=png_pipe`, so `probe` classifies it
+# as `ProbedKind::Image`; ffmpeg exposes the file as a 1-frame PNG video
+# stream, so `video` is `Some` with codec="png".
+ffmpeg -y -f lavfi -i color=c=red:s=2x2:d=0.04 -frames:v 1 testsrc_image.png

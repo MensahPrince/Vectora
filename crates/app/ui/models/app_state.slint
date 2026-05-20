@@ -11,4 +11,10 @@ export global AppState {
     // timeline time in **seconds** (float). Rust connects this to
     // `engine::Engine::seek_scrub`.
     callback request-preview(float);
+
+    // Fired from the library pane's `+` button or empty-state region. Rust
+    // opens a native file picker, probes each picked path via
+    // `engine::probe`, and appends the resulting `MediaSource`s to
+    // `project.media-bin`.
+    callback import-media();
 }

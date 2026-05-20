@@ -2,17 +2,19 @@
 //!
 //! Responsibilities:
 //!
-//! * Spawn the engine worker and open the demo video.
+//! * Spawn the engine worker so the editor has a live decoder to talk to.
 //! * Forward `AppState.request-preview(time-sec)` → `Engine::seek_scrub`.
 //!   The call is non-blocking — the engine has a latest-wins scrub slot so we
 //!   can drive this every pointer move without backing up.
 //! * Drain `EngineEvent`s on a small background thread and post the resulting
 //!   `slint::Image` to the UI thread via `slint::invoke_from_event_loop`.
 //!
+//! On a fresh empty project there's no source open yet — the preview pane
+//! stays blank until media import wires `Engine::open` into project state.
+//!
 //! The returned [`PreviewSession`] keeps the engine handle + drain thread
-//! alive for the lifetime of the app. Drop it and the engine shuts down.
+//! alive for the lifetime of the editor. Drop it and the engine shuts down.
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -21,12 +23,7 @@ use tracing::{debug, error, warn};
 
 use engine::{Engine, EngineEvent, EventReceiver, Rational};
 
-use crate::ui::{AppState, AppWindow};
-
-/// Demo asset shipped under `assets/`. 720p H.264, ~13 s — small enough to
-/// load fast, large enough to look like real footage. Swap to a real
-/// media-bin lookup once the importer lands.
-const DEMO_RELATIVE: &str = "assets/15881269_3840_2160_60fps_720p_proxy.mp4";
+use crate::ui::{AppState, EditorWindow};
 
 pub struct PreviewSession {
     /// Holding the engine here keeps the worker thread alive.
@@ -35,26 +32,15 @@ pub struct PreviewSession {
     _drain: JoinHandle<()>,
 }
 
-/// Install the preview pipeline. Spawns the engine, opens the demo source,
-/// connects the playhead → seek bridge, and starts pumping frames into
-/// `AppState.preview-frame`.
-pub fn install(app: &AppWindow) -> PreviewSession {
+/// Install the preview pipeline. Spawns the engine, connects the playhead →
+/// seek bridge, and starts pumping decoded frames into `AppState.preview-frame`.
+/// No source is opened — that happens when the user imports media.
+pub fn install(editor: &EditorWindow) -> PreviewSession {
     let (engine, rx) = Engine::spawn();
     let engine = Arc::new(engine);
 
-    let demo_path = resolve_demo_path();
-    if let Err(e) = engine.open(demo_path.clone()) {
-        error!(?e, path = %demo_path.display(), "engine: open failed");
-    } else {
-        debug!(path = %demo_path.display(), "engine: opened demo source");
-    }
-
-    install_playhead_bridge(app, engine.clone());
-    let drain = spawn_event_drain(app.as_weak(), rx);
-
-    // Kick a seek so the first frame appears even before the user touches
-    // anything. `playhead-x = 160px, zoom = 50 px/s → 3.2 s`.
-    engine.seek_scrub(seconds_to_rational(3.2));
+    install_playhead_bridge(editor, engine.clone());
+    let drain = spawn_event_drain(editor.as_weak(), rx);
 
     PreviewSession {
         _engine: engine,
@@ -62,20 +48,22 @@ pub fn install(app: &AppWindow) -> PreviewSession {
     }
 }
 
-fn install_playhead_bridge(app: &AppWindow, engine: Arc<Engine>) {
-    app.global::<AppState>().on_request_preview(move |sec: f32| {
-        engine.seek_scrub(seconds_to_rational(sec as f64));
-    });
+fn install_playhead_bridge(editor: &EditorWindow, engine: Arc<Engine>) {
+    editor
+        .global::<AppState>()
+        .on_request_preview(move |sec: f32| {
+            engine.seek_scrub(seconds_to_rational(sec as f64));
+        });
 }
 
-fn spawn_event_drain(weak_app: Weak<AppWindow>, rx: EventReceiver) -> JoinHandle<()> {
+fn spawn_event_drain(weak_editor: Weak<EditorWindow>, rx: EventReceiver) -> JoinHandle<()> {
     thread::Builder::new()
         .name("cutlass-preview-drain".into())
-        .spawn(move || drain_loop(weak_app, rx))
+        .spawn(move || drain_loop(weak_editor, rx))
         .expect("spawn cutlass-preview-drain thread")
 }
 
-fn drain_loop(weak_app: Weak<AppWindow>, rx: EventReceiver) {
+fn drain_loop(weak_editor: Weak<EditorWindow>, rx: EventReceiver) {
     while let Ok(ev) = rx.recv() {
         match ev {
             EngineEvent::Opened {
@@ -97,11 +85,11 @@ fn drain_loop(weak_app: Weak<AppWindow>, rx: EventReceiver) {
                 let width = frame.width;
                 let height = frame.height;
                 let rgba = frame.rgba;
-                let app = weak_app.clone();
+                let editor = weak_editor.clone();
                 if let Err(e) = slint::invoke_from_event_loop(move || {
-                    if let Some(app) = app.upgrade() {
+                    if let Some(editor) = editor.upgrade() {
                         let image = rgba_bytes_to_image(width, height, &rgba);
-                        app.global::<AppState>().set_preview_frame(image);
+                        editor.global::<AppState>().set_preview_frame(image);
                     }
                 }) {
                     warn!(?e, "engine drain: event loop closed");
@@ -137,19 +125,4 @@ fn seconds_to_rational(sec: f64) -> Rational {
     const DEN: u32 = 1_000_000;
     let num = (sec.max(0.0) * f64::from(DEN)).round() as i64;
     Rational::new_raw(num, DEN)
-}
-
-/// Resolve the demo asset path relative to the workspace root. Falls back to
-/// the cwd-relative path if the workspace can't be located (e.g. installed
-/// binary), which is fine for dev workflow.
-fn resolve_demo_path() -> PathBuf {
-    // CARGO_MANIFEST_DIR points at `crates/app/`; the assets live two levels up.
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    if let Some(workspace) = manifest.ancestors().nth(2) {
-        let p = workspace.join(DEMO_RELATIVE);
-        if p.exists() {
-            return p;
-        }
-    }
-    PathBuf::from(DEMO_RELATIVE)
 }

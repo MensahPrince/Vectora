@@ -1,4 +1,9 @@
-//! Shared helpers for `tests/decode_integration.rs` (integration test crate).
+//! Shared helpers for the integration test binaries (`decode_integration`,
+//! `probe_integration`). Each integration test is its own crate, so an unused
+//! helper here is dead code in the binaries that don't reference it — silence
+//! that with a crate-level allow rather than per-item attributes.
+
+#![allow(dead_code)]
 
 use std::path::PathBuf;
 
