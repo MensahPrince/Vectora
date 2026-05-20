@@ -5,7 +5,6 @@
 
 import { Track, TrackKind } from "../../models/project.slint";
 import { ClipView } from "./clip.slint";
-import { TimelineInteraction } from "../../models/timeline_interaction.slint";
 
 export component TrackRow inherits Rectangle {
     in property <Track> info;
@@ -18,19 +17,9 @@ export component TrackRow inherits Rectangle {
 
     border-radius: 2px;
 
-    // Click empty lane space to clear clip selection. Clips render above.
-    TouchArea {
-        width: 100%;
-        height: 100%;
-        clicked => {
-            TimelineInteraction.select-clip("");
-        }
-    }
-
     for clip in info.clips: ClipView {
         info: clip;
         row-height: info.height-px * 1px;
-        track-locked: info.locked;
     }
 }
 

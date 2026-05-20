@@ -12,8 +12,6 @@ import {
 import { LibraryPane } from "./components/library/library.slint";
 import { DragGhost } from "./components/drag_ghost.slint";
 import { DragState } from "./models/drag_state.slint";
-import { TimelineInteraction } from "./models/timeline_interaction.slint";
-import { TimelineState } from "./components/timeline/state.slint";
 
 export * from "./models/index.slint";
 export { TimelineState } from "./components/timeline/state.slint";
@@ -84,34 +82,6 @@ export component EditorWindow inherits Window {
         }
 
         if DragState.active: DragGhost { }
-
-        // Full-window grab while dragging a clip so move/up continue when the
-        // cursor leaves the pill (same pattern as library import drag).
-        if TimelineInteraction.clip-drag-active: TouchArea {
-            width: 100%;
-            height: 100%;
-
-            moved => {
-                let root-x = self.absolute-position.x + self.mouse-x;
-                let delta-px = root-x - TimelineInteraction.drag-origin-root-x;
-                TimelineInteraction.drag-preview-start-sec =
-                    max(0, TimelineInteraction.drag-start-sec + delta-px / TimelineState.zoom / 1px);
-            }
-
-            pointer-event(event) => {
-                if (event.kind != PointerEventKind.up || event.button != PointerEventButton.left) {
-                    return;
-                }
-                if (TimelineInteraction.dragging-clip-id != "") {
-                    TimelineInteraction.move-clip(
-                        TimelineInteraction.dragging-clip-id,
-                        TimelineInteraction.drag-preview-start-sec,
-                    );
-                }
-                TimelineInteraction.clip-drag-active = false;
-                TimelineInteraction.dragging-clip-id = "";
-            }
-        }
 
         // Full-window grab while dragging so pointer-up is caught even when
         // the cursor leaves the library tile mid-drag.

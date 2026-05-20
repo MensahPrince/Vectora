@@ -22,8 +22,8 @@ use std::rc::Rc;
 use std::str::FromStr;
 
 use models::{
-    AudioStreamInfo, Clip, ClipId, Color, MediaKind, MediaSource, ModelParseError, Project,
-    Rational, RationalTime, SchemaVersion, Sequence, Track, TrackKind, VideoStreamInfo,
+    AudioStreamInfo, Clip, Color, MediaKind, MediaSource, ModelParseError, Project, Rational,
+    RationalTime, SchemaVersion, Sequence, Track, TrackKind, VideoStreamInfo,
 };
 use slint::{Model, ModelRc, SharedString, VecModel};
 
@@ -322,30 +322,26 @@ impl TryFrom<&ui::MediaSource> for MediaSource {
 
 impl From<&Clip> for ui::Clip {
     fn from(c: &Clip) -> Self {
-        clip_to_ui(c, false)
-    }
-}
-
-fn clip_to_ui(c: &Clip, selected: bool) -> ui::Clip {
-    ui::Clip {
-        id: ss(c.id.to_string()),
-        media_id: c
-            .media_id
-            .as_ref()
-            .map(|m| ss(m.to_string()))
-            .unwrap_or_default(),
-        track_id: ss(c.track_id.to_string()),
-        name: ss(&c.name),
-        start: (&c.start).into(),
-        duration: (&c.duration).into(),
-        source_in: (&c.source_in).into(),
-        source_out: (&c.source_out).into(),
-        speed: (&c.speed).into(),
-        opacity: c.opacity,
-        volume: c.volume,
-        enabled: c.enabled,
-        color: color_to_slint(c.color),
-        selected,
+        ui::Clip {
+            id: ss(c.id.to_string()),
+            media_id: c
+                .media_id
+                .as_ref()
+                .map(|m| ss(m.to_string()))
+                .unwrap_or_default(),
+            track_id: ss(c.track_id.to_string()),
+            name: ss(&c.name),
+            start: (&c.start).into(),
+            duration: (&c.duration).into(),
+            source_in: (&c.source_in).into(),
+            source_out: (&c.source_out).into(),
+            speed: (&c.speed).into(),
+            opacity: c.opacity,
+            volume: c.volume,
+            enabled: c.enabled,
+            color: color_to_slint(c.color),
+            selected: false,
+        }
     }
 }
 
@@ -376,16 +372,7 @@ impl TryFrom<&ui::Clip> for Clip {
 
 impl From<&Track> for ui::Track {
     fn from(t: &Track) -> Self {
-        track_to_ui(t, None)
-    }
-}
-
-fn track_to_ui(t: &Track, selected: Option<ClipId>) -> ui::Track {
-        let clips: Vec<ui::Clip> = t
-            .clips
-            .iter()
-            .map(|c| clip_to_ui(c, selected == Some(c.id)))
-            .collect();
+        let clips: Vec<ui::Clip> = t.clips.iter().map(ui::Clip::from).collect();
         ui::Track {
             id: ss(t.id.to_string()),
             name: ss(&t.name),
@@ -397,6 +384,7 @@ fn track_to_ui(t: &Track, selected: Option<ClipId>) -> ui::Track {
             visible: t.visible,
             clips: vec_model(clips),
         }
+    }
 }
 
 impl TryFrom<&ui::Track> for Track {
@@ -426,41 +414,33 @@ impl TryFrom<&ui::Track> for Track {
 
 impl From<&Sequence> for ui::Sequence {
     fn from(s: &Sequence) -> Self {
-        sequence_to_ui(s, None)
-    }
-}
+        let tracks: Vec<ui::Track> = s.tracks.iter().map(ui::Track::from).collect();
+        let tracks_total_height_px: i32 = s.tracks.iter().map(|t| t.height_px as i32).sum();
+        let zero = RationalTime::ZERO;
+        ui::Sequence {
+            id: ss(s.id.to_string()),
+            name: ss(&s.name),
+            width: s.width as i32,
+            height: s.height as i32,
+            fps: (&s.fps).into(),
+            sample_rate: s.sample_rate as i32,
+            timebase: s.timebase.min(i32::MAX as u32) as i32,
+            duration: (&s.duration).into(),
 
-fn sequence_to_ui(s: &Sequence, selected: Option<ClipId>) -> ui::Sequence {
-    let tracks: Vec<ui::Track> = s
-        .tracks
-        .iter()
-        .map(|t| track_to_ui(t, selected))
-        .collect();
-    let tracks_total_height_px: i32 = s.tracks.iter().map(|t| t.height_px as i32).sum();
-    let zero = RationalTime::ZERO;
-    ui::Sequence {
-        id: ss(s.id.to_string()),
-        name: ss(&s.name),
-        width: s.width as i32,
-        height: s.height as i32,
-        fps: (&s.fps).into(),
-        sample_rate: s.sample_rate as i32,
-        timebase: s.timebase.min(i32::MAX as u32) as i32,
-        duration: (&s.duration).into(),
+            has_in_point: s.in_point.is_some(),
+            in_point: (&s.in_point.unwrap_or(zero)).into(),
+            has_out_point: s.out_point.is_some(),
+            out_point: (&s.out_point.unwrap_or(zero)).into(),
 
-        has_in_point: s.in_point.is_some(),
-        in_point: (&s.in_point.unwrap_or(zero)).into(),
-        has_out_point: s.out_point.is_some(),
-        out_point: (&s.out_point.unwrap_or(zero)).into(),
+            tracks: vec_model(tracks),
+            tracks_total_height_px,
 
-        tracks: vec_model(tracks),
-        tracks_total_height_px,
-
-        // Ephemeral UI state — fresh defaults; real values come from
-        // TimelineState / Flickable scroll positions at runtime.
-        playhead: (&zero).into(),
-        zoom: 50.0,
-        scroll: (&zero).into(),
+            // Ephemeral UI state — fresh defaults; real values come from
+            // TimelineState / Flickable scroll positions at runtime.
+            playhead: (&zero).into(),
+            zoom: 50.0,
+            scroll: (&zero).into(),
+        }
     }
 }
 
@@ -501,22 +481,17 @@ impl TryFrom<&ui::Sequence> for Sequence {
 
 impl From<&Project> for ui::Project {
     fn from(p: &Project) -> Self {
-        project_to_ui(p, None)
-    }
-}
-
-/// Build the Slint project DTO, optionally marking one clip as selected.
-pub fn project_to_ui(p: &Project, selected: Option<ClipId>) -> ui::Project {
-    let media_bin: Vec<ui::MediaSource> = p.media_bin.iter().map(ui::MediaSource::from).collect();
-    let sequence = sequence_to_ui(&p.sequence, selected);
-    ui::Project {
-        id: ss(p.id.to_string()),
-        name: ss(&p.name),
-        file_path: opt_path_to_sentinel(&p.file_path),
-        schema: (&p.schema).into(),
-        sequence,
-        media_bin: vec_model(media_bin),
-        is_dirty: p.is_dirty,
+        let media_bin: Vec<ui::MediaSource> =
+            p.media_bin.iter().map(ui::MediaSource::from).collect();
+        ui::Project {
+            id: ss(p.id.to_string()),
+            name: ss(&p.name),
+            file_path: opt_path_to_sentinel(&p.file_path),
+            schema: (&p.schema).into(),
+            sequence: (&p.sequence).into(),
+            media_bin: vec_model(media_bin),
+            is_dirty: p.is_dirty,
+        }
     }
 }
 

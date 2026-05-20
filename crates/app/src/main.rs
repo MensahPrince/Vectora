@@ -13,7 +13,6 @@ mod demo;
 mod import;
 mod preview;
 mod session;
-mod timeline_ui;
 
 pub mod ui {
     //! Slint-generated types live here so they don't collide with the
@@ -26,9 +25,7 @@ pub mod ui {
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use models::{
-    Project, ProjectId, Rational, RationalTime, SchemaVersion, Sequence, SequenceId,
-};
+use models::{Project, ProjectId, Rational, RationalTime, SchemaVersion, Sequence, SequenceId};
 use slint::wgpu_28::WGPUConfiguration;
 use slint::{BackendSelector, CloseRequestResponse, ComponentHandle};
 use tracing::error;
@@ -36,7 +33,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::preview::PreviewSession;
 use crate::session::Session;
-use crate::timeline_ui::Selection;
 use crate::ui::{AppState, AppWindow, EditorWindow, TimelineState};
 
 /// Canonical ticks-per-second for an empty sequence. 90 000 is the standard
@@ -120,12 +116,10 @@ fn open_editor(project: Project) -> Result<EditorSession, Box<dyn std::error::Er
     let fps = project.sequence.fps.as_f32().max(1.0);
     editor.global::<TimelineState>().set_fps(fps);
 
-    let selection = timeline_ui::new_selection();
-    let session = build_session(&editor, project, selection.clone());
+    let session = build_session(&editor, project);
 
     let preview = preview::install(&editor);
     import::install(&editor, session.clone());
-    timeline_ui::install(&editor, session.clone(), selection);
 
     editor.window().on_close_requested(|| {
         let _ = slint::quit_event_loop();
@@ -148,16 +142,11 @@ fn open_editor(project: Project) -> Result<EditorSession, Box<dyn std::error::Er
 /// reading from `AppState` and trying to mutate the project from another
 /// callback). `set_project` is just a property write — Slint won't fire
 /// further Rust callbacks synchronously from it.
-fn build_session(
-    editor: &EditorWindow,
-    project: Project,
-    selection: Selection,
-) -> Rc<RefCell<Session>> {
+fn build_session(editor: &EditorWindow, project: Project) -> Rc<RefCell<Session>> {
     let weak = editor.as_weak();
     Rc::new(RefCell::new(Session::new(project, move |project| {
         if let Some(editor) = weak.upgrade() {
-            let selected = *selection.borrow();
-            let dto = convert::project_to_ui(project, selected);
+            let dto: ui::Project = project.into();
             editor.global::<AppState>().set_project(dto);
         }
     })))
