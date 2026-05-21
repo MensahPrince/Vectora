@@ -14,6 +14,7 @@ import { TimelineState } from "state.slint";
 
 export component TimelinePanel inherits PanelBase {
     private property <int> track-count: 10;
+    private property <length> track-spacing: AppStore.theme.metrics.spacing.sm;
     VerticalLayout {
 
         spacing: AppStore.theme.metrics.spacing.none;
@@ -35,7 +36,7 @@ export component TimelinePanel inherits PanelBase {
 
                 VerticalLayout {
 
-                    spacing: AppStore.theme.metrics.spacing.lg;
+                    spacing: track-spacing;
                     vertical-stretch: 1;
 
                     for i in track-count: TrackHead { }
@@ -48,19 +49,22 @@ export component TimelinePanel inherits PanelBase {
             }
 
             Flickable {
+                viewport-width: 1000000px;
                 viewport-y <=> TimelineState.scroll-y;
+                viewport-x <=> TimelineState.scroll-x;
+
                 VerticalLayout {
-                    spacing: AppStore.theme.metrics.spacing.lg;
-                    width: 100%;
+                    spacing: track-spacing;
+
                     vertical-stretch: 1;
                     horizontal-stretch: 1;
                     for _ in track-count: TrackLane {
                         for c in 10: Rectangle {
 
                             x: c * 220px;
-                            height: 50px;
+                            height: 58px;
                             width: 200px;
-                            background: #444040;
+                            background: #373737;
                         }
                     }
                 }
