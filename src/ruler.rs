@@ -45,10 +45,31 @@ use std::rc::Rc;
 use crate::RulerTick;
 use crate::timecode::format_timecode;
 
-/// Target minimum pixel distance between two consecutive major
-/// (labelled) ticks. The ladder picks the smallest interval whose
-/// projected pixel width is `>=` this value.
+/// Lower bound on pixel distance between two consecutive major
+/// (labelled) ticks. Below this, labels run into each other.
 const MIN_MAJOR_PX: f32 = 80.0;
+
+/// Upper bound on pixel distance between two consecutive major
+/// (labelled) ticks. Above this, majors are so widely spaced that the
+/// user gets too few labels per viewport — better to switch to a
+/// finer subdivision (sub-second frame counts when zoomed in past
+/// 1 sec, smaller seconds-step when zoomed out near the wide end).
+///
+/// 500 px is roughly "3 major labels visible in a typical 1500 px
+/// timeline panel", which matches what Premiere / Resolve / FCP show
+/// at default zoom.
+const MAX_MAJOR_PX: f32 = 500.0;
+
+/// Target pixel distance between consecutive minor ticks. `pick_minor`
+/// picks a divisor of `major` whose projected width sits closest to
+/// this. 60 px gives ~3-4 minors between each pair of seconds-aligned
+/// majors at default zoom — dense enough to be useful, not so dense
+/// the ruler becomes a smear.
+const TARGET_MINOR_PX: f32 = 60.0;
+
+/// Floor on minor pixel width. Below this they're noise, not guides;
+/// `pick_minor` skips candidates whose px-span is smaller.
+const MIN_MINOR_PX: f32 = 6.0;
 
 /// Horizontal padding (px) added to each side of the visible frame
 /// range so labels can clip gracefully across viewport edges.
@@ -199,33 +220,129 @@ pub fn ticks_model(
 }
 
 /// Pick the (major, minor) tick intervals (in frames) for the current
-/// zoom level. The minor entry is `None` when the major is already at
-/// the bottom of the ladder.
+/// zoom level.
+///
+/// The algorithm prefers **seconds-aligned** majors so that labels read
+/// `00:00:01:00, 00:00:02:00, ...` (rolling cleanly on second boundaries)
+/// instead of `00:00:00:10, 00:00:00:20, 00:00:01:06, 00:00:01:16, ...`
+/// (which is what you get if you just pick "smallest ladder entry whose
+/// pixel span >= MIN_MAJOR_PX" — the major lands on a frame count that
+/// doesn't divide 1 second evenly, so the FF field walks irrationally).
+///
+/// Every pro NLE (Premiere, Resolve, FCP, Avid) anchors ruler majors
+/// to seconds / minutes / hours when those fit in a reasonable pixel
+/// band, falling back to sub-second frame counts only when zoomed in
+/// past the point where 1 second can sensibly host a single label span.
+///
+/// Selection is phased to express that priority explicitly:
+///
+///   1. Smallest seconds-aligned entry whose pixel width is in
+///      [`MIN_MAJOR_PX`, `MAX_MAJOR_PX`].
+///   2. Smallest entry that is a **divisor of 1 second** (so labels
+///      still snap cleanly within each second) and fits the band.
+///      This covers the "zoomed in past 1s major" regime.
+///   3. Smallest entry that fits the band (any).
+///   4. Smallest entry >= MIN (any, even if it overshoots MAX).
+///   5. Largest ladder entry (degenerate fallback for absurd zooms).
 fn pick_intervals(zoom: f32, fps_num: i64, fps_den: i64) -> (i64, Option<i64>) {
+    let fps_int = (fps_num + fps_den - 1) / fps_den;
     let ladder = build_ladder(fps_num, fps_den);
-    // Linear scan — the ladder is ~22 entries, so a binary search would
-    // be premature optimisation. Picks the *smallest* entry whose
-    // projected pixel span is at least MIN_MAJOR_PX.
+
+    let in_band = |f: i64| {
+        let px = f as f32 * zoom;
+        (MIN_MAJOR_PX..=MAX_MAJOR_PX).contains(&px)
+    };
+    let above_min = |f: i64| f as f32 * zoom >= MIN_MAJOR_PX;
+
     let major_idx = ladder
         .iter()
-        .position(|&f| (f as f32) * zoom >= MIN_MAJOR_PX)
+        .enumerate()
+        // Phase 1: seconds-aligned (>= 1 second in frames) and in band.
+        .find(|&(_, &f)| f >= fps_int && in_band(f))
+        .map(|(i, _)| i)
+        .or_else(|| {
+            // Phase 2: divisor of 1 second, in band. This is the
+            // zoomed-in regime where 1s would be too wide as a major,
+            // but we still want labels that snap to second boundaries
+            // (every 1/2 sec, 1/4 sec, etc.). Filtering by `fps_int % f == 0`
+            // means at 24 fps we'll only consider 1, 2, 3, 4, 6, 8, 12
+            // frames as majors (the divisors of 24), never the weird-
+            // looking 10 or 15 that don't subdivide a second evenly.
+            ladder
+                .iter()
+                .enumerate()
+                .find(|&(_, &f)| fps_int % f == 0 && in_band(f))
+                .map(|(i, _)| i)
+        })
+        .or_else(|| {
+            // Phase 3: any entry in band. Last resort before "just pick
+            // something >= MIN".
+            ladder.iter().position(|&f| in_band(f))
+        })
+        .or_else(|| {
+            // Phase 4: smallest entry >= MIN (may overshoot MAX at
+            // extreme zoom-in where every entry is too big).
+            ladder.iter().position(|&f| above_min(f))
+        })
         .unwrap_or(ladder.len() - 1);
+
     let major = ladder[major_idx];
-    let minor = if major_idx == 0 {
-        None
-    } else {
-        Some(ladder[major_idx - 1])
-    };
+    let minor = pick_minor(major, zoom);
     (major, minor)
+}
+
+/// Pick a minor interval as a clean divisor of `major`.
+///
+/// Why divisors? Because minor ticks visually subdivide the *interval
+/// between consecutive majors*. If the minor doesn't evenly divide the
+/// major, the minor pattern drifts across major boundaries (minor at
+/// 5, 10, 15, 20 between major-0 and major-24, then minor at 29, 34, ...
+/// in the next "cycle" — looks broken). Forcing divisors makes the
+/// subdivision pattern repeat identically between every pair of majors.
+///
+/// We try the small divisors {2, 3, 4, 5, 6, 8, 10} and pick whichever
+/// projects closest to `TARGET_MINOR_PX`. At default zoom (24fps,
+/// zoom=10, major=24 frames) this picks `/4` → minor = 6 frames =
+/// quarter-second, giving 3 minor ticks between every labelled second.
+fn pick_minor(major: i64, zoom: f32) -> Option<i64> {
+    if major <= 1 {
+        return None;
+    }
+    [2i64, 3, 4, 5, 6, 8, 10]
+        .iter()
+        .filter_map(|&n| {
+            if major % n != 0 {
+                return None;
+            }
+            let m = major / n;
+            if m < 1 || (m as f32) * zoom < MIN_MINOR_PX {
+                return None;
+            }
+            Some(m)
+        })
+        .min_by(|&a, &b| {
+            let da = ((a as f32) * zoom - TARGET_MINOR_PX).abs();
+            let db = ((b as f32) * zoom - TARGET_MINOR_PX).abs();
+            da.partial_cmp(&db).unwrap_or(std::cmp::Ordering::Equal)
+        })
 }
 
 /// Build the "nice tick intervals" ladder for a given frame rate.
 /// Entries are in **frames**, sorted ascending. Two regimes:
 ///
 ///   * **Sub-second** (frames < ceil(fps)): direct frame counts
-///     `1, 2, 5, 10, 15, 30`. Capped at `< fps_int` so they stay below
-///     one second of wall-time and don't collide with the seconds
-///     regime below.
+///     `1, 2, 5, 10, 15, 30`, plus a "half-second" entry (`fps/2`).
+///     Capped at `< fps_int` so they stay below one second of wall-time
+///     and don't collide with the seconds regime below.
+///
+///     The half-second entry is what lets `pick_intervals` smoothly
+///     bridge the "1s major is too wide → switch to sub-second" gap:
+///     at 24 fps the ladder goes `..., 10, 12 (=1/2 s), 24 (=1 s), ...`,
+///     so when you zoom past the point where 1s fits as a major, we
+///     drop to 1/2 s (=12 frames, divisor of 24) instead of jumping
+///     straight to a 5-frame or 10-frame major (which wouldn't divide
+///     a second evenly and would produce the irrational FF-walk
+///     labels we're explicitly avoiding).
 ///
 ///   * **One second and above**: a repeating `{1, 2, 5, 10, 15, 30}`
 ///     progression mapped onto seconds → minutes → hours. Each entry
@@ -245,6 +362,17 @@ fn build_ladder(fps_num: i64, fps_den: i64) -> Vec<i64> {
             ladder.push(k);
         }
     }
+
+    // Half-second entry. Gives `pick_intervals` a clean stepping stone
+    // between 1-frame and 1-second majors at zooms where 1s is just
+    // slightly too wide for the major band.
+    let half_sec = fps_int / 2;
+    if half_sec > 0 && !ladder.contains(&half_sec) {
+        ladder.push(half_sec);
+    }
+
+    ladder.sort_unstable();
+    ladder.dedup();
 
     // Seconds-multiple entries:
     //   1s, 2s, 5s, 10s, 15s, 30s,
@@ -303,15 +431,54 @@ mod tests {
     // ---------- Ladder picks ----------
 
     #[test]
-    fn picks_10_frame_major_at_24fps_zoom10() {
+    fn picks_one_second_major_at_24fps_zoom10() {
         // 24fps, zoom = 10 px/frame.
-        //   pps = 24 * 10 = 240 px/s
-        //   target = 80 / 240 = 0.333 s
-        //   ladder: 1f, 2f, 5f, 10f, 15f, ... (24fps caps sub-second at <24)
-        //   10f * 10 px = 100 px ≥ 80; 5f * 10 = 50 px < 80; pick 10f.
+        //
+        // The naive rule "smallest ladder entry whose px >= 80" would
+        // pick 10 frames (10*10=100 px), giving labels at frames
+        //   0, 10, 20, 30 (= 1s 6f), 40 (= 1s 16f), 50 (= 2s 2f), ...
+        // — the FF field walks irrationally because 10 doesn't divide
+        // 24 evenly. That was the original glitch.
+        //
+        // The seconds-aligned algorithm instead picks 24 frames (= 1s
+        // = 240 px, which sits comfortably inside [MIN=80, MAX=500]),
+        // giving cleanly seconds-anchored labels:
+        //   "00:00:00:00", "00:00:01:00", "00:00:02:00", ...
+        //
+        // Minor at major=24 picks `/4` (= 6 frames, 60 px ≈ target 60):
+        // 3 minor ticks between each pair of labelled majors, at the
+        // 1/4, 1/2, 3/4 second marks.
         let (major, minor) = pick_intervals(10.0, 24, 1);
-        assert_eq!(major, 10);
-        assert_eq!(minor, Some(5));
+        assert_eq!(major, 24, "expected 1-second major at 24fps zoom 10");
+        assert_eq!(minor, Some(6), "expected quarter-second minor");
+    }
+
+    #[test]
+    fn picks_half_second_major_when_one_second_too_wide() {
+        // 24fps, zoom = 25 px/frame. 1s = 600 px > MAX_MAJOR_PX (500),
+        // so Phase 1 (seconds-aligned in band) fails. Phase 2 looks
+        // for a divisor of 1 second within the band: 12 frames (= 1/2 s)
+        // is in our ladder, 12*25 = 300 px is in [80, 500], and
+        // 24 % 12 == 0 — so it qualifies. We pick 12-frame majors
+        // rather than the 10-frame major the naive rule would have
+        // chosen (10 is in band at 250 px but doesn't divide 24).
+        let (major, _minor) = pick_intervals(25.0, 24, 1);
+        assert_eq!(major, 12);
+    }
+
+    #[test]
+    fn labels_at_24fps_zoom10_are_all_on_second_boundaries() {
+        // End-to-end check of the user-visible glitch: at default zoom,
+        // every emitted major label should have ":00" in the FF field
+        // (i.e. land exactly on a second boundary).
+        let ticks = compute_visible_ticks(0.0, 1500.0, 10.0, 24, 1, false);
+        for t in ticks.iter().filter(|t| t.is_major) {
+            assert!(
+                t.label.ends_with(":00"),
+                "major label {:?} is not on a second boundary",
+                t.label
+            );
+        }
     }
 
     #[test]
@@ -344,20 +511,20 @@ mod tests {
 
     #[test]
     fn ticks_respect_scroll_offset() {
-        // Scroll right by 100 px (scroll_x == -100). Zoom = 10 px/frame,
-        // major every 10 frames = 100 px.
+        // Scroll right by 100 px (scroll_x == -100). Zoom = 10 px/frame.
+        // With seconds-aligned majors, major spacing is 24 frames = 240 px.
         //
-        // With label padding, frame 0 ("00:00:00:00") is still emitted
-        // — at viewport_x = -100 — so its label can clip gracefully
-        // (in practice it'd be fully off-screen here, but the model
-        // doesn't know the label width; the parent clip handles it).
-        // The first major *inside* the viewport (x >= 0) is frame 10
-        // at viewport_x = 100 + (-100) = 0, labelled "00:00:00:10".
+        // Frame 0 ("00:00:00:00") is still in the model — emitted at
+        // viewport_x = -100 — because the label-padding logic keeps
+        // majors near the left edge so their labels can clip in
+        // gracefully. The first major *inside* the viewport (x >= 0)
+        // is frame 24 at viewport_x = 240 + (-100) = 140, labelled
+        // "00:00:01:00".
         let ticks = compute_visible_ticks(-100.0, 1000.0, 10.0, 24, 1, false);
         let m = majors(&ticks);
         let first_inside = m.iter().find(|(x, _)| *x >= 0.0).unwrap();
-        assert_eq!(first_inside.0, 0.0);
-        assert_eq!(first_inside.1, "00:00:00:10");
+        assert_eq!(first_inside.0, 140.0);
+        assert_eq!(first_inside.1, "00:00:01:00");
     }
 
     #[test]
@@ -436,8 +603,11 @@ mod tests {
         let m = majors(&ticks);
         // At least one major label should use the ';' (drop-frame) separator.
         assert!(m.iter().any(|(_, l)| l.contains(';')));
-        assert!(!m.iter().any(|(_, l)| l.split_once(';').is_none() && l.matches(':').count() == 3),
-            "any DF label should have exactly 2 ':' and 1 ';'");
+        assert!(
+            !m.iter()
+                .any(|(_, l)| l.split_once(';').is_none() && l.matches(':').count() == 3),
+            "any DF label should have exactly 2 ':' and 1 ';'"
+        );
     }
 
     #[test]
