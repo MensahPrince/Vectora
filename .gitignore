@@ -22,3 +22,4 @@ Cargo.lock.bak
 # already existing elements were commented out
 
 #/target
+.env

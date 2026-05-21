@@ -1,0 +1,202 @@
+// Cutlass grid view.
+//
+// A scrollable, fixed-cell grid built on `CutlassScrollView`. Callers
+// set `columns` (+ optionally `cell-width` / `cell-height`) and provide
+// children through a `for` loop wrapped in `CutlassGridCell`; the cell
+// reads `grid.metrics` and `index` and computes its own
+// `x` / `y` / `width` / `height`. No per-tile positioning bindings.
+//
+// Why not std `GridLayout`
+// ------------------------
+// `GridLayout` propagates child size constraints up to its window — a
+// `for` loop of fixed-height tiles collapses the parent to that height
+// and refuses to resize because min == max. It also panics with
+// `RepeatedItemTree::grid_layout_input_data() not implemented for …
+// InnerComponent__Opacity_N` whenever a repeated child's root has an
+// `opacity` / `clip` / `transform` binding (anything you'd reasonably
+// want for "loading" or "selected" states). We sidestep both by
+// placing children absolutely inside a `CutlassScrollView` and driving
+// the scrollable extent from `item-count` rather than from child
+// constraint propagation.
+//
+// Why a wrapper cell instead of per-tile `cell-x(i)` helpers
+// ----------------------------------------------------------
+// The helpers still exist (useful when positioning something that
+// isn't a `CutlassGridCell` — e.g. an overlay aligned to a tile), but
+// for the common case `CutlassGridCell` removes the 4-line per-tile
+// boilerplate. Caller writes:
+//
+//     grid := CutlassGridView {
+//         columns: 3;
+//         cell-width: 100px;
+//         cell-height: 100px;
+//         spacing: 10px;
+//         inset: 12px;
+//         item-count: AppState.media-bin.length;
+//
+//         for source[i] in AppState.media-bin: CutlassGridCell {
+//             metrics: grid.metrics;
+//             index: i;
+//
+//             LibraryTile {
+//                 width: 100%;
+//                 height: 100%;
+//                 source: source;
+//             }
+//         }
+//     }
+//
+// `metrics: grid.metrics; index: i;` is the entire per-tile contract.
+//
+// Why the metrics struct
+// ----------------------
+// Slint doesn't have first-class component-typed properties, so a cell
+// can't take a `grid` reference directly. Bundling columns / cell
+// dimensions / spacing / inset into a struct lets the caller wire them
+// in one binding instead of five.
+//
+// Why `item-count` is explicit
+// ----------------------------
+// `@children` exposes neither a row count nor the iterated model.
+// Mirroring `model.length` in one extra binding buys us stable layout
+// (the parent never collapses around the grid's content) and lets the
+// scrollable extent be known before the first frame of `for`-loop
+// instantiation.
+//
+// Why no per-child intrinsic sizing
+// ---------------------------------
+// Slint can't iterate `@children` from inside a component, so reading
+// each tile's preferred size to size cells individually isn't feasible
+// without an API restructured around model + template (Slint doesn't
+// support component templates as first-class parameters either). The
+// best we can do for "adaptive" sizing is `auto-fit-width`, which
+// stretches `cell-width` to fill the panel for a given `columns` —
+// uniform cells, but column width scales with panel width.
+
+import { CutlassScrollView } from "scroll-view.slint";
+
+export struct CutlassGridMetrics {
+    columns: int,
+    cell-width: length,
+    cell-height: length,
+    spacing: length,
+    inset: length,
+}
+
+// Positioned slot for `CutlassGridView`. Reads grid geometry through
+// `metrics` and its own `index`, then anchors itself at the matching
+// cell with `width: cell-width`, `height: cell-height`. The caller's
+// content lands inside via `@children` and can use `100%` sizing.
+export component CutlassGridCell inherits Rectangle {
+    in property <CutlassGridMetrics> metrics;
+    in property <int> index: 0;
+
+    // Guard against divide-by-zero / negative indices during the brief
+    // window where the parent is still wiring properties. `columns < 1`
+    // collapses the grid to a single column rather than NaN-ing the
+    // layout.
+    property <int> safe-columns: max(metrics.columns, 1);
+
+    x: metrics.inset + mod(index, safe-columns) * (metrics.cell-width + metrics.spacing);
+    y: metrics.inset + floor(index / safe-columns) * (metrics.cell-height + metrics.spacing);
+    width: metrics.cell-width;
+    height: metrics.cell-height;
+    background: transparent;
+
+    @children
+}
+
+export component CutlassGridView inherits Rectangle {
+    // ---- Public layout configuration ---------------------------------------
+
+    in property <int> columns: 3;
+    in property <length> cell-width: 100px;
+    in property <length> cell-height: 100px;
+    in property <length> spacing: 0px;
+    // Named `inset` rather than `padding` because Rectangle reserves
+    // `padding` for layout-engine use and refuses to be overridden.
+    in property <length> inset: 0px;
+
+    // Mirror of the caller's model length (see file header).
+    in property <int> item-count: 0;
+
+    // When `true`, `cell-width` is recomputed to fill the panel width
+    // for the current column count: `(width - 2*inset - (columns-1)*spacing) / columns`.
+    // Cell height is left to the caller — width-driven aspect ratios
+    // are easy (`cell-height: cell-width;`) but a single auto rule
+    // can't know whether tiles are square, 16:9, or text-only.
+    in property <bool> auto-fit-width: false;
+
+    // Forwarded to the inner `CutlassScrollView`. Defaults auto-hide
+    // each bar when content fits along that axis; callers can pin a
+    // bar visible (or hide it permanently) by setting these
+    // explicitly.
+    in property <bool> show-horizontal-scrollbar: content-width > self.width;
+    in property <bool> show-vertical-scrollbar: content-height > self.height;
+
+    // ---- Derived geometry --------------------------------------------------
+
+    // The cell width the grid actually paints with (auto-fit-aware).
+    // Cells read this via `metrics`; callers can also bind directly for
+    // adornments that need to match the painted width.
+    out property <length> effective-cell-width: auto-fit-width
+        ? max(0px, (self.width - 2 * inset - (max(columns, 1) - 1) * spacing) / max(columns, 1))
+        : cell-width;
+
+    // Ceiling division so a partial last row still counts. Exposed so
+    // callers can hang scrollbar overlays, "X of Y" counters, etc., off
+    // the same value the view uses internally.
+    out property <int> row-count:
+        columns > 0 ? floor((max(item-count, 0) + columns - 1) / columns) : 0;
+
+    out property <length> content-width:
+        columns <= 0 ? 0px : columns * effective-cell-width + (columns - 1) * spacing + 2 * inset;
+
+    out property <length> content-height:
+        row-count <= 0 ? 0px : row-count * cell-height + (row-count - 1) * spacing + 2 * inset;
+
+    // Packaged metrics for `CutlassGridCell`. Saves callers from wiring
+    // five properties at every cell instantiation.
+    out property <CutlassGridMetrics> metrics: {
+        columns: columns,
+        cell-width: effective-cell-width,
+        cell-height: cell-height,
+        spacing: spacing,
+        inset: inset,
+    };
+
+    // ---- Public placement helpers ------------------------------------------
+    //
+    // Still useful when the caller needs to position something that
+    // isn't a `CutlassGridCell` (e.g. a selection ring overlay aligned
+    // to a specific cell, or a drop indicator between rows). Pure, so
+    // Slint can inline them at every call site.
+
+    public pure function cell-x(i: int) -> length {
+        inset + mod(i, max(columns, 1)) * (effective-cell-width + spacing)
+    }
+    public pure function cell-y(i: int) -> length {
+        inset + floor(i / max(columns, 1)) * (cell-height + spacing)
+    }
+
+    // ---- Layout ------------------------------------------------------------
+
+    // Fill by default — most call sites want the grid to take the
+    // whole panel and let the scroll view handle overflow.
+    horizontal-stretch: 1;
+    vertical-stretch: 1;
+    background: transparent;
+
+    CutlassScrollView {
+        x: 0;
+        y: 0;
+        width: 100%;
+        height: 100%;
+        viewport-width: root.content-width;
+        viewport-height: root.content-height;
+        show-horizontal-scrollbar: root.show-horizontal-scrollbar;
+        show-vertical-scrollbar: root.show-vertical-scrollbar;
+
+        @children
+    }
+}

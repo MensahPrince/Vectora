@@ -1,0 +1,66 @@
+import {
+    VSplitGripTimeline,
+    HSplitGripLead,
+    HSplitGripTrail,
+} from "components/split_grips.slint";
+import { InspectorPanel } from "panels/inspector/inspector.slint";
+import { LibraryPanel } from "panels/library/library.slint";
+import { PreviewPanel } from "panels/preview/preview.slint";
+import { TimelinePanel } from "panels/timeline/timeline.slint";
+import { Button } from "std-widgets.slint";
+export component AppWindow inherits Window {
+    title: "Hello World";
+
+    preferred-width: 1280px;
+    preferred-height: 800px;
+
+    in-out property <length> left-pane-width: 350px;
+    in-out property <length> right-pane-width: 350px;
+    in-out property <length> timeline-height: 400px;
+
+    background: #28282a;
+
+    VerticalLayout {
+        spacing: 0;
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            horizontal-stretch: 1;
+            spacing: 0;
+
+            LibraryPanel {
+                width: root.left-pane-width;
+                vertical-stretch: 1;
+            }
+
+            HSplitGripLead {
+                pane-width <=> root.left-pane-width;
+                vertical-stretch: 1;
+            }
+
+            PreviewPanel {
+                vertical-stretch: 1;
+                horizontal-stretch: 1;
+            }
+
+            HSplitGripTrail {
+                pane-width <=> root.right-pane-width;
+                vertical-stretch: 1;
+            }
+
+            InspectorPanel {
+                width: root.right-pane-width;
+                vertical-stretch: 1;
+            }
+        }
+
+        VSplitGripTimeline {
+            timeline-height <=> root.timeline-height;
+        }
+
+        TimelinePanel {
+            height: root.timeline-height;
+            horizontal-stretch: 1;
+        }
+    }
+}
