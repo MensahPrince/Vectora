@@ -43,7 +43,7 @@ import { TimelineViewState } from "state.slint";
 import { RulerBackend, RulerTick } from "../../lib/ruler-backend.slint";
 
 export component Ruler inherits Rectangle {
-    background: AppStore.theme.surface.app-background;
+    // background: AppStore.theme.surface.app-background;
 
     // Inputs to the tick generator. Pulled from globals so the parent
     // (`timeline.slint`) doesn't have to wire 5 properties just to draw
@@ -63,19 +63,12 @@ export component Ruler inherits Rectangle {
     private property <[RulerTick]> tick-model:
         RulerBackend.ticks(scroll-x, self.width, zoom, fps-num, fps-den, drop-frame);
 
-    // Bottom hairline that separates the ruler from the track lanes.
-    Rectangle {
-        y: parent.height - self.height;
-        height: AppStore.theme.metrics.stroke.hairline;
-        width: parent.width;
-        background: AppStore.theme.surface.divider;
-    }
-
     // Tick marks (both major and minor; the per-tick `is-major` flag
     // controls colour and height so a single `for` covers both).
     for tick in tick-model: Rectangle {
         x: tick.x;
-        y: parent.height - self.height;
+        y: 3px;
+        // y: parent.height - self.height;
         width: AppStore.theme.metrics.stroke.hairline;
         height: tick.is-major ? 12px : 5px;
         background: tick.is-major ? AppStore.theme.text.secondary : AppStore.theme.text.muted;
@@ -91,7 +84,7 @@ export component Ruler inherits Rectangle {
     // sit inside their "cell" instead of straddling the tick line.
     for tick in tick-model: CutlassText {
         x: tick.x + 3px;
-        y: 3px;
+        y: 4px;
         text: tick.label;
         // Monospaced so digits don't dance horizontally as the timecode
         // scrolls (a common reason cheap rulers look "alive" while pro
