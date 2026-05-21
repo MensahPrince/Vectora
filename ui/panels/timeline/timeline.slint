@@ -68,17 +68,25 @@ export component TimelinePanel inherits PanelBase {
                 viewport-y <=> TimelineState.scroll-y;
                 viewport-x <=> TimelineState.scroll-x;
 
-                VerticalLayout {
-                    spacing: track-spacing;
-
+                Rectangle {
+                    background: #6d5555;
                     vertical-stretch: 1;
                     horizontal-stretch: 1;
+                    VerticalLayout {
+                        align-items: LayoutAlignItems.end;
+                        alignment: LayoutAlignment.end;
 
-                    ForceHeadSpace { }
+                        spacing: track-spacing;
 
-                    for t in sequence.tracks: TrackLane {
-                        for c in t.clips: ClipView {
-                            model: c;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        ForceHeadSpace { }
+
+                        for t in sequence.tracks: TrackLane {
+                            for c in t.clips: ClipView {
+                                model: c;
+                            }
                         }
                     }
                 }
