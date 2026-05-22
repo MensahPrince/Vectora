@@ -1,0 +1,129 @@
+import { AppStore, EditorStore } from "store/index.slint";
+import { TimelineLib } from "lib/timeline-lib.slint";
+import { Slider } from "std-widgets.slint";
+
+export component FullscreenPreview inherits Window {
+    title: "Fullscreen Preview";
+    no-frame: true;
+    resize-border-width: 0;
+    background: AppStore.theme.panel.background;
+
+    private property <float> sequence-aspect-ratio:
+        EditorStore.project.sequence.width / EditorStore.project.sequence.height;
+
+    Rectangle {
+        width: root.width;
+        height: root.height;
+
+        preview := Rectangle {
+            width: min(parent.width, parent.height * sequence-aspect-ratio);
+            height: self.width / sequence-aspect-ratio;
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: black;
+
+            Image {
+                width: parent.width;
+                height: parent.height;
+                source: @image-url("../assets/texture.png");
+                image-fit: ImageFit.contain;
+            }
+        }
+
+        Rectangle {
+            height: 45px;
+            background: #141414;
+            width: 580px;
+            border-radius: 6px;
+            x: (parent.width - self.width) / 2;
+            y: parent.height - self.height - 65px;
+            border-color: #282828;
+            border-width: 1px;
+            clip: true;
+
+            Image {
+                source: @image-url("./assets/icon/play.svg");
+                image-fit: ImageFit.contain;
+                colorize: #ffffff;
+
+                width: 20px;
+                height: 20px;
+                x: 20px;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Text {
+                text: "00:00:00:00";
+                font-size: 12px;
+                font-weight: 600;
+                color: #ffffff;
+                horizontal-alignment: TextHorizontalAlignment.center;
+                vertical-alignment: TextVerticalAlignment.center;
+
+                width: 115px;
+                height: parent.height;
+                x: 58px;
+                y: 0px;
+            }
+
+            Text {
+                text: "/";
+                font-size: 16px;
+                font-weight: 700;
+                color: #484848;
+                horizontal-alignment: TextHorizontalAlignment.center;
+                vertical-alignment: TextVerticalAlignment.center;
+
+                width: 16px;
+                height: parent.height;
+                x: 160px;
+                y: 0px;
+            }
+
+            Text {
+                text: "00:00:00:00";
+                font-size: 12px;
+                font-weight: 600;
+
+                color: #ffffff;
+                horizontal-alignment: TextHorizontalAlignment.center;
+                vertical-alignment: TextVerticalAlignment.center;
+
+                width: 115px;
+                height: parent.height;
+                x: 170px;
+                y: 0px;
+            }
+
+            Slider {
+                maximum: 100;
+                value: 0;
+                minimum: 0;
+
+                height: 10px;
+                width: 170px;
+                x: 330px;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Rectangle {
+                height: 15px;
+                width: 1px;
+                background: #787878;
+                x: 520px;
+                y: (parent.height - self.height) / 2;
+            }
+
+            Image {
+                source: @image-url("./assets/icon/fullscreen.svg");
+                image-fit: ImageFit.contain;
+                colorize: #ffffff;
+
+                width: 20px;
+                height: 20px;
+                x: 545px;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+    }
+}

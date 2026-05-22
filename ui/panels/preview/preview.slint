@@ -7,13 +7,91 @@ export component PreviewPanel inherits PanelBase {
             title: "Preview";
         }
 
-        // padding: AppStore.theme.metrics.spacing.xxl;
         spacing: AppStore.theme.metrics.spacing.none;
 
-        Rectangle {
-            vertical-stretch: 1;
-            horizontal-stretch: 1;
-            background: AppStore.theme.surface.content-background;
+        VerticalLayout {
+            padding-left: AppStore.theme.metrics.spacing.md;
+            padding-right: AppStore.theme.metrics.spacing.md;
+            padding-bottom: AppStore.theme.metrics.spacing.md;
+
+            spacing: AppStore.theme.metrics.spacing.xl;
+
+            HorizontalLayout {
+                Image {
+                    source: @image-url("../../../assets/texture.png");
+                    image-fit: ImageFit.contain;
+                }
+            }
+
+            HorizontalLayout {
+                spacing: AppStore.theme.metrics.spacing.sm;
+                height: 30px;
+                horizontal-stretch: 1;
+
+                Rectangle {
+                    width: 33%;
+                    clip: true;
+
+                    HorizontalLayout {
+
+                        alignment: LayoutAlignment.start;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        Text {
+                            text: "00:00:00:00";
+
+                            horizontal-alignment: TextHorizontalAlignment.center;
+                            vertical-alignment: TextVerticalAlignment.center;
+                        }
+
+                        Text {
+                            text: "/";
+                            color: #484848;
+                            font-size: 16px;
+                            font-weight: 700;
+
+                            horizontal-alignment: TextHorizontalAlignment.center;
+                            vertical-alignment: TextVerticalAlignment.center;
+                        }
+
+                        Text {
+                            text: "00:00:00:00";
+
+                            horizontal-alignment: TextHorizontalAlignment.center;
+                            vertical-alignment: TextVerticalAlignment.center;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 33%;
+
+                    HorizontalLayout {
+                        alignment: LayoutAlignment.center;
+
+                        Image {
+                            source: @image-url("../../assets/icon/play.svg");
+                            image-fit: ImageFit.contain;
+                            colorize: #ffffff;
+
+                            horizontal-alignment: ImageHorizontalAlignment.center;
+                            vertical-alignment: ImageVerticalAlignment.center;
+                        }
+                    }
+                }
+
+                Rectangle {
+                    width: 33%;
+                    HorizontalLayout {
+                        alignment: LayoutAlignment.end;
+                        Image {
+                            source: @image-url("../../assets/icon/fullscreen.svg");
+                            image-fit: ImageFit.contain;
+                            colorize: #ffffff;
+                        }
+                    }
+                }
+            }
         }
     }
 }

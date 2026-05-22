@@ -1,4 +1,4 @@
-import { RationalTime, Clip } from "../models/index.slint";
+import { RationalTime, Clip, Sequence } from "../models/index.slint";
 
 export global TimelineLib {
 
@@ -14,6 +14,12 @@ export global TimelineLib {
     public pure function clip-timeline-duration(c: Clip) -> RationalTime {
         return c.source-range.duration;
     }
+
+    // Sequence duration is the latest clip end across all tracks:
+    // max(clip.timeline-start + clip-timeline-duration(clip)).
+    // Implemented in Rust because Slint functions cannot reduce nested
+    // models procedurally.
+    pure callback sequence-duration(sequence: Sequence) -> RationalTime;
 
     // Timeline projection: 1 tick == `zoom` logical pixels.
     // Zoom is owned by `TimelineStore.zoom` rather than the time model, so
