@@ -1,7 +1,9 @@
+mod models;
 mod ruler;
 mod timecode;
 mod timeline;
 
+use models::dto;
 use slint::SharedString;
 
 use slint::BackendSelector;
@@ -15,6 +17,9 @@ fn main() -> Result<(), slint::PlatformError> {
         .select()?;
 
     let app = AppWindow::new()?;
+
+    let editor = app.global::<EditorStore>();
+    editor.set_project(dto::project_to_slint(&models::sample_project()));
 
     let timeline = app.global::<TimelineLib>();
     timeline.on_sequence_duration(timeline::sequence_duration);

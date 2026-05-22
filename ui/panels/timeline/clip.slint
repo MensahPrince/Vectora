@@ -1,6 +1,7 @@
-import { AppStore } from "../../store/index.slint";
+import { AppStore, EditorStore } from "../../store/index.slint";
 import { Clip } from "../../models/index.slint";
 import { TimelineLib } from "../../lib/timeline-lib.slint";
+import { TimelineStore } from "../../store/timeline-store.slint";
 
 // View for a single Clip on a TrackLane. Positions itself within the lane
 // based on the model's `timeline-start` and effective timeline width
@@ -27,6 +28,9 @@ export component ClipView inherits Rectangle {
                 return;
             }
             root.x = self.mouse-x;
+        }
+        clicked => {
+            debug("clip clicked");
         }
     }
 }
