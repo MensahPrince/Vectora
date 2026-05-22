@@ -1,7 +1,6 @@
 import { AppStore } from "../../store/index.slint";
 import { Clip } from "../../models/index.slint";
 import { TimelineLib } from "../../lib/timeline-lib.slint";
-import { EditorBackend } from "../../lib/editor-backend.slint";
 
 // View for a single Clip on a TrackLane. Positions itself within the lane
 // based on the model's `timeline-start` and effective timeline width
@@ -11,26 +10,13 @@ import { EditorBackend } from "../../lib/editor-backend.slint";
 // boolean property on Slint visual elements.
 export component ClipView inherits Rectangle {
     in property <Clip> model;
-    in property <string> track-id;
     in property <float> zoom;
 
-    private property <length> drag-offset: 0px;
-    // Base x and press pointer captured at pointer-down so drag delta is
-    // computed in parent (track-lane) space. Local `mouse-x - pressed-x`
-    // breaks once the clip moves under the cursor.
-    private property <length> drag-start-base-x: 0px;
-    private property <length> drag-press-pointer-x: 0px;
-    private property <int> committed-start-tick: model.timeline-start.value;
-
-    x: TimelineLib.rational-to-length(model.timeline-start, zoom) + drag-offset;
+    x: TimelineLib.rational-to-length(model.timeline-start, zoom);
     width: TimelineLib.clip-timeline-width(model, zoom);
     height: AppStore.theme.track-lane.clip.height;
     background: AppStore.theme.track-lane.clip.background;
     border-radius: AppStore.theme.track-lane.clip.radius;
-
-    changed committed-start-tick => {
-        root.drag-offset = 0px;
-    }
 
     ta := TouchArea {
         width: parent.width;
@@ -40,28 +26,7 @@ export component ClipView inherits Rectangle {
             if (!self.pressed) {
                 return;
             }
-            let pointer-x = self.absolute-position.x + self.mouse-x;
-            root.drag-offset = pointer-x - root.drag-press-pointer-x;
-        }
-
-        pointer-event(event) => {
-            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
-                root.drag-start-base-x = TimelineLib.rational-to-length(model.timeline-start, zoom);
-                root.drag-press-pointer-x = self.absolute-position.x + self.mouse-x;
-                root.drag-offset = 0px;
-            } else if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
-                if (root.drag-offset != 0px) {
-                    let final-x = root.drag-start-base-x + root.drag-offset;
-                    let new-start = TimelineLib.length-to-rational(
-                        final-x,
-                        model.timeline-start.rate,
-                        zoom,
-                    );
-                    EditorBackend.move-clip(model.id, track-id, new-start);
-                }
-            } else if (event.kind == PointerEventKind.cancel) {
-                root.drag-offset = 0px;
-            }
+            root.x = self.mouse-x;
         }
     }
 }

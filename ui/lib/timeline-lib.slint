@@ -1,4 +1,4 @@
-import { RationalTime, Clip, Sequence, Rational } from "../models/index.slint";
+import { RationalTime, Clip, Sequence } from "../models/index.slint";
 
 export global TimelineLib {
 
@@ -13,14 +13,6 @@ export global TimelineLib {
     // do not change.
     public pure function clip-timeline-duration(c: Clip) -> RationalTime {
         return c.source-range.duration;
-    }
-
-    // Inverse of `rational-to-length`: project pixel offset back to
-    // sequence ticks at the given rate. Rounds to the nearest tick and
-    // clamps to zero — negative timeline positions are invalid.
-    public pure function length-to-rational(len: length, rate: Rational, zoom: float) -> RationalTime {
-        let ticks = Math.round(len / 1px / zoom);
-        return { value: max(0, ticks), rate: rate };
     }
 
     // Sequence duration is the latest clip end across all tracks:

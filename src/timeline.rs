@@ -1,52 +1,13 @@
-//! Sequence-level time queries and timeline edit commands called from Slint.
+//! Sequence-level time queries called from Slint.
 //!
-//! Read-only queries (`sequence_duration`) bind to `TimelineLib` callbacks;
-//! mutations (`move_clip`) bind to `EditorBackend`. Heavier timeline math
-//! (overlap resolution, trim) belongs here next to the engine.
+//! Currently exposes one entry point — `sequence_duration` — bound to
+//! the `TimelineLib.sequence-duration` callback in
+//! `ui/lib/timeline-lib.slint`. Heavier timeline math (cut/trim,
+//! overlap resolution, render extents) belongs next to the engine,
+//! not here.
 
-use crate::{Clip, Project, Rational, RationalTime, Sequence, Track};
-use slint::{Model, ModelRc, VecModel};
-
-/// Reposition a clip on the sequence timeline.
-///
-/// Bound to `EditorBackend.move-clip` in `ui/lib/editor-backend.slint`.
-/// Mutates the clip model in place. Requires a hydrated project — see
-/// [`crate::models::dto::hydrate_project`].
-pub fn move_clip(
-    project: &Project,
-    clip_id: &str,
-    track_id: &str,
-    timeline_start: RationalTime,
-) -> bool {
-    let sequence_fps = project.sequence.fps.clone();
-    let clamped_start = RationalTime {
-        value: timeline_start.value.max(0),
-        rate: sequence_fps,
-    };
-
-    for track_idx in 0..project.sequence.tracks.row_count() {
-        let Some(track) = project.sequence.tracks.row_data(track_idx) else {
-            continue;
-        };
-        if track.id.as_str() != track_id {
-            continue;
-        }
-
-        for clip_idx in 0..track.clips.row_count() {
-            let Some(clip) = track.clips.row_data(clip_idx) else {
-                continue;
-            };
-            if clip.id.as_str() == clip_id {
-                let mut updated = clip;
-                updated.timeline_start = clamped_start;
-                track.clips.set_row_data(clip_idx, updated);
-                return true;
-            }
-        }
-    }
-
-    false
-}
+use crate::{Clip, Rational, RationalTime, Sequence};
+use slint::Model;
 
 /// Latest content end across all tracks, expressed at the sequence rate.
 ///
@@ -169,8 +130,8 @@ fn ceil_div(num: i128, den: i128) -> i128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Project, TimeRange, Track};
-    use slint::{ModelRc, SharedString, VecModel};
+    use crate::{TimeRange, Track};
+    use slint::{ModelRc, VecModel};
     use std::rc::Rc;
 
     // ---- builders ----------------------------------------------------
@@ -377,82 +338,5 @@ mod tests {
             )])],
         ));
         assert_eq!(d.value, 108_000);
-    }
-
-    // ---- move_clip -------------------------------------------------
-
-    fn clip_with_id(id: &str, timeline_start: RationalTime, duration: RationalTime) -> Clip {
-        Clip {
-            id: SharedString::from(id),
-            timeline_start,
-            source_range: TimeRange {
-                duration,
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    fn track_with_id(id: &str, clips: Vec<Clip>) -> Track {
-        Track {
-            id: SharedString::from(id),
-            clips: ModelRc::from(Rc::new(VecModel::from(clips))),
-            ..Default::default()
-        }
-    }
-
-    fn project_with_tracks(tracks: Vec<Track>) -> Project {
-        Project {
-            sequence: Sequence {
-                fps: r(24, 1),
-                tracks: ModelRc::from(Rc::new(VecModel::from(tracks))),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn move_clip_updates_timeline_start() {
-        let project = project_with_tracks(vec![track_with_id(
-            "t1",
-            vec![clip_with_id("c1", rt(10, 24, 1), rt(50, 24, 1))],
-        )]);
-
-        assert!(move_clip(&project, "c1", "t1", rt(40, 24, 1)));
-        let track = project.sequence.tracks.row_data(0).unwrap();
-        let clip = track.clips.row_data(0).unwrap();
-        assert_eq!(clip.timeline_start.value, 40);
-    }
-
-    #[test]
-    fn move_clip_clamps_negative_start_to_zero() {
-        let project = project_with_tracks(vec![track_with_id(
-            "t1",
-            vec![clip_with_id("c1", rt(10, 24, 1), rt(50, 24, 1))],
-        )]);
-
-        assert!(move_clip(&project, "c1", "t1", rt(-5, 24, 1)));
-        let track = project.sequence.tracks.row_data(0).unwrap();
-        let clip = track.clips.row_data(0).unwrap();
-        assert_eq!(clip.timeline_start.value, 0);
-    }
-
-    #[test]
-    fn move_clip_noop_when_ids_missing() {
-        let project = project_with_tracks(vec![track_with_id(
-            "t1",
-            vec![clip_with_id("c1", rt(10, 24, 1), rt(50, 24, 1))],
-        )]);
-
-        assert!(!move_clip(&project, "missing", "t1", rt(40, 24, 1)));
-        let track = project.sequence.tracks.row_data(0).unwrap();
-        let clip = track.clips.row_data(0).unwrap();
-        assert_eq!(clip.timeline_start.value, 10);
-
-        assert!(!move_clip(&project, "c1", "missing", rt(40, 24, 1)));
-        let track = project.sequence.tracks.row_data(0).unwrap();
-        let clip = track.clips.row_data(0).unwrap();
-        assert_eq!(clip.timeline_start.value, 10);
     }
 }

@@ -2,7 +2,7 @@ import { Project, Rational } from "../models/index.slint";
 
 export global EditorStore {
     private property <Rational> fps: { num: 24, den: 1 };
-    in-out property <Project> project: {
+    out property <Project> project: {
         id: "1",
         title: "Project 1",
         sequence: {
