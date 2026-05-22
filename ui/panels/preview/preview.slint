@@ -1,5 +1,6 @@
 import { PanelBase, PanelHeader } from "../../components/index.slint";
 import { AppStore } from "../../store/index.slint";
+import { AppState } from "../../state.slint";
 
 export component PreviewPanel inherits PanelBase {
     VerticalLayout {
@@ -88,6 +89,12 @@ export component PreviewPanel inherits PanelBase {
                             source: @image-url("../../assets/icon/fullscreen.svg");
                             image-fit: ImageFit.contain;
                             colorize: #ffffff;
+
+                            TouchArea {
+                                clicked => {
+                                    AppState.enter-preview-maximized();
+                                }
+                            }
                         }
                     }
                 }

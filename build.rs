@@ -4,6 +4,4 @@ fn main() {
         std::env::set_var("SLINT_ENABLE_EXPERIMENTAL_FEATURES", "1");
     }
     slint_build::compile("ui/app.slint").unwrap();
-    // slint_build::compile("ui/fullscreen-preview.slint").unwrap();
-    // slint_build::compile("ui/test-app.slint").unwrap();
 }

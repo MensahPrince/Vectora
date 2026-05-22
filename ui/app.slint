@@ -11,17 +11,20 @@ import {
     TimelinePanel,
 } from "panels/index.slint";
 import { AppStore } from "store/index.slint";
+import { AppState } from "state.slint";
+import { FullscreenPreview } from "fullscreen-preview.slint";
+
+// Re-export globals so Slint's codegen generates accessors on `AppWindow`.
+// Slint only exposes globals from the entry file's exports to the host
+// language (Rust here) — transitive imports aren't enough.
+//   https://docs.slint.dev/latest/docs/slint/src/language/syntax/globals
+export { AppState } from "state.slint";
 export { TimelineViewState } from "panels/timeline/index.slint";
 export { TimelineLib } from "lib/index.slint";
-// Re-export `RulerBackend` from the entry file so Slint's codegen
-// generates an accessor on `AppWindow`. Slint only exposes globals
-// from the entry file's exports to the host language (Rust here) —
-// transitive imports aren't enough.
-//   https://docs.slint.dev/latest/docs/slint/src/language/syntax/globals
 export { RulerBackend, RulerTick } from "lib/ruler-backend.slint";
-export { FullscreenPreview } from "fullscreen-preview.slint";
+
 export component AppWindow inherits Window {
-    title: "Hello World";
+    title: "Cutlass";
 
     preferred-width: 1280px;
     preferred-height: 800px;
@@ -33,11 +36,19 @@ export component AppWindow inherits Window {
     in-out property <length> right-pane-width: 350px;
     in-out property <length> timeline-height: 400px;
 
-    background: AppStore.theme.surface.app-background;
+    background: AppState.preview-maximized
+        ? AppStore.theme.panel.background
+        : AppStore.theme.surface.app-background;
 
-    VerticalLayout {
+    if AppState.preview-maximized: FullscreenPreview {
+        width: root.width;
+        height: root.height;
+    }
+
+    if !AppState.preview-maximized: VerticalLayout {
         padding: AppStore.theme.metrics.spacing.sm;
         spacing: AppStore.theme.metrics.spacing.none;
+
         Rectangle {
             height: 40px;
             background: AppStore.theme.surface.app-background;

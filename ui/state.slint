@@ -1,0 +1,15 @@
+// App-wide window/view state. Anything that affects the whole shell
+// (chrome visibility, full-window overlays, …) lives here rather than
+// inside any one panel's state global.
+export global AppState {
+    // True while the preview is shown maximized over the whole window
+    // (panels and chrome hidden). The window itself is just maximized —
+    // not OS-exclusive fullscreen — so the title bar and menu bar stay
+    // visible.
+    in-out property <bool> preview-maximized: false;
+
+    // UI -> host intents. The host (Rust) toggles window state and
+    // flips `preview-maximized` so both stay in sync.
+    callback enter-preview-maximized();
+    callback exit-preview-maximized();
+}
