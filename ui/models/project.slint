@@ -1,0 +1,114 @@
+// Time model is OpenTimelineIO-aligned:
+//   RationalTime { value, rate } means `value` ticks at `rate` ticks-per-second.
+//   e.g. { value: 24, rate: { num: 24, den: 1 } } == 1 second.
+//
+// `rate` is itself rational so we can represent NTSC rates exactly
+// (e.g. 23.976 fps == 24000/1001) without float drift.
+
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+export struct Rational {
+    num: int,
+    den: int,
+}
+
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+export struct RationalTime {
+    value: int,
+    rate: Rational,
+}
+
+// OTIO-style range: start time + duration (exclusive end == start + duration).
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+    export struct TimeRange {
+    start: RationalTime,
+    duration: RationalTime,
+}
+
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+export struct Clip {
+    id: string,
+    name: string,
+    // Where the clip plays on the sequence timeline.
+    //
+    // Advances under head-trim (the visible content starts later on the
+    // sequence). Unchanged under tail-trim.
+    timeline-start: RationalTime,
+    // Window into the source media (in/out points):
+    //   .start    = source in-point (offset into the underlying media)
+    //   .duration = how much of the source plays
+    //
+    // This is the SINGLE source of truth for clip extent. Effective timeline
+    // duration == source-range.duration under 1:1 playback (no time-remap),
+    // so the clip occupies the timeline interval
+    //   [timeline-start, timeline-start + source-range.duration).
+    //
+    // Trim semantics — both edges are expressed by mutating this field; there
+    // is intentionally no second "timeline-duration" to keep in sync.
+    //
+    //   head-trim by Δ (drag left edge right by Δ):
+    //     timeline-start         += Δ
+    //     source-range.start     += Δ
+    //     source-range.duration  -= Δ
+    //
+    //   tail-trim by Δ (drag right edge left by Δ):
+    //     source-range.duration  -= Δ
+    //     (timeline-start and source-range.start unchanged)
+    //
+    // Why no separate `timeline-duration`: under cut/trim the two would
+    // always be equal, so storing both invites silent drift. The only thing
+    // that breaks the invariant is speed change / time-remap, which should
+    // be modelled as an EXPLICIT warp factor or curve — not as two durations
+    // whose ratio implicitly encodes speed (OTIO does the same: `LinearTimeWarp`
+    // / `FreezeFrame` effects on top of a single `source_range`).
+    source-range: TimeRange,
+}
+
+// Drives the "audio always at the bottom" lane invariant and the
+// gesture-layer rule that a clip can only land on a same-kind lane.
+// Mirrored as `crate::models::TrackKind` on the Rust side; the
+// projector converts between the two.
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+export enum TrackKind {
+    video,
+    audio,
+}
+
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+export struct Track {
+    id: string,
+    name: string,
+    kind: TrackKind,
+    // Single source of truth for clip color on this lane. Set
+    // per-lane (not per-clip) so the "one lane, one color" invariant
+    // is structural — a clip's color simply changes the moment it
+    // moves to a different lane.
+    color: color,
+    clips: [Clip],
+}
+
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+export struct Sequence {
+    id: string,
+    name: string,
+    fps: Rational,
+    // SMPTE drop-frame timecode display flag. Only meaningful for NTSC
+    // rates (29.97 == 30000/1001, 59.94 == 60000/1001) — for everything
+    // else the ruler / timecode formatter ignores it. This is a *display*
+    // setting, not a rate change: the underlying frame indices are the
+    // same; we only relabel them so the displayed timecode tracks
+    // wall-clock time. (For 23.976 there is no standard drop scheme;
+    // by convention 23.976 projects are always non-drop and accept the
+    // ~3.6s/hour drift.)
+    drop-frame: bool,
+    tracks: [Track],
+    width: length,
+    height: length,
+}
+
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+export struct Project {
+    id: string,
+    title: string,
+    // A project has exactly one sequence at this stage. Future may allow multiple.
+    sequence: Sequence,
+}

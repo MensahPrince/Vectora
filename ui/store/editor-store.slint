@@ -1,0 +1,31 @@
+import { Project } from "../models/index.slint";
+
+// Canonical project state lives in Rust (`src/models/`) and is mutated
+// only by `Editor::apply(Command)` (`src/state.rs`). Rust publishes
+// the projection here once at startup, then patches individual clip
+// rows in place via `src/projector.rs` — Slint never writes back into
+// `project`, so it's declared `in` (read-only inside `.slint`,
+// settable from Rust).
+//
+// Domain mutations from the UI happen exclusively through the
+// callbacks on this global. Each one is the canonical entry point
+// for one `Command` variant — the same vocabulary the AI agent
+// will eventually emit as tagged JSON.
+export global EditorStore {
+    in property <Project> project;
+
+    // Place `clip-id` (currently on `source-track-id`) onto
+    // `target-track-id` starting at `new-start-value` ticks at the
+    // clip's existing rate. `target-track-id` may equal
+    // `source-track-id` (intra-lane reposition).
+    //
+    // Dispatched from `ClipView` on drag-release; Rust handles the
+    // collision / new-lane policy in one atomic command (see
+    // `src/command.rs`).
+    callback move-clip(
+        string /* source-track-id */,
+        string /* clip-id */,
+        string /* target-track-id */,
+        int    /* new-start-value */,
+    );
+}

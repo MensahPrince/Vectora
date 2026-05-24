@@ -1,0 +1,103 @@
+import {
+    CutlassText,
+    HSplitGripLead,
+    HSplitGripTrail,
+    VSplitGripTimeline,
+} from "components/index.slint";
+import {
+    InspectorPanel,
+    LibraryPanel,
+    PreviewPanel,
+    TimelinePanel,
+} from "panels/index.slint";
+import { AppStore } from "store/index.slint";
+import { AppState } from "state.slint";
+import { FullscreenPreview } from "fullscreen-preview.slint";
+
+// Re-export globals so Slint's codegen generates accessors on `AppWindow`.
+// Slint only exposes globals from the entry file's exports to the host
+// language (Rust here) — transitive imports aren't enough.
+//   https://docs.slint.dev/latest/docs/slint/src/language/syntax/globals
+export { AppState } from "state.slint";
+export { EditorStore } from "store/index.slint";
+export { TimelineViewState } from "panels/timeline/index.slint";
+export { TimelineLib } from "lib/index.slint";
+export { RulerBackend, RulerTick } from "lib/ruler-backend.slint";
+export { DragBackend, SnapResult, ResolvedTarget } from "lib/drag-backend.slint";
+
+export component AppWindow inherits Window {
+    title: "Cutlass";
+
+    preferred-width: 1280px;
+    preferred-height: 800px;
+
+    default-font-size: AppStore.theme.typography.body.size;
+    default-font-weight: AppStore.theme.typography.body.weight;
+
+    full-screen: AppState.preview-maximized;
+
+    in-out property <length> left-pane-width: 350px;
+    in-out property <length> right-pane-width: 350px;
+    in-out property <length> timeline-height: 400px;
+
+    background: AppState.preview-maximized ? AppStore.theme.panel.background : AppStore.theme.surface.app-background;
+
+    if AppState.preview-maximized: FullscreenPreview {
+        width: root.width;
+        height: root.height;
+    }
+
+    if !AppState.preview-maximized: VerticalLayout {
+        padding: AppStore.theme.metrics.spacing.sm;
+        spacing: AppStore.theme.metrics.spacing.none;
+
+        Rectangle {
+            height: 40px;
+            background: AppStore.theme.surface.app-background;
+            CutlassText {
+                text: "Cutlass Head";
+                style: AppStore.theme.typography.label;
+            }
+        }
+
+        HorizontalLayout {
+            vertical-stretch: 1;
+            horizontal-stretch: 1;
+            spacing: AppStore.theme.metrics.spacing.none;
+
+            LibraryPanel {
+                width: root.left-pane-width;
+                vertical-stretch: 1;
+            }
+
+            HSplitGripLead {
+                pane-width <=> root.left-pane-width;
+                vertical-stretch: 1;
+            }
+
+            PreviewPanel {
+                vertical-stretch: 1;
+                horizontal-stretch: 1;
+            }
+
+            HSplitGripTrail {
+                pane-width <=> root.right-pane-width;
+                vertical-stretch: 1;
+            }
+
+            InspectorPanel {
+                width: root.right-pane-width;
+                vertical-stretch: 1;
+            }
+        }
+
+        VSplitGripTimeline {
+            timeline-height <=> root.timeline-height;
+        }
+
+        TimelinePanel {
+            height: root.timeline-height;
+            horizontal-stretch: 1;
+        }
+    }
+}

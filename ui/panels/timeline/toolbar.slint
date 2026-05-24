@@ -1,0 +1,15 @@
+import { CutlassText, HorizontalDivider } from "../../components/index.slint";
+import { AppStore } from "../../store/index.slint";
+
+export component Toolbar inherits Rectangle {
+    height: AppStore.theme.metrics.layout.toolbar-height;
+
+    CutlassText {
+        text: "Tools";
+        style: AppStore.theme.typography.label;
+    }
+
+    HorizontalDivider {
+        y: parent.height - self.height;
+    }
+}

@@ -1,9 +1,0 @@
-[package]
-name = "timeline"
-version.workspace = true
-edition.workspace = true
-description = "Cutlass timeline brain — structured edit commands, applied against a Project with invariant enforcement"
-
-[dependencies]
-models = { path = "../models" }
-thiserror.workspace = true
