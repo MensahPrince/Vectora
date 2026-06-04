@@ -294,11 +294,12 @@ pub fn release_device_ref(device: &mut Option<*mut AVBufferRef>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "macos")]
     use super::*;
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn auto_priority_includes_videotoolbox_on_macos() {
-        #[cfg(target_os = "macos")]
         assert!(auto_probe_order().contains(&HwAccel::VideoToolbox));
     }
 }
