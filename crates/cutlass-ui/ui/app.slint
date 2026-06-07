@@ -125,34 +125,68 @@ export component AppWindow inherits Window {
         HorizontalLayout {
             spacing: 6px;
             height: 32px;
-            Button { text: "Import…"; clicked => { root.import(); } }
+            Button {
+                text: "Import…";
+                clicked => { root.import(); }
+            }
+
             Button {
                 text: root.exporting ? "Exporting…" : "Export…";
                 enabled: root.has-media && !root.playing && !root.exporting;
                 clicked => { root.export(); }
             }
-            Rectangle { width: 12px; }
+
+            Rectangle {
+                width: 12px;
+            }
+
             Button {
                 text: "Split";
                 enabled: root.selected != -1;
                 clicked => { root.split(); }
             }
+
             Button {
                 text: "Delete";
                 enabled: root.selected != -1;
                 clicked => { root.delete-clip(); }
             }
+
             Button {
                 text: "Ripple delete";
                 enabled: root.selected != -1;
                 clicked => { root.ripple-delete(); }
             }
-            Rectangle { width: 12px; }
-            Button { text: "Undo"; enabled: root.can-undo; clicked => { root.do-undo(); } }
-            Button { text: "Redo"; enabled: root.can-redo; clicked => { root.do-redo(); } }
-            Rectangle { horizontal-stretch: 1; }
-            Button { text: "−"; clicked => { root.ppf = clamp(root.ppf / 1.5, 0.5px, 80px); } }
-            Button { text: "+"; clicked => { root.ppf = clamp(root.ppf * 1.5, 0.5px, 80px); } }
+
+            Rectangle {
+                width: 12px;
+            }
+
+            Button {
+                text: "Undo";
+                enabled: root.can-undo;
+                clicked => { root.do-undo(); }
+            }
+
+            Button {
+                text: "Redo";
+                enabled: root.can-redo;
+                clicked => { root.do-redo(); }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Button {
+                text: "-";
+                clicked => { root.ppf = clamp(root.ppf / 1.5, 0.5px, 80px); }
+            }
+
+            Button {
+                text: "+";
+                clicked => { root.ppf = clamp(root.ppf * 1.5, 0.5px, 80px); }
+            }
         }
 
         // --- preview ------------------------------------------------------
@@ -185,6 +219,7 @@ export component AppWindow inherits Window {
                 enabled: root.has-media;
                 clicked => { root.toggle-play(); }
             }
+
             Slider {
                 horizontal-stretch: 1;
                 enabled: root.has-media;
@@ -193,6 +228,7 @@ export component AppWindow inherits Window {
                 value: root.playhead;
                 changed(v) => { root.scrub(round(v)); }
             }
+
             Text {
                 width: 150px;
                 color: #c9d1d9;
@@ -267,7 +303,11 @@ export component AppWindow inherits Window {
                 vertical-alignment: center;
                 text: root.status;
             }
-            Rectangle { horizontal-stretch: 1; }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
             if root.exporting: Rectangle {
                 width: 160px;
                 height: 8px;
