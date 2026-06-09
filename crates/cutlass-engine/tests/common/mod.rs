@@ -4,9 +4,10 @@
 
 use std::path::{Path, PathBuf};
 
-use cutlass_commands::{Command, EditCommand, EditOutcome};
+use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
+use cutlass_encoder::ExportStats;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
-use cutlass_models::{Rational, RationalTime, TimeRange, TrackId, TrackKind};
+use cutlass_models::{ClipId, Generator, MediaId, Rational, RationalTime, TimeRange, TrackId, TrackKind};
 
 pub fn assets_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets")
@@ -62,8 +63,7 @@ pub fn add_track(engine: &mut Engine, kind: TrackKind, name: &str) -> TrackId {
     }
 }
 
-pub fn import_asset(engine: &mut Engine, path: &Path) -> cutlass_models::MediaId {
-    use cutlass_commands::ProjectCommand;
+pub fn import_asset(engine: &mut Engine, path: &Path) -> MediaId {
     match engine
         .apply(Command::Project(ProjectCommand::Import {
             path: path.to_path_buf(),
@@ -72,5 +72,60 @@ pub fn import_asset(engine: &mut Engine, path: &Path) -> cutlass_models::MediaId
     {
         ApplyOutcome::Imported { media } => media,
         other => panic!("expected import outcome, got {other:?}"),
+    }
+}
+
+pub fn created_clip(outcome: ApplyOutcome) -> ClipId {
+    match outcome {
+        ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
+        other => panic!("expected Created, got {other:?}"),
+    }
+}
+
+pub fn add_generated(
+    engine: &mut Engine,
+    track: TrackId,
+    generator: Generator,
+    timeline: TimeRange,
+) -> ClipId {
+    created_clip(
+        engine
+            .apply(Command::Edit(EditCommand::AddGenerated {
+                track,
+                generator,
+                timeline,
+            }))
+            .expect("add generated"),
+    )
+}
+
+pub fn add_media_clip(
+    engine: &mut Engine,
+    track: TrackId,
+    media: MediaId,
+    source: TimeRange,
+    start: RationalTime,
+) -> ClipId {
+    created_clip(
+        engine
+            .apply(Command::Edit(EditCommand::AddClip {
+                track,
+                media,
+                source,
+                start,
+            }))
+            .expect("add clip"),
+    )
+}
+
+pub fn export_to(engine: &mut Engine, path: &Path) -> ExportStats {
+    match engine
+        .apply(Command::Project(ProjectCommand::Export {
+            path: path.to_path_buf(),
+        }))
+        .expect("export command")
+    {
+        ApplyOutcome::Exported { stats } => stats,
+        other => panic!("expected Exported, got {other:?}"),
     }
 }
