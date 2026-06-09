@@ -6,4 +6,5 @@ license.workspace = true
 description = "Cutlass project/timeline data model"
 
 [dependencies]
-tracing.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
