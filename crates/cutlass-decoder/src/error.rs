@@ -25,3 +25,26 @@ impl DecodeError {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_wraps_message() {
+        let err = DecodeError::unsupported("no video stream found");
+        assert!(matches!(err, DecodeError::Unsupported { .. }));
+        assert_eq!(err.to_string(), "unsupported: no video stream found");
+    }
+
+    #[test]
+    fn hw_accel_unavailable_formats_accel_name() {
+        let err = DecodeError::HwAccelUnavailable {
+            accel: "videotoolbox",
+        };
+        assert_eq!(
+            err.to_string(),
+            "hardware acceleration unavailable: videotoolbox"
+        );
+    }
+}

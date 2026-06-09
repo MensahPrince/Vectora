@@ -148,12 +148,16 @@ impl Decoder {
 
     /// Seek to the keyframe at or before `target` and flush decoder buffers.
     pub fn seek(&mut self, target: Duration) -> Result<(), DecodeError> {
-        let ts = i64::try_from(target.as_micros()).unwrap_or(i64::MAX);
+        let target_ticks = self.indexer.duration_to_ticks(target);
+        let ts = self
+            .indexer
+            .seek_us_at_or_before(target_ticks)
+            .ok_or_else(|| DecodeError::unsupported("target is before the first keyframe"))?;
         self.input.seek(ts, ..ts).map_err(DecodeError::Io)?;
         self.decoder.flush();
         self.demuxer_done = false;
         self.pending_packet = None;
-        debug!(target_micros = ts, "seeked to keyframe");
+        debug!(target_micros = ts, target_ticks, "seeked to keyframe");
         Ok(())
     }
 
@@ -161,10 +165,10 @@ impl Decoder {
     pub fn seek_to_frame(&mut self, target: Duration) -> Result<Option<DecodedFrame>, DecodeError> {
         self.seek(target)?;
 
-        let target_pts = self.duration_to_pts(target);
+        let target_ticks = self.indexer.duration_to_ticks(target);
         while let Some(frame) = self.next_video_frame()? {
             let pts = frame_pts(&frame).unwrap_or(i64::MIN);
-            if pts >= target_pts {
+            if pts >= target_ticks {
                 let cpu = if is_hardware_pixel_format(frame.format()) {
                     transfer_to_cpu(&frame, &mut self.sw_frame)?;
                     &self.sw_frame
@@ -188,12 +192,27 @@ impl Decoder {
         &mut self,
         target: Duration,
     ) -> Result<Option<DecodedFrame>, DecodeError> {
+        let target_ticks = self.indexer.duration_to_ticks(target);
         self.seek(target)?;
         self.set_skip_frame(Discard::NonKey);
-        let target_pts = self.duration_to_pts(target);
+        if let Some(frame) = self.seek_dirty_walk_to_target(target_ticks)? {
+            self.set_skip_frame(Discard::Default);
+            return Ok(Some(frame));
+        }
+        // No keyframe at/after target (common with sparse GOPs): fall back to
+        // full decode from a fresh seek.
+        self.set_skip_frame(Discard::Default);
+        self.seek(target)?;
+        self.seek_dirty_walk_to_target(target_ticks)
+    }
+
+    fn seek_dirty_walk_to_target(
+        &mut self,
+        target_ticks: i64,
+    ) -> Result<Option<DecodedFrame>, DecodeError> {
         while let Some(frame) = self.next_video_frame()? {
             let pts = frame_pts(&frame).unwrap_or(i64::MIN);
-            if pts >= target_pts {
+            if pts >= target_ticks {
                 let cpu = if is_hardware_pixel_format(frame.format()) {
                     transfer_to_cpu(&frame, &mut self.sw_frame)?;
                     &self.sw_frame
@@ -204,16 +223,6 @@ impl Decoder {
             }
         }
         Ok(None)
-    }
-
-    fn duration_to_pts(&self, target: Duration) -> i64 {
-        let tb = self.info.time_base;
-        let num = tb.numerator();
-        let den = tb.denominator();
-        if num <= 0 || den <= 0 {
-            return 0;
-        }
-        (target.as_secs_f64() * (f64::from(den) / f64::from(num))) as i64
     }
 
     pub fn next_video_frame(&mut self) -> Result<Option<Video>, DecodeError> {
@@ -392,13 +401,13 @@ mod tests {
             .expect("open");
 
         let target = Duration::from_millis(500);
-        let target_pts = dec.duration_to_pts(target);
+        let target_ticks = dec.indexer.duration_to_ticks(target);
 
         let frame = dec
             .seek_to_frame(target)
             .expect("seek")
             .expect("frame after seek");
-        assert!(frame.pts_ticks >= target_pts);
+        assert!(frame.pts_ticks >= target_ticks);
         assert!(frame.width > 0 && !frame.planes.is_empty());
     }
 
@@ -414,5 +423,103 @@ mod tests {
             frame.format,
             PixelFormat::Yuv420p | PixelFormat::Nv12 | PixelFormat::Rgba8
         ));
+    }
+
+    #[test]
+    fn hw_accel_from_env_parses_aliases() {
+        assert_eq!(hw_accel_from_env("none"), HwAccel::None);
+        assert_eq!(hw_accel_from_env("SW"), HwAccel::None);
+        assert_eq!(hw_accel_from_env("auto"), HwAccel::Auto);
+        assert_eq!(hw_accel_from_env("videotoolbox"), HwAccel::VideoToolbox);
+        assert_eq!(hw_accel_from_env(" vt "), HwAccel::VideoToolbox);
+        assert_eq!(hw_accel_from_env("bogus-backend"), HwAccel::Auto);
+    }
+
+    #[test]
+    fn ffmpeg_version_is_non_empty() {
+        let v = ffmpeg_version();
+        assert!(!v.is_empty());
+        assert!(v.chars().any(|c| c.is_ascii_digit()));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn open_rejects_non_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::path::Path::new(std::ffi::OsStr::from_bytes(b"\xff\xfe/video.mp4"));
+        let err = match Decoder::open(path) {
+            Err(e) => e,
+            Ok(_) => panic!("expected non-utf8 path to be rejected"),
+        };
+        assert!(matches!(err, DecodeError::Unsupported { .. }));
+    }
+
+    #[test]
+    fn source_info_reports_dimensions_and_time_base() {
+        let Some(path) = any_video_asset() else {
+            return;
+        };
+        let dec = Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::None))
+            .expect("open");
+        let info = dec.info();
+        assert!(info.width > 0);
+        assert!(info.height > 0);
+        assert!(info.time_base.denominator() > 0);
+        assert!(info.frame_rate_parts().0 > 0);
+    }
+
+    #[test]
+    fn sequential_decode_advances_pts() {
+        let Some(path) = any_video_asset() else {
+            return;
+        };
+        let mut dec = Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::None))
+            .expect("open");
+        let f0 = dec.next_frame().expect("decode").expect("frame 0");
+        let f1 = dec.next_frame().expect("decode").expect("frame 1");
+        assert!(f1.pts_ticks >= f0.pts_ticks);
+    }
+
+    #[test]
+    fn seek_snaps_to_keyframe_at_or_before_target() {
+        let Some(path) = any_video_asset() else {
+            return;
+        };
+        let dec = Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::None))
+            .expect("open");
+        let target = Duration::from_millis(500);
+        let target_ticks = dec.indexer.duration_to_ticks(target);
+        let kf = dec
+            .indexer
+            .keyframe_at_or_before_ticks(target_ticks)
+            .expect("keyframe");
+        assert!(kf <= target_ticks);
+    }
+
+    #[test]
+    fn seek_dirty_to_frame_returns_keyframe_or_later() {
+        let Some(path) = any_video_asset() else {
+            return;
+        };
+        let mut dec = Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::None))
+            .expect("open");
+        let target = Duration::from_millis(750);
+        let target_ticks = dec.indexer.duration_to_ticks(target);
+        let frame = dec
+            .seek_dirty_to_frame(target)
+            .expect("seek dirty")
+            .expect("frame");
+        assert!(frame.pts_ticks >= target_ticks);
+    }
+
+    #[test]
+    fn duration_reports_positive_for_asset() {
+        let Some(path) = any_video_asset() else {
+            return;
+        };
+        let dec = Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::None))
+            .expect("open");
+        let dur = dec.duration().expect("duration");
+        assert!(dur > Duration::ZERO);
     }
 }

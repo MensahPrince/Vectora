@@ -292,12 +292,48 @@ pub fn release_device_ref(device: &mut Option<*mut AVBufferRef>) {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(target_os = "macos")]
     use super::*;
+    use ffmpeg_next::util::format::pixel::Pixel;
+
+    #[test]
+    fn hw_accel_names_are_stable() {
+        assert_eq!(HwAccel::Auto.name(), "auto");
+        assert_eq!(HwAccel::None.name(), "none");
+        assert_eq!(HwAccel::VideoToolbox.name(), "videotoolbox");
+    }
+
+    #[test]
+    fn uses_hardware_excludes_auto_and_none() {
+        assert!(!HwAccel::Auto.uses_hardware());
+        assert!(!HwAccel::None.uses_hardware());
+        assert!(HwAccel::VideoToolbox.uses_hardware());
+    }
+
+    #[test]
+    fn decode_options_builder_overrides_hw_accel() {
+        let opts = DecodeOptions::default().hw_accel(HwAccel::None);
+        assert_eq!(opts.hw_accel, HwAccel::None);
+    }
+
+    #[test]
+    fn is_hardware_pixel_format_classifies_gpu_surfaces() {
+        assert!(is_hardware_pixel_format(Pixel::VIDEOTOOLBOX));
+        assert!(is_hardware_pixel_format(Pixel::CUDA));
+        assert!(is_hardware_pixel_format(Pixel::VAAPI));
+        assert!(!is_hardware_pixel_format(Pixel::YUV420P));
+        assert!(!is_hardware_pixel_format(Pixel::NV12));
+        assert!(!is_hardware_pixel_format(Pixel::RGBA));
+    }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn auto_priority_includes_videotoolbox_on_macos() {
         assert!(auto_probe_order().contains(&HwAccel::VideoToolbox));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn auto_priority_includes_vaapi_on_linux() {
+        assert!(auto_probe_order().contains(&HwAccel::Vaapi));
     }
 }

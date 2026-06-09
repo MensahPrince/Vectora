@@ -113,3 +113,52 @@ impl DecodedFrame {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ffmpeg_next::util::format::pixel::Pixel;
+
+    #[test]
+    fn from_ffmpeg_maps_supported_pixels() {
+        assert_eq!(PixelFormat::from_ffmpeg(Pixel::YUV420P), Some(PixelFormat::Yuv420p));
+        assert_eq!(PixelFormat::from_ffmpeg(Pixel::NV12), Some(PixelFormat::Nv12));
+        assert_eq!(PixelFormat::from_ffmpeg(Pixel::RGBA), Some(PixelFormat::Rgba8));
+    }
+
+    #[test]
+    fn from_ffmpeg_rejects_unsupported_pixels() {
+        assert_eq!(PixelFormat::from_ffmpeg(Pixel::YUV422P), None);
+        assert_eq!(PixelFormat::from_ffmpeg(Pixel::GRAY8), None);
+    }
+
+    #[test]
+    fn plane_count_matches_format() {
+        assert_eq!(PixelFormat::Yuv420p.plane_count(), 3);
+        assert_eq!(PixelFormat::Nv12.plane_count(), 2);
+        assert_eq!(PixelFormat::Rgba8.plane_count(), 1);
+    }
+
+    #[test]
+    fn yuv_plane_heights_require_even_height() {
+        assert!(PixelFormat::Yuv420p.plane_heights(1080).is_ok());
+        assert_eq!(
+            PixelFormat::Yuv420p.plane_heights(1080).unwrap(),
+            vec![1080, 540, 540]
+        );
+        assert_eq!(PixelFormat::Yuv420p.plane_heights(1079), Err("YUV420P requires even height"));
+        assert_eq!(PixelFormat::Nv12.plane_heights(1079), Err("NV12 requires even height"));
+    }
+
+    #[test]
+    fn rgba_plane_height_matches_frame_height() {
+        assert_eq!(PixelFormat::Rgba8.plane_heights(721).unwrap(), vec![721]);
+    }
+
+    #[test]
+    fn zero_height_is_rejected_for_all_formats() {
+        for fmt in [PixelFormat::Yuv420p, PixelFormat::Nv12, PixelFormat::Rgba8] {
+            assert_eq!(fmt.plane_heights(0), Err("frame height is zero"));
+        }
+    }
+}

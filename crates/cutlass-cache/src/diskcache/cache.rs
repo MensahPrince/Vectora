@@ -25,7 +25,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -42,7 +42,7 @@ const ERR_NO_SPACE: i32 = 28;
 #[cfg(windows)]
 const ERR_NO_SPACE: i32 = 112;
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 fn synthetic_no_space_error() -> std::io::Error {
     std::io::Error::from_raw_os_error(ERR_NO_SPACE)
 }
@@ -133,11 +133,11 @@ struct SourceCache {
     reader: Option<Mmap>,
     mapped_len: u64, // how much of the blob the current mmap covers
     bytes_used: u64, // live bytes (== sum of entry.len; not file size if fragmented)
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fail_writes_enospc: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fail_writes_after_bytes: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fail_flush_enospc: Arc<AtomicBool>,
 }
 
@@ -147,9 +147,9 @@ impl SourceCache {
         id: SourceId,
         fingerprint: SourceFingerprint,
         spec: CacheSpec,
-        #[cfg(test)] fail_writes_enospc: Arc<AtomicBool>,
-        #[cfg(test)] fail_writes_after_bytes: Arc<AtomicUsize>,
-        #[cfg(test)] fail_flush_enospc: Arc<AtomicBool>,
+        #[cfg(any(test, debug_assertions))] fail_writes_enospc: Arc<AtomicBool>,
+        #[cfg(any(test, debug_assertions))] fail_writes_after_bytes: Arc<AtomicUsize>,
+        #[cfg(any(test, debug_assertions))] fail_flush_enospc: Arc<AtomicBool>,
     ) -> std::io::Result<Self> {
         let blob_path = cache_dir.join(format!("{id:016x}.yuv"));
         let manifest_path = cache_dir.join(format!("{id:016x}.idx"));
@@ -204,11 +204,11 @@ impl SourceCache {
             reader: None,
             mapped_len: 0,
             bytes_used,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             fail_writes_enospc,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             fail_writes_after_bytes,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             fail_flush_enospc,
         })
     }
@@ -224,7 +224,7 @@ impl SourceCache {
 
     /// Write bytes at `write_cursor` without advancing it. Resyncs cursor on error.
     fn write_blob_at_cursor(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         if self.fail_writes_enospc.load(Ordering::Acquire) {
             return Err(synthetic_no_space_error());
         }
@@ -232,7 +232,7 @@ impl SourceCache {
         self.writer
             .seek(SeekFrom::Start(self.manifest.write_cursor))?;
 
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         {
             let fail_after = self.fail_writes_after_bytes.load(Ordering::Acquire);
             if fail_after > 0 {
@@ -303,7 +303,7 @@ impl SourceCache {
     }
 
     fn flush_manifest(&self) -> std::io::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, debug_assertions))]
         if self.fail_flush_enospc.load(Ordering::Acquire) {
             return Err(synthetic_no_space_error());
         }
@@ -341,11 +341,11 @@ struct CacheState {
     budget_bytes: u64,
     access_counter: u64,
     writes_since_flush: u32,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fail_writes_enospc: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fail_writes_after_bytes: Arc<AtomicUsize>,
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     fail_flush_enospc: Arc<AtomicBool>,
 }
 
@@ -393,11 +393,11 @@ impl FrameCache {
             budget_bytes,
             access_counter: 0,
             writes_since_flush: 0,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             fail_writes_enospc: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             fail_writes_after_bytes: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             fail_flush_enospc: Arc::new(AtomicBool::new(false)),
         }));
         let disk_pressure = Arc::new(AtomicBool::new(false));
@@ -451,11 +451,11 @@ impl FrameCache {
             id,
             fingerprint,
             spec,
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Arc::clone(&st.fail_writes_enospc),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Arc::clone(&st.fail_writes_after_bytes),
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             Arc::clone(&st.fail_flush_enospc),
         )?;
         st.total_bytes += sc.bytes_used;
@@ -464,7 +464,7 @@ impl FrameCache {
     }
 
     /// Test-only: simulate `ENOSPC` on subsequent blob writes for this cache instance.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn set_fail_writes_enospc_for_test(&self, enabled: bool) {
         self.inner
             .state
@@ -475,7 +475,7 @@ impl FrameCache {
     }
 
     /// Test-only: write `n` bytes then fail with `ENOSPC` on the next blob write.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn set_fail_writes_after_bytes_for_test(&self, n: usize) {
         self.inner
             .state
@@ -486,7 +486,7 @@ impl FrameCache {
     }
 
     /// Test-only: simulate `ENOSPC` on subsequent manifest flushes for this cache instance.
-    #[cfg(test)]
+    #[cfg(any(test, debug_assertions))]
     pub fn set_fail_flush_enospc_for_test(&self, enabled: bool) {
         self.inner
             .state
