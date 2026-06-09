@@ -1,11 +1,10 @@
 [package]
-name = "cutlass-decoder"
+name = "cutlass-probe"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cutlass video demux + decode"
+description = "Cutlass media file probing (container, codec, stream metadata)"
 
 [dependencies]
-ffmpeg-next.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -6,4 +6,5 @@ license.workspace = true
 description = "Cutlass editing engine"
 
 [dependencies]
+cutlass-cache = { path = "../cutlass-cache" }
 tracing.workspace = true

@@ -6,4 +6,10 @@ license.workspace = true
 description = "Cutlass video encode + mux"
 
 [dependencies]
+cutlass-decoder = { path = "../cutlass-decoder" }
+ffmpeg-next.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+cutlass-decoder = { path = "../cutlass-decoder" }

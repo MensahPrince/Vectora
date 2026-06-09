@@ -10,10 +10,8 @@ name = "cutlass-app"
 path = "src/main.rs"
 
 [dependencies]
-cutlass-compositor = { path = "../cutlass-compositor" }
 cutlass-decoder = { path = "../cutlass-decoder" }
 cutlass-encoder = { path = "../cutlass-encoder" }
-cutlass-engine = { path = "../cutlass-engine" }
-cutlass-models = { path = "../cutlass-models" }
+image = "0.25"
 tracing.workspace = true
 tracing-subscriber.workspace = true

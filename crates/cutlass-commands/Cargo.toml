@@ -1,11 +1,9 @@
 [package]
-name = "cutlass-decoder"
+name = "cutlass-commands"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cutlass video demux + decode"
+description = "Cutlass structured editor commands (import, trim, split, …)"
 
 [dependencies]
-ffmpeg-next.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
