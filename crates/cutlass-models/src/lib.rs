@@ -2,8 +2,8 @@
 //!
 //! Design goals:
 //! - **Correct types**: strongly-typed IDs (no mixing a [`TrackId`] with a
-//!   [`ClipId`]), rational frame rates (exact for 23.976/29.97), and explicit
-//!   timeline-vs-source frame ranges.
+//!   [`ClipId`]), OTIO-style [`RationalTime`] (exact NTSC rates), and explicit
+//!   timeline-vs-source ranges each carrying their own rate.
 //! - **Fast lookup**: entities are stored in hash maps keyed by ID, so finding
 //!   a clip/track/media by ID is O(1). The timeline keeps a `ClipId -> TrackId`
 //!   index so a clip can be located across all tracks without scanning.
@@ -30,6 +30,8 @@ pub use error::ModelError;
 pub use ids::{ClipId, MediaId, ProjectId, TrackId};
 pub use media::MediaSource;
 pub use project::Project;
-pub use time::{Rational, TimeRange, convert_frames};
+pub use time::{
+    Rational, RationalTime, TimeRange, check_same_rate, rate_eq, resample, time_add, time_sub,
+};
 pub use timeline::Timeline;
 pub use track::{Track, TrackKind};

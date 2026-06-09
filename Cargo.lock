@@ -315,6 +315,7 @@ dependencies = [
 name = "cutlass-commands"
 version = "0.1.0"
 dependencies = [
+ "cutlass-models",
  "tracing",
 ]
 
@@ -356,7 +357,8 @@ dependencies = [
 name = "cutlass-models"
 version = "0.1.0"
 dependencies = [
- "tracing",
+ "rustc-hash",
+ "thiserror",
 ]
 
 [[package]]

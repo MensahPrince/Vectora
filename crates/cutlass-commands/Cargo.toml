@@ -6,4 +6,5 @@ license.workspace = true
 description = "Cutlass structured editor commands (import, trim, split, …)"
 
 [dependencies]
+cutlass-models = { path = "../cutlass-models" }
 tracing.workspace = true

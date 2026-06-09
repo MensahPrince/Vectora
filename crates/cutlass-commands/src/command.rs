@@ -5,22 +5,7 @@
 
 use std::path::PathBuf;
 
-/// Placeholder IDs until `cutlass-models` exports the real newtypes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ClipId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MediaId(pub u64);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct TrackId(pub u64);
-
-/// Inclusive timeline or source frame range `[start, end)`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct TimeRange {
-    pub start: i64,
-    pub end: i64,
-}
+use cutlass_models::{ClipId, Generator, MediaId, RationalTime, TimeRange, TrackId};
 
 /// A project-level action (media pool, not timeline placement).
 #[derive(Debug, Clone, PartialEq)]
@@ -37,24 +22,23 @@ pub enum EditCommand {
         track: TrackId,
         media: MediaId,
         source: TimeRange,
-        start: i64,
+        start: RationalTime,
     },
     /// Place a generated clip (text, solid, shape, …) on a track.
     AddGenerated {
         track: TrackId,
-        /// Generator payload TBD in `cutlass-models`.
-        generator: (),
+        generator: Generator,
         timeline: TimeRange,
     },
-    /// Split a clip at a timeline frame into two abutting clips.
-    SplitClip { clip: ClipId, at: i64 },
+    /// Split a clip at a timeline position into two abutting clips.
+    SplitClip { clip: ClipId, at: RationalTime },
     /// Re-place / trim a clip to occupy `timeline`.
     TrimClip { clip: ClipId, timeline: TimeRange },
     /// Move a clip to `to_track` starting at `start`, keeping its duration.
     MoveClip {
         clip: ClipId,
         to_track: TrackId,
-        start: i64,
+        start: RationalTime,
     },
     /// Remove a clip, leaving a gap where it sat.
     RemoveClip { clip: ClipId },

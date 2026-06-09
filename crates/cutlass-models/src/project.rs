@@ -1,11 +1,11 @@
 use crate::Map;
+use crate::clip::{Clip, ClipSource, Generator};
 use crate::error::ModelError;
 use crate::ids::{ClipId, MediaId, ProjectId, TrackId};
 use crate::media::MediaSource;
-use crate::time::{Rational, TimeRange, convert_frames};
+use crate::time::{Rational, RationalTime, TimeRange, check_same_rate, resample, time_sub};
 use crate::timeline::Timeline;
 use crate::track::{Track, TrackKind};
-use crate::clip::{Clip, ClipSource, Generator};
 
 /// Top-level container: a media pool plus exactly one [`Timeline`].
 ///
@@ -87,48 +87,47 @@ impl Project {
 
     /// Place a clip referencing `media_id` on `track_id`.
     ///
-    /// The clip's timeline duration is conformed from the source's frame rate to
-    /// the timeline's frame rate, so a 30fps source on a 24fps timeline occupies
-    /// the right number of timeline frames. Validates media/track existence,
-    /// that `source` is within the media bounds, and that the placement does not
-    /// overlap an existing clip on the track.
+    /// The clip's timeline duration is resampled from the source rate to the
+    /// timeline rate. Validates media/track existence, source bounds, and overlap.
     pub fn add_clip(
         &mut self,
         track_id: TrackId,
         media_id: MediaId,
         source: TimeRange,
-        timeline_start: i64,
+        timeline_start: RationalTime,
     ) -> Result<ClipId, ModelError> {
         let media = self
             .media
             .get(&media_id)
             .ok_or(ModelError::UnknownMedia(media_id))?;
+        let tl_rate = self.timeline.frame_rate;
+
+        check_same_rate(source.start.rate, media.frame_rate)?;
+        check_same_rate(timeline_start.rate, tl_rate)?;
 
         if source.is_empty() {
             return Err(ModelError::InvalidRange);
         }
-        if source.start < 0 || source.end() > media.duration {
+        if source.start.value < 0 || source.end_tick() > media.duration.value {
             return Err(ModelError::SourceOutOfBounds);
         }
 
-        let timeline_duration =
-            convert_frames(source.duration, media.frame_rate, self.timeline.frame_rate);
-        let timeline = TimeRange::new(timeline_start, timeline_duration.max(1));
+        let timeline_duration = resample(source.duration, tl_rate);
+        let duration_ticks = timeline_duration.value.max(1);
+        let timeline = TimeRange::at_rate(timeline_start.value, duration_ticks, tl_rate);
 
         let clip = Clip::from_media(media_id, source, timeline);
         self.timeline.add_clip(track_id, clip)
     }
 
-    /// Place a generated clip (text, shape, solid, ...) on `track_id`.
-    ///
-    /// Generated content has no source media, so the caller specifies the
-    /// timeline placement directly (in timeline frames).
+    /// Place a generated clip on `track_id` at the given timeline range.
     pub fn add_generated(
         &mut self,
         track_id: TrackId,
         generator: Generator,
         timeline: TimeRange,
     ) -> Result<ClipId, ModelError> {
+        check_same_rate(timeline.start.rate, self.timeline.frame_rate)?;
         if timeline.is_empty() {
             return Err(ModelError::InvalidRange);
         }
@@ -142,42 +141,28 @@ impl Project {
     }
 
     // --- editing primitives ----------------------------------------------
-    //
-    // These are the invariant-preserving mutations the engine's command layer
-    // (and through it, the AI agent and UI) dispatch. Each leaves the timeline
-    // in a legal state — no overlaps, no out-of-bounds source ranges — or
-    // returns a [`ModelError`] without mutating anything.
 
-    /// Remove a clip from wherever it lives. Returns the removed clip, or
-    /// `None` if no clip has that ID. Leaves a gap (use
-    /// [`ripple_delete`](Project::ripple_delete) to close it).
     pub fn remove_clip(&mut self, clip_id: ClipId) -> Option<Clip> {
         self.timeline.remove_clip(clip_id)
     }
 
-    /// Split the clip under `clip_id` at timeline frame `at` into two abutting
-    /// clips. The original becomes the left half `[start, at)`; a new clip takes
-    /// the right half `[at, end)` and is returned.
-    ///
-    /// `at` must be strictly inside the clip (`start < at < end`). For media
-    /// clips the source range is divided at the corresponding source frame
-    /// (rate-converted the same way [`resolve`](crate) maps positions), so each
-    /// half plays its own portion of the footage.
-    pub fn split_clip(&mut self, clip_id: ClipId, at: i64) -> Result<ClipId, ModelError> {
+    /// Split the clip at timeline position `at` into two abutting clips.
+    pub fn split_clip(&mut self, clip_id: ClipId, at: RationalTime) -> Result<ClipId, ModelError> {
         let clip = self
             .timeline
             .clip(clip_id)
             .ok_or(ModelError::UnknownClip(clip_id))?;
         let tl = clip.timeline;
-        if at <= tl.start || at >= tl.end() {
+        let tl_rate = self.timeline.frame_rate;
+        check_same_rate(at.rate, tl_rate)?;
+
+        if at.value <= tl.start.value || at.value >= tl.end_tick() {
             return Err(ModelError::InvalidRange);
         }
-        let left_tl = TimeRange::new(tl.start, at - tl.start);
-        let right_tl = TimeRange::new(at, tl.end() - at);
-        let tl_fps = self.timeline.frame_rate;
 
-        // Build the right-hand clip and figure out the left clip's new source
-        // range from an immutable borrow, then apply mutations afterwards.
+        let left_tl = TimeRange::at_rate(tl.start.value, at.value - tl.start.value, tl_rate);
+        let right_tl = TimeRange::at_rate(at.value, tl.end_tick() - at.value, tl_rate);
+
         let (new_left_source, new_clip) = match clip.content.clone() {
             ClipSource::Media { media, source } => {
                 let media_fps = self
@@ -185,15 +170,18 @@ impl Project {
                     .get(&media)
                     .ok_or(ModelError::UnknownMedia(media))?
                     .frame_rate;
-                if source.duration < 2 {
-                    // No room to give each half at least one source frame.
+                if source.duration.value < 2 {
                     return Err(ModelError::InvalidRange);
                 }
-                let left_src_dur = convert_frames(left_tl.duration, tl_fps, media_fps)
-                    .clamp(1, source.duration - 1);
-                let left_source = TimeRange::new(source.start, left_src_dur);
-                let right_source =
-                    TimeRange::new(source.start + left_src_dur, source.duration - left_src_dur);
+                let left_src_dur = resample(left_tl.duration, media_fps)
+                    .value
+                    .clamp(1, source.duration.value - 1);
+                let left_source = TimeRange::at_rate(source.start.value, left_src_dur, media_fps);
+                let right_source = TimeRange::at_rate(
+                    source.start.value + left_src_dur,
+                    source.duration.value - left_src_dur,
+                    media_fps,
+                );
                 (Some(left_source), Clip::from_media(media, right_source, right_tl))
             }
             ClipSource::Generated(generator) => (None, Clip::generated(generator, right_tl)),
@@ -204,8 +192,6 @@ impl Project {
             .track_of(clip_id)
             .ok_or(ModelError::UnknownClip(clip_id))?;
 
-        // Shrink the original to the left half first, then add the right half;
-        // the freed `[at, end)` no longer overlaps anything.
         {
             let left = self
                 .timeline
@@ -221,13 +207,12 @@ impl Project {
         self.timeline.add_clip(track_id, new_clip)
     }
 
-    /// Set the clip's timeline placement to `new_timeline` (a trim/extend).
-    ///
-    /// For media clips the source in-point and length are adjusted to match, so
-    /// trimming the head reveals a different start frame and trimming the tail
-    /// shortens the played range. Fails if the new range would overlap a
-    /// neighbour on the track or fall outside the media's source bounds.
-    pub fn trim_clip(&mut self, clip_id: ClipId, new_timeline: TimeRange) -> Result<(), ModelError> {
+    /// Set the clip's timeline placement to `new_timeline` (trim/extend).
+    pub fn trim_clip(
+        &mut self,
+        clip_id: ClipId,
+        new_timeline: TimeRange,
+    ) -> Result<(), ModelError> {
         if new_timeline.is_empty() {
             return Err(ModelError::InvalidRange);
         }
@@ -240,13 +225,14 @@ impl Project {
             .clip(clip_id)
             .ok_or(ModelError::UnknownClip(clip_id))?;
         let old_tl = clip.timeline;
-        let tl_fps = self.timeline.frame_rate;
+        let tl_rate = self.timeline.frame_rate;
+        check_same_rate(new_timeline.start.rate, tl_rate)?;
 
         if self
             .timeline
             .track(track_id)
             .expect("clip is on a track")
-            .has_overlap(new_timeline, Some(clip_id))
+            .has_overlap(new_timeline, Some(clip_id))?
         {
             return Err(ModelError::Overlap(track_id));
         }
@@ -254,14 +240,24 @@ impl Project {
         let new_source = match clip.content.clone() {
             ClipSource::Media { media, source } => {
                 let media = self.media.get(&media).ok_or(ModelError::UnknownMedia(media))?;
-                let head_delta = convert_frames(new_timeline.start - old_tl.start, tl_fps, media.frame_rate);
-                let new_src_start = source.start + head_delta;
-                let new_src_dur =
-                    convert_frames(new_timeline.duration, tl_fps, media.frame_rate).max(1);
-                if new_src_start < 0 || new_src_start + new_src_dur > media.duration {
+                let head_delta =
+                    resample(
+                        RationalTime::new(new_timeline.start.value - old_tl.start.value, tl_rate),
+                        media.frame_rate,
+                    )
+                    .value;
+                let new_src_start = source.start.value + head_delta;
+                let new_src_dur = resample(new_timeline.duration, media.frame_rate)
+                    .value
+                    .max(1);
+                if new_src_start < 0 || new_src_start + new_src_dur > media.duration.value {
                     return Err(ModelError::SourceOutOfBounds);
                 }
-                Some(TimeRange::new(new_src_start, new_src_dur))
+                Some(TimeRange::at_rate(
+                    new_src_start,
+                    new_src_dur,
+                    media.frame_rate,
+                ))
             }
             ClipSource::Generated(_) => None,
         };
@@ -277,18 +273,19 @@ impl Project {
         Ok(())
     }
 
-    /// Move a clip to `to_track`, starting at timeline frame `new_start`,
-    /// preserving its duration and source range. Fails on a negative start, an
-    /// unknown track, or an overlap at the destination.
+    /// Move a clip to `to_track` at `new_start`, preserving duration and source.
     pub fn move_clip(
         &mut self,
         clip_id: ClipId,
         to_track: TrackId,
-        new_start: i64,
+        new_start: RationalTime,
     ) -> Result<(), ModelError> {
-        if new_start < 0 {
+        let tl_rate = self.timeline.frame_rate;
+        check_same_rate(new_start.rate, tl_rate)?;
+        if new_start.value < 0 {
             return Err(ModelError::InvalidRange);
         }
+
         let from_track = self
             .timeline
             .track_of(clip_id)
@@ -303,12 +300,12 @@ impl Project {
             .clip(clip_id)
             .expect("clip is on a track")
             .timeline
-            .duration;
-        let new_tl = TimeRange::new(new_start, duration);
+            .duration
+            .value;
+        let new_tl = TimeRange::at_rate(new_start.value, duration, tl_rate);
 
-        // Ignore the clip itself only when it stays on the same track.
         let ignore = (from_track == to_track).then_some(clip_id);
-        if dest.has_overlap(new_tl, ignore) {
+        if dest.has_overlap(new_tl, ignore)? {
             return Err(ModelError::Overlap(to_track));
         }
 
@@ -328,9 +325,7 @@ impl Project {
         Ok(())
     }
 
-    /// Delete a clip and close the gap: every clip starting at or after the
-    /// deleted clip on the same track shifts earlier by its duration. Returns
-    /// the removed clip.
+    /// Delete a clip and slide later clips on its track left to close the gap.
     pub fn ripple_delete(&mut self, clip_id: ClipId) -> Result<Clip, ModelError> {
         let track_id = self
             .timeline
@@ -348,10 +343,423 @@ impl Project {
             .track_mut(track_id)
             .expect("track existence checked above");
         for clip in track.clips_mut() {
-            if clip.timeline.start >= gap_start {
-                clip.timeline.start -= gap;
+            if clip.timeline.start.value >= gap_start.value {
+                clip.timeline.start = time_sub(&clip.timeline.start, &gap)?;
             }
         }
         Ok(removed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::clip::Shape;
+
+    const R24: Rational = Rational::FPS_24;
+    const R30: Rational = Rational::FPS_30;
+
+    fn rt(value: i64) -> RationalTime {
+        RationalTime::new(value, R24)
+    }
+
+    fn tr(start: i64, duration: i64) -> TimeRange {
+        TimeRange::at_rate(start, duration, R24)
+    }
+
+    fn tr_at(start: i64, duration: i64, rate: Rational) -> TimeRange {
+        TimeRange::at_rate(start, duration, rate)
+    }
+
+    fn sample_media(fps: Rational, duration: i64) -> MediaSource {
+        MediaSource::new("/tmp/sample.mp4", 1920, 1080, fps, duration, true)
+    }
+
+    fn project_with_media(duration: i64) -> (Project, MediaId, TrackId) {
+        let mut project = Project::new("test", R24);
+        let media_id = project.add_media(sample_media(R24, duration));
+        let track = project.add_track(TrackKind::Video, "V1");
+        (project, media_id, track)
+    }
+
+    // --- Project::new -----------------------------------------------------
+
+    #[test]
+    fn new_creates_empty_project_at_frame_rate() {
+        let project = Project::new("my edit", R24);
+        assert_eq!(project.name, "my edit");
+        assert_eq!(project.timeline().frame_rate, R24);
+        assert_eq!(project.media_count(), 0);
+        assert_eq!(project.timeline().track_count(), 0);
+        assert_eq!(project.timeline().clip_count(), 0);
+        assert!(project.id.raw() >= 1);
+    }
+
+    #[test]
+    fn new_accepts_string_name() {
+        let owned = Project::new(String::from("owned"), R24);
+        assert_eq!(owned.name, "owned");
+    }
+
+    // --- media pool -------------------------------------------------------
+
+    #[test]
+    fn add_media_returns_id_and_lookup_works() {
+        let mut project = Project::new("test", R24);
+        let media = sample_media(R24, 500);
+        let id = project.add_media(media.clone());
+
+        assert_eq!(project.media_count(), 1);
+        assert_eq!(project.media(id).unwrap().path(), media.path());
+    }
+
+    #[test]
+    fn media_iter_visits_all_sources() {
+        let mut project = Project::new("test", R24);
+        project.add_media(sample_media(R24, 10));
+        project.add_media(sample_media(R24, 20));
+        let durations: Vec<i64> = project.media_iter().map(|m| m.duration.value).collect();
+        assert_eq!(durations.len(), 2);
+        assert!(durations.contains(&10));
+        assert!(durations.contains(&20));
+    }
+
+    #[test]
+    fn remove_media_unknown_errors() {
+        let mut project = Project::new("test", R24);
+        let missing = MediaId::from_raw(99);
+        assert_eq!(
+            project.remove_media(missing),
+            Err(ModelError::UnknownMedia(missing))
+        );
+    }
+
+    #[test]
+    fn is_media_referenced_reflects_clip_usage() {
+        let (mut project, media_id, track) = project_with_media(100);
+        assert!(!project.is_media_referenced(media_id));
+
+        let clip = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
+        assert!(project.is_media_referenced(media_id));
+
+        project.remove_clip(clip);
+        assert!(!project.is_media_referenced(media_id));
+    }
+
+    #[test]
+    fn remove_media_succeeds_when_unreferenced() {
+        let mut project = Project::new("test", R24);
+        let id = project.add_media(sample_media(R24, 10));
+        let removed = project.remove_media(id).unwrap();
+        assert_eq!(removed.duration.value, 10);
+        assert_eq!(project.media_count(), 0);
+    }
+
+    // --- add_clip ---------------------------------------------------------
+
+    #[test]
+    fn add_clip_places_media_with_rate_conform() {
+        let mut project = Project::new("test", R24);
+        let media_id = project.add_media(sample_media(R30, 1000));
+        let track = project.add_track(TrackKind::Video, "V1");
+
+        let clip = project
+            .add_clip(track, media_id, tr_at(0, 120, R30), rt(10))
+            .unwrap();
+
+        let placed = project.clip(clip).unwrap();
+        assert_eq!(placed.start().value, 10);
+        assert_eq!(placed.timeline.duration.value, 96);
+        assert_eq!(placed.source_range(), Some(tr_at(0, 120, R30)));
+    }
+
+    #[test]
+    fn add_clip_rejects_unknown_track_and_media() {
+        let (mut project, media_id, _) = project_with_media(100);
+        let missing_track = TrackId::from_raw(999);
+        let missing_media = MediaId::from_raw(999);
+
+        assert_eq!(
+            project.add_clip(missing_track, media_id, tr(0, 10), rt(0)),
+            Err(ModelError::UnknownTrack(missing_track))
+        );
+        let track = project.add_track(TrackKind::Video, "V2");
+        assert_eq!(
+            project.add_clip(track, missing_media, tr(0, 10), rt(0)),
+            Err(ModelError::UnknownMedia(missing_media))
+        );
+    }
+
+    #[test]
+    fn add_clip_rejects_empty_source_and_out_of_bounds() {
+        let (mut project, media_id, track) = project_with_media(100);
+
+        assert_eq!(
+            project.add_clip(track, media_id, tr(0, 0), rt(0)),
+            Err(ModelError::InvalidRange)
+        );
+        assert_eq!(
+            project.add_clip(track, media_id, tr(-1, 10), rt(0)),
+            Err(ModelError::SourceOutOfBounds)
+        );
+        assert_eq!(
+            project.add_clip(track, media_id, tr(95, 10), rt(0)),
+            Err(ModelError::SourceOutOfBounds)
+        );
+    }
+
+    #[test]
+    fn add_clip_rejects_rate_mismatches() {
+        let (mut project, media_id, track) = project_with_media(100);
+
+        assert_eq!(
+            project.add_clip(track, media_id, tr_at(0, 10, R30), rt(0)),
+            Err(ModelError::RateMismatch {
+                expected: R24,
+                got: R30,
+            })
+        );
+        let bad_start = RationalTime::new(0, R30);
+        assert_eq!(
+            project.add_clip(track, media_id, tr(0, 10), bad_start),
+            Err(ModelError::RateMismatch {
+                expected: R24,
+                got: R30,
+            })
+        );
+    }
+
+    #[test]
+    fn add_clip_rejects_overlap() {
+        let (mut project, media_id, track) = project_with_media(1000);
+        project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        assert_eq!(
+            project.add_clip(track, media_id, tr(0, 50), rt(50)),
+            Err(ModelError::Overlap(track))
+        );
+    }
+
+    // --- add_generated ----------------------------------------------------
+
+    #[test]
+    fn add_generated_without_media() {
+        let mut project = Project::new("test", R24);
+        let track = project.add_track(TrackKind::Video, "Titles");
+        let clip = project
+            .add_generated(
+                track,
+                Generator::Text {
+                    content: "Hi".into(),
+                },
+                tr(0, 24),
+            )
+            .unwrap();
+
+        assert!(project.clip(clip).unwrap().is_generated());
+        assert_eq!(project.media_count(), 0);
+    }
+
+    #[test]
+    fn add_generated_rejects_empty_and_wrong_rate() {
+        let mut project = Project::new("test", R24);
+        let track = project.add_track(TrackKind::Video, "V1");
+
+        assert_eq!(
+            project.add_generated(track, Generator::Adjustment, tr(0, 0)),
+            Err(ModelError::InvalidRange)
+        );
+        assert_eq!(
+            project.add_generated(
+                track,
+                Generator::Shape {
+                    shape: Shape::Rectangle,
+                },
+                tr_at(0, 10, R30),
+            ),
+            Err(ModelError::RateMismatch {
+                expected: R24,
+                got: R30,
+            })
+        );
+    }
+
+    // --- remove_clip ------------------------------------------------------
+
+    #[test]
+    fn remove_clip_returns_clip_and_leaves_gap() {
+        let (mut project, media_id, track) = project_with_media(200);
+        let a = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
+        let b = project.add_clip(track, media_id, tr(50, 50), rt(100)).unwrap();
+
+        let removed = project.remove_clip(a).unwrap();
+        assert_eq!(removed.id, a);
+        assert!(project.clip(a).is_none());
+        assert_eq!(project.clip(b).unwrap().start().value, 100);
+        assert_eq!(project.timeline().clip_count(), 1);
+    }
+
+    #[test]
+    fn remove_clip_unknown_returns_none() {
+        let (mut project, _, _) = project_with_media(10);
+        assert!(project.remove_clip(ClipId::from_raw(404)).is_none());
+    }
+
+    // --- split_clip -------------------------------------------------------
+
+    #[test]
+    fn split_clip_divides_media_and_generated() {
+        let (mut project, media_id, track) = project_with_media(500);
+        let media_clip = project
+            .add_clip(track, media_id, tr(100, 100), rt(0))
+            .unwrap();
+        let right = project.split_clip(media_clip, rt(40)).unwrap();
+        assert_eq!(project.clip(media_clip).unwrap().timeline, tr(0, 40));
+        assert_eq!(project.clip(right).unwrap().timeline, tr(40, 60));
+
+        let generated = project
+            .add_generated(track, Generator::Adjustment, tr(200, 100))
+            .unwrap();
+        let generated_right = project.split_clip(generated, rt(250)).unwrap();
+        assert_eq!(project.clip(generated).unwrap().timeline, tr(200, 50));
+        assert_eq!(
+            project.clip(generated_right).unwrap().timeline,
+            tr(250, 50)
+        );
+    }
+
+    #[test]
+    fn split_clip_rejects_at_boundaries() {
+        let (mut project, media_id, track) = project_with_media(500);
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(10))
+            .unwrap();
+        assert_eq!(project.split_clip(clip, rt(10)), Err(ModelError::InvalidRange));
+        assert_eq!(project.split_clip(clip, rt(110)), Err(ModelError::InvalidRange));
+    }
+
+    #[test]
+    fn split_clip_rejects_unknown_clip() {
+        let (mut project, _, _) = project_with_media(10);
+        let unknown = ClipId::from_raw(999);
+        assert_eq!(
+            project.split_clip(unknown, rt(5)),
+            Err(ModelError::UnknownClip(unknown))
+        );
+    }
+
+    #[test]
+    fn split_clip_rejects_wrong_timeline_rate() {
+        let (mut project, media_id, track) = project_with_media(100);
+        let clip = project
+            .add_clip(track, media_id, tr(0, 50), rt(0))
+            .unwrap();
+        assert_eq!(
+            project.split_clip(clip, RationalTime::new(25, R30)),
+            Err(ModelError::RateMismatch {
+                expected: R24,
+                got: R30,
+            })
+        );
+    }
+
+    // --- trim_clip --------------------------------------------------------
+
+    #[test]
+    fn trim_clip_tail_shortens_media_source() {
+        let (mut project, media_id, track) = project_with_media(500);
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+
+        project.trim_clip(clip, tr(0, 60)).unwrap();
+        let trimmed = project.clip(clip).unwrap();
+        assert_eq!(trimmed.timeline, tr(0, 60));
+        assert_eq!(trimmed.source_range(), Some(tr(0, 60)));
+    }
+
+    #[test]
+    fn trim_clip_generated_only_moves_timeline() {
+        let mut project = Project::new("test", R24);
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project
+            .add_generated(track, Generator::Adjustment, tr(0, 100))
+            .unwrap();
+
+        project.trim_clip(clip, tr(20, 50)).unwrap();
+        let trimmed = project.clip(clip).unwrap();
+        assert_eq!(trimmed.timeline, tr(20, 50));
+        assert_eq!(trimmed.source_range(), None);
+    }
+
+    // --- move_clip --------------------------------------------------------
+
+    #[test]
+    fn move_clip_repositions_on_same_track() {
+        let (mut project, media_id, track) = project_with_media(200);
+        let clip = project
+            .add_clip(track, media_id, tr(0, 50), rt(0))
+            .unwrap();
+
+        project.move_clip(clip, track, rt(80)).unwrap();
+        assert_eq!(project.clip(clip).unwrap().timeline, tr(80, 50));
+        assert_eq!(project.timeline().track_of(clip), Some(track));
+    }
+
+    #[test]
+    fn move_clip_rejects_negative_start_and_unknown_track() {
+        let (mut project, media_id, track) = project_with_media(200);
+        let clip = project
+            .add_clip(track, media_id, tr(0, 50), rt(0))
+            .unwrap();
+        let missing = TrackId::from_raw(77);
+
+        assert_eq!(
+            project.move_clip(clip, track, rt(-1)),
+            Err(ModelError::InvalidRange)
+        );
+        assert_eq!(
+            project.move_clip(clip, missing, rt(0)),
+            Err(ModelError::UnknownTrack(missing))
+        );
+    }
+
+    // --- ripple_delete ----------------------------------------------------
+
+    #[test]
+    fn ripple_delete_shifts_later_clips() {
+        let (mut project, media_id, track) = project_with_media(300);
+        let a = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
+        let b = project.add_clip(track, media_id, tr(50, 50), rt(50)).unwrap();
+        let c = project.add_clip(track, media_id, tr(100, 50), rt(150)).unwrap();
+
+        project.ripple_delete(b).unwrap();
+        assert!(project.clip(b).is_none());
+        assert_eq!(project.clip(a).unwrap().start().value, 0);
+        assert_eq!(project.clip(c).unwrap().start().value, 100);
+    }
+
+    // --- timeline accessors -----------------------------------------------
+
+    #[test]
+    fn timeline_mut_allows_direct_timeline_edits() {
+        let mut project = Project::new("test", R24);
+        let track = project.add_track(TrackKind::Audio, "A1");
+        assert_eq!(project.timeline_mut().track_count(), 1);
+        assert_eq!(project.timeline().track(track).unwrap().kind, TrackKind::Audio);
+    }
+
+    // --- Clone ------------------------------------------------------------
+
+    #[test]
+    fn project_clone_is_independent_snapshot() {
+        let (mut project, media_id, track) = project_with_media(100);
+        let clip = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
+
+        let mut cloned = project.clone();
+        assert_eq!(cloned.clip(clip).unwrap().timeline, tr(0, 50));
+
+        cloned.remove_clip(clip);
+        assert!(cloned.clip(clip).is_none());
+        assert!(project.clip(clip).is_some());
     }
 }

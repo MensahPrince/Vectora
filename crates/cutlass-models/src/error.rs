@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use crate::ids::{ClipId, MediaId, TrackId};
+use crate::time::Rational;
 
 /// Errors from model mutations that would violate a referential or layout
 /// invariant.
@@ -26,4 +27,10 @@ pub enum ModelError {
 
     #[error("invalid time range (negative or zero duration where positive required)")]
     InvalidRange,
+
+    #[error("rate mismatch: expected {expected:?}, got {got:?}")]
+    RateMismatch { expected: Rational, got: Rational },
+
+    #[error("time arithmetic overflow")]
+    TimeOverflow,
 }
