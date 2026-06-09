@@ -1,0 +1,189 @@
+import {
+    CutlassText,
+    HorizontalDivider,
+    PanelBase,
+    CutlassScrollView,
+    VerticalDivider,
+} from "../../components/index.slint";
+import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
+import { Toolbar } from "toolbar.slint";
+import { TrackLane } from "track-lane.slint";
+import { TrackHead } from "track-head.slint";
+import { Ruler } from "ruler.slint";
+import { ClipView } from "clip.slint";
+import { TimelineViewState } from "state.slint";
+import { Sequence } from "../../models/index.slint";
+import { TimelineLib } from "../../lib/timeline-lib.slint";
+
+
+
+component ForceHeadSpace inherits Rectangle {
+
+    height: AppStore.theme.track-lane.height;
+
+    background: transparent;
+}
+
+export component TimelinePanel inherits PanelBase {
+
+    private property <length> track-spacing: AppStore.theme.metrics.spacing.sm;
+    private property <length> track-height: AppStore.theme.track-lane.height;
+    property <Sequence> sequence: EditorStore.project.sequence;
+
+    // Available height for the scrolling rows (everything below toolbar+ruler).
+    // Both flickables below share this — it's the row's own `height`.
+    private property <length> row-height: root.height - tb.height - rl.height;
+
+    // Total intrinsic height of the track content. The `+1` mirrors the
+    // `ForceHeadSpace` row at the top of both flickables so heads and lanes
+    // stay vertically aligned.
+    private property <length> content-height: TimelineLib.calc-viewport-height(
+        sequence.tracks.length + 1,
+        track-height,
+        track-spacing,
+    );
+    private property <length> content-width: TimelineLib.calc-viewport-width(
+        sequence,
+        TimelineStore.zoom,
+    );
+
+    // The Flickable's clamp range is `[row-height - content-height, 0]` (or
+    // `[0, 0]` when content fits). Flickable re-clamps `viewport-y` on user
+    // interaction but NOT on container resize. Without the `changed` hook
+    // below, dragging the splitter taller while scrolled to the bottom
+    // leaves a stale `scroll-y` past the new lower bound, which renders as
+    // empty space below the last track until the next scroll event snaps
+    // it back. Watching the bound (not just `row-height`) also covers
+    // future track-count / track-height / spacing changes.
+    private property <length> min-scroll-y: min(0px, row-height - content-height);
+
+    changed min-scroll-y => {
+        TimelineViewState.scroll-y = clamp(TimelineViewState.scroll-y, min-scroll-y, 0px);
+    }
+
+    VerticalLayout {
+
+        spacing: AppStore.theme.metrics.spacing.none;
+
+        tb := Toolbar {
+            height: AppStore.theme.metrics.layout.toolbar-height;
+        }
+
+        rl := HorizontalLayout {
+            height: 30px;
+            spacing: 60px;
+
+            Rectangle { //head space
+                width: 100px;
+            }
+
+            Rectangle { // ruler container — clip so ticks that scroll into the head column are hidden.
+                clip: true;
+                // The Ruler itself does *not* translate with scroll. It
+                // stays at x=0 inside this container and reads scroll-x
+                // internally to compute viewport-local tick positions.
+                // See `ruler.slint` for the coordinate model.
+                Ruler { }
+            }
+        }
+
+        // A `Flickable`'s preferred-height equals its `viewport-height`
+        // (see Slint docs). That propagates up through `HorizontalLayout`
+        // and makes this row claim the full panel height instead of just
+        // the remainder after toolbar+ruler — overflowing the panel and
+        // leaving no scroll range. Pin the row to the leftover space.
+        HorizontalLayout {
+
+            height: row-height;
+            spacing: 60px;
+            Rectangle {
+                height: 100%;
+                width: 100px;
+
+                Flickable {
+                    viewport-y <=> TimelineViewState.scroll-y;
+
+                    viewport-height: max(self.height, content-height);
+
+                    VerticalLayout {
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+                        spacing: track-spacing;
+
+                        ForceHeadSpace { }
+
+                        for t in sequence.tracks: TrackHead { }
+                    }
+                }
+
+                VerticalDivider {
+                    x: parent.width - self.width;
+                    width: AppStore.theme.metrics.stroke.thin;
+                }
+            }
+
+            Flickable {
+                interactive: false;
+                viewport-width: max(content-width, self.width);
+                viewport-height: max(self.height, content-height);
+
+                viewport-y <=> TimelineViewState.scroll-y;
+                viewport-x <=> TimelineViewState.scroll-x;
+
+                VerticalLayout {
+                    vertical-stretch: 1;
+                    horizontal-stretch: 1;
+                    spacing: track-spacing;
+
+                    ForceHeadSpace { }
+
+                    for t[i] in sequence.tracks: TrackLane {
+                        track-id: t.id;
+                        kind: t.kind;
+                        for c in t.clips: ClipView {
+                            model: c;
+                            track-id: t.id;
+                            track-kind: t.kind;
+                            // Lane is the single source of truth for
+                            // clip color — see `Track.color` in the
+                            // domain model.
+                            track-color: t.color;
+                            lane-index: i;
+                            // Lane pitch = lane height + lane spacing.
+                            // Used by ClipView to translate vertical
+                            // drag delta into a target lane offset.
+                            lane-pitch-px: track-height + track-spacing;
+                            height: parent.height - 5px;
+                            zoom: TimelineStore.zoom;
+                        }
+                    }
+                }
+
+                // ---- snap-line overlay -----------------------------
+                //
+                // Thin vertical guide that spans every lane while a
+                // snap is active during a drag. Lives inside the
+                // Flickable's viewport so it scrolls with the content
+                // (the snapped tick is in sequence space, not viewport
+                // space). Hidden via `visible:` rather than
+                // conditional-render so we don't pay layout cost on
+                // every drag-state flip.
+                //
+                // The dragged clip itself stays glued to the cursor
+                // (see `clip.slint`'s `x` derivation); the line is
+                // the user's signal that release will commit to a
+                // snapped position, not the cursor position.
+                Rectangle {
+                    visible: TimelineViewState.dragging-clip-id != ""
+                                && TimelineViewState.drag-snap-active;
+                    x: TimelineViewState.drag-snap-tick * TimelineStore.zoom * 1px;
+                    y: 0px;
+                    width: AppStore.theme.metrics.stroke.hairline;
+                    height: content-height;
+                    background: AppStore.theme.text.primary;
+                    opacity: 0.85;
+                }
+            }
+        }
+    }
+}

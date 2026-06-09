@@ -1,0 +1,266 @@
+// Cutlass scroll view.
+//
+// A `Flickable` viewport with overlay scrollbars: proportional thumbs,
+// drag-to-scroll, click-track-to-jump, and hover/pressed states. Mouse
+// wheel and touch-drag scrolling come from the underlying `Flickable`.
+//
+// Why not `std-widgets::ScrollView`
+// ---------------------------------
+// The Fluent/Cupertino styling clashes with the dark Cutlass chrome and
+// the std widget doesn't expose track/thumb colors. We also want the
+// view to drive scrollbar metrics from caller-supplied
+// `viewport-width` / `viewport-height` so it composes with `GridView`
+// and other content that knows its own extent.
+//
+// Why a Rectangle wrapper instead of `inherits Flickable`
+// -------------------------------------------------------
+// In Slint, children declared on a `Flickable` (including via
+// `@children`) are placed inside its viewport and scroll with the
+// content. Inheriting `Flickable` would make the scrollbars themselves
+// scroll off-screen. Wrapping a `Flickable` keeps the bars pinned in
+// root coordinates while content flows underneath.
+//
+// Geometry
+// --------
+// `Flickable` clamps `viewport-x` / `viewport-y` to
+// `[-(viewport-* - *), 0]`, so:
+//   overflow   = viewport-extent - visible-extent          (>= 0)
+//   thumb-size = track * visible-extent / viewport-extent  (proportional)
+//   thumb-pos  = (track - thumb-size) * (-viewport) / overflow
+// Thumb-size is clamped to a sensible minimum so it stays grabbable on
+// very tall content.
+//
+// Usage
+// -----
+//     CutlassScrollView {
+//         viewport-width: content.width;
+//         viewport-height: content.height;
+//
+//         content := VerticalLayout {
+//             for i in 200: Rectangle { height: 24px; /* ... */ }
+//         }
+//     }
+//
+// Callers that already produce their own viewport extent (e.g.
+// `GridView` exposes `content-width` / `content-height`) plug those
+// straight into the matching properties.
+
+import { AppStore } from "../store/index.slint";
+
+export component CutlassScrollView inherits Rectangle {
+    // ---- Public viewport ----------------------------------------------------
+
+    // Total scrollable extent. Default `0px` means "no scrolling" — the
+    // bars auto-hide via the `show-*-scrollbar` defaults below.
+    in property <length> viewport-width: 0px;
+    in property <length> viewport-height: 0px;
+
+    // Current scroll offset. Two-way bound to the inner `Flickable` so
+    // callers can programmatically scroll (e.g. "reveal selection") and
+    // observe drag/wheel-driven changes.
+    in-out property <length> viewport-x;
+    in-out property <length> viewport-y;
+
+    // Forwarded to the inner Flickable. `false` disables touch-drag
+    // scrolling (the scrollbar thumbs still work).
+    in property <bool> interactive: true;
+
+    // ---- Scrollbar configuration --------------------------------------------
+
+    // Auto-hide by default: only show a bar when content actually
+    // overflows along that axis. Callers can force a bar visible (e.g.
+    // for layout stability) by setting these explicitly.
+    in property <bool> show-horizontal-scrollbar: viewport-width > self.width;
+    in property <bool> show-vertical-scrollbar: viewport-height > self.height;
+
+    in property <color> scrollbar-track-color: AppStore.theme.scrollbar.track;
+    in property <color> scrollbar-thumb-color: AppStore.theme.scrollbar.thumb;
+    in property <color> scrollbar-thumb-hover-color: AppStore.theme.scrollbar.thumb-hover;
+    in property <color> scrollbar-thumb-active-color: AppStore.theme.scrollbar.thumb-active;
+
+    in property <length> scrollbar-size: AppStore.theme.scrollbar.size;
+    // Inset between the thumb and the track edges along the short axis.
+    in property <length> scrollbar-thumb-inset: AppStore.theme.scrollbar.thumb-inset;
+    // Lower bound on thumb length so it stays draggable when content is
+    // very long relative to the visible area.
+    in property <length> scrollbar-thumb-min: AppStore.theme.scrollbar.thumb-min;
+    in property <length> scrollbar-thumb-radius: AppStore.theme.scrollbar.thumb-radius;
+
+    // ---- Derived metrics ----------------------------------------------------
+
+    // Reserve the opposite bar's footprint so the two tracks meet at a
+    // square corner instead of painting over each other.
+    property <length> reserve-bottom: show-horizontal-scrollbar ? scrollbar-size : 0px;
+    property <length> reserve-right: show-vertical-scrollbar ? scrollbar-size : 0px;
+
+    background: transparent;
+    // Children that exceed the viewport should be hidden by the
+    // Flickable's own clip, but clipping the root protects against
+    // sub-pixel rounding leaking content past the scrollbar tracks.
+    clip: true;
+
+    flick := Flickable {
+        x: 0;
+        y: 0;
+        width: root.width;
+        height: root.height;
+        interactive: root.interactive;
+        viewport-width: root.viewport-width;
+        viewport-height: root.viewport-height;
+        viewport-x <=> root.viewport-x;
+        viewport-y <=> root.viewport-y;
+
+        @children
+    }
+
+    // ---- Vertical scrollbar -------------------------------------------------
+
+    if show-vertical-scrollbar: v-bar := Rectangle {
+        // `max(1px, …)` keeps the denominator non-zero when the bar is
+        // forced visible but content already fits.
+        property <length> overflow: max(1px, flick.viewport-height - flick.height);
+        property <length> track-h: root.height - reserve-bottom;
+        property <length> thumb-h: clamp(
+            track-h * flick.height / max(flick.viewport-height, 1px),
+            min(scrollbar-thumb-min, track-h),
+            track-h,
+        );
+        property <length> thumb-range: max(0px, track-h - thumb-h);
+        property <length> thumb-y: thumb-range * (-flick.viewport-y) / overflow;
+
+        x: root.width - scrollbar-size;
+        y: 0;
+        width: scrollbar-size;
+        height: track-h;
+        background: scrollbar-track-color;
+
+        Rectangle {
+            x: scrollbar-thumb-inset;
+            y: v-bar.thumb-y;
+            width: scrollbar-size - 2 * scrollbar-thumb-inset;
+            height: v-bar.thumb-h;
+            border-radius: scrollbar-thumb-radius;
+            background: v-ta.pressed
+                ? scrollbar-thumb-active-color
+                : (v-ta.has-hover ? scrollbar-thumb-hover-color : scrollbar-thumb-color);
+            animate background { duration: 120ms; easing: ease-out; }
+        }
+
+        v-ta := TouchArea {
+            // Captured on press so the drag math stays linear in mouse
+            // delta and is unaffected by binding re-evaluation while
+            // `viewport-y` updates each frame.
+            property <length> press-mouse-y;
+            property <length> press-viewport-y;
+
+            width: 100%;
+            height: 100%;
+
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    // Track click outside the thumb: center the thumb on
+                    // the click first, then fall through to drag the
+                    // newly positioned thumb.
+                    if (self.mouse-y < v-bar.thumb-y || self.mouse-y > v-bar.thumb-y + v-bar.thumb-h) {
+                        flick.viewport-y = clamp(
+                            -(self.mouse-y - v-bar.thumb-h / 2) * v-bar.overflow / max(v-bar.thumb-range, 1px),
+                            -v-bar.overflow,
+                            0px,
+                        );
+                    }
+                    self.press-mouse-y = self.mouse-y;
+                    self.press-viewport-y = flick.viewport-y;
+                }
+            }
+
+            moved() => {
+                if (!self.pressed || v-bar.thumb-range <= 0px) {
+                    return;
+                }
+                flick.viewport-y = clamp(
+                    self.press-viewport-y - (self.mouse-y - self.press-mouse-y) * v-bar.overflow / v-bar.thumb-range,
+                    -v-bar.overflow,
+                    0px,
+                );
+            }
+        }
+    }
+
+    // ---- Horizontal scrollbar -----------------------------------------------
+
+    if show-horizontal-scrollbar: h-bar := Rectangle {
+        property <length> overflow: max(1px, flick.viewport-width - flick.width);
+        property <length> track-w: root.width - reserve-right;
+        property <length> thumb-w: clamp(
+            track-w * flick.width / max(flick.viewport-width, 1px),
+            min(scrollbar-thumb-min, track-w),
+            track-w,
+        );
+        property <length> thumb-range: max(0px, track-w - thumb-w);
+        property <length> thumb-x: thumb-range * (-flick.viewport-x) / overflow;
+
+        x: 0;
+        y: root.height - scrollbar-size;
+        width: track-w;
+        height: scrollbar-size;
+        background: scrollbar-track-color;
+
+        Rectangle {
+            x: h-bar.thumb-x;
+            y: scrollbar-thumb-inset;
+            width: h-bar.thumb-w;
+            height: scrollbar-size - 2 * scrollbar-thumb-inset;
+            border-radius: scrollbar-thumb-radius;
+            background: h-ta.pressed
+                ? scrollbar-thumb-active-color
+                : (h-ta.has-hover ? scrollbar-thumb-hover-color : scrollbar-thumb-color);
+            animate background { duration: 120ms; easing: ease-out; }
+        }
+
+        h-ta := TouchArea {
+            property <length> press-mouse-x;
+            property <length> press-viewport-x;
+
+            width: 100%;
+            height: 100%;
+
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    if (self.mouse-x < h-bar.thumb-x || self.mouse-x > h-bar.thumb-x + h-bar.thumb-w) {
+                        flick.viewport-x = clamp(
+                            -(self.mouse-x - h-bar.thumb-w / 2) * h-bar.overflow / max(h-bar.thumb-range, 1px),
+                            -h-bar.overflow,
+                            0px,
+                        );
+                    }
+                    self.press-mouse-x = self.mouse-x;
+                    self.press-viewport-x = flick.viewport-x;
+                }
+            }
+
+            moved() => {
+                if (!self.pressed || h-bar.thumb-range <= 0px) {
+                    return;
+                }
+                flick.viewport-x = clamp(
+                    self.press-viewport-x - (self.mouse-x - self.press-mouse-x) * h-bar.overflow / h-bar.thumb-range,
+                    -h-bar.overflow,
+                    0px,
+                );
+            }
+        }
+    }
+
+    // ---- Corner cap ---------------------------------------------------------
+    //
+    // Fills the square where the two tracks meet so the underlying
+    // content doesn't peek through. Cheap (single Rectangle, no input
+    // handling) and only instantiated when both bars are visible.
+    if show-vertical-scrollbar && show-horizontal-scrollbar: Rectangle {
+        x: root.width - scrollbar-size;
+        y: root.height - scrollbar-size;
+        width: scrollbar-size;
+        height: scrollbar-size;
+        background: scrollbar-track-color;
+    }
+}

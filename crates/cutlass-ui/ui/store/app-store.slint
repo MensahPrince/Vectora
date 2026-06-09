@@ -1,0 +1,6 @@
+import { Theme } from "../types/index.slint";
+import { DefaultTheme } from "../theme/index.slint";
+
+export global AppStore {
+    in-out property <Theme> theme: DefaultTheme.theme;
+}

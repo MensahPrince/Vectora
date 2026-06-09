@@ -1,0 +1,6 @@
+// App-wide window/view state. Anything that affects the whole shell
+// (chrome visibility, full-window overlays, …) lives here rather than
+// inside any one panel's state global.
+export global AppState {
+    in-out property <bool> preview-maximized: false;
+}

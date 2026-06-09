@@ -1,0 +1,131 @@
+import {
+    PanelBase,
+    HorizontalDivider,
+    PanelHeader,
+} from "../../components/index.slint";
+import { AppStore } from "../../store/index.slint";
+
+struct InspectorField {
+    label: string,
+    value: string,
+}
+
+export component InspectorPanel inherits PanelBase {
+
+    private property <[InspectorField]> fields: [
+        { label: "Name", value: "dummy project" },
+        {
+            label: "Path",
+            value: "/Users/mrnewton/Downloads/all_media_downloers/mrnewton/Downloads/all_media_downloers/mrnewton/Downloads/all_media_downloers/mrnewton/Downloads/all_media_downloader_2026-05-14_08-49-.mp4" // intentionally long path to test wrapping
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        
+        },
+        { label: "Color space", value: "sRGB" },
+        { label: "Imported media", value: "100" },
+        { label: "Proxy", value: "100" },
+        { label: "Timeline name", value: "Main timeline" },
+        { label: "Width", value: "1920" },
+        { label: "Height", value: "1080" },
+        { label: "Frame rate", value: "30" },
+        { label: "Resolution", value: "1920×1080" },
+        { label: "Aspect ratio", value: "16:9" },
+    ];
+    VerticalLayout {
+        spacing: AppStore.theme.metrics.spacing.none;
+        PanelHeader {
+            title: "Inspector";
+        }
+
+        Flickable {
+            VerticalLayout {
+                vertical-stretch: 1;
+                horizontal-stretch: 1;
+                alignment: LayoutAlignment.start;
+                padding: AppStore.theme.metrics.spacing.lg;
+                spacing: 30px;
+
+                for field in fields: HorizontalLayout {
+                    spacing: AppStore.theme.metrics.spacing.lg;
+                    // min-height: 40px;
+
+                    Text {
+                        text: field.label;
+                        min-width: 120px;
+                        color: AppStore.theme.text.secondary;
+                        font-size: AppStore.theme.typography.label.size;
+                    }
+
+                    Text {
+                        text: field.value;
+                        horizontal-stretch: 1;
+                        wrap: TextWrap.char-wrap;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            height: 40px;
+            background: AppStore.theme.panel.header-background;
+
+            HorizontalLayout {
+                alignment: end;
+                padding: AppStore.theme.metrics.spacing.md;
+                Rectangle {
+                    width: 70px;
+                    height: 20px;
+                    border-radius: 5px;
+                    background: #666666;
+                    Text {
+                        text: "Modify";
+                    }
+                }
+            }
+        }
+    }
+}
