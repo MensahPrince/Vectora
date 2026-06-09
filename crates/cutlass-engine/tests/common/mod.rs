@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_encoder::ExportStats;
-use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
+use cutlass_engine::{ApplyOutcome, ColorConvertPath, Engine, EngineConfig};
 use cutlass_models::{ClipId, Generator, MediaId, Rational, RationalTime, TimeRange, TrackId, TrackKind};
 
 pub fn assets_dir() -> PathBuf {
@@ -37,6 +37,7 @@ pub fn temp_engine() -> (tempfile::TempDir, Engine) {
         cache_dir: dir.path().join("cache"),
         cache_budget_bytes: 64 * 1024 * 1024,
         undo_limit: 32,
+        color_convert: ColorConvertPath::Gpu,
     };
     let engine = Engine::new(config).expect("engine");
     (dir, engine)

@@ -1,13 +1,17 @@
 //! Timeline → composited RGBA frames → H.264 MP4.
+//!
+//! Export decodes media from original source files, composites on GPU, converts
+//! to YUV420P on GPU, then encodes. It does not read or write the session frame
+//! cache, and must not use proxy transcodes (preview-only when proxies land).
 
 use std::path::Path;
 
-use cutlass_cache::FrameCache;
 use cutlass_compositor::{Compositor, GpuContext};
 use cutlass_encoder::{ExportConfig, ExportStats, VideoExport};
 use cutlass_models::{Project, RationalTime};
 use tracing::info;
 
+use crate::ColorConvertPath;
 use crate::composite::composite_canvas_size;
 use crate::decoder_pool::DecoderPool;
 use crate::error::EngineError;
@@ -32,11 +36,11 @@ pub fn export_config_for(project: &Project) -> Result<ExportConfig, EngineError>
 /// Composite every timeline frame `0..duration` and mux to `output`.
 pub fn export_timeline(
     project: &Project,
-    cache: &FrameCache,
     pool: &mut DecoderPool,
     gpu: &GpuContext,
     compositor: &mut Compositor,
     output: &Path,
+    color_convert: ColorConvertPath,
 ) -> Result<ExportStats, EngineError> {
     let frame_count = project.timeline().duration().value;
     if frame_count <= 0 {
@@ -57,14 +61,21 @@ pub fn export_timeline(
 
     for tick in 0..frame_count {
         let time = RationalTime::new(tick, rate);
-        let frame = preview::get_frame(project, cache, pool, gpu, compositor, time)?;
-        if frame.width != config.width || frame.height != config.height {
+        let yuv = preview::get_export_yuv_frame(
+            project,
+            pool,
+            gpu,
+            compositor,
+            time,
+            color_convert,
+        )?;
+        if yuv.width != config.width || yuv.height != config.height {
             return Err(EngineError::Export(format!(
                 "composite size {}x{} does not match export {}x{}",
-                frame.width, frame.height, config.width, config.height
+                yuv.width, yuv.height, config.width, config.height
             )));
         }
-        sink.push_rgba(&frame.bytes)?;
+        sink.push_yuv420p(yuv.width, yuv.height, &yuv.y, &yuv.u, &yuv.v)?;
     }
 
     sink.finish().map_err(Into::into)

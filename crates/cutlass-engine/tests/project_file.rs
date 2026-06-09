@@ -14,6 +14,7 @@ fn engine_config(cache_dir: PathBuf) -> EngineConfig {
         cache_dir,
         cache_budget_bytes: 64 * 1024 * 1024,
         undo_limit: 8,
+        ..Default::default()
     }
 }
 

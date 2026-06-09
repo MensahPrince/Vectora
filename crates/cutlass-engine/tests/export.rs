@@ -9,6 +9,7 @@ use common::{
     add_generated, add_media_clip, add_track, export_to, import_asset, rt, small_video_asset,
     temp_engine, tr,
 };
+use cutlass_cache::SourceFingerprint;
 use cutlass_commands::{Command, EditCommand, ProjectCommand};
 use cutlass_decoder::{DecodeOptions, Decoder, HwAccel};
 use cutlass_models::{Generator, TrackKind};
@@ -332,6 +333,40 @@ fn export_delayed_clip_start_errors_on_leading_gap() {
         msg.contains("no video") || msg.contains("Preview"),
         "expected leading-gap failure, got: {msg}"
     );
+}
+
+#[test]
+fn export_decodes_from_source_when_cache_corrupt() {
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = add_track(&mut engine, TrackKind::Video, "V1");
+    add_media_clip(&mut engine, track, media_id, tr(0, 24), rt(0));
+
+    engine.get_frame(rt(0)).expect("warm preview cache");
+    engine.cache().sync();
+    let source_id = SourceFingerprint::from_path(&path)
+        .expect("fingerprint")
+        .id();
+    assert!(
+        engine.cache().frame_count(source_id) > 0,
+        "preview should populate cache"
+    );
+
+    let blob = engine.config().cache_dir.join(format!("{source_id}.yuv"));
+    std::fs::write(&blob, vec![0u8; 64]).expect("corrupt cache blob");
+
+    let out = dir.path().join("cache_bypass_export.mp4");
+    let stats = export_to(&mut engine, &out);
+    assert_eq!(stats.frames, 24);
+    assert!(out.exists());
+
+    let mut dec = open_export(&out);
+    dec.seek_to_frame(Duration::ZERO)
+        .expect("seek")
+        .expect("decoded frame after corrupt cache");
 }
 
 // --- engine semantics -----------------------------------------------------

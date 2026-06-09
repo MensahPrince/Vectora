@@ -1,15 +1,17 @@
-//! Timeline layer resolution and CPU decode helpers for GPU compositing.
+//! Timeline layer resolution and decode helpers for GPU compositing.
 
 use std::time::Duration;
 
 use cutlass_cache::{FrameCache, SourceFingerprint};
 use cutlass_compositor::{CompositeLayer, CompositorConfig};
+use cutlass_decoder::DecodedFrame;
 use cutlass_models::{Clip, Generator, ModelError, Project, RationalTime, TrackKind};
 use tracing::debug;
 
+use crate::ColorConvertPath;
 use crate::decoder_pool::DecoderPool;
 use crate::error::EngineError;
-use crate::frame::{decoded_to_rgba, pack_yuv420p, unpack_yuv420p, RgbaFrame};
+use crate::frame::{decoded_to_yuv_layer, legacy_decoded_to_rgba, RgbaFrame};
 
 const DEFAULT_WIDTH: u32 = 1920;
 const DEFAULT_HEIGHT: u32 = 1080;
@@ -42,12 +44,17 @@ pub fn composite_canvas_size(project: &Project) -> (u32, u32) {
 }
 
 /// Resolve enabled video layers at `time`, bottom to top.
+///
+/// Pass `cache: Some(...)` for interactive preview (disk cache on hit). Pass
+/// `None` for export so every media frame is decoded from the original source
+/// file — never from cached YUV blobs (and never from future proxy paths).
 pub fn resolve_layers(
     project: &Project,
-    cache: &FrameCache,
+    cache: Option<&FrameCache>,
     pool: &mut DecoderPool,
     time: RationalTime,
     canvas: &CompositorConfig,
+    color_convert: ColorConvertPath,
 ) -> Result<Vec<CompositeLayer>, EngineError> {
     let mut layers = Vec::new();
 
@@ -61,9 +68,18 @@ pub fn resolve_layers(
 
         match &clip.content {
             cutlass_models::ClipSource::Media { .. } => {
-                let frame = decode_media_rgba(project, cache, pool, clip, time)?;
-                let bytes = resize_rgba(&frame, canvas.width, canvas.height)?;
-                layers.push(CompositeLayer::Rgba { bytes });
+                let layer = match color_convert {
+                    ColorConvertPath::Gpu => {
+                        let decoded = decode_media_frame(project, cache, pool, clip, time)?;
+                        CompositeLayer::Yuv420p(decoded_to_yuv_layer(&decoded)?)
+                    }
+                    ColorConvertPath::LegacyCpu => {
+                        let frame = decode_media_rgba_legacy(project, cache, pool, clip, time)?;
+                        let bytes = legacy_resize_rgba(&frame, canvas.width, canvas.height)?;
+                        CompositeLayer::Rgba { bytes }
+                    }
+                };
+                layers.push(layer);
             }
             cutlass_models::ClipSource::Generated(generator) => match generator {
                 Generator::SolidColor { rgba } => {
@@ -79,13 +95,13 @@ pub fn resolve_layers(
     Ok(layers)
 }
 
-fn decode_media_rgba(
+fn decode_media_frame(
     project: &Project,
-    cache: &FrameCache,
+    cache: Option<&FrameCache>,
     pool: &mut DecoderPool,
     clip: &Clip,
     time: RationalTime,
-) -> Result<RgbaFrame, EngineError> {
+) -> Result<DecodedFrame, EngineError> {
     let source_time = clip
         .source_time_at(time)?
         .ok_or_else(|| EngineError::Preview("timeline position outside clip".into()))?;
@@ -101,26 +117,40 @@ fn decode_media_rgba(
     let source_id = fingerprint.id();
     let target = rational_time_to_duration(source_time);
 
-    let (decoder, index) = pool.decoder_and_index(media_id, media.path())?;
-    let pts = index.duration_to_ticks(target);
+    let (decoder, _index) = pool.decoder_and_index(media_id, media.path())?;
+    let pts = _index.duration_to_ticks(target);
 
-    if let Some(packed) = cache.get(source_id, pts) {
-        let decoded = unpack_yuv420p(&packed, media.width, media.height)?;
-        return decoded_to_rgba(&decoded);
+    if let Some(cache) = cache
+        && let Some(packed) = cache.get(source_id, pts)
+    {
+        return crate::frame::unpack_yuv420p(&packed, media.width, media.height);
     }
 
     let decoded = decoder
         .seek_to_frame(target)?
         .ok_or_else(|| EngineError::Preview("decoder returned no frame".into()))?;
 
-    if let Ok(packed) = pack_yuv420p(&decoded) {
+    if let Some(cache) = cache
+        && let Ok(packed) = crate::frame::pack_yuv420p(&decoded)
+    {
         cache.cache_frame(source_id, decoded.pts_ticks, packed);
     }
 
-    decoded_to_rgba(&decoded)
+    Ok(decoded)
 }
 
-fn resize_rgba(frame: &RgbaFrame, dst_w: u32, dst_h: u32) -> Result<Vec<u8>, EngineError> {
+fn decode_media_rgba_legacy(
+    project: &Project,
+    cache: Option<&FrameCache>,
+    pool: &mut DecoderPool,
+    clip: &Clip,
+    time: RationalTime,
+) -> Result<RgbaFrame, EngineError> {
+    let decoded = decode_media_frame(project, cache, pool, clip, time)?;
+    legacy_decoded_to_rgba(&decoded)
+}
+
+fn legacy_resize_rgba(frame: &RgbaFrame, dst_w: u32, dst_h: u32) -> Result<Vec<u8>, EngineError> {
     if frame.width == dst_w && frame.height == dst_h {
         return Ok(frame.bytes.clone());
     }
@@ -207,10 +237,10 @@ mod tests {
     }
 
     #[test]
-    fn resize_identity_is_copy() {
+    fn legacy_resize_identity_is_copy() {
         let frame = RgbaFrame::new(2, 2, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
             .unwrap();
-        let out = resize_rgba(&frame, 2, 2).unwrap();
+        let out = legacy_resize_rgba(&frame, 2, 2).unwrap();
         assert_eq!(out, frame.bytes);
     }
 }

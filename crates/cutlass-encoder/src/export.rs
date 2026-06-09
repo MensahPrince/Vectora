@@ -22,7 +22,9 @@ use ffmpeg_next::{Dictionary, Rational, codec, encoder::Video as VideoEncoder};
 use tracing::debug;
 
 use crate::error::EncodeError;
-use crate::h264::{drain_encoder, ensure_ffmpeg_init, fill_rgba_frame, find_h264_encoder};
+use crate::h264::{
+    drain_encoder, ensure_ffmpeg_init, fill_rgba_frame, fill_yuv420p_frame, find_h264_encoder,
+};
 
 /// How to encode an exported timeline.
 #[derive(Debug, Clone, Copy)]
@@ -182,6 +184,37 @@ impl VideoExport {
     /// Frames are consumed in presentation order; the Nth call becomes output
     /// frame N. The buffer is copied into the encoder's pipeline, so the caller
     /// may reuse or drop it immediately after this returns.
+    /// Encode one frame from tight YUV420P planes (typical GPU readback layout).
+    pub fn push_yuv420p(
+        &mut self,
+        width: u32,
+        height: u32,
+        y: &[u8],
+        u: &[u8],
+        v: &[u8],
+    ) -> Result<(), EncodeError> {
+        if width != self.width || height != self.height {
+            return Err(EncodeError::unsupported(format!(
+                "yuv frame is {width}x{height}, expected {}x{}",
+                self.width, self.height
+            )));
+        }
+        let mut yuv = VideoFrame::new(Pixel::YUV420P, width, height);
+        fill_yuv420p_frame(&mut yuv, width, height, y, u, v)?;
+        yuv.set_pts(Some(self.frame_index));
+        self.encoder.send_frame(&yuv).map_err(EncodeError::Encode)?;
+        self.frame_index += 1;
+
+        drain_encoder(
+            &mut self.encoder,
+            &mut self.octx,
+            self.ost_index,
+            self.enc_tb,
+            self.ost_tb,
+        )
+    }
+
+    /// Legacy: encode from RGBA8 via CPU FFmpeg scaler.
     pub fn push_rgba(&mut self, rgba: &[u8]) -> Result<(), EncodeError> {
         fill_rgba_frame(&mut self.rgba, self.width, self.height, rgba)?;
 

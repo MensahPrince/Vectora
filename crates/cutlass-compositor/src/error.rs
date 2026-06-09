@@ -11,6 +11,9 @@ pub enum CompositorError {
     #[error("invalid canvas dimensions: {width}x{height}")]
     InvalidDimensions { width: u32, height: u32 },
 
+    #[error("invalid YUV layer dimensions: {width}x{height}")]
+    InvalidYuvDimensions { width: u32, height: u32 },
+
     #[error("layer RGBA buffer size mismatch: got {got} bytes, expected {expected}")]
     LayerSizeMismatch { got: usize, expected: usize },
 

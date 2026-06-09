@@ -22,6 +22,16 @@ fn gpu_init_err(err: cutlass_compositor::CompositorError) -> std::io::Error {
 /// Default on-disk frame cache budget (50 GiB).
 pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 50 * 1024 * 1024 * 1024;
 
+/// Where YUV ↔ RGBA conversion runs for preview and export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ColorConvertPath {
+    /// GPU shaders in `cutlass-compositor` (default).
+    #[default]
+    Gpu,
+    /// Legacy CPU routines in `cutlass-engine::frame` / `composite`.
+    LegacyCpu,
+}
+
 /// Session configuration for [`Engine`].
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
@@ -31,6 +41,8 @@ pub struct EngineConfig {
     pub cache_budget_bytes: u64,
     /// Maximum inverse actions retained on the undo stack.
     pub undo_limit: usize,
+    /// YUV/RGBA conversion path for preview and export compositing.
+    pub color_convert: ColorConvertPath,
 }
 
 impl Default for EngineConfig {
@@ -39,6 +51,7 @@ impl Default for EngineConfig {
             cache_dir: PathBuf::from(".cutlass/cache"),
             cache_budget_bytes: DEFAULT_CACHE_BUDGET_BYTES,
             undo_limit: 100,
+            color_convert: ColorConvertPath::Gpu,
         }
     }
 }
@@ -124,11 +137,11 @@ impl Engine {
         if let Command::Project(ProjectCommand::Export { path }) = command {
             let stats = crate::export::export_timeline(
                 &self.project,
-                &self.cache,
                 &mut self.decoder_pool,
                 &self.gpu,
                 &mut self.compositor,
                 &path,
+                self.config.color_convert,
             )?;
             return Ok(ApplyOutcome::Exported { stats });
         }
@@ -158,6 +171,7 @@ impl Engine {
             &self.gpu,
             &mut self.compositor,
             time,
+            self.config.color_convert,
         )
     }
 

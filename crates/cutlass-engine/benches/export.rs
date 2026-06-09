@@ -17,6 +17,7 @@ fn engine_with_solid(frames: i64) -> (tempfile::TempDir, Engine) {
         cache_dir: dir.path().join("cache"),
         cache_budget_bytes: 512 * 1024 * 1024,
         undo_limit: 8,
+        ..Default::default()
     };
     let mut engine = Engine::new(config).expect("engine");
     let track = match engine

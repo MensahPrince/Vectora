@@ -11,10 +11,14 @@ impl CompositorConfig {
     }
 }
 
+use crate::yuv::Yuv420pLayer;
+
 /// One layer in bottom-to-top stacking order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CompositeLayer {
-    /// Full-canvas RGBA8 (width×height×4), row-major.
+    /// Decoder-native YUV420P; converted and scaled on GPU.
+    Yuv420p(Yuv420pLayer),
+    /// Legacy: full-canvas RGBA8 (width×height×4) from CPU conversion/resize.
     Rgba { bytes: Vec<u8> },
     /// Full-canvas solid fill (RGBA 0–255).
     Solid { rgba: [u8; 4] },

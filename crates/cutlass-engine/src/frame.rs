@@ -1,5 +1,9 @@
-//! CPU frame buffers for preview.
+//! Frame buffers for preview and export.
+//!
+//! GPU conversion is the default path ([`decoded_to_yuv_layer`]). CPU routines
+//! in this module are legacy fallbacks kept for tests and [`ColorConvertPath::LegacyCpu`].
 
+use cutlass_compositor::Yuv420pLayer;
 use cutlass_decoder::{DecodedFrame, PixelFormat};
 
 use crate::error::EngineError;
@@ -32,7 +36,44 @@ impl RgbaFrame {
     }
 }
 
+/// Build a [`Yuv420pLayer`] from a decoded frame for GPU conversion.
+pub fn decoded_to_yuv_layer(frame: &DecodedFrame) -> Result<Yuv420pLayer, EngineError> {
+    match frame.format {
+        PixelFormat::Yuv420p => {
+            let y = &frame.planes[0];
+            let u = &frame.planes[1];
+            let v = &frame.planes[2];
+            Ok(Yuv420pLayer::new(
+                frame.width,
+                frame.height,
+                y.data.clone(),
+                y.stride as u32,
+                u.data.clone(),
+                u.stride as u32,
+                v.data.clone(),
+                v.stride as u32,
+            ))
+        }
+        PixelFormat::Rgba8 => Err(EngineError::Preview(
+            "RGBA source must use legacy CPU path".into(),
+        )),
+        PixelFormat::Nv12 => Err(EngineError::Preview(
+            "NV12 preview conversion not implemented yet".into(),
+        )),
+    }
+}
+
+/// Legacy CPU YUV/RGBA conversion.
+pub fn legacy_decoded_to_rgba(frame: &DecodedFrame) -> Result<RgbaFrame, EngineError> {
+    decoded_to_rgba_inner(frame)
+}
+
+/// Legacy alias used by older tests and [`ColorConvertPath::LegacyCpu`].
 pub fn decoded_to_rgba(frame: &DecodedFrame) -> Result<RgbaFrame, EngineError> {
+    legacy_decoded_to_rgba(frame)
+}
+
+fn decoded_to_rgba_inner(frame: &DecodedFrame) -> Result<RgbaFrame, EngineError> {
     match frame.format {
         PixelFormat::Rgba8 => rgba_from_rgba8(frame),
         PixelFormat::Yuv420p => yuv420p_to_rgba(frame),

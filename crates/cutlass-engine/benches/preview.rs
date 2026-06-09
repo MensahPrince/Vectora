@@ -53,6 +53,7 @@ fn engine_with_solid_clip(frames: i64) -> (tempfile::TempDir, Engine) {
         cache_dir: dir.path().join("cache"),
         cache_budget_bytes: 512 * 1024 * 1024,
         undo_limit: 8,
+        ..Default::default()
     };
     let mut engine = Engine::new(config).expect("engine");
     let track = match engine
@@ -83,6 +84,7 @@ fn engine_with_media(path: &Path, source_frames: i64) -> (tempfile::TempDir, Eng
         cache_dir: dir.path().join("cache"),
         cache_budget_bytes: 512 * 1024 * 1024,
         undo_limit: 8,
+        ..Default::default()
     };
     let mut engine = Engine::new(config).expect("engine");
     let media = match engine

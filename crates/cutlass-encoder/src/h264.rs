@@ -72,6 +72,48 @@ pub(crate) fn scaled_dims(src_w: u32, src_h: u32, target_h: u32) -> (u32, u32) {
     (w.max(2) & !1, h.max(2) & !1)
 }
 
+/// Fill a YUV420P frame from tight plane buffers (GPU readback layout).
+pub(crate) fn fill_yuv420p_frame(
+    frame: &mut VideoFrame,
+    width: u32,
+    height: u32,
+    y: &[u8],
+    u: &[u8],
+    v: &[u8],
+) -> Result<(), EncodeError> {
+    let w = width as usize;
+    let h = height as usize;
+    let y_need = w * h;
+    let uv_need = (w / 2) * (h / 2);
+    if y.len() != y_need || u.len() != uv_need || v.len() != uv_need {
+        return Err(EncodeError::unsupported(format!(
+            "yuv plane sizes mismatch for {width}x{height}"
+        )));
+    }
+
+    let y_stride = frame.stride(0);
+    let u_stride = frame.stride(1);
+    let v_stride = frame.stride(2);
+    for row in 0..h {
+        let dst = &mut frame.data_mut(0)[row * y_stride..row * y_stride + w];
+        let src = &y[row * w..row * w + w];
+        dst.copy_from_slice(src);
+    }
+    let uv_h = h / 2;
+    let uv_w = w / 2;
+    for row in 0..uv_h {
+        let dst = &mut frame.data_mut(1)[row * u_stride..row * u_stride + uv_w];
+        let src = &u[row * uv_w..row * uv_w + uv_w];
+        dst.copy_from_slice(src);
+    }
+    for row in 0..uv_h {
+        let dst = &mut frame.data_mut(2)[row * v_stride..row * v_stride + uv_w];
+        let src = &v[row * uv_w..row * uv_w + uv_w];
+        dst.copy_from_slice(src);
+    }
+    Ok(())
+}
+
 /// Fill a reusable RGBA frame from a row-major RGBA8 buffer.
 pub(crate) fn fill_rgba_frame(
     frame: &mut VideoFrame,

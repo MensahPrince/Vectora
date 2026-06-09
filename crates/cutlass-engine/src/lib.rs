@@ -11,7 +11,7 @@ mod import;
 mod preview;
 
 pub use action::ApplyOutcome;
-pub use engine::{DEFAULT_CACHE_BUDGET_BYTES, Engine, EngineConfig};
+pub use engine::{ColorConvertPath, DEFAULT_CACHE_BUDGET_BYTES, Engine, EngineConfig};
 pub use error::EngineError;
 pub use export::{export_config_for, export_timeline};
 pub use frame::RgbaFrame;
