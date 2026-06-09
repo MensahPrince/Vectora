@@ -462,6 +462,7 @@ dependencies = [
  "cutlass-commands",
  "cutlass-compositor",
  "cutlass-decoder",
+ "cutlass-encoder",
  "cutlass-models",
  "pollster",
  "tempfile",

@@ -12,6 +12,7 @@ pub enum ApplyOutcome {
     Saved,
     Opened,
     Loaded,
+    Exported { stats: cutlass_encoder::ExportStats },
     Edited(EditOutcome),
 }
 
@@ -46,6 +47,9 @@ fn dispatch_project(
             project::load::execute(ctx, path)?;
             Ok((ApplyOutcome::Loaded, None))
         }
+        ProjectCommand::Export { .. } => Err(EngineError::Export(
+            "export is handled by Engine::apply, not dispatch".into(),
+        )),
     }
 }
 

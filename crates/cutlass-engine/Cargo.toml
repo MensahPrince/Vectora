@@ -10,10 +10,12 @@ cutlass-cache = { path = "../cutlass-cache" }
 cutlass-commands = { path = "../cutlass-commands" }
 cutlass-compositor = { path = "../cutlass-compositor" }
 cutlass-decoder = { path = "../cutlass-decoder" }
+cutlass-encoder = { path = "../cutlass-encoder" }
 cutlass-models = { path = "../cutlass-models" }
 pollster.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+cutlass-decoder = { path = "../cutlass-decoder" }
 tempfile = "3"

@@ -18,6 +18,8 @@ pub enum ProjectCommand {
     Open { path: PathBuf },
     /// Replace the session from a project file; missing media paths are kept but not relinked.
     Load { path: PathBuf },
+    /// Render the timeline to an H.264 MP4 at the project frame rate.
+    Export { path: PathBuf },
 }
 
 /// A single structured edit against the timeline.

@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use cutlass_cache::FrameCache;
-use cutlass_commands::Command;
+use cutlass_commands::{Command, ProjectCommand};
 use cutlass_compositor::{Compositor, GpuContext};
 use cutlass_models::Project;
 
@@ -121,6 +121,18 @@ impl Engine {
 
     /// Apply a wire command. On success, pushes the inverse action onto the undo stack.
     pub fn apply(&mut self, command: Command) -> Result<ApplyOutcome, EngineError> {
+        if let Command::Project(ProjectCommand::Export { path }) = command {
+            let stats = crate::export::export_timeline(
+                &self.project,
+                &self.cache,
+                &mut self.decoder_pool,
+                &self.gpu,
+                &mut self.compositor,
+                &path,
+            )?;
+            return Ok(ApplyOutcome::Exported { stats });
+        }
+
         let mut ctx = ApplyContext {
             project: &mut self.project,
             cache: &self.cache,

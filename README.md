@@ -34,7 +34,7 @@ The codebase is a Cargo workspace split into focused crates:
 | `cutlass-models` | Project, timeline, track, and clip data model with edit invariants. |
 | `cutlass-decoder` | FFmpeg demux + decode, hardware acceleration, keyframe indexing, proxy encode. |
 | `cutlass-compositor` | WGPU frame compositor (multi-layer alpha-over, RGBA readback). |
-| `cutlass-engine` | Headless editing engine: edit commands + undo/redo, frame resolution, frame cache, proxy/media pool. |
+| `cutlass-engine` | Headless editing engine: edit commands + undo/redo, WGPU preview, timeline export, frame cache. |
 | `cutlass-ui` | Slint desktop shell: preview, scrub/playback, timeline editing, undo/redo, proxy progress. |
 | `cutlass-app` | End-to-end render CLI that exercises the full decode → resolve → composite pipeline. |
 
