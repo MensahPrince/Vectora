@@ -130,3 +130,54 @@ pub fn export_to(engine: &mut Engine, path: &Path) -> ExportStats {
         other => panic!("expected Exported, got {other:?}"),
     }
 }
+
+pub fn save_project(engine: &mut Engine, path: &Path) {
+    match engine
+        .apply(Command::Project(ProjectCommand::Save {
+            path: path.to_path_buf(),
+        }))
+        .expect("save")
+    {
+        ApplyOutcome::Saved => {}
+        other => panic!("expected Saved, got {other:?}"),
+    }
+}
+
+pub fn open_project(engine: &mut Engine, path: &Path) {
+    match engine
+        .apply(Command::Project(ProjectCommand::Open {
+            path: path.to_path_buf(),
+        }))
+        .expect("open")
+    {
+        ApplyOutcome::Opened => {}
+        other => panic!("expected Opened, got {other:?}"),
+    }
+}
+
+pub fn load_project(engine: &mut Engine, path: &Path) {
+    match engine
+        .apply(Command::Project(ProjectCommand::Load {
+            path: path.to_path_buf(),
+        }))
+        .expect("load")
+    {
+        ApplyOutcome::Loaded => {}
+        other => panic!("expected Loaded, got {other:?}"),
+    }
+}
+
+/// All MP4 assets under `assets/`, sorted for deterministic tests.
+pub fn video_assets() -> Vec<PathBuf> {
+    let dir = assets_dir();
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && p.extension().is_some_and(|ext| ext == "mp4"))
+        .collect();
+    paths.sort();
+    paths
+}
