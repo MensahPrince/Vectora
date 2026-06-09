@@ -1,9 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use cutlass_models::MediaId;
 
-use super::remove_media::RemoveMediaAction;
-use super::{ApplyContext, EditAction};
+use crate::action::edit::remove_media::RemoveMediaAction;
+use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 use crate::import::import_media;
 
@@ -13,7 +13,7 @@ pub struct ImportAction {
 
 pub fn execute(
     ctx: &mut ApplyContext<'_>,
-    path: &std::path::Path,
+    path: &Path,
 ) -> Result<(MediaId, Box<dyn EditAction>), EngineError> {
     let media = import_media(path, ctx.cache)?;
     let id = ctx.project.add_media(media);

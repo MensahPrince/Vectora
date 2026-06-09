@@ -1,7 +1,7 @@
 use cutlass_models::{ClipId, MediaId, RationalTime, TimeRange, TrackId};
 
-use super::remove_clip::RemoveClipAction;
-use super::{ApplyContext, EditAction};
+use crate::action::edit::remove_clip::RemoveClipAction;
+use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 
 pub struct AddClipAction {

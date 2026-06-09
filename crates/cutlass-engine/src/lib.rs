@@ -4,7 +4,6 @@ mod action;
 mod engine;
 mod error;
 mod import;
-mod session;
 
 pub use action::ApplyOutcome;
 pub use engine::{DEFAULT_CACHE_BUDGET_BYTES, Engine, EngineConfig};

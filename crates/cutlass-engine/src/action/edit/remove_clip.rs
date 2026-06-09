@@ -1,6 +1,7 @@
 use cutlass_models::{ClipId, ModelError};
 
-use super::{ApplyContext, EditAction};
+use crate::action::edit::insert_clip::InsertClipAction;
+use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 
 pub struct RemoveClipAction {
@@ -18,6 +19,6 @@ impl EditAction for RemoveClipAction {
             .project
             .remove_clip(self.clip)
             .ok_or(ModelError::UnknownClip(self.clip))?;
-        Ok(Box::new(super::insert_clip::InsertClipAction { track, clip }))
+        Ok(Box::new(InsertClipAction { track, clip }))
     }
 }

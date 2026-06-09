@@ -3,7 +3,7 @@
 use cutlass_commands::{EditCommand, EditOutcome};
 use cutlass_models::Project;
 
-use super::{ApplyContext, EditAction};
+use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 
 pub struct RestoreProject {
@@ -17,7 +17,7 @@ impl EditAction for RestoreProject {
     }
 }
 
-pub fn apply_edit_legacy(
+pub fn apply(
     ctx: &mut ApplyContext<'_>,
     command: EditCommand,
 ) -> Result<(EditOutcome, Box<dyn EditAction>), EngineError> {

@@ -1,13 +1,8 @@
-//! Inverse-command editing: each [`EditAction::apply`] returns the action that undoes it.
+//! Command dispatch: undoable timeline edits and session project commands.
 
-mod add_clip;
 mod dispatch;
-mod import;
-mod insert_clip;
-mod insert_media;
-mod legacy;
-mod remove_clip;
-mod remove_media;
+mod edit;
+mod project;
 
 pub use dispatch::{ApplyOutcome, dispatch};
 
@@ -16,7 +11,7 @@ use cutlass_models::Project;
 
 use crate::error::EngineError;
 
-/// Session surface passed to every edit action.
+/// Session surface passed to every command handler.
 pub struct ApplyContext<'a> {
     pub project: &'a mut Project,
     pub cache: &'a FrameCache,
@@ -93,6 +88,7 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::edit::{add_clip, remove_media};
     use cutlass_cache::FrameCache;
     use cutlass_models::{MediaSource, Rational, RationalTime, TimeRange, TrackKind};
 
@@ -101,6 +97,20 @@ mod tests {
         let cache = FrameCache::new(dir.path().join("cache"), 1024 * 1024).unwrap();
         let project = Project::new("test", Rational::FPS_24);
         (dir, project, cache)
+    }
+
+    fn test_ctx<'a>(
+        project: &'a mut Project,
+        cache: &'a FrameCache,
+        project_path: &'a mut Option<std::path::PathBuf>,
+        history: &'a mut History,
+    ) -> ApplyContext<'a> {
+        ApplyContext {
+            project,
+            cache,
+            project_path,
+            history,
+        }
     }
 
     #[test]
@@ -118,12 +128,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = ApplyContext {
-            project: &mut project,
-            cache: &cache,
-            project_path: &mut project_path,
-            history: &mut history,
-        };
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
 
         let (id, inv1) = add_clip::execute(
             &mut ctx,
@@ -154,12 +159,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = ApplyContext {
-            project: &mut project,
-            cache: &cache,
-            project_path: &mut project_path,
-            history: &mut history,
-        };
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
 
         let inv1 = Box::new(remove_media::RemoveMediaAction { media: id });
         let inv2 = inv1.apply(&mut ctx).unwrap();
