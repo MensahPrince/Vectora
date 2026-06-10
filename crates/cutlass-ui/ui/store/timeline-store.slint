@@ -1,22 +1,6 @@
-// Cross-panel, agent-addressable timeline state. Everything in here is
-// fair game for the command layer to read/mutate (zoom-to-fit, set
-// playhead, select clips, etc.) and may need to be read by other panels
-// (inspector, preview).
-//
-// Ephemeral view state of the timeline panel itself (scroll offsets,
-// in-progress drags, hover, …) does *not* belong here — it lives in
-// `TimelineViewState` next to the panel (`ui/panels/timeline/state.slint`).
+// Cross-panel timeline state (zoom, playhead). Ephemeral panel view state
+// lives in `TimelineViewState` (`ui/panels/timeline/state.slint`).
 export global TimelineStore {
-    // Timeline projection scale: 1 tick == `zoom` logical pixels.
     in-out property <float> zoom: 3;
-
-    // Current position in timeline ticks at the sequence frame rate.
-    // Written by ruler/lane scrub; read by the playhead overlay and preview.
     in-out property <int> playhead-tick: 0;
-
-    callback playhead-changed(int);
-
-    changed playhead-tick => {
-        root.playhead-changed(root.playhead-tick);
-    }
 }

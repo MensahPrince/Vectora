@@ -1,5 +1,7 @@
 import { CutlassText, HorizontalDivider } from "../../components/index.slint";
 import { AppStore } from "../../store/index.slint";
+import { Slider } from "std-widgets.slint";
+import { EditorStore } from "../../store/editor-store.slint";
 
 export component Toolbar inherits Rectangle {
     height: AppStore.theme.metrics.layout.toolbar-height;
@@ -7,6 +9,20 @@ export component Toolbar inherits Rectangle {
     CutlassText {
         text: "Tools";
         style: AppStore.theme.typography.label;
+    }
+
+    Slider {
+        minimum: 0;
+        maximum: 100;
+        value: 0;
+        step: 1;
+        y: 10px;
+        x: 150px;
+        width: 90%;
+
+        changed(value) => {
+            EditorStore.on-slider-changed(value);
+        }
     }
 
     HorizontalDivider {

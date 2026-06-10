@@ -1,26 +1,19 @@
-mod bootstrap;
-mod ids;
-mod palette;
-mod projector;
+mod preview;
+mod preview_worker;
 mod ruler;
-mod session;
 mod snap;
-mod snapshot;
 mod timecode;
 mod timeline;
 
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
-
-use slint::ComponentHandle;
-use slint::SharedString;
 use slint::BackendSelector;
+use slint::Global;
+use slint::SharedString;
 use slint::wgpu_28::WGPUConfiguration;
+use tracing::info;
 use tracing_subscriber::EnvFilter;
 
-use crate::projector::Projector;
-use crate::session::{EngineEvent, EngineHandle, drain_events, install_event_pump};
-use crate::snapshot::ProjectSnapshot;
+use cutlass_engine::EngineConfig;
+use std::path::PathBuf;
 
 slint::include_modules!();
 
@@ -32,6 +25,14 @@ fn setup_tracing() {
         .init();
 }
 
+fn slider_to_timeline_tick(value: f32, duration_ticks: i64) -> i64 {
+    if duration_ticks <= 0 {
+        return 0;
+    }
+    let max_tick = duration_ticks - 1;
+    ((value.clamp(0.0, 100.0) / 100.0) * max_tick as f32).round() as i64
+}
+
 fn main() -> Result<(), slint::PlatformError> {
     setup_tracing();
     BackendSelector::new()
@@ -39,81 +40,28 @@ fn main() -> Result<(), slint::PlatformError> {
         .select()?;
 
     let app = AppWindow::new()?;
-    let engine = Rc::new(EngineHandle::spawn());
-    let frame_generation = Rc::new(Cell::new(0u64));
+    let preview_store_weak = app.global::<PreviewStore>().as_weak();
 
-    let initial_snapshot = loop {
-        match engine.events.recv() {
-            Ok(EngineEvent::Project(snapshot)) => break snapshot,
-            Ok(EngineEvent::MoveRejected(msg)) => {
-                eprintln!("engine bootstrap error: {msg}");
-            }
-            Ok(EngineEvent::Frame(_))
-            | Ok(EngineEvent::ClipMoved { .. })
-            | Ok(EngineEvent::ClipTransferred { .. }) => {}
-            Err(_) => {
-                eprintln!("engine thread exited before publishing a project");
-                break ProjectSnapshot::from_engine(&cutlass_models::Project::new(
-                    "empty",
-                    cutlass_models::Rational::FPS_24,
-                ));
-            }
-        }
-    };
+    let (preview_worker, session) = preview_worker::PreviewWorker::spawn(
+        EngineConfig::default(),
+        PathBuf::from("assets/16078866_3840_2160_60fps.mp4"),
+        preview_store_weak,
+    )
+    .map_err(slint::PlatformError::from)?;
 
-    let projector = Rc::new(RefCell::new(Projector::from_snapshot(&initial_snapshot)));
-    app.global::<EditorStore>()
-        .set_project(projector.borrow().slint_project().clone());
-
-    let generation = frame_generation.get() + 1;
-    frame_generation.set(generation);
-    engine.request_frame(0, generation);
-
-    install_event_pump(
-        &app,
-        engine.clone(),
-        projector.clone(),
-        frame_generation.clone(),
+    info!(
+        duration_ticks = session.duration_ticks,
+        tl_rate = ?session.tl_rate,
+        "timeline ready for scrub"
     );
 
-    {
-        let engine = engine.clone();
-        let frame_generation = frame_generation.clone();
-        let weak = app.as_weak();
-        let projector = projector.clone();
-        app.global::<TimelineStore>().on_playhead_changed(move |tick| {
-            let generation = frame_generation.get() + 1;
-            frame_generation.set(generation);
-            engine.request_frame(tick, generation);
-            if let Some(app) = weak.upgrade() {
-                let mut last = 0u64;
-                drain_events(&engine, &app, &projector, &mut last);
-            }
-        });
-    }
+    preview_worker.request_frame(0);
 
-    {
-        let engine = engine.clone();
-        let weak = app.as_weak();
-        let projector = projector.clone();
-        app.global::<EditorStore>().on_move_clip(
-            move |source_track_id: SharedString,
-                  clip_id: SharedString,
-                  target_track_id: SharedString,
-                  new_start_value: i32| {
-                engine.move_clip(
-                    source_track_id.as_str(),
-                    clip_id.as_str(),
-                    target_track_id.as_str(),
-                    new_start_value,
-                );
-                if let Some(app) = weak.upgrade() {
-                    let mut last = 0u64;
-                    drain_events(&engine, &app, &projector, &mut last);
-                }
-            },
-        );
-    }
+    let duration_ticks = session.duration_ticks;
+    let editor = app.global::<EditorStore>();
+    editor.on_on_slider_changed(move |value| {
+        preview_worker.request_frame(slider_to_timeline_tick(value, duration_ticks));
+    });
 
     let timeline = app.global::<TimelineLib>();
     timeline.on_sequence_duration(timeline::sequence_duration);
@@ -128,14 +76,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     app.global::<RulerBackend>().on_ticks(
         |scroll_x, viewport_w, zoom, fps_num, fps_den, drop_frame| {
-            ruler::ticks_model(
-                scroll_x,
-                viewport_w,
-                zoom,
-                fps_num,
-                fps_den,
-                drop_frame,
-            )
+            ruler::ticks_model(scroll_x, viewport_w, zoom, fps_num, fps_den, drop_frame)
         },
     );
 
@@ -162,19 +103,14 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
-    app.global::<DragBackend>().on_resolve_target_lane(
-        |sequence, source_track_id, lane_offset| {
-            let r = snap::resolve_drag_target(
-                sequence,
-                source_track_id.as_str(),
-                lane_offset,
-            );
+    app.global::<DragBackend>()
+        .on_resolve_target_lane(|sequence, source_track_id, lane_offset| {
+            let r = snap::resolve_drag_target(sequence, source_track_id.as_str(), lane_offset);
             ResolvedTarget {
                 track_id: r.track_id,
                 clamped_offset: r.clamped_offset,
             }
-        },
-    );
+        });
 
     app.run()
 }

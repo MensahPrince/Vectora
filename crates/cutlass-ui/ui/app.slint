@@ -18,12 +18,16 @@ import { FullscreenPreview } from "fullscreen-preview.slint";
 // Slint only exposes globals from the entry file's exports to the host
 // language (Rust here) — transitive imports aren't enough.
 //   https://docs.slint.dev/latest/docs/slint/src/language/syntax/globals
-export { AppState } from "state.slint";
-export { EditorStore, PreviewStore, TimelineStore } from "store/index.slint";
-export { TimelineViewState } from "panels/timeline/index.slint";
-export { TimelineLib } from "lib/index.slint";
-export { RulerBackend, RulerTick } from "lib/ruler-backend.slint";
-export { DragBackend, SnapResult, ResolvedTarget } from "lib/drag-backend.slint";
+export { AppState }from "state.slint";
+export { EditorStore, TimelineStore, PreviewStore }from "store/index.slint";
+export { TimelineViewState }from "panels/timeline/index.slint";
+export { TimelineLib }from "lib/index.slint";
+export { RulerBackend, RulerTick }from "lib/ruler-backend.slint";
+export {
+    DragBackend,
+    SnapResult,
+    ResolvedTarget,
+}from "lib/drag-backend.slint";
 
 export component AppWindow inherits Window {
     title: "Cutlass";

@@ -10,10 +10,10 @@ name = "cutlass-ui"
 path = "src/main.rs"
 
 [dependencies]
-crossbeam-channel = "0.5.15"
-cutlass-commands = { path = "../cutlass-commands" }
 cutlass-engine = { path = "../cutlass-engine" }
 cutlass-models = { path = "../cutlass-models" }
+cutlass-commands = { path = "../cutlass-commands" }
+crossbeam-channel = "0.5.15"
 serde = { workspace = true }
 slint = { version = "1.16", features = [
     "unstable-winit-030",
@@ -21,7 +21,6 @@ slint = { version = "1.16", features = [
     "renderer-femtovg-wgpu",
     "serde",
 ] }
-tempfile = "3"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 

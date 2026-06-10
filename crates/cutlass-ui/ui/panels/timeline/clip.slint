@@ -11,7 +11,7 @@ import { TimelineViewState } from "state.slint";
 // dragged.
 //
 // Drag updates only ephemeral view state. On release the clip returns
-// to its committed position until the engine handles move commands.
+// to its committed position until edit commands are wired.
 //
 // Note: input is named `model` (not `clip`) because `clip` is a
 // built-in boolean property on Slint visual elements.
@@ -83,7 +83,7 @@ export component ClipView inherits Rectangle {
         //   move    → accumulate (dx, dy) in view state, ask Rust for
         //             snap result, compute target lane index — all
         //             without mutating any domain state
-        //   release → dispatch move-clip to the engine via EditorStore.
+        //   release → clear drag state
         //
         // Why this shape:
         //   * Dragging through view state keeps the per-frame work to
@@ -105,15 +105,6 @@ export component ClipView inherits Rectangle {
                 TimelineViewState.drag-snap-tick = 0;
                 TimelineViewState.drag-snapped-start-value = model.timeline-start.value;
             } else if (is-active-drag) {
-                let cursor-start: int =
-                    round((base-x + TimelineViewState.drag-dx-px) / (1px * zoom));
-                let final-start: int = TimelineViewState.drag-snap-active
-                    ? TimelineViewState.drag-snapped-start-value
-                    : cursor-start;
-                let target-track: string = TimelineViewState.drag-target-track-id != ""
-                    ? TimelineViewState.drag-target-track-id
-                    : track-id;
-
                 TimelineViewState.dragging-source-track-id = "";
                 TimelineViewState.dragging-clip-id = "";
                 TimelineViewState.drag-dx-px = 0px;
@@ -121,11 +112,6 @@ export component ClipView inherits Rectangle {
                 TimelineViewState.drag-target-track-id = "";
                 TimelineViewState.drag-snap-active = false;
                 TimelineViewState.drag-snap-tick = 0;
-
-                if (final-start != model.timeline-start.value
-                        || target-track != track-id) {
-                    EditorStore.move-clip(track-id, model.id, target-track, final-start);
-                }
             }
         }
 

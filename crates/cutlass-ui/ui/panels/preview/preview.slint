@@ -26,7 +26,7 @@ export component PreviewPanel inherits PanelBase {
 
             HorizontalLayout {
                 Image {
-                    source: PreviewStore.has-frame ? PreviewStore.frame : @image-url("../../../assets/texture.png");
+                    source: PreviewStore.frame;
                     image-fit: ImageFit.contain;
                 }
             }

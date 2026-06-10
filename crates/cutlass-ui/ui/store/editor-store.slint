@@ -1,26 +1,125 @@
-import { Project } from "../models/index.slint";
+import { Project, TrackKind } from "../models/index.slint";
 
-// View model for the open project. Rust sets this once at startup, then
-// patches it after engine commands.
+// Slint-side view model. Demo data for UI work — replaced at runtime once
+// the engine publishes a live projection into `EditorStore.project`.
 export global EditorStore {
+    callback on-slider-changed(value: float);
+
     in-out property <Project> project: {
-        id: "",
-        title: "",
+        id: "1",
+        title: "Project 1",
         sequence: {
-            id: "",
-            name: "",
+            id: "1",
+            name: "Sequence 1",
             fps: { num: 24, den: 1 },
             drop-frame: false,
-            width: 1920px,
-            height: 1080px,
-            tracks: [],
+            width: 1080px,
+            height: 1920px,
+            tracks: [
+                {
+                    id: "1",
+                    name: "V1",
+                    kind: TrackKind.video,
+                    color: #4A6FA5,
+                    clips: [
+                        {
+                            id: "1",
+                            name: "Clip 1",
+                            timeline-start: { value: 10, rate: { num: 24, den: 1 } },
+                            source-range: {
+                                start: { value: 10, rate: { num: 24, den: 1 } },
+                                duration: { value: 100, rate: { num: 24, den: 1 } },
+                            },
+                        }
+                    ],
+                },
+                {
+                    id: "2",
+                    name: "V2",
+                    kind: TrackKind.video,
+                    color: #5E8B7E,
+                    clips: [
+                        {
+                            id: "2",
+                            name: "Clip 2",
+                            timeline-start: { value: 0, rate: { num: 24, den: 1 } },
+                            source-range: {
+                                start: { value: 0, rate: { num: 24, den: 1 } },
+                                duration: { value: 80, rate: { num: 24, den: 1 } },
+                            },
+                        },
+                        {
+                            id: "3",
+                            name: "Clip 3",
+                            timeline-start: { value: 120, rate: { num: 24, den: 1 } },
+                            source-range: {
+                                start: { value: 0, rate: { num: 24, den: 1 } },
+                                duration: { value: 60, rate: { num: 24, den: 1 } },
+                            },
+                        },
+                    ],
+                },
+                {
+                    id: "3",
+                    name: "V3",
+                    kind: TrackKind.video,
+                    color: #6C5B7B,
+                    clips: [
+                        {
+                            id: "4",
+                            name: "Clip 4",
+                            timeline-start: { value: 50, rate: { num: 24, den: 1 } },
+                            source-range: {
+                                start: { value: 0, rate: { num: 24, den: 1 } },
+                                duration: { value: 90, rate: { num: 24, den: 1 } },
+                            },
+                        }
+                    ],
+                },
+                {
+                    id: "4",
+                    name: "A1",
+                    kind: TrackKind.audio,
+                    color: #C99846,
+                    clips: [
+                        {
+                            id: "5",
+                            name: "Clip 5",
+                            timeline-start: { value: 30, rate: { num: 24, den: 1 } },
+                            source-range: {
+                                start: { value: 5, rate: { num: 24, den: 1 } },
+                                duration: { value: 70, rate: { num: 24, den: 1 } },
+                            },
+                        },
+                        {
+                            id: "6",
+                            name: "Clip 6",
+                            timeline-start: { value: 150, rate: { num: 24, den: 1 } },
+                            source-range: {
+                                start: { value: 0, rate: { num: 24, den: 1 } },
+                                duration: { value: 45, rate: { num: 24, den: 1 } },
+                            },
+                        },
+                    ],
+                },
+                {
+                    id: "5",
+                    name: "A2",
+                    kind: TrackKind.audio,
+                    color: #BF6F4A,
+                    clips: [
+                        {
+                            id: "7",
+                            name: "Clip 7",
+                            timeline-start: { value: 0, rate: { num: 24, den: 1 } },
+                            source-range: {
+                                start: { value: 0, rate: { num: 24, den: 1 } },
+                                duration: { value: 200, rate: { num: 24, den: 1 } },
+                            },
+                        }
+                    ],
+                },
+            ],
         },
     };
-
-    callback move-clip(
-        string /* source-track-id */,
-        string /* clip-id */,
-        string /* target-track-id */,
-        int    /* new-start-value */,
-    );
 }
