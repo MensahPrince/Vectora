@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 
 use crate::Map;
@@ -77,6 +79,13 @@ impl Project {
 
     pub fn media_count(&self) -> usize {
         self.media.len()
+    }
+
+    /// Lookup a pool entry by filesystem path (canonical comparison when possible).
+    pub fn find_media_by_path(&self, path: &Path) -> Option<MediaId> {
+        self.media_iter()
+            .find(|m| paths_refer_to_same_file(m.path(), path))
+            .map(|m| m.id)
     }
 
     /// Whether any clip currently references `media_id`.
@@ -391,9 +400,21 @@ impl Project {
     }
 }
 
+fn paths_refer_to_same_file(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
     use crate::clip::Shape;
 
     const R24: Rational = Rational::FPS_24;
@@ -464,6 +485,17 @@ mod tests {
         assert_eq!(durations.len(), 2);
         assert!(durations.contains(&10));
         assert!(durations.contains(&20));
+    }
+
+    #[test]
+    fn find_media_by_path_matches_same_file() {
+        let mut project = Project::new("test", R24);
+        let id = project.add_media(sample_media(R24, 10));
+        assert_eq!(
+            project.find_media_by_path(Path::new("/tmp/sample.mp4")),
+            Some(id)
+        );
+        assert_eq!(project.find_media_by_path(Path::new("/tmp/other.mp4")), None);
     }
 
     #[test]

@@ -33,7 +33,7 @@ fn dispatch_project(
     match command {
         ProjectCommand::Import { path } => {
             let (media, inverse) = import::execute(ctx, &path)?;
-            Ok((ApplyOutcome::Imported { media }, Some(inverse)))
+            Ok((ApplyOutcome::Imported { media }, inverse))
         }
         ProjectCommand::Save { path } => {
             project::save::execute(ctx, path)?;

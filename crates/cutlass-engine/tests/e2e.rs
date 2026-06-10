@@ -167,6 +167,7 @@ fn e2e_multi_import_save_reopen_export() {
         assert_eq!(engine.project().media_count(), 2);
     } else {
         let second = import_asset(&mut engine, &assets[0]);
+        assert_eq!(second, first, "re-import must reuse existing pool entry");
         let second_len = first_len.min(12);
         add_media_clip(
             &mut engine,
@@ -175,7 +176,7 @@ fn e2e_multi_import_save_reopen_export() {
             TimeRange::at_rate(0, second_len, first_rate),
             rt(first_len),
         );
-        assert_eq!(engine.project().media_count(), 2);
+        assert_eq!(engine.project().media_count(), 1);
     }
 
     let expected_frames = engine.project().timeline().duration().value;
@@ -186,7 +187,8 @@ fn e2e_multi_import_save_reopen_export() {
 
     let (_dir2, mut reopened) = temp_engine();
     open_project(&mut reopened, &project_file);
-    assert_eq!(reopened.project().media_count(), 2);
+    let expected_media = if assets.len() >= 2 { 2 } else { 1 };
+    assert_eq!(reopened.project().media_count(), expected_media);
     assert_eq!(reopened.project().timeline().clip_count(), 2);
     assert_eq!(
         reopened.project().timeline().duration().value,

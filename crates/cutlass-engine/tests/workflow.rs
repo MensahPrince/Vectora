@@ -127,3 +127,23 @@ fn import_via_command_from_missing_file_fails_cleanly() {
     assert!(!engine.can_undo());
     assert!(format!("{err}").contains("Open") || format!("{err}").contains("open"));
 }
+
+#[test]
+fn reimport_same_path_returns_existing_media_without_duplicating_pool() {
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let first = import_asset(&mut engine, &path);
+    assert_eq!(engine.project().media_count(), 1);
+    assert!(engine.can_undo());
+
+    let second = import_asset(&mut engine, &path);
+    assert_eq!(first, second);
+    assert_eq!(engine.project().media_count(), 1);
+    assert!(engine.can_undo(), "re-import must not push undo history");
+
+    assert!(engine.undo());
+    assert_eq!(engine.project().media_count(), 0);
+    assert!(engine.project().media(first).is_none());
+}
