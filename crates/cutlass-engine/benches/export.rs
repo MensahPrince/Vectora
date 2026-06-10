@@ -24,6 +24,7 @@ fn engine_with_solid(frames: i64) -> (tempfile::TempDir, Engine) {
         .apply(Command::Edit(EditCommand::AddTrack {
             kind: TrackKind::Video,
             name: "V1".into(),
+            index: None,
         }))
         .expect("track")
     {

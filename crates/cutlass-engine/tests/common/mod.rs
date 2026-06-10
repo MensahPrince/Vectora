@@ -56,6 +56,7 @@ pub fn add_track(engine: &mut Engine, kind: TrackKind, name: &str) -> TrackId {
         .apply(Command::Edit(EditCommand::AddTrack {
             kind,
             name: name.into(),
+            index: None,
         }))
         .expect("add track")
     {

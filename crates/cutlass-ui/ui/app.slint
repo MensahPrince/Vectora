@@ -111,9 +111,8 @@ export component AppWindow inherits Window {
     // also clips children to the panel bounds.
     private property <length> library-ghost-clip-h:
         AppStore.theme.track-lane.clip.height - 5px;
-    // Placeholder until media duration is projected into the Library model.
     private property <length> library-ghost-clip-w:
-        5 * EditorStore.project.sequence.fps.num / EditorStore.project.sequence.fps.den * TimelineStore.zoom * 1px;
+        AppState.library-drag-duration-ticks * TimelineStore.zoom * 1px;
 
     if AppState.library-drag-active: Rectangle {
         width: AppState.library-drag-over-timeline ? root.library-ghost-clip-w : AppState.library-drag-w;

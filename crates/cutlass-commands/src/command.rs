@@ -25,10 +25,13 @@ pub enum ProjectCommand {
 /// A single structured edit against the timeline.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EditCommand {
-    /// Append a track to the timeline stack.
+    /// Add a track to the timeline stack.
     AddTrack {
         kind: TrackKind,
         name: String,
+        /// Stack position (0 = bottom layer, composited first). `None`
+        /// appends to the top of the stack. Clamped to the stack height.
+        index: Option<usize>,
     },
     /// Place a trimmed range of imported media on a track.
     AddClip {

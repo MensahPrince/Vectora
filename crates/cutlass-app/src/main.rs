@@ -209,6 +209,7 @@ fn run() -> Result<(), AnyError> {
     let track_id = match engine.apply(Command::Edit(EditCommand::AddTrack {
         kind: TrackKind::Video,
         name: "V1".into(),
+        index: None,
     }))? {
         ApplyOutcome::Edited(EditOutcome::CreatedTrack(id)) => id,
         other => return Err(format!("add track failed: {other:?}").into()),

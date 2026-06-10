@@ -15,7 +15,7 @@ use std::rc::Rc;
 use cutlass_models::{
     Clip as EngineClip, ClipSource, Generator, MediaSource, Project as EngineProject,
     RationalTime as EngineTime, TimeRange as EngineRange, Track as EngineTrack,
-    TrackKind as EngineKind,
+    TrackKind as EngineKind, resample,
 };
 use slint::{Color, ModelRc, VecModel};
 
@@ -31,10 +31,14 @@ pub fn project_to_slint(project: &EngineProject) -> Project {
     let timeline = project.timeline();
     let (width, height) = canvas_size(project);
 
-    let tracks: Vec<Track> = timeline
+    // The engine stacks bottom→top (last track composites in front); the lane
+    // list shows the stack top-first so the top lane is the front layer, like
+    // CapCut/Premiere. UI row r ↔ engine order index (track_count - 1 - r).
+    let mut tracks: Vec<Track> = timeline
         .tracks_ordered()
         .map(|track| track_to_slint(project, track))
         .collect();
+    tracks.reverse();
 
     let id = project.id.raw().to_string();
 
@@ -57,18 +61,23 @@ pub fn project_to_slint(project: &EngineProject) -> Project {
 /// The media pool as Library bin entries, ordered by id (the engine's pool is a
 /// hash map, so a stable sort keeps tile order from jumping between imports).
 fn media_pool(project: &EngineProject) -> Vec<Media> {
+    let tl_rate = project.timeline().frame_rate;
     let mut sources: Vec<&MediaSource> = project.media_iter().collect();
     sources.sort_by_key(|media| media.id.raw());
-    sources.into_iter().map(media_to_slint).collect()
+    sources
+        .into_iter()
+        .map(|media| media_to_slint(media, tl_rate))
+        .collect()
 }
 
-fn media_to_slint(media: &MediaSource) -> Media {
+fn media_to_slint(media: &MediaSource, tl_rate: cutlass_models::Rational) -> Media {
     Media {
         id: media.id.raw().to_string().into(),
         name: media_name(media).into(),
         width: media.width as i32,
         height: media.height as i32,
         has_audio: media.has_audio,
+        duration_ticks: clamp_i32(resample(media.duration, tl_rate).value),
     }
 }
 

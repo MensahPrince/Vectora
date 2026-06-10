@@ -60,6 +60,7 @@ fn engine_with_solid_clip(frames: i64) -> (tempfile::TempDir, Engine) {
         .apply(Command::Edit(EditCommand::AddTrack {
             kind: TrackKind::Video,
             name: "V1".into(),
+            index: None,
         }))
         .expect("track")
     {
@@ -100,6 +101,7 @@ fn engine_with_media(path: &Path, source_frames: i64) -> (tempfile::TempDir, Eng
         .apply(Command::Edit(EditCommand::AddTrack {
             kind: TrackKind::Video,
             name: "V1".into(),
+            index: None,
         }))
         .expect("track")
     {

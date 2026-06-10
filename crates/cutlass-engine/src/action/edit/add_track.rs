@@ -16,8 +16,12 @@ pub fn execute(
     ctx: &mut ApplyContext<'_>,
     kind: TrackKind,
     name: impl Into<String>,
+    index: Option<usize>,
 ) -> Result<(TrackId, Box<dyn EditAction>), EngineError> {
-    let id = ctx.project.add_track(kind, name);
+    let id = match index {
+        Some(order_index) => ctx.project.insert_track(kind, name, order_index),
+        None => ctx.project.add_track(kind, name),
+    };
     Ok((id, Box::new(RemoveTrackAction { track_id: id })))
 }
 

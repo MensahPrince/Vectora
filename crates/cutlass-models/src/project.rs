@@ -121,6 +121,17 @@ impl Project {
         self.timeline.add_track(Track::new(kind, name))
     }
 
+    /// Convenience: create a track at `order_index` in the stack (0 = bottom
+    /// layer; clamped), returning its [`TrackId`].
+    pub fn insert_track(
+        &mut self,
+        kind: TrackKind,
+        name: impl Into<String>,
+        order_index: usize,
+    ) -> TrackId {
+        self.timeline.insert_track(Track::new(kind, name), order_index)
+    }
+
     /// Place a clip referencing `media_id` on `track_id`.
     ///
     /// The clip's timeline duration is resampled from the source rate to the

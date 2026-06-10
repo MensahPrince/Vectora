@@ -119,6 +119,9 @@ export struct Media {
     width: int,
     height: int,
     has-audio: bool,
+    // Full length of the source, resampled to sequence-rate ticks. Drives the
+    // drag ghost width and the default placement length when dropped.
+    duration-ticks: int,
 }
 
 @rust-attr(derive(serde::Serialize, serde::Deserialize))

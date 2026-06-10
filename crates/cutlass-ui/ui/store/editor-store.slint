@@ -9,6 +9,13 @@ import { Project } from "../models/index.slint";
 export global EditorStore {
     callback on-slider-changed(value: float);
     callback on-import-clicked();
+    // A library tile was dropped on the timeline. `track-id` is the video lane
+    // under the cursor, or empty when there is none — the engine then creates
+    // a new video track at `drop-row` (the lane-list row under the cursor; may
+    // be out of range, meaning above/below the existing lanes). Drops that
+    // overlap clips on the targeted lane slide right into the first gap that
+    // fits.
+    callback on-clip-dropped(media-id: string, track-id: string, start-tick: int, drop-row: int);
 
     in-out property <Project> project: {
         id: "",

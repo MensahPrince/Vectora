@@ -46,6 +46,16 @@ impl Timeline {
         id
     }
 
+    /// Insert a track at `order_index` in the stack (0 = bottom layer),
+    /// clamped to the current stack height. Returns its [`TrackId`].
+    pub fn insert_track(&mut self, track: Track, order_index: usize) -> TrackId {
+        let id = track.id;
+        self.tracks.insert(id, track);
+        let idx = order_index.min(self.order.len());
+        self.order.insert(idx, id);
+        id
+    }
+
     pub fn track(&self, id: TrackId) -> Option<&Track> {
         self.tracks.get(&id)
     }
@@ -220,6 +230,20 @@ mod tests {
         assert_eq!(timeline.track_count(), 3);
         assert_eq!(timeline.track(v1).unwrap().name, "V1");
         assert_eq!(timeline.track(a1).unwrap().kind, TrackKind::Audio);
+    }
+
+    #[test]
+    fn insert_track_places_at_order_index_and_clamps() {
+        let mut timeline = Timeline::new(R24);
+        let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
+        let v2 = timeline.add_track(Track::new(TrackKind::Video, "V2"));
+
+        let bottom = timeline.insert_track(Track::new(TrackKind::Video, "V3"), 0);
+        let middle = timeline.insert_track(Track::new(TrackKind::Video, "V4"), 2);
+        let top = timeline.insert_track(Track::new(TrackKind::Video, "V5"), 99);
+
+        assert_eq!(timeline.order(), &[bottom, v1, middle, v2, top]);
+        assert_eq!(timeline.track_count(), 5);
     }
 
     #[test]

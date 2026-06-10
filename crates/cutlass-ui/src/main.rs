@@ -72,6 +72,16 @@ fn main() -> Result<(), slint::PlatformError> {
         frame_handle.request_frame(slider_to_timeline_tick(value, duration_ticks));
     });
 
+    let drop_handle = preview_worker.handle();
+    editor.on_on_clip_dropped(move |media_id, track_id, start_tick, drop_row| {
+        drop_handle.add_clip(
+            media_id.to_string(),
+            track_id.to_string(),
+            i64::from(start_tick),
+            i64::from(drop_row),
+        );
+    });
+
     let import_handle = preview_worker.handle();
     editor.on_on_import_clicked(move || {
         // Native picker is modal and must run on the main thread — which is

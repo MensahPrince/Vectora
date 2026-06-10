@@ -6,6 +6,10 @@ export global AppState {
 
     // Window-space ghost while dragging a library tile onto the timeline.
     in-out property <bool> library-drag-active: false;
+    // Identity + length (sequence ticks) of the media being dragged — set at
+    // press, consumed by the timeline's drop handler.
+    in-out property <string> library-drag-media-id: "";
+    in-out property <int> library-drag-duration-ticks: 0;
     in-out property <length> library-drag-w: 0px;
     in-out property <length> library-drag-h: 0px;
     // Cursor offset within the library tile at press — used to anchor the square ghost.

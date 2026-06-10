@@ -12,8 +12,9 @@ import { TrackHead } from "track-head.slint";
 import { Ruler } from "ruler.slint";
 import { ClipView } from "clip.slint";
 import { TimelineViewState } from "state.slint";
-import { Sequence } from "../../models/index.slint";
+import { Sequence, TrackKind } from "../../models/index.slint";
 import { TimelineLib } from "../../lib/timeline-lib.slint";
+import { DragBackend, SnapResult } from "../../lib/drag-backend.slint";
 import { AppState } from "../../state.slint";
 
 
@@ -27,20 +28,73 @@ component ForceHeadSpace inherits Rectangle {
 
 export component TimelinePanel inherits PanelBase {
 
-    // True while a library tile is being dragged and the cursor is inside this
-    // panel. The drag's TouchArea holds the pointer grab, so we never receive
-    // pointer events here — instead hit-test the cursor in window space.
-    private property <bool> library-drag-over:
-        AppState.library-drag-active
-        && AppState.library-drag-cursor-x >= self.absolute-position.x
+    // The drag's TouchArea holds the pointer grab, so we never receive pointer
+    // events here — instead hit-test the cursor in window space.
+    private property <bool> library-cursor-inside:
+        AppState.library-drag-cursor-x >= self.absolute-position.x
         && AppState.library-drag-cursor-x < self.absolute-position.x + self.width
         && AppState.library-drag-cursor-y >= self.absolute-position.y
         && AppState.library-drag-cursor-y < self.absolute-position.y + self.height;
 
-    // Mirror into AppState so the library's pointer-up handler (which owns the
-    // drop) and the ghost can react.
+    // True while a library tile is being dragged and the cursor is inside this
+    // panel.
+    private property <bool> library-drag-over:
+        AppState.library-drag-active && self.library-cursor-inside;
+
+    // Mirror into AppState so the ghost can react.
     changed library-drag-over => {
         AppState.library-drag-over-timeline = self.library-drag-over;
+    }
+
+    // --- library drop targeting --------------------------------------------
+    // All lazy: nothing reads these per drag frame; the drop handler below
+    // pulls them once when the drag ends.
+
+    // Cursor x in lane-content space → sequence tick (scroll-x is the
+    // Flickable viewport-x, ≤ 0 when scrolled right).
+    private property <int> library-drop-cursor-tick: max(0, round(
+        (AppState.library-drag-cursor-x - lanes.absolute-position.x - TimelineViewState.scroll-x)
+        / TimelineStore.zoom / 1px));
+
+    // Magnet against clip edges and tick 0, ~10px of slack. Empty drag ids ⇒
+    // every placed clip is a snap candidate.
+    private property <SnapResult> library-drop-snap: DragBackend.snap-clip-start(
+        root.sequence,
+        "",
+        "",
+        root.library-drop-cursor-tick,
+        AppState.library-drag-duration-ticks,
+        max(1, round(10 / TimelineStore.zoom)));
+
+    private property <int> library-drop-tick: max(0, library-drop-snap.snapped-start-value);
+
+    // Lane row under the cursor: row 0 is the ForceHeadSpace spacer, tracks
+    // start at row 1 (same pitch — every row is track-height + spacing tall).
+    private property <int> library-drop-row: floor(
+        (AppState.library-drag-cursor-y - lanes.absolute-position.y - TimelineViewState.scroll-y)
+        / (root.track-height + root.track-spacing)) - 1;
+
+    // Video lane under the cursor, or empty (the engine then creates a new
+    // video track for the drop).
+    private property <string> library-drop-track-id:
+        library-drop-row >= 0
+        && library-drop-row < sequence.tracks.length
+        && sequence.tracks[library-drop-row].kind == TrackKind.video
+            ? sequence.tracks[library-drop-row].id
+            : "";
+
+    // Commit the drop when the drag ends with the cursor over this panel. The
+    // pointer-up fires in the library tile's TouchArea (it owns the grab), so
+    // watch the shared drag flag instead of a pointer event.
+    private property <bool> library-drag-live: AppState.library-drag-active;
+    changed library-drag-live => {
+        if (!self.library-drag-live && self.library-cursor-inside) {
+            EditorStore.on-clip-dropped(
+                AppState.library-drag-media-id,
+                self.library-drop-track-id,
+                self.library-drop-tick,
+                self.library-drop-row);
+        }
     }
 
     private property <length> track-spacing: AppStore.theme.metrics.spacing.sm;
@@ -137,7 +191,7 @@ export component TimelinePanel inherits PanelBase {
                 }
             }
 
-            Flickable {
+            lanes := Flickable {
                 interactive: false;
                 viewport-width: max(content-width, self.width);
                 viewport-height: max(self.height, content-height);

@@ -55,6 +55,8 @@ export component LibraryPanel inherits PanelBase {
 
                     pointer-event(event) => {
                         if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                            AppState.library-drag-media-id = m.id;
+                            AppState.library-drag-duration-ticks = m.duration-ticks;
                             AppState.library-drag-w = parent.width;
                             AppState.library-drag-h = parent.height;
                             AppState.library-drag-tile-anchor-x = self.mouse-x;
