@@ -1278,6 +1278,7 @@ dependencies = [
 name = "cutlass-ui"
 version = "0.1.0"
 dependencies = [
+ "crossbeam-channel",
  "cutlass-commands",
  "cutlass-engine",
  "cutlass-models",
@@ -1285,6 +1286,7 @@ dependencies = [
  "serde_json",
  "slint",
  "slint-build",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

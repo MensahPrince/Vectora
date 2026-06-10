@@ -5,7 +5,7 @@
 // bar that auto-hides after mouse idle (CapCut-style).
 import { AppState } from "state.slint";
 import { AppStore } from "store/index.slint";
-import { EditorStore } from "store/index.slint";
+import { EditorStore, PreviewStore, TimelineStore } from "store/index.slint";
 import { TimelineLib } from "lib/timeline-lib.slint";
 import { RationalTime } from "models/index.slint";
 import { Slider } from "std-widgets.slint";
@@ -78,7 +78,7 @@ export component FullscreenPreview inherits Rectangle {
         Image {
             width: parent.width;
             height: parent.height;
-            source: @image-url("../assets/texture.png");
+            source: PreviewStore.has-frame ? PreviewStore.frame : @image-url("../assets/texture.png");
             image-fit: ImageFit.contain;
         }
 
@@ -137,7 +137,7 @@ export component FullscreenPreview inherits Rectangle {
 
         Text {
             text: TimelineLib.format-timecode(
-                0,
+                TimelineStore.playhead-tick,
                 EditorStore.project.sequence.fps.num,
                 EditorStore.project.sequence.fps.den,
                 EditorStore.project.sequence.drop-frame,

@@ -9,4 +9,14 @@
 export global TimelineStore {
     // Timeline projection scale: 1 tick == `zoom` logical pixels.
     in-out property <float> zoom: 3;
+
+    // Current position in timeline ticks at the sequence frame rate.
+    // Written by ruler/lane scrub; read by the playhead overlay and preview.
+    in-out property <int> playhead-tick: 0;
+
+    callback playhead-changed(int);
+
+    changed playhead-tick => {
+        root.playhead-changed(root.playhead-tick);
+    }
 }

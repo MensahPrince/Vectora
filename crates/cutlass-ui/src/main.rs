@@ -1,22 +1,26 @@
-mod command;
-mod models;
+mod bootstrap;
+mod ids;
+mod palette;
 mod projector;
 mod ruler;
+mod session;
 mod snap;
-mod state;
+mod snapshot;
 mod timecode;
 mod timeline;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use slint::ComponentHandle;
 use slint::SharedString;
 use slint::BackendSelector;
 use slint::wgpu_28::WGPUConfiguration;
 use tracing_subscriber::EnvFilter;
 
-use crate::command::Command;
-use crate::state::Editor;
+use crate::projector::Projector;
+use crate::session::{EngineEvent, EngineHandle, drain_events, install_event_pump};
+use crate::snapshot::ProjectSnapshot;
 
 slint::include_modules!();
 
@@ -30,45 +34,82 @@ fn setup_tracing() {
 
 fn main() -> Result<(), slint::PlatformError> {
     setup_tracing();
-    cutlass_engine::init();
     BackendSelector::new()
         .require_wgpu_28(WGPUConfiguration::default())
         .select()?;
 
     let app = AppWindow::new()?;
+    let engine = Rc::new(EngineHandle::spawn());
+    let frame_generation = Rc::new(Cell::new(0u64));
 
-    // The Editor is the only thing in the program allowed to mutate
-    // the project. Slint never writes to `EditorStore.project`; UI
-    // gestures dispatch commands through callbacks like `move-clip`
-    // below, the Editor applies them to the domain model, and the
-    // projector patches the matching row in the Slint projection.
-    let editor = Rc::new(RefCell::new(Editor::new(models::sample_project())));
+    let initial_snapshot = loop {
+        match engine.events.recv() {
+            Ok(EngineEvent::Project(snapshot)) => break snapshot,
+            Ok(EngineEvent::MoveRejected(msg)) => {
+                eprintln!("engine bootstrap error: {msg}");
+            }
+            Ok(EngineEvent::Frame(_))
+            | Ok(EngineEvent::ClipMoved { .. })
+            | Ok(EngineEvent::ClipTransferred { .. }) => {}
+            Err(_) => {
+                eprintln!("engine thread exited before publishing a project");
+                break ProjectSnapshot::from_engine(&cutlass_models::Project::new(
+                    "empty",
+                    cutlass_models::Rational::FPS_24,
+                ));
+            }
+        }
+    };
 
-    // One-shot hand-off of the projection to Slint. After this, the
-    // projector keeps the underlying `VecModel`s alive and writes
-    // into them in place; we never set `project` again.
+    let projector = Rc::new(RefCell::new(Projector::from_snapshot(&initial_snapshot)));
     app.global::<EditorStore>()
-        .set_project(editor.borrow().slint_project().clone());
+        .set_project(projector.borrow().slint_project().clone());
+
+    let generation = frame_generation.get() + 1;
+    frame_generation.set(generation);
+    engine.request_frame(0, generation);
+
+    install_event_pump(
+        &app,
+        engine.clone(),
+        projector.clone(),
+        frame_generation.clone(),
+    );
 
     {
-        let editor = editor.clone();
+        let engine = engine.clone();
+        let frame_generation = frame_generation.clone();
+        let weak = app.as_weak();
+        let projector = projector.clone();
+        app.global::<TimelineStore>().on_playhead_changed(move |tick| {
+            let generation = frame_generation.get() + 1;
+            frame_generation.set(generation);
+            engine.request_frame(tick, generation);
+            if let Some(app) = weak.upgrade() {
+                let mut last = 0u64;
+                drain_events(&engine, &app, &projector, &mut last);
+            }
+        });
+    }
+
+    {
+        let engine = engine.clone();
+        let weak = app.as_weak();
+        let projector = projector.clone();
         app.global::<EditorStore>().on_move_clip(
             move |source_track_id: SharedString,
                   clip_id: SharedString,
                   target_track_id: SharedString,
                   new_start_value: i32| {
-                let cmd = Command::MoveClip {
-                    source_track_id: source_track_id.into(),
-                    clip_id: clip_id.into(),
-                    target_track_id: target_track_id.into(),
+                engine.move_clip(
+                    source_track_id.as_str(),
+                    clip_id.as_str(),
+                    target_track_id.as_str(),
                     new_start_value,
-                };
-                if let Err(err) = editor.borrow_mut().apply(&cmd) {
-                    // The gesture layer can produce ids that no
-                    // longer exist (e.g. the clip was deleted by
-                    // another command mid-drag) — log and drop, never
-                    // panic on UI input.
-                    eprintln!("move-clip rejected: {err}");
+                );
+                if let Some(app) = weak.upgrade() {
+                    let mut last = 0u64;
+                    drain_events(&engine, &app, &projector, &mut last);
                 }
             },
         );
@@ -98,56 +139,42 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
-    {
-        // Snap-clip-start handler — re-invoked by Slint every drag
-        // frame. Borrows the domain project read-only; the gesture
-        // layer never calls this while a command is in-flight, but
-        // a stray re-entry would surface as a `RefCell` panic, which
-        // is loud enough to be noticed in debug.
-        let editor = editor.clone();
-        app.global::<DragBackend>().on_snap_clip_start(
-            move |dragging_source_track_id: SharedString,
-                  dragging_clip_id: SharedString,
-                  cursor_start_value: i32,
-                  clip_duration_ticks: i32,
-                  snap_threshold_ticks: i32| {
-                let editor = editor.borrow();
-                let r = snap::compute_drag_snap(
-                    editor.project(),
-                    dragging_source_track_id.as_str(),
-                    dragging_clip_id.as_str(),
-                    cursor_start_value,
-                    clip_duration_ticks,
-                    snap_threshold_ticks,
-                );
-                SnapResult {
-                    has_snap: r.has_snap,
-                    snapped_start_value: r.snapped_start_value,
-                    snap_line_tick: r.snap_line_tick,
-                }
-            },
-        );
-    }
+    app.global::<DragBackend>().on_snap_clip_start(
+        |sequence,
+         dragging_source_track_id,
+         dragging_clip_id,
+         cursor_start_value,
+         clip_duration_ticks,
+         snap_threshold_ticks| {
+            let r = snap::compute_drag_snap(
+                sequence,
+                dragging_source_track_id.as_str(),
+                dragging_clip_id.as_str(),
+                cursor_start_value,
+                clip_duration_ticks,
+                snap_threshold_ticks,
+            );
+            SnapResult {
+                has_snap: r.has_snap,
+                snapped_start_value: r.snapped_start_value,
+                snap_line_tick: r.snap_line_tick,
+            }
+        },
+    );
 
-    {
-        // Resolve-target-lane handler — also a hot per-frame call
-        // during drag. Same read-only borrow rules as snap above.
-        let editor = editor.clone();
-        app.global::<DragBackend>().on_resolve_target_lane(
-            move |source_track_id: SharedString, lane_offset: i32| {
-                let editor = editor.borrow();
-                let r = snap::resolve_drag_target(
-                    editor.project(),
-                    source_track_id.as_str(),
-                    lane_offset,
-                );
-                ResolvedTarget {
-                    track_id: SharedString::from(r.track_id),
-                    clamped_offset: r.clamped_offset,
-                }
-            },
-        );
-    }
+    app.global::<DragBackend>().on_resolve_target_lane(
+        |sequence, source_track_id, lane_offset| {
+            let r = snap::resolve_drag_target(
+                sequence,
+                source_track_id.as_str(),
+                lane_offset,
+            );
+            ResolvedTarget {
+                track_id: r.track_id,
+                clamped_offset: r.clamped_offset,
+            }
+        },
+    );
 
     app.run()
 }

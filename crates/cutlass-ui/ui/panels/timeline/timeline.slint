@@ -79,11 +79,9 @@ export component TimelinePanel inherits PanelBase {
 
             Rectangle { // ruler container — clip so ticks that scroll into the head column are hidden.
                 clip: true;
-                // The Ruler itself does *not* translate with scroll. It
-                // stays at x=0 inside this container and reads scroll-x
-                // internally to compute viewport-local tick positions.
-                // See `ruler.slint` for the coordinate model.
-                Ruler { }
+                Ruler {
+                    content-width: root.content-width;
+                }
             }
         }
 
@@ -182,6 +180,15 @@ export component TimelinePanel inherits PanelBase {
                     height: content-height;
                     background: AppStore.theme.text.primary;
                     opacity: 0.85;
+                }
+
+                // Playhead line — content-space x; scrolls with the lanes.
+                Rectangle {
+                    x: TimelineStore.playhead-tick * TimelineStore.zoom * 1px;
+                    y: 0;
+                    width: 1px;
+                    height: max(parent.height, content-height);
+                    background: #ffffff;
                 }
             }
         }

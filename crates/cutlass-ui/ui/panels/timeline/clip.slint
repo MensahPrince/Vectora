@@ -1,21 +1,17 @@
-import { AppStore, EditorStore } from "../../store/index.slint";
+import { AppStore } from "../../store/index.slint";
+import { EditorStore } from "../../store/editor-store.slint";
 import { Clip, TrackKind } from "../../models/index.slint";
 import { TimelineLib, DragBackend, SnapResult, ResolvedTarget } from "../../lib/index.slint";
 import { TimelineStore } from "../../store/timeline-store.slint";
 import { TimelineViewState } from "state.slint";
 
 // View for a single Clip on a TrackLane. Positions itself within the
-// lane based on the model's `timeline-start` (committed domain state)
-// plus an in-flight pixel offset from `TimelineViewState.drag-dx-px`
-// while this clip is being dragged.
+// lane based on the model's `timeline-start` plus an in-flight pixel
+// offset from `TimelineViewState.drag-dx-px` while this clip is being
+// dragged.
 //
-// IMPORTANT: this view never mutates the clip model. The drag updates
-// only ephemeral view state; on release we dispatch ONE `move-clip`
-// command (which Rust converts into the appropriate intra-lane,
-// cross-lane, or new-lane edit) and clear the drag fields. Rust
-// applies the command, patches the Slint projection in place, and
-// the clip re-renders at its new committed position with no further
-// work here.
+// Drag updates only ephemeral view state. On release the clip returns
+// to its committed position until the engine handles move commands.
 //
 // Note: input is named `model` (not `clip`) because `clip` is a
 // built-in boolean property on Slint visual elements.
@@ -25,7 +21,7 @@ export component ClipView inherits Rectangle {
     in property <TrackKind> track-kind;
     // Per-lane clip color. Single source of truth for what color a
     // clip renders in is its owning lane — so a clip changes color
-    // the instant a move-clip command lands it on a different lane.
+    // the instant a move lands it on a different lane.
     in property <color> track-color;
     // Row index of THIS clip's lane in the sequence's `track-order`.
     // Used together with `lane-pitch-px` to translate the cursor's
@@ -87,9 +83,7 @@ export component ClipView inherits Rectangle {
         //   move    → accumulate (dx, dy) in view state, ask Rust for
         //             snap result, compute target lane index — all
         //             without mutating any domain state
-        //   release → dispatch ONE `EditorStore.move-clip` command
-        //             with (source, clip, target, snapped-start) and
-        //             clear drag state
+        //   release → dispatch move-clip to the engine via EditorStore.
         //
         // Why this shape:
         //   * Dragging through view state keeps the per-frame work to
@@ -111,9 +105,6 @@ export component ClipView inherits Rectangle {
                 TimelineViewState.drag-snap-tick = 0;
                 TimelineViewState.drag-snapped-start-value = model.timeline-start.value;
             } else if (is-active-drag) {
-                // Compose the release args. `drag-snap-active` already
-                // captured the snapped start; if no snap fired this
-                // frame, fall back to the cursor-derived value.
                 let cursor-start: int =
                     round((base-x + TimelineViewState.drag-dx-px) / (1px * zoom));
                 let final-start: int = TimelineViewState.drag-snap-active
@@ -123,8 +114,6 @@ export component ClipView inherits Rectangle {
                     ? TimelineViewState.drag-target-track-id
                     : track-id;
 
-                // Capture before clearing — the clear triggers a
-                // re-render that depends on these.
                 TimelineViewState.dragging-source-track-id = "";
                 TimelineViewState.dragging-clip-id = "";
                 TimelineViewState.drag-dx-px = 0px;
@@ -133,9 +122,6 @@ export component ClipView inherits Rectangle {
                 TimelineViewState.drag-snap-active = false;
                 TimelineViewState.drag-snap-tick = 0;
 
-                // Dispatch only if anything actually changed —
-                // tap-without-drag is common and shouldn't emit a
-                // command.
                 if (final-start != model.timeline-start.value
                         || target-track != track-id) {
                     EditorStore.move-clip(track-id, model.id, target-track, final-start);
@@ -166,7 +152,7 @@ export component ClipView inherits Rectangle {
             // cross the video/audio boundary.
             let raw-lane-offset: int = round(TimelineViewState.drag-dy-px / lane-pitch-px);
             let target: ResolvedTarget =
-                DragBackend.resolve-target-lane(track-id, raw-lane-offset);
+                DragBackend.resolve-target-lane(EditorStore.project.sequence, track-id, raw-lane-offset);
             TimelineViewState.drag-target-track-id = target.track-id;
             if (target.clamped-offset != raw-lane-offset) {
                 // Drag tried to go past a kind boundary — clamp the
@@ -188,6 +174,7 @@ export component ClipView inherits Rectangle {
             let snap-threshold-ticks: int =
                 max(1, round(snap-threshold-px / (1px * zoom)));
             let snap: SnapResult = DragBackend.snap-clip-start(
+                EditorStore.project.sequence,
                 track-id,
                 model.id,
                 cursor-start,

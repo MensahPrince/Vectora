@@ -12,11 +12,8 @@ import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
 //   * The view shows the dragged clip at its committed
 //     (`timeline-start`, source lane) offset by `drag-dx-px` /
 //     `drag-dy-px` while a drag is in progress.
-//   * The gesture layer dispatches exactly one
-//     `EditorStore.move-clip` command on release with
-//     `(source-track-id, clip-id, target-track-id, new-start-value)`.
-//     Rust applies its collision / new-lane policy in that single
-//     command — the UI never has to encode the policy.
+//   * On release the drag offsets are cleared; the clip returns to its
+//     committed position until the engine handles edit commands.
 //
 // Domain timeline state (zoom, playhead, selection, marks, …) lives
 // in `TimelineStore` (`ui/store/timeline-store.slint`).
@@ -60,7 +57,7 @@ export global TimelineViewState {
     // Populated by `DragBackend.snap-clip-start` on every drag frame.
     // When `drag-snap-active` is true, the timeline overlays a thin
     // vertical guide at `drag-snap-tick * zoom`. The snapped start
-    // value is what gets sent in the release command.
+    // value is what would be committed once the engine is wired.
     in-out property <bool> drag-snap-active: false;
     in-out property <int> drag-snap-tick: 0;
     in-out property <int> drag-snapped-start-value: 0;

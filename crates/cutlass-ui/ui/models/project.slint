@@ -65,8 +65,6 @@ export struct Clip {
 
 // Drives the "audio always at the bottom" lane invariant and the
 // gesture-layer rule that a clip can only land on a same-kind lane.
-// Mirrored as `crate::models::TrackKind` on the Rust side; the
-// projector converts between the two.
 @rust-attr(derive(serde::Serialize, serde::Deserialize))
 export enum TrackKind {
     video,
