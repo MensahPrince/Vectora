@@ -30,6 +30,13 @@ cargo build --release -p cutlass-ui
 smoke tests — distributed builds must bundle FFmpeg or users on machines
 without Homebrew will fail to launch.
 
+### macOS Gatekeeper (alpha)
+
+Release zips are **adhoc-signed**, not notarized. Double-click may do nothing
+until the user right-clicks `Cutlass.app` → **Open** once. The zip includes
+`INSTALL-macos.txt` with full steps. Proper fix for a stable channel is Apple
+Developer ID signing + notarization in CI.
+
 ## GitHub release
 
 Push a tag to trigger `.github/workflows/release.yml`:

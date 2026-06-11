@@ -29,7 +29,7 @@ features, and no project compatibility guarantees yet.
 
 | Platform | Artifact |
 | --- | --- |
-| macOS (Apple Silicon) | `Cutlass-*-macos-arm64.zip` — unzip, drag `Cutlass.app` to Applications |
+| macOS (Apple Silicon) | `Cutlass-*-macos-arm64.zip` — unzip, drag `Cutlass.app` to Applications. **First launch:** right-click → Open (not notarized). See `INSTALL-macos.txt`. |
 | Linux (x86_64) | `Cutlass-*-linux-x86_64.tar.gz` — extract and run `./cutlass-ui`; requires FFmpeg |
 
 macOS builds bundle FFmpeg. Linux builds expect FFmpeg shared libraries on the

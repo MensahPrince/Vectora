@@ -77,7 +77,7 @@ Prebuilt **alpha** builds are published on [GitHub Releases](https://github.com/
 
 | Platform | Install |
 | --- | --- |
-| **macOS** (Apple Silicon) | Download `Cutlass-*-macos-arm64.zip`, unzip, drag `Cutlass.app` to Applications. FFmpeg is bundled. |
+| **macOS** (Apple Silicon) | Download `Cutlass-*-macos-arm64.zip`, unzip, drag `Cutlass.app` to Applications. **First launch:** right-click `Cutlass.app` → **Open** (alpha builds are not notarized). See `INSTALL-macos.txt` in the zip. FFmpeg is bundled. |
 | **Linux** (x86_64) | Download `Cutlass-*-linux-x86_64.tar.gz`, extract, run `./cutlass-ui`. Install FFmpeg dev/runtime libs first (see `README-INSTALL.txt` in the archive). |
 
 Maintainers: see [packaging/README.md](packaging/README.md) for local build scripts and the release workflow.

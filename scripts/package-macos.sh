@@ -79,9 +79,25 @@ if [[ "$BUNDLE_FFMPEG" -eq 1 ]]; then
         -p @executable_path/../Frameworks/
 fi
 
+# Adhoc-sign the full bundle so Launch Services can validate nested Frameworks.
+echo "==> adhoc-signing app bundle"
+codesign --force --deep --sign - "$APP"
+codesign --verify --deep --strict "$APP"
+
+RELEASE="$STAGING/release"
+rm -rf "$RELEASE"
+mkdir -p "$RELEASE"
+ditto "$APP" "$RELEASE/$APP_NAME"
+cp packaging/macos/INSTALL.txt "$RELEASE/INSTALL-macos.txt"
+
 ZIP="$DIST/Cutlass-${VERSION}-macos-${ARCH}.zip"
 rm -f "$ZIP"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+(
+    cd "$RELEASE"
+    # zip -y preserves symlinks inside the .app Frameworks tree.
+    zip -r -y "$ROOT/$ZIP" "$APP_NAME" INSTALL-macos.txt
+)
 
 echo "==> wrote $ZIP ($(du -h "$ZIP" | awk '{print $1}'))"
-echo "    install: unzip and drag Cutlass.app to /Applications"
+echo "    install: unzip, read INSTALL-macos.txt, drag Cutlass.app to /Applications"
+echo "    first launch: Right-click Cutlass.app → Open (Gatekeeper; not notarized yet)"
