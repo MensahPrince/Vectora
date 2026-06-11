@@ -1,5 +1,4 @@
 import {
-    CutlassText,
     HSplitGripLead,
     HSplitGripTrail,
     VSplitGripTimeline,
@@ -13,6 +12,7 @@ import {
 import { AppStore, EditorStore, TimelineStore, TimelineActions } from "store/index.slint";
 import { AppState } from "state.slint";
 import { FullscreenPreview } from "fullscreen-preview.slint";
+import { TitleBar } from "shell/title-bar.slint";
 
 // Re-export globals so Slint's codegen generates accessors on `AppWindow`.
 // Slint only exposes globals from the entry file's exports to the host
@@ -36,9 +36,15 @@ export { SelectionBackend, SelectionUpdate }from "lib/selection-backend.slint";
 export { InspectorBackend, SelectedClipInfo }from "lib/inspector-backend.slint";
 export { StripBackend, StripTile }from "lib/strip-backend.slint";
 export { TransportBackend }from "lib/transport-backend.slint";
+export { WindowBackend }from "lib/window-backend.slint";
 
 export component AppWindow inherits Window {
     title: "Cutlass";
+
+    // Frameless shell: the TitleBar below replaces the OS decorations
+    // (drag region, minimize/maximize/close) — wired to winit in
+    // src/main.rs through WindowBackend.
+    no-frame: true;
 
     preferred-width: 1280px;
     preferred-height: 800px;
@@ -192,56 +198,56 @@ export component AppWindow inherits Window {
         }
 
         if !AppState.preview-maximized: VerticalLayout {
-            padding: AppStore.theme.metrics.spacing.sm;
             spacing: AppStore.theme.metrics.spacing.none;
 
-            Rectangle {
-                height: 40px;
-                background: AppStore.theme.surface.app-background;
-                CutlassText {
-                    text: "Cutlass Head";
-                    style: AppStore.theme.typography.label;
-                }
-            }
+            // Edge-to-edge so the drag region reaches the window borders —
+            // the panel padding below must not shrink the grabbable strip.
+            TitleBar { }
 
-            HorizontalLayout {
-                vertical-stretch: 1;
-                horizontal-stretch: 1;
+            VerticalLayout {
+                padding: AppStore.theme.metrics.spacing.sm;
+                padding-top: AppStore.theme.metrics.spacing.none;
                 spacing: AppStore.theme.metrics.spacing.none;
 
-                LibraryPanel {
-                    width: root.left-pane-width;
-                    vertical-stretch: 1;
-                }
-
-                HSplitGripLead {
-                    pane-width <=> root.left-pane-width;
-                    vertical-stretch: 1;
-                }
-
-                PreviewPanel {
+                HorizontalLayout {
                     vertical-stretch: 1;
                     horizontal-stretch: 1;
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    LibraryPanel {
+                        width: root.left-pane-width;
+                        vertical-stretch: 1;
+                    }
+
+                    HSplitGripLead {
+                        pane-width <=> root.left-pane-width;
+                        vertical-stretch: 1;
+                    }
+
+                    PreviewPanel {
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+                    }
+
+                    HSplitGripTrail {
+                        pane-width <=> root.right-pane-width;
+                        vertical-stretch: 1;
+                    }
+
+                    InspectorPanel {
+                        width: root.right-pane-width;
+                        vertical-stretch: 1;
+                    }
                 }
 
-                HSplitGripTrail {
-                    pane-width <=> root.right-pane-width;
-                    vertical-stretch: 1;
+                VSplitGripTimeline {
+                    timeline-height <=> root.timeline-height;
                 }
 
-                InspectorPanel {
-                    width: root.right-pane-width;
-                    vertical-stretch: 1;
+                TimelinePanel {
+                    height: root.timeline-height;
+                    horizontal-stretch: 1;
                 }
-            }
-
-            VSplitGripTimeline {
-                timeline-height <=> root.timeline-height;
-            }
-
-            TimelinePanel {
-                height: root.timeline-height;
-                horizontal-stretch: 1;
             }
         }
     }

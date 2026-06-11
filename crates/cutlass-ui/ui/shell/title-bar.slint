@@ -1,0 +1,179 @@
+// Frameless-window title bar (CapCut layout): brand at the left, project
+// title centered, Export and the window controls at the right. The whole
+// strip doubles as the OS drag region — press-and-move anywhere that isn't
+// a button moves the window, double-click toggles maximize. Buttons are
+// declared after the drag TouchArea so they stack above it and keep their
+// clicks.
+
+import { CutlassText } from "../components/index.slint";
+import { AppStore, EditorStore } from "../store/index.slint";
+import { WindowBackend } from "../lib/window-backend.slint";
+
+// Caption button (minimize/maximize/close): full-height hover strip, no
+// radius — Windows-style, like CapCut's. `danger` paints the close
+// button's red hover.
+component CaptionButton inherits Rectangle {
+    in property <string> glyph;
+    in property <bool> danger: false;
+    callback clicked();
+
+    width: 44px;
+    background: !ta.has-hover ? transparent
+        : danger ? #E81123
+        : #ffffff14;
+
+    CutlassText {
+        width: parent.width;
+        height: parent.height;
+        text: glyph;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        style: AppStore.theme.typography.label;
+        foreground: ta.has-hover ? AppStore.theme.text.primary : AppStore.theme.text.secondary;
+    }
+
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// Filled accent button (CapCut's Export).
+component AccentButton inherits Rectangle {
+    in property <string> label;
+    callback clicked();
+
+    width: text.preferred-width + 2 * AppStore.theme.metrics.spacing.lg;
+    height: 26px;
+    border-radius: AppStore.theme.metrics.radius.sm;
+    background: ta.has-hover ? #2BEFD6 : #00E5C7;
+
+    text := CutlassText {
+        width: parent.width;
+        height: parent.height;
+        text: label;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        style: AppStore.theme.typography.label;
+        foreground: #0A0A0A;
+    }
+
+    ta := TouchArea {
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+export component TitleBar inherits Rectangle {
+    height: AppStore.theme.metrics.layout.toolbar-height;
+    background: AppStore.theme.surface.app-background;
+
+    drag := TouchArea {
+        moved => {
+            // Small threshold so a stationary double-click never turns
+            // into a 1px system move (which would eat the second click).
+            if (abs(self.mouse-x - self.pressed-x) > 2px || abs(self.mouse-y - self.pressed-y) > 2px) {
+                WindowBackend.begin-move();
+            }
+        }
+        double-clicked => {
+            WindowBackend.toggle-maximize();
+        }
+    }
+
+    // Centered over the full bar (not the leftover layout space) so the
+    // title doesn't shift when buttons appear. Text takes no pointer
+    // input, so the drag region underneath keeps working.
+    CutlassText {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        text: EditorStore.project.title == "" ? "Untitled project" : EditorStore.project.title;
+        style: AppStore.theme.typography.caption;
+        foreground: AppStore.theme.text.secondary;
+    }
+
+    HorizontalLayout {
+        padding-left: AppStore.theme.metrics.spacing.md;
+        spacing: AppStore.theme.metrics.spacing.sm;
+
+        VerticalLayout {
+            alignment: center;
+
+            HorizontalLayout {
+                spacing: AppStore.theme.metrics.spacing.sm;
+
+                Rectangle {
+                    width: 18px;
+                    height: 18px;
+                    border-radius: AppStore.theme.metrics.radius.sm;
+                    background: @linear-gradient(135deg, #00E5C7 0%, #00A3FF 100%);
+
+                    CutlassText {
+                        width: parent.width;
+                        height: parent.height;
+                        text: "C";
+                        horizontal-alignment: center;
+                        vertical-alignment: center;
+                        style: AppStore.theme.typography.heading-sm;
+                        foreground: #0A0A0A;
+                    }
+                }
+
+                VerticalLayout {
+                    alignment: center;
+
+                    CutlassText {
+                        text: "Cutlass";
+                        style: AppStore.theme.typography.heading-sm;
+                    }
+                }
+            }
+        }
+
+        // Flexible middle: stays empty (the centered title paints at bar
+        // level) and stays draggable — plain rectangles don't intercept
+        // the drag TouchArea below.
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+
+        VerticalLayout {
+            alignment: center;
+
+            AccentButton {
+                label: "Export";
+                clicked => {
+                    EditorStore.on-export-clicked();
+                }
+            }
+        }
+
+        Rectangle {
+            width: AppStore.theme.metrics.spacing.md;
+        }
+
+        CaptionButton {
+            glyph: "─";
+            clicked => {
+                WindowBackend.minimize();
+            }
+        }
+
+        CaptionButton {
+            glyph: WindowBackend.maximized ? "❐" : "□";
+            clicked => {
+                WindowBackend.toggle-maximize();
+            }
+        }
+
+        CaptionButton {
+            glyph: "✕";
+            danger: true;
+            clicked => {
+                WindowBackend.close();
+            }
+        }
+    }
+}

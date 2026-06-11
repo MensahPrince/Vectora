@@ -1,0 +1,17 @@
+// Native window chrome, implemented in Rust (src/main.rs). The window is
+// frameless (`no-frame` on AppWindow), so the custom title bar drives the
+// OS window through these callbacks instead of native decorations.
+export global WindowBackend {
+    // Mirrors the OS maximized state so the maximize button can flip its
+    // glyph; Rust updates it whenever it changes the window state.
+    in-out property <bool> maximized: false;
+
+    callback minimize();
+    callback toggle-maximize();
+    callback close();
+    // Start an OS-driven window move. Must be called while a pointer
+    // button is down (the title bar's drag TouchArea); once the system
+    // move begins the OS owns the gesture and no further pointer events
+    // reach the app until release.
+    callback begin-move();
+}

@@ -17,6 +17,7 @@ use slint::Model;
 use slint::Global;
 use slint::SharedString;
 use slint::wgpu_28::WGPUConfiguration;
+use slint::winit_030::WinitWindowAccessor;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -43,9 +44,48 @@ fn main() -> Result<(), slint::PlatformError> {
     slint::invoke_from_event_loop(move || {
         if let Some(app) = app_weak.upgrade() {
             app.window().set_maximized(true);
+            app.global::<WindowBackend>().set_maximized(true);
         }
     })
     .map_err(|e| slint::PlatformError::from(format!("failed to schedule maximize: {e}")))?;
+
+    // Frameless shell (`no-frame` in app.slint): the custom title bar
+    // replaces the OS decorations, so window management is wired here.
+    let window_backend = app.global::<WindowBackend>();
+
+    let weak = app.as_weak();
+    window_backend.on_minimize(move || {
+        if let Some(app) = weak.upgrade() {
+            app.window().set_minimized(true);
+        }
+    });
+
+    let weak = app.as_weak();
+    window_backend.on_toggle_maximize(move || {
+        if let Some(app) = weak.upgrade() {
+            let maximized = !app.window().is_maximized();
+            app.window().set_maximized(maximized);
+            app.global::<WindowBackend>().set_maximized(maximized);
+        }
+    });
+
+    window_backend.on_close(|| {
+        let _ = slint::quit_event_loop();
+    });
+
+    // Native window move: only valid while a pointer button is down (the
+    // title bar's drag TouchArea guarantees that); the OS owns the rest of
+    // the gesture, so no further pointer events arrive until release.
+    let weak = app.as_weak();
+    window_backend.on_begin_move(move || {
+        if let Some(app) = weak.upgrade() {
+            app.window().with_winit_window(|winit_window| {
+                if let Err(e) = winit_window.drag_window() {
+                    tracing::warn!("window drag rejected by backend: {e}");
+                }
+            });
+        }
+    });
     let preview_store_weak = app.global::<PreviewStore>().as_weak();
     let editor_store_weak = app.global::<EditorStore>().as_weak();
 
@@ -125,6 +165,12 @@ fn main() -> Result<(), slint::PlatformError> {
         {
             import_handle.import(path);
         }
+    });
+
+    editor.on_on_export_clicked(|| {
+        // Title bar button lands ahead of the exporter; the timeline →
+        // video-file path is the next engine milestone (see overview).
+        tracing::info!("export requested — exporter not wired up yet");
     });
 
     let timeline = app.global::<TimelineLib>();
