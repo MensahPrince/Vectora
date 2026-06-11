@@ -42,6 +42,35 @@ fn default_export_path() -> SharedString {
     dir.join("untitled.mp4").to_string_lossy().into_owned().into()
 }
 
+// The Dock icon of a bare (non-bundled) binary is the generic executable
+// glyph: AppKit takes it from the .app bundle, which `cargo run` doesn't
+// have, and winit has no window-icon concept on macOS — so `Window.icon`
+// in app.slint only covers Windows/Linux. Set it on NSApplication instead.
+#[cfg(target_os = "macos")]
+fn set_dock_icon() {
+    use objc2::{AnyThread, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    static ICON_PNG: &[u8] = include_bytes!("../../../assets/icon/cutlass-in-app.png");
+
+    let Some(mtm) = MainThreadMarker::new() else {
+        tracing::warn!("skipping dock icon: not on the main thread");
+        return;
+    };
+    let data = NSData::with_bytes(ICON_PNG);
+    match NSImage::initWithData(NSImage::alloc(), &data) {
+        Some(image) => {
+            // SAFETY: `image` is a valid NSImage and we are on the main
+            // thread (proven by `mtm`), which is all AppKit requires here.
+            unsafe {
+                NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image));
+            }
+        }
+        None => tracing::warn!("skipping dock icon: embedded PNG failed to decode"),
+    }
+}
+
 fn setup_tracing() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -57,6 +86,11 @@ fn main() -> Result<(), slint::PlatformError> {
         .select()?;
 
     let app = AppWindow::new()?;
+
+    // The window (and NSApp) exist now; safe to brand the Dock tile.
+    #[cfg(target_os = "macos")]
+    set_dock_icon();
+
     let app_weak = app.as_weak();
     slint::invoke_from_event_loop(move || {
         if let Some(app) = app_weak.upgrade() {

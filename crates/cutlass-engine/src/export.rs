@@ -10,7 +10,7 @@ use std::path::Path;
 
 use cutlass_compositor::{Compositor, CompositorError, GpuContext};
 use cutlass_decoder::AUDIO_CHANNELS;
-use cutlass_encoder::{ExportConfig, ExportStats, VideoExport, scaled_dims};
+use cutlass_encoder::{ExportConfig, ExportStats, VideoExport};
 use cutlass_models::{Project, Rational, RationalTime};
 use tracing::info;
 
@@ -31,8 +31,9 @@ fn gpu_err(err: CompositorError) -> EngineError {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ExportSettings {
     /// Target output height; width follows the canvas aspect ratio, both
-    /// rounded to even (H.264 4:2:0) and never upscaled past the canvas.
-    /// `None` ⇒ the composite canvas size.
+    /// rounded to even (H.264 4:2:0). Honored exactly — picking 2160p over
+    /// a 1080p canvas upscales, like CapCut. `None` ⇒ the composite canvas
+    /// size.
     pub target_height: Option<u32>,
     /// Output frame rate. `None` ⇒ the timeline rate. Other rates resample
     /// by nearest-tick: output frame `n` composites the timeline frame under
@@ -67,7 +68,7 @@ pub fn export_config_with(
         return Err(EngineError::Export("invalid export frame rate".into()));
     }
     let (width, height) = match settings.target_height {
-        Some(target) => scaled_dims(canvas_w, canvas_h, target),
+        Some(target) => export_dims(canvas_w, canvas_h, target),
         // The canvas follows media dimensions, which may be odd; H.264
         // 4:2:0 needs even, so the no-preset path still rounds.
         None => (canvas_w.max(2) & !1, canvas_h.max(2) & !1),
@@ -81,6 +82,19 @@ pub fn export_config_with(
         quality: settings.quality.unwrap_or(defaults.quality),
         ..defaults
     })
+}
+
+/// Output dimensions for a resolution preset: exactly `target_h` tall (up
+/// *or* down from the canvas — the user's pick wins), width following the
+/// canvas aspect ratio, both rounded to even for H.264 4:2:0. Unlike the
+/// proxy path's `scaled_dims`, this never clamps to the source size.
+fn export_dims(canvas_w: u32, canvas_h: u32, target_h: u32) -> (u32, u32) {
+    if canvas_w == 0 || canvas_h == 0 {
+        return (canvas_w.max(2) & !1, target_h.max(2) & !1);
+    }
+    let h = target_h.max(2);
+    let w = ((canvas_w as u64 * h as u64) / canvas_h as u64) as u32;
+    (w.max(2) & !1, h & !1)
 }
 
 /// Output frames for `tl_frames` timeline ticks resampled from `tl` to `out`
@@ -281,14 +295,27 @@ mod tests {
     }
 
     #[test]
-    fn settings_never_upscale_past_canvas() {
+    fn settings_upscale_to_requested_resolution() {
+        // 4K preset over the default 1080p canvas: the pick wins (CapCut
+        // behavior), so the file really is 3840×2160.
         let project = Project::new("test", Rational::FPS_24);
         let cfg = export_config_with(&project, ExportSettings {
             target_height: Some(2160),
             ..Default::default()
         })
         .unwrap();
-        assert_eq!((cfg.width, cfg.height), (1920, 1080));
+        assert_eq!((cfg.width, cfg.height), (3840, 2160));
+    }
+
+    #[test]
+    fn export_dims_follow_aspect_and_round_even() {
+        // Down, up, and odd-aspect rounding.
+        assert_eq!(export_dims(1920, 1080, 540), (960, 540));
+        assert_eq!(export_dims(1920, 1080, 2160), (3840, 2160));
+        // 1280×720 → 480 tall: 853.33 wide floors to 853, rounds even to 852.
+        assert_eq!(export_dims(1280, 720, 480), (852, 480));
+        // Degenerate canvas still yields legal even dims.
+        assert_eq!(export_dims(0, 0, 720), (2, 720));
     }
 
     #[test]

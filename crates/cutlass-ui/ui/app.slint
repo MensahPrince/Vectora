@@ -44,6 +44,10 @@ export { ExportBackend }from "lib/export-backend.slint";
 export component AppWindow inherits Window {
     title: "Cutlass";
 
+    // Taskbar/window icon on Windows and Linux. macOS ignores this —
+    // the Dock icon is set at runtime in src/main.rs instead.
+    icon: @image-url("../../../assets/icon/cutlass-in-app.png");
+
     // Frameless shell: the TitleBar below replaces the OS decorations
     // (drag region, minimize/maximize/close) — wired to winit in
     // src/main.rs through WindowBackend.

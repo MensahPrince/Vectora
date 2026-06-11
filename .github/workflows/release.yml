@@ -1,0 +1,87 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "alpha-*"
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-macos:
+    name: macos / arm64
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg and dylibbundler
+        run: brew install ffmpeg dylibbundler pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cutlass-ui (release)
+        run: cargo build --release -p cutlass-ui
+
+      - name: Package .app
+        run: chmod +x scripts/package-macos.sh && ./scripts/package-macos.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cutlass-macos-arm64
+          path: dist/Cutlass-*-macos-*.zip
+
+  build-linux:
+    name: linux / x86_64
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg development libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config clang \
+            libavcodec-dev libavformat-dev libavutil-dev \
+            libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cutlass-ui (release)
+        run: cargo build --release -p cutlass-ui
+
+      - name: Package tarball
+        run: chmod +x scripts/package-linux.sh && ./scripts/package-linux.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cutlass-linux-x86_64
+          path: dist/Cutlass-*-linux-*.tar.gz
+
+  publish:
+    name: github release
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: CHANGELOG.md
+          draft: true
+          prerelease: true
+          files: artifacts/**/*
+          generate_release_notes: false

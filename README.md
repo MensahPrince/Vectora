@@ -17,13 +17,12 @@ This is an early-stage project. The headless editing core is real and tested, an
 - A closed set of deterministic, undo/redo-able edit commands: add clip, add generated clip, split, trim, move, remove, and ripple-delete.
 - Frame resolution through the engine: timeline frame → ordered layers → composited image.
 - A WGPU compositor and an on-disk proxy/transcode cache to keep cold seeks fast.
-- A desktop editor shell (`cutlass-ui`, built on [Slint](https://slint.dev/)): import a video, scrub and play back a live preview, drag clips, split/delete/ripple-delete, undo/redo, with background proxy progress.
+- A desktop editor shell (`cutlass-ui`, built on [Slint](https://slint.dev/)): import media, multi-lane timeline editing (snap, magnet, linkage, trim, split, undo/redo), live GPU preview with real-time playback and audio sync, and export to H.264/AAC MP4.
 - A small end-to-end CLI (`cutlass-app`) that imports a clip, saves a `.cutlass` project, and exports an MP4 — a smoke test for the whole pipeline.
 
 **Not built yet (the goal)**
 
 - The natural-language agent that turns a prompt into edit commands. The command layer it will drive already exists.
-- GPU compositing via [wgpu](https://wgpu.rs/) for preview (export path next).
 
 ## Architecture
 
@@ -71,6 +70,17 @@ sudo apt-get install -y pkg-config clang \
   libavcodec-dev libavformat-dev libavutil-dev \
   libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
 ```
+
+## Releases
+
+Prebuilt **alpha** builds are published on [GitHub Releases](https://github.com/1Mr-Newton/cutlass/releases) when tagged (`alpha-0.1.0`, …).
+
+| Platform | Install |
+| --- | --- |
+| **macOS** (Apple Silicon) | Download `Cutlass-*-macos-arm64.zip`, unzip, drag `Cutlass.app` to Applications. FFmpeg is bundled. |
+| **Linux** (x86_64) | Download `Cutlass-*-linux-x86_64.tar.gz`, extract, run `./cutlass-ui`. Install FFmpeg dev/runtime libs first (see `README-INSTALL.txt` in the archive). |
+
+Maintainers: see [packaging/README.md](packaging/README.md) for local build scripts and the release workflow.
 
 ## Build & run
 

@@ -1,4 +1,5 @@
 /target
+/dist
 assets/
 .env
 .DS_Store

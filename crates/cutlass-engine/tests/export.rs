@@ -410,6 +410,43 @@ fn export_with_settings_scales_and_resamples() {
 }
 
 #[test]
+fn export_upscales_above_canvas_when_requested() {
+    let (dir, mut engine) = temp_engine();
+    let track = add_track(&mut engine, TrackKind::Sticker, "T1");
+    add_generated(
+        &mut engine,
+        track,
+        Generator::SolidColor {
+            rgba: [120, 60, 30, 255],
+        },
+        tr(0, 6),
+    );
+
+    // 1920×1080 canvas, 1440p preset: the pick wins — no clamping to canvas.
+    let out = dir.path().join("upscale_export.mp4");
+    let stats = cutlass_engine::export_project_with(
+        engine.project(),
+        &out,
+        cutlass_engine::ColorConvertPath::Gpu,
+        cutlass_engine::ExportSettings {
+            target_height: Some(1440),
+            quality: Some(35),
+            ..Default::default()
+        },
+        &mut |_, _| true,
+    )
+    .expect("upscaled export");
+    assert_eq!((stats.width, stats.height), (2560, 1440));
+
+    let mut dec = open_export(&out);
+    let frame = dec
+        .seek_to_frame(Duration::ZERO)
+        .expect("seek")
+        .expect("frame");
+    assert_eq!((frame.width, frame.height), (2560, 1440));
+}
+
+#[test]
 fn export_cancel_stops_partway() {
     let (dir, mut engine) = temp_engine();
     let track = add_track(&mut engine, TrackKind::Sticker, "T1");

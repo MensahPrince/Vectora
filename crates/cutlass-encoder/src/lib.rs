@@ -10,7 +10,6 @@ mod proxy;
 
 pub use error::EncodeError;
 pub use export::{AUDIO_CHANNELS, ExportConfig, ExportStats, VideoExport};
-pub use h264::scaled_dims;
 pub use proxy::{ProxyBuildOptions, ProxyConfig, ProxyStats, build_proxy, build_proxy_with};
 
 use tracing::info;

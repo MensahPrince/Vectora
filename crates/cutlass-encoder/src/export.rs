@@ -406,6 +406,8 @@ impl VideoExport {
 
     /// The cached YUV resize context for `src` → output dimensions. Input size
     /// is constant for a whole export, so this builds once in practice.
+    /// Lanczos: this resize lands in the deliverable (including upscales to
+    /// presets above the canvas), where bilinear visibly softens.
     fn yuv_scaler_for(
         &mut self,
         src_w: u32,
@@ -420,7 +422,7 @@ impl VideoExport {
                 Pixel::YUV420P,
                 self.width,
                 self.height,
-                scaling::Flags::BILINEAR,
+                scaling::Flags::LANCZOS,
             )
             .map_err(EncodeError::Encode)?;
             self.yuv_scaler = Some((src_w, src_h, ctx));

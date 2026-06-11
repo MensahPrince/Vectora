@@ -61,7 +61,9 @@ pub(crate) fn is_eagain(e: &FfmpegError) -> bool {
 }
 
 /// Target dimensions: preserve aspect ratio, never upscale, round to even.
-pub fn scaled_dims(src_w: u32, src_h: u32, target_h: u32) -> (u32, u32) {
+/// Proxy-only policy — export sizing honors the user's pick exactly
+/// (`export_dims` in cutlass-engine).
+pub(crate) fn scaled_dims(src_w: u32, src_h: u32, target_h: u32) -> (u32, u32) {
     if src_h == 0 {
         return (src_w.max(2) & !1, src_h);
     }
