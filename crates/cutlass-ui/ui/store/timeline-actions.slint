@@ -87,6 +87,13 @@ export global TimelineActions {
         EditorStore.on-redo();
     }
 
+    // Main-track magnet toggle. The worker mirrors the flag (delete/paste/
+    // duplicate policy) and packs the main lane when it turns on.
+    public function toggle-main-magnet() {
+        TimelineStore.main-magnet-enabled = !TimelineStore.main-magnet-enabled;
+        EditorStore.on-main-magnet-changed(TimelineStore.main-magnet-enabled);
+    }
+
     // --- playhead ----------------------------------------------------
     // TimelinePanel watches playhead-tick and turns every change into a
     // (coalesced) preview frame request, so these only set the tick.

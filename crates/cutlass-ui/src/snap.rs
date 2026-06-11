@@ -9,11 +9,16 @@
 //!   the playhead, and tick 0, with a vertical guide line at the snap point;
 //! - lanes only accept their own kind; hovering a foreign-kind lane, empty
 //!   space, or a conflicting (overlapping) span resolves to a *new lane*
-//!   inserted at the hovered row.
+//!   inserted at the hovered row;
+//! - with the main-track magnet on, the bottom video lane stays gapless:
+//!   hovering it resolves to an *insertion* between clips (caret instead of
+//!   a free landing ghost); the commit shifts later clips right.
 
 use slint::Model;
 
-use crate::{ClipDragResolution, ClipTrimResolution, Sequence, SnapResult, TrackKind};
+use crate::{
+    ClipDragResolution, ClipTrimResolution, LibraryDropResolution, Sequence, SnapResult, TrackKind,
+};
 
 pub fn compute_drag_snap(
     sequence: &Sequence,
@@ -78,6 +83,8 @@ pub fn compute_drag_snap(
 ///
 /// `hover_row` is the lane-list row under the dragged clip's vertical center
 /// (top-first; may be out of range, meaning above/below the existing lanes).
+/// With `main_magnet` on, hovering the main lane (bottom video lane) with a
+/// video clip resolves to an insertion between clips instead of a free spot.
 /// O(total clips) per call — evaluated per drag frame, fine at editing scale.
 pub fn resolve_clip_drag(
     sequence: &Sequence,
@@ -87,6 +94,7 @@ pub fn resolve_clip_drag(
     hover_row: i32,
     playhead_tick: i32,
     snap_threshold_ticks: i32,
+    main_magnet: bool,
 ) -> ClipDragResolution {
     let track_count = sequence.tracks.row_count() as i32;
     let Some((source_kind, orig_start, duration)) =
@@ -96,6 +104,33 @@ pub fn resolve_clip_drag(
     };
 
     let desired = (orig_start.saturating_add(dx_ticks)).max(0);
+
+    // Main-track magnet: the bottom video lane is gapless, so a video clip
+    // hovering it lands *between* clips (the commit shifts later clips right
+    // to open the hole). The edge magnet is irrelevant here — position is
+    // quantized to clip boundaries, picked by the unsnapped left edge.
+    if main_magnet
+        && source_kind == TrackKind::Video
+        && main_video_row(sequence) == Some(hover_row)
+        && let Some(track) = sequence.tracks.row_data(hover_row as usize)
+    {
+        let exclude = (track.id == source_track_id).then_some(dragging_clip_id);
+        let ins = resolve_insertion(&track, exclude, desired);
+        return ClipDragResolution {
+            valid: true,
+            is_new_lane: false,
+            target_track_id: track.id.clone(),
+            target_row: hover_row,
+            resolved_start: ins.commit_tick,
+            duration_ticks: duration,
+            has_snap: false,
+            snap_line_tick: 0,
+            is_noop: ins.noop,
+            is_insert: true,
+            caret_tick: ins.display_tick,
+        };
+    }
+
     let snap = compute_drag_snap(
         sequence,
         source_track_id,
@@ -127,6 +162,8 @@ pub fn resolve_clip_drag(
                 has_snap: snap.has_snap,
                 snap_line_tick: snap.snap_line_tick,
                 is_noop: track.id == source_track_id && snapped == orig_start,
+                is_insert: false,
+                caret_tick: 0,
             };
         }
         // The snap pulled us into a conflict the raw position doesn't have —
@@ -143,6 +180,8 @@ pub fn resolve_clip_drag(
                 has_snap: false,
                 snap_line_tick: 0,
                 is_noop: track.id == source_track_id && desired == orig_start,
+                is_insert: false,
+                caret_tick: 0,
             };
         }
     }
@@ -159,6 +198,166 @@ pub fn resolve_clip_drag(
         has_snap: snap.has_snap,
         snap_line_tick: snap.snap_line_tick,
         is_noop: false,
+        is_insert: false,
+        caret_tick: 0,
+    }
+}
+
+/// Resolve where a library tile dropped at (`cursor_tick`, `drop_row`) lands.
+///
+/// Freeform: a video lane under the cursor (or empty ⇒ the worker creates
+/// one at `drop_row`), position magneted to clip edges / playhead / tick 0.
+/// With `main_magnet` on, dropping on the main lane resolves to an insertion
+/// between clips (the worker ripple-inserts, shifting later clips right).
+pub fn resolve_library_drop(
+    sequence: &Sequence,
+    duration_ticks: i32,
+    cursor_tick: i32,
+    drop_row: i32,
+    playhead_tick: i32,
+    snap_threshold_ticks: i32,
+    main_magnet: bool,
+) -> LibraryDropResolution {
+    let track_count = sequence.tracks.row_count() as i32;
+    let row_track = (0..track_count)
+        .contains(&drop_row)
+        .then(|| sequence.tracks.row_data(drop_row as usize))
+        .flatten()
+        .filter(|t| t.kind == TrackKind::Video);
+
+    if main_magnet
+        && main_video_row(sequence) == Some(drop_row)
+        && let Some(track) = &row_track
+    {
+        let ins = resolve_insertion(track, None, cursor_tick.max(0));
+        return LibraryDropResolution {
+            target_track_id: track.id.clone(),
+            target_row: drop_row,
+            resolved_start: ins.commit_tick,
+            is_insert: true,
+            caret_tick: ins.display_tick,
+        };
+    }
+
+    // Magnet against clip edges, the playhead, and tick 0. Empty drag ids ⇒
+    // every placed clip is a snap candidate.
+    let snap = compute_drag_snap(
+        sequence,
+        "",
+        "",
+        cursor_tick,
+        duration_ticks,
+        snap_threshold_ticks,
+        playhead_tick,
+    );
+    LibraryDropResolution {
+        target_track_id: row_track.map(|t| t.id.clone()).unwrap_or_default(),
+        target_row: drop_row,
+        resolved_start: snap.snapped_start_value.max(0),
+        is_insert: false,
+        caret_tick: 0,
+    }
+}
+
+/// Lane-list row of the main track: the *bottom* video lane. Rows are
+/// top-first, so that's the last video row; `None` without any video lane.
+fn main_video_row(sequence: &Sequence) -> Option<i32> {
+    let mut main = None;
+    for idx in 0..sequence.tracks.row_count() {
+        if sequence
+            .tracks
+            .row_data(idx)
+            .is_some_and(|t| t.kind == TrackKind::Video)
+        {
+            main = Some(idx as i32);
+        }
+    }
+    main
+}
+
+/// An insertion slot on the (gapless) main lane.
+struct Insertion {
+    /// Caret position in the lane's *current* visual space.
+    display_tick: i32,
+    /// Commit position handed to the worker. For reorders (`exclude` set)
+    /// this is in the post-close arrangement — the worker closes the dragged
+    /// clip's own gap before opening the new hole, shifting every later
+    /// boundary left by the clip's duration.
+    commit_tick: i32,
+    /// The slot is exactly where the excluded clip already sits.
+    noop: bool,
+}
+
+/// Pick the insertion slot for content whose left edge sits at `desired`:
+/// before the first clip whose midpoint lies right of it (CapCut feel —
+/// crossing a clip's middle flips the caret to its other side), else after
+/// the last clip.
+fn resolve_insertion(track: &crate::Track, exclude: Option<&str>, desired: i32) -> Insertion {
+    // (start, end) spans of every clip except the excluded one. The
+    // projection publishes clips in start order, but sort defensively —
+    // lanes hold tens of clips, this runs once per drag frame.
+    let mut spans: Vec<(i32, i32)> = Vec::new();
+    let mut excluded: Option<(i32, i32)> = None; // (start, duration)
+    for idx in 0..track.clips.row_count() {
+        let Some(clip) = track.clips.row_data(idx) else {
+            continue;
+        };
+        let start = clip.timeline_start.value;
+        let dur = clip.source_range.duration.value;
+        if exclude.is_some_and(|id| clip.id == id) {
+            excluded = Some((start, dur));
+        } else {
+            spans.push((start, start.saturating_add(dur)));
+        }
+    }
+    spans.sort_unstable();
+
+    let index = spans
+        .iter()
+        .position(|(s, e)| desired < s + (e - s) / 2)
+        .unwrap_or(spans.len());
+
+    let (noop, ex_start, ex_dur) = match excluded {
+        Some((start, dur)) => {
+            let orig_index = spans.iter().filter(|(s, _)| *s < start).count();
+            (index == orig_index, start, dur)
+        }
+        None => (false, 0, 0),
+    };
+
+    let display_tick = if noop {
+        ex_start
+    } else if index < spans.len() {
+        spans[index].0
+    } else {
+        // After the last clip: the lane's current content end (the excluded
+        // clip can't be last here, or the slot would be its own ⇒ noop).
+        spans.iter().map(|(_, e)| *e).max().unwrap_or(0)
+    };
+
+    // Reorders commit against the closed arrangement: every boundary right
+    // of the excluded clip's old start moves left by its duration.
+    let closed = |tick: i32, anchor: i32| -> i32 {
+        if excluded.is_some() && anchor > ex_start {
+            tick - ex_dur
+        } else {
+            tick
+        }
+    };
+    let commit_tick = if index < spans.len() {
+        closed(spans[index].0, spans[index].0)
+    } else {
+        spans
+            .iter()
+            .map(|(s, e)| closed(*e, *s))
+            .max()
+            .unwrap_or(0)
+    };
+
+    Insertion {
+        display_tick,
+        commit_tick,
+        noop,
     }
 }
 
@@ -345,6 +544,8 @@ impl ClipDragResolution {
             has_snap: false,
             snap_line_tick: 0,
             is_noop: true,
+            is_insert: false,
+            caret_tick: 0,
         }
     }
 }
@@ -460,7 +661,7 @@ mod tests {
     fn free_spot_on_same_lane_lands_there() {
         let seq = sample_sequence();
         // Clip "1" (row 1, start 10, dur 100) dragged right by 200 ticks.
-        let r = resolve_clip_drag(&seq, "1", "1", 200, 1, 0, 5);
+        let r = resolve_clip_drag(&seq, "1", "1", 200, 1, 0, 5, false);
         assert!(r.valid && !r.is_new_lane);
         assert_eq!(r.target_track_id, "1");
         assert_eq!(r.resolved_start, 210);
@@ -470,7 +671,7 @@ mod tests {
     #[test]
     fn unmoved_drag_is_noop() {
         let seq = sample_sequence();
-        let r = resolve_clip_drag(&seq, "1", "1", 0, 1, 0, 0);
+        let r = resolve_clip_drag(&seq, "1", "1", 0, 1, 0, 0, false);
         assert!(r.valid && !r.is_new_lane && r.is_noop);
     }
 
@@ -478,7 +679,7 @@ mod tests {
     fn conflict_on_hovered_lane_creates_new_lane_at_row() {
         let seq = sample_sequence();
         // Drag clip "1" up onto row 0 at a position overlapping clip "2" [0,80).
-        let r = resolve_clip_drag(&seq, "1", "1", 20, 0, 0, 0);
+        let r = resolve_clip_drag(&seq, "1", "1", 20, 0, 0, 0, false);
         assert!(r.valid && r.is_new_lane);
         assert_eq!(r.target_row, 0);
         assert_eq!(r.resolved_start, 30);
@@ -489,7 +690,7 @@ mod tests {
         let seq = sample_sequence();
         // Dragging clip "1" so its start sits at 78 — overlaps "2" [0,80) by 2
         // ticks, but the magnet pulls it to abut at 80, which is free.
-        let r = resolve_clip_drag(&seq, "1", "1", 68, 0, 0, 5);
+        let r = resolve_clip_drag(&seq, "1", "1", 68, 0, 0, 5, false);
         assert!(r.valid && !r.is_new_lane);
         assert_eq!(r.target_track_id, "2");
         assert_eq!(r.resolved_start, 80);
@@ -500,7 +701,7 @@ mod tests {
     fn foreign_kind_lane_creates_new_lane() {
         let seq = sample_sequence();
         // Video clip hovered over the audio lane (row 2).
-        let r = resolve_clip_drag(&seq, "1", "1", 200, 2, 0, 0);
+        let r = resolve_clip_drag(&seq, "1", "1", 200, 2, 0, 0, false);
         assert!(r.valid && r.is_new_lane);
         assert_eq!(r.target_row, 2);
     }
@@ -508,11 +709,11 @@ mod tests {
     #[test]
     fn rows_outside_stack_clamp_to_top_and_bottom_insertion() {
         let seq = sample_sequence();
-        let above = resolve_clip_drag(&seq, "1", "1", 200, -3, 0, 0);
+        let above = resolve_clip_drag(&seq, "1", "1", 200, -3, 0, 0, false);
         assert!(above.is_new_lane);
         assert_eq!(above.target_row, 0);
 
-        let below = resolve_clip_drag(&seq, "1", "1", 200, 9, 0, 0);
+        let below = resolve_clip_drag(&seq, "1", "1", 200, 9, 0, 0, false);
         assert!(below.is_new_lane);
         assert_eq!(below.target_row, 3);
     }
@@ -520,8 +721,104 @@ mod tests {
     #[test]
     fn unknown_ids_resolve_invalid() {
         let seq = sample_sequence();
-        let r = resolve_clip_drag(&seq, "1", "404", 0, 1, 0, 0);
+        let r = resolve_clip_drag(&seq, "1", "404", 0, 1, 0, 0, false);
         assert!(!r.valid);
+    }
+
+    // --- main-track magnet (insertion) --------------------------------------
+    // sample_sequence rows: 0 = V2 (overlay video), 1 = V1 (main: bottom
+    // video lane, clip "1" [10,110)), 2 = A1 (audio).
+
+    #[test]
+    fn magnet_hover_on_main_lane_resolves_to_insertion() {
+        let seq = sample_sequence();
+        // Video clip "2" (row 0, [0,80)) onto the main lane; left edge 5 is
+        // left of clip "1"'s midpoint (60) → caret before it.
+        let r = resolve_clip_drag(&seq, "2", "2", 5, 1, 0, 5, true);
+        assert!(r.valid && r.is_insert && !r.is_new_lane);
+        assert_eq!(r.target_track_id, "1");
+        assert_eq!(r.caret_tick, 10);
+        assert_eq!(r.resolved_start, 10);
+        assert!(!r.has_snap && !r.is_noop);
+    }
+
+    #[test]
+    fn magnet_insert_after_last_clip_lands_at_content_end() {
+        let seq = sample_sequence();
+        let r = resolve_clip_drag(&seq, "2", "2", 500, 1, 0, 0, true);
+        assert!(r.is_insert);
+        assert_eq!(r.caret_tick, 110);
+        assert_eq!(r.resolved_start, 110);
+    }
+
+    #[test]
+    fn magnet_reorder_to_own_slot_is_noop() {
+        let seq = sample_sequence();
+        let r = resolve_clip_drag(&seq, "1", "1", 0, 1, 0, 0, true);
+        assert!(r.is_insert && r.is_noop);
+        assert_eq!(r.caret_tick, 10);
+    }
+
+    #[test]
+    fn magnet_reorder_commits_in_post_close_space() {
+        // Single (= main) video lane, packed: A [0,50) B [50,80) C [80,120).
+        let seq = sequence(vec![track(
+            "1",
+            TrackKind::Video,
+            vec![clip("A", 0, 50), clip("B", 50, 30), clip("C", 80, 40)],
+        )]);
+        // A dragged right past C's midpoint (100): insert after C.
+        let r = resolve_clip_drag(&seq, "1", "A", 105, 0, 0, 0, true);
+        assert!(r.is_insert && !r.is_noop);
+        // Caret renders at the current content end…
+        assert_eq!(r.caret_tick, 120);
+        // …but commits against the closed arrangement (A's 50 ticks gone).
+        assert_eq!(r.resolved_start, 70);
+    }
+
+    #[test]
+    fn magnet_off_or_overlay_lane_stays_freeform() {
+        let seq = sample_sequence();
+        let off = resolve_clip_drag(&seq, "2", "2", 130, 1, 0, 0, false);
+        assert!(!off.is_insert && !off.is_new_lane);
+        assert_eq!(off.resolved_start, 130);
+
+        // Magnet on, but hovering the *overlay* video lane (row 0): freeform.
+        let overlay = resolve_clip_drag(&seq, "1", "1", 300, 0, 0, 0, true);
+        assert!(!overlay.is_insert && !overlay.is_new_lane);
+        assert_eq!(overlay.target_track_id, "2");
+    }
+
+    // --- resolve_library_drop -----------------------------------------------
+
+    #[test]
+    fn magnet_library_drop_on_main_lane_inserts_at_boundary() {
+        let seq = sample_sequence();
+        let before = resolve_library_drop(&seq, 48, 30, 1, 0, 5, true);
+        assert!(before.is_insert);
+        assert_eq!(before.target_track_id, "1");
+        assert_eq!(before.resolved_start, 10);
+        assert_eq!(before.caret_tick, 10);
+
+        let after = resolve_library_drop(&seq, 48, 90, 1, 0, 5, true);
+        assert!(after.is_insert);
+        assert_eq!(after.resolved_start, 110);
+    }
+
+    #[test]
+    fn library_drop_freeform_snaps_and_targets_video_lane() {
+        let seq = sample_sequence();
+        // Overlay video lane (row 0): cursor 78 magnets to clip "2"'s end.
+        let r = resolve_library_drop(&seq, 48, 78, 0, 0, 5, false);
+        assert!(!r.is_insert);
+        assert_eq!(r.target_track_id, "2");
+        assert_eq!(r.resolved_start, 80);
+
+        // Audio row: no video target — the worker creates a lane at the row.
+        let foreign = resolve_library_drop(&seq, 48, 100, 2, 0, 0, true);
+        assert_eq!(foreign.target_track_id, "");
+        assert_eq!(foreign.target_row, 2);
+        assert!(!foreign.is_insert);
     }
 
     // --- resolve_clip_trim ----------------------------------------------------

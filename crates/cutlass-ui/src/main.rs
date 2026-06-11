@@ -66,13 +66,19 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let drop_handle = preview_worker.handle();
-    editor.on_on_clip_dropped(move |media_id, track_id, start_tick, drop_row| {
+    editor.on_on_clip_dropped(move |media_id, track_id, start_tick, drop_row, insert| {
         drop_handle.add_clip(
             media_id.to_string(),
             track_id.to_string(),
             i64::from(start_tick),
             i64::from(drop_row),
+            insert,
         );
+    });
+
+    let magnet_handle = preview_worker.handle();
+    editor.on_on_main_magnet_changed(move |enabled| {
+        magnet_handle.set_main_magnet(enabled);
     });
 
     let import_handle = preview_worker.handle();
@@ -124,7 +130,7 @@ fn main() -> Result<(), slint::PlatformError> {
     );
 
     app.global::<DragBackend>().on_resolve_clip_drag(
-        |sequence, source_track_id, dragging_clip_id, dx_ticks, hover_row, playhead_tick, snap_threshold_ticks| {
+        |sequence, source_track_id, dragging_clip_id, dx_ticks, hover_row, playhead_tick, snap_threshold_ticks, main_magnet| {
             snap::resolve_clip_drag(
                 &sequence,
                 source_track_id.as_str(),
@@ -133,6 +139,21 @@ fn main() -> Result<(), slint::PlatformError> {
                 hover_row,
                 playhead_tick,
                 snap_threshold_ticks,
+                main_magnet,
+            )
+        },
+    );
+
+    app.global::<DragBackend>().on_resolve_library_drop(
+        |sequence, duration_ticks, cursor_tick, drop_row, playhead_tick, snap_threshold_ticks, main_magnet| {
+            snap::resolve_library_drop(
+                &sequence,
+                duration_ticks,
+                cursor_tick,
+                drop_row,
+                playhead_tick,
+                snap_threshold_ticks,
+                main_magnet,
             )
         },
     );
@@ -152,12 +173,13 @@ fn main() -> Result<(), slint::PlatformError> {
     );
 
     let move_handle = preview_worker.handle();
-    editor.on_on_clip_moved(move |clip_id, track_id, insert_row, start_tick| {
+    editor.on_on_clip_moved(move |clip_id, track_id, insert_row, start_tick, insert| {
         move_handle.move_clip(
             clip_id.to_string(),
             track_id.to_string(),
             i64::from(insert_row),
             i64::from(start_tick),
+            insert,
         );
     });
 

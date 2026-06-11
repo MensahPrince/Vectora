@@ -136,30 +136,61 @@ after a text input had it.
       places the copy right after the original.
 - [x] Esc clears selection (empty-lane click already did).
 
-## Phase 6 — Compound undo (one gesture = one history entry)
+## Phase 6 — Compound undo (one gesture = one history entry) ✅
 
-A new-lane move currently records up to three entries (`AddTrack` + `MoveClip`
-+ `RemoveTrack`), and a delete that empties its lane records two
-(`RemoveClip` + `RemoveTrack`); one Ctrl+Z should revert the whole gesture.
+A new-lane move used to record up to three entries (`AddTrack` + `MoveClip`
++ `RemoveTrack`), and a delete that emptied its lane two (`RemoveClip` +
+`RemoveTrack`); one Ctrl+Z now reverts the whole gesture.
 
-- [ ] Engine: transaction/grouping in `history` (begin/commit around a
-      dispatched batch, inverses applied in reverse order).
-- [ ] Worker: wrap multi-command gestures (new-lane move, drop-with-new-lane,
-      future ripple ops) in one group.
+- [x] Engine: history groups (`Engine::begin_group` / `commit_group`) collect
+      every inverse a dispatched batch records into one compound entry; undo
+      applies them in reverse order, and the entry oscillates like any single
+      action. Empty groups record nothing; single-command groups collapse to
+      a plain entry.
+- [x] `Engine::rollback_group` aborts a failed gesture: the collected
+      inverses are applied in reverse on the spot, restoring the pre-gesture
+      state and leaving history untouched — including the redo stack, so a
+      failed gesture is a complete no-op. (Replaces the worker's hand-rolled
+      "remove the lane we just created" compensation; failed drops now clean
+      up their lane too.)
+- [x] Worker: new-lane moves, drops that create a lane, deletes that empty
+      their lane, and pastes that recreate a lane each commit as one group;
+      future ripple ops should use the same wrapper.
 
-## Phase 7 — Main-track magnet (ripple)
+## Phase 7 — Main-track magnet (ripple) ✅
 
-CapCut's signature behavior; needs design care, ship behind its own toggle
-(separate from Snap, as in CapCut).
+CapCut's signature behavior, behind its own toolbar **Magnet** toggle
+(separate from Snap, as in CapCut; on by default). Engine stays mechanism,
+the magnet policy lives UI/worker-side.
 
-- [ ] Designate a **main track** (bottom video lane). With main-track magnet
-      on: clips on it pack left (no gaps), drops/moves *insert* and shift
-      later clips right, deletions close the gap (`RippleDelete` exists;
-      ripple-insert does not).
-- [ ] Engine: `RippleInsert` / shift-right primitives with inverses.
-- [ ] Drag UX on the main lane: insertion index ghost (between-clip caret)
-      instead of free positioning.
-- [ ] Off state = today's freeform behavior.
+- [x] Main track designation: the **bottom video lane** (engine: first video
+      track in stack order; resolver: last video row). Computed, not stored —
+      it follows lane creation/removal automatically.
+- [x] Engine: `ShiftClips { track, from, delta }` ripple primitive (shift
+      every clip starting ≥ `from`; validated atomically, exact-set inverse)
+      and `RippleInsert { track, media, source, at }` (shift right + place,
+      atomic with a compound inverse — built on Phase 6's `CompoundAction`).
+- [x] With the magnet on, the main lane stays gapless: library drops
+      `RippleInsert`; cross-lane moves in open a hole (`ShiftClips` + 
+      `MoveClip`); reorders park-close-open-land as one group; moves *off*
+      and `RippleDelete`s close the gap behind them; paste/duplicate insert
+      at the nearest clip boundary / right after the original. Every gesture
+      is one history entry (Phase 6 groups), rollback on failure.
+- [x] Enabling the magnet packs the main lane (leading gap included) as one
+      undoable entry — CapCut's lane is gapless the moment the toggle is on.
+      The worker mirrors the flag (`SetMainMagnet`) for the ops that have no
+      drag resolution (delete/paste/duplicate/pack).
+- [x] Drag UX on the main lane: insertion caret between clips (slot picked
+      by the dragged left edge vs clip midpoints) instead of free
+      positioning, for clip drags and library drags alike. Reorders commit
+      in post-close space; releasing on the clip's own slot is a no-op.
+- [x] Off state = freeform behavior, unchanged everywhere else.
+
+Deliberate gap: **trims don't ripple yet.** CapCut ripple-trims the main
+track (later clips follow the dragged edge); here a magnet-on trim can still
+leave/eat a gap. Needs a resolver mode (no neighbor clamp) plus a
+`TrimClip`+`ShiftClips` composition with order depending on grow vs shrink —
+tracked as the first item of future ripple work.
 
 ## Phase 8 — Clip content rendering
 

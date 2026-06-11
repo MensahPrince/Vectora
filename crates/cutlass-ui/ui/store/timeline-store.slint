@@ -11,4 +11,11 @@ export global TimelineStore {
     // CapCut's "auto snapping" magnet: drags snap to clip edges on all lanes,
     // the playhead, and tick 0. Toggled from the timeline toolbar.
     in-out property <bool> snap-enabled: true;
+    // CapCut's main-track magnet (separate toggle): the bottom video lane
+    // stays gapless — drops/moves insert between clips and shift later ones
+    // right, deletes ripple the gap closed, and enabling packs the lane.
+    // Default on, like CapCut. Off = freeform, same as the other lanes.
+    // Mirrored to the worker via EditorStore.on-main-magnet-changed (paste/
+    // duplicate/delete have no drag resolution, so the worker needs the flag).
+    in-out property <bool> main-magnet-enabled: true;
 }

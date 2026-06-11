@@ -12,7 +12,8 @@ export struct SnapResult {
 }
 
 // Where a dragged clip would land if released right now (CapCut policy:
-// same-kind lanes only; conflicts and foreign rows insert a new lane).
+// same-kind lanes only; conflicts and foreign rows insert a new lane; with
+// the main-track magnet on, the bottom video lane takes insertions only).
 export struct ClipDragResolution {
     valid: bool,
     // Landing: an existing lane (`target-track-id` at `target-row`) or a new
@@ -27,6 +28,24 @@ export struct ClipDragResolution {
     snap-line-tick: int,
     // Release would land exactly where the clip already is — skip the commit.
     is-noop: bool,
+    // Main-track magnet: release *inserts* at `resolved-start`, shifting
+    // later clips right (`resolved-start` is in post-close space for
+    // reorders). The caret renders at `caret-tick` (current visual space)
+    // instead of a landing ghost.
+    is-insert: bool,
+    caret-tick: int,
+}
+
+// Where a library tile dropped right now would land. `target-track-id` is
+// the video lane under the cursor, or empty when there is none (the worker
+// then creates a new video lane at `target-row`). With the main-track magnet
+// on, dropping on the main lane resolves to an insertion between clips.
+export struct LibraryDropResolution {
+    target-track-id: string,
+    target-row: int,
+    resolved-start: int,
+    is-insert: bool,
+    caret-tick: int,
 }
 
 // Where a trimmed clip edge would settle if released right now. The dragged
@@ -47,7 +66,9 @@ export struct ClipTrimResolution {
 export global DragBackend {
     pure callback snap-clip-start(Sequence /* sequence */, string /* dragging-source-track-id */, string /* dragging-clip-id */, int    /* cursor-start-value */, int    /* clip-duration-ticks */, int    /* snap-threshold-ticks */, int    /* playhead-tick */, ) -> SnapResult;
 
-    pure callback resolve-clip-drag(Sequence /* sequence */, string /* source-track-id */, string /* dragging-clip-id */, int    /* dx-ticks */, int    /* hover-row */, int    /* playhead-tick */, int    /* snap-threshold-ticks */, ) -> ClipDragResolution;
+    pure callback resolve-clip-drag(Sequence /* sequence */, string /* source-track-id */, string /* dragging-clip-id */, int    /* dx-ticks */, int    /* hover-row */, int    /* playhead-tick */, int    /* snap-threshold-ticks */, bool   /* main-magnet */, ) -> ClipDragResolution;
+
+    pure callback resolve-library-drop(Sequence /* sequence */, int    /* duration-ticks */, int    /* cursor-tick */, int    /* drop-row */, int    /* playhead-tick */, int    /* snap-threshold-ticks */, bool   /* main-magnet */, ) -> LibraryDropResolution;
 
     pure callback resolve-clip-trim(Sequence /* sequence */, string /* track-id */, string /* clip-id */, bool   /* trim-head (left edge) */, int    /* dx-ticks */, int    /* playhead-tick */, int    /* snap-threshold-ticks */, ) -> ClipTrimResolution;
 }

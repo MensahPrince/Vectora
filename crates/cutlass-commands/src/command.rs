@@ -62,6 +62,24 @@ pub enum EditCommand {
     RemoveTrack { track: TrackId },
     /// Remove a clip and slide later clips on its track left to close the gap.
     RippleDelete { clip: ClipId },
+    /// Shift every clip on `track` whose start is ≥ `from` by `delta` ticks
+    /// (signed). The ripple primitive: opens a hole for an insert when
+    /// positive, closes a gap when negative; rejected if a left shift would
+    /// collide or push below tick 0.
+    ShiftClips {
+        track: TrackId,
+        from: RationalTime,
+        delta: RationalTime,
+    },
+    /// Insert a trimmed range of media at `at`, first shifting every clip
+    /// starting at/after `at` right by the new clip's duration (CapCut
+    /// main-track insert). Atomic: a rejected placement restores the shift.
+    RippleInsert {
+        track: TrackId,
+        media: MediaId,
+        source: TimeRange,
+        at: RationalTime,
+    },
 }
 
 /// Top-level command surface: media registration or a timeline edit.
@@ -79,4 +97,6 @@ pub enum EditOutcome {
     Updated(ClipId),
     Removed(ClipId),
     RemovedTrack(TrackId),
+    /// Clips on the track were ripple-shifted (no single clip to point at).
+    ShiftedTrack(TrackId),
 }

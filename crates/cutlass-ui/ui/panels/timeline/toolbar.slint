@@ -126,6 +126,18 @@ export component Toolbar inherits Rectangle {
             }
         }
 
+        // CapCut's main-track magnet: the bottom video lane stays gapless
+        // (drops/moves insert, deletes ripple). Separate from Snap, as in
+        // CapCut; routed through TimelineActions so the worker can mirror
+        // the flag and pack the lane on enable.
+        ToolButton {
+            label: "Magnet";
+            active: TimelineStore.main-magnet-enabled;
+            clicked => {
+                TimelineActions.toggle-main-magnet();
+            }
+        }
+
         // CapCut's auto-snapping magnet toggle: latched while active.
         ToolButton {
             label: "Snap";

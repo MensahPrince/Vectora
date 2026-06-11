@@ -284,7 +284,10 @@ mod tests {
         for clip in track.clips_mut() {
             clip.timeline = tr(clip.timeline.start.value + 1, clip.timeline.duration.value);
         }
-        let starts: Vec<i64> = track.clips().map(|c| c.start().value).collect();
+        // `clips()` iterates the backing hash map — unordered by contract
+        // (FxHash order shifts with the globally allocated clip ids).
+        let mut starts: Vec<i64> = track.clips().map(|c| c.start().value).collect();
+        starts.sort_unstable();
         assert_eq!(starts, vec![1, 21]);
     }
 

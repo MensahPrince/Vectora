@@ -24,12 +24,41 @@ pub trait EditAction: Send {
     fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError>;
 }
 
+/// Inverses for a multi-command gesture, undone/redone as one history entry.
+///
+/// `actions` holds the inverses in the order their commands were executed;
+/// `apply` runs them in reverse (last command reverted first) and returns a
+/// compound of the produced inverses, so the entry oscillates like any single
+/// action. Also the inverse shape of engine-internal composites
+/// (e.g. `RippleInsert` = shift + add).
+pub(crate) struct CompoundAction {
+    pub(crate) actions: Vec<Box<dyn EditAction>>,
+}
+
+impl EditAction for CompoundAction {
+    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+        let mut inverses = Vec::with_capacity(self.actions.len());
+        for action in self.actions.into_iter().rev() {
+            inverses.push(action.apply(ctx)?);
+        }
+        Ok(Box::new(CompoundAction { actions: inverses }))
+    }
+}
+
 /// Inverse-command undo/redo stacks.
+///
+/// A *group* collects the inverses of several dispatched commands into one
+/// undo entry (one gesture = one Ctrl+Z): [`begin_group`](Self::begin_group),
+/// then dispatch the batch, then [`commit_group`](Self::commit_group). While a
+/// group is open, recorded inverses are held aside and the redo stack is left
+/// untouched, so an abandoned group (see `Engine::rollback_group`) leaves
+/// history exactly as it was.
 #[derive(Default)]
 pub struct History {
     undo: Vec<Box<dyn EditAction>>,
     redo: Vec<Box<dyn EditAction>>,
     limit: usize,
+    pending: Option<Vec<Box<dyn EditAction>>>,
 }
 
 impl History {
@@ -38,6 +67,7 @@ impl History {
             undo: Vec::new(),
             redo: Vec::new(),
             limit: limit.max(1),
+            pending: None,
         }
     }
 
@@ -49,7 +79,47 @@ impl History {
         !self.redo.is_empty()
     }
 
+    pub fn in_group(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// Start collecting recorded inverses into a single compound entry.
+    /// Groups don't nest; a stray second begin keeps the open group.
+    pub fn begin_group(&mut self) {
+        debug_assert!(self.pending.is_none(), "history group already open");
+        if self.pending.is_none() {
+            self.pending = Some(Vec::new());
+        }
+    }
+
+    /// Close the open group and push it as one undo entry. No-op when the
+    /// group is empty (the gesture made no edits) or no group is open.
+    pub fn commit_group(&mut self) {
+        debug_assert!(self.pending.is_some(), "no history group open");
+        let Some(mut actions) = self.pending.take() else {
+            return;
+        };
+        match actions.len() {
+            0 => {}
+            1 => self.record_do(actions.pop().expect("len checked")),
+            _ => self.record_do(Box::new(CompoundAction { actions })),
+        }
+    }
+
+    /// Detach the open group's collected inverses without recording them
+    /// (for rollback: the caller applies them in reverse order).
+    pub fn take_group(&mut self) -> Vec<Box<dyn EditAction>> {
+        debug_assert!(self.pending.is_some(), "no history group open");
+        self.pending.take().unwrap_or_default()
+    }
+
     pub fn record_do(&mut self, inverse: Box<dyn EditAction>) {
+        if let Some(pending) = self.pending.as_mut() {
+            // Redo clearing waits for commit_group so a rolled-back group
+            // leaves the redo stack intact.
+            pending.push(inverse);
+            return;
+        }
         if self.undo.len() >= self.limit {
             self.undo.remove(0);
         }
@@ -82,6 +152,7 @@ impl History {
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
+        self.pending = None;
     }
 }
 
@@ -89,7 +160,8 @@ impl History {
 mod tests {
     use super::*;
     use crate::action::edit::{
-        add_clip, add_generated, move_clip, remove_media, ripple_delete, split_clip, trim_clip,
+        add_clip, add_generated, add_track, move_clip, remove_media, ripple_delete,
+        ripple_insert, shift_clips, split_clip, trim_clip,
     };
     use cutlass_cache::FrameCache;
     use cutlass_models::{
@@ -434,6 +506,222 @@ mod tests {
 
         let _ = inv2.apply(&mut ctx).unwrap();
         assert_eq!(ctx.project.timeline().clip_count(), 2);
+    }
+
+    #[test]
+    fn shift_clips_inverse_selects_exactly_the_shifted_set() {
+        let (_dir, mut project, cache) = setup();
+        let track = project.add_track(TrackKind::Adjustment, "FX");
+        // A [60,80) stays put; B [100,120) shifts left into [80,100). The
+        // inverse boundary (B's new start, 80) must re-select only B — a
+        // naive `from + delta` boundary (also 80 here, but 60-adjacent cases
+        // differ) could drag A along.
+        let a = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(60, 20)))
+            .unwrap();
+        let b = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(100, 20)))
+            .unwrap();
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+
+        let inv = shift_clips::execute(&mut ctx, track, rt(100), rt(-20)).unwrap();
+        assert_eq!(ctx.project.clip(b).unwrap().start().value, 80);
+
+        let redo = inv.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.clip(a).unwrap().start().value, 60, "A untouched");
+        assert_eq!(ctx.project.clip(b).unwrap().start().value, 100);
+
+        let _ = redo.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.clip(a).unwrap().start().value, 60);
+        assert_eq!(ctx.project.clip(b).unwrap().start().value, 80);
+    }
+
+    #[test]
+    fn ripple_insert_shifts_then_places_and_oscillates() {
+        let (_dir, mut project, cache) = setup();
+        let media_id = project.add_media(MediaSource::new(
+            "/tmp/ri.mp4",
+            1920,
+            1080,
+            Rational::FPS_24,
+            240,
+            false,
+        ));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let first = project
+            .add_clip(
+                track,
+                media_id,
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+                RationalTime::new(0, Rational::FPS_24),
+            )
+            .unwrap();
+        let second = project
+            .add_clip(
+                track,
+                media_id,
+                TimeRange::at_rate(48, 48, Rational::FPS_24),
+                RationalTime::new(48, Rational::FPS_24),
+            )
+            .unwrap();
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+
+        // Insert 24 ticks at the boundary between the two clips.
+        let (inserted, inv) = ripple_insert::execute(
+            &mut ctx,
+            track,
+            media_id,
+            TimeRange::at_rate(100, 24, Rational::FPS_24),
+            rt(48),
+        )
+        .unwrap();
+        assert_eq!(ctx.project.clip(first).unwrap().start().value, 0);
+        assert_eq!(ctx.project.clip(inserted).unwrap().start().value, 48);
+        assert_eq!(ctx.project.clip(second).unwrap().start().value, 72);
+
+        let redo = inv.apply(&mut ctx).unwrap();
+        assert!(ctx.project.clip(inserted).is_none());
+        assert_eq!(ctx.project.clip(second).unwrap().start().value, 48);
+
+        let _ = redo.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.timeline().clip_count(), 3);
+        assert_eq!(ctx.project.clip(second).unwrap().start().value, 72);
+    }
+
+    #[test]
+    fn ripple_insert_rejected_placement_restores_shift() {
+        let (_dir, mut project, cache) = setup();
+        let media_id = project.add_media(MediaSource::new(
+            "/tmp/ri-bad.mp4",
+            1920,
+            1080,
+            Rational::FPS_24,
+            240,
+            false,
+        ));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project
+            .add_clip(
+                track,
+                media_id,
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+                RationalTime::new(0, Rational::FPS_24),
+            )
+            .unwrap();
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+
+        // Source range exceeds the media's 240 ticks → add_clip rejects after
+        // the shift already ran; the shift must be rolled back atomically.
+        let result = ripple_insert::execute(
+            &mut ctx,
+            track,
+            media_id,
+            TimeRange::at_rate(200, 100, Rational::FPS_24),
+            rt(0),
+        );
+        assert!(result.is_err());
+        assert_eq!(ctx.project.timeline().clip_count(), 1);
+        assert_eq!(ctx.project.clip(clip).unwrap().start().value, 0, "shift undone");
+    }
+
+    #[test]
+    fn compound_action_applies_in_reverse_and_oscillates() {
+        let (_dir, mut project, cache) = setup();
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+
+        // Gesture: AddTrack + AddGenerated. Inverses are stored in execution
+        // order; undo must run them in reverse (remove the clip before its
+        // track) or the second inverse hits an unknown clip.
+        let (track, inv_track) =
+            add_track::execute(&mut ctx, TrackKind::Text, "T1", None).unwrap();
+        let (clip, inv_clip) = add_generated::execute(
+            &mut ctx,
+            track,
+            Generator::Text { content: "x".into() },
+            tr(0, 10),
+        )
+        .unwrap();
+
+        let compound: Box<dyn EditAction> = Box::new(CompoundAction {
+            actions: vec![inv_track, inv_clip],
+        });
+
+        let redo = compound.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.timeline().track_count(), 0);
+        assert_eq!(ctx.project.timeline().clip_count(), 0);
+
+        let undo = redo.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.timeline().track_count(), 1);
+        assert_eq!(ctx.project.timeline().track_of(clip), Some(track));
+
+        let _ = undo.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.timeline().track_count(), 0);
+        assert_eq!(ctx.project.timeline().clip_count(), 0);
+    }
+
+    /// Inert action for history bookkeeping tests.
+    struct NoopAction;
+
+    impl EditAction for NoopAction {
+        fn apply(
+            self: Box<Self>,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            Ok(Box::new(NoopAction))
+        }
+    }
+
+    #[test]
+    fn group_commits_as_single_entry() {
+        let mut history = History::new(8);
+        history.begin_group();
+        history.record_do(Box::new(NoopAction));
+        history.record_do(Box::new(NoopAction));
+        assert!(!history.can_undo(), "pending group is not undoable yet");
+        history.commit_group();
+        assert!(history.pop_undo().is_some());
+        assert!(history.pop_undo().is_none(), "group collapsed to one entry");
+    }
+
+    #[test]
+    fn empty_group_records_nothing() {
+        let mut history = History::new(8);
+        history.begin_group();
+        history.commit_group();
+        assert!(!history.can_undo());
+    }
+
+    #[test]
+    fn group_defers_redo_clear_until_commit() {
+        let mut history = History::new(8);
+        history.push_redo(Box::new(NoopAction));
+
+        history.begin_group();
+        history.record_do(Box::new(NoopAction));
+        let taken = history.take_group();
+        assert_eq!(taken.len(), 1);
+        assert!(history.can_redo(), "rolled-back group must not clear redo");
+        assert!(!history.can_undo());
+
+        history.begin_group();
+        history.record_do(Box::new(NoopAction));
+        history.commit_group();
+        assert!(!history.can_redo(), "commit clears redo like any new edit");
+        assert!(history.can_undo());
     }
 
     fn ctx_project_clip(project: &Project, id: cutlass_models::ClipId) -> cutlass_models::Clip {

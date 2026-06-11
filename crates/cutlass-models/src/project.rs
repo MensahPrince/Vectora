@@ -9,7 +9,9 @@ use crate::ids::{ClipId, MediaId, ProjectId, TrackId};
 use crate::media::MediaSource;
 use crate::metadata::ProjectMetadata;
 use crate::schema::ProjectSchema;
-use crate::time::{Rational, RationalTime, TimeRange, check_same_rate, resample, time_sub};
+use crate::time::{
+    Rational, RationalTime, TimeRange, check_same_rate, resample, time_add, time_sub,
+};
 use crate::timeline::Timeline;
 use crate::track::{Track, TrackKind};
 
@@ -383,6 +385,69 @@ impl Project {
             self.timeline.add_clip(to_track, clip)?;
         }
         Ok(())
+    }
+
+    /// Shift every clip on `track_id` whose start is at or after `from` by
+    /// `delta` ticks (ripple primitive: opens a hole for an insert when
+    /// positive, closes a gap when negative).
+    ///
+    /// Validated atomically: shifting left must not collide with the nearest
+    /// unshifted clip or push the first shifted clip below tick 0. Relative
+    /// spacing among the shifted clips is preserved, so no other overlap can
+    /// arise. Returns the new start of the first shifted clip, or `None` when
+    /// no clip starts at/after `from` (a no-op).
+    pub fn shift_clips(
+        &mut self,
+        track_id: TrackId,
+        from: RationalTime,
+        delta: RationalTime,
+    ) -> Result<Option<RationalTime>, ModelError> {
+        let tl_rate = self.timeline.frame_rate;
+        check_same_rate(from.rate, tl_rate)?;
+        check_same_rate(delta.rate, tl_rate)?;
+        if delta.value == 0 {
+            return Err(ModelError::InvalidRange);
+        }
+
+        let track = self
+            .timeline
+            .track(track_id)
+            .ok_or(ModelError::UnknownTrack(track_id))?;
+
+        // Clips never overlap, so the shifted set is a contiguous suffix in
+        // start order; only its first member can collide when moving left.
+        let mut first_shifted: Option<i64> = None;
+        let mut prev_end: i64 = 0;
+        for clip in track.clips() {
+            let start = clip.timeline.start.value;
+            if start >= from.value {
+                first_shifted = Some(first_shifted.map_or(start, |s| s.min(start)));
+            } else {
+                prev_end = prev_end.max(clip.timeline.end_tick());
+            }
+        }
+        let Some(first) = first_shifted else {
+            return Ok(None);
+        };
+
+        let new_first = first + delta.value;
+        if new_first < 0 {
+            return Err(ModelError::InvalidRange);
+        }
+        if delta.value < 0 && new_first < prev_end {
+            return Err(ModelError::Overlap(track_id));
+        }
+
+        let track = self
+            .timeline
+            .track_mut(track_id)
+            .expect("track existence checked above");
+        for clip in track.clips_mut() {
+            if clip.timeline.start.value >= from.value {
+                clip.timeline.start = time_add(&clip.timeline.start, &delta)?;
+            }
+        }
+        Ok(Some(RationalTime::new(new_first, tl_rate)))
     }
 
     /// Delete a clip and slide later clips on its track left to close the gap.
@@ -805,6 +870,75 @@ mod tests {
         );
         assert_eq!(
             project.move_clip(clip, missing, rt(0)),
+            Err(ModelError::UnknownTrack(missing))
+        );
+    }
+
+    // --- shift_clips ------------------------------------------------------
+
+    fn packed_track() -> (Project, MediaId, TrackId, [ClipId; 3]) {
+        let (mut project, media_id, track) = project_with_media(1000);
+        let a = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
+        let b = project.add_clip(track, media_id, tr(50, 50), rt(50)).unwrap();
+        let c = project.add_clip(track, media_id, tr(100, 50), rt(100)).unwrap();
+        (project, media_id, track, [a, b, c])
+    }
+
+    #[test]
+    fn shift_clips_right_moves_suffix_only() {
+        let (mut project, _, track, [a, b, c]) = packed_track();
+        let first = project.shift_clips(track, rt(50), rt(30)).unwrap();
+        assert_eq!(first, Some(rt(80)));
+        assert_eq!(project.clip(a).unwrap().start().value, 0);
+        assert_eq!(project.clip(b).unwrap().start().value, 80);
+        assert_eq!(project.clip(c).unwrap().start().value, 130);
+    }
+
+    #[test]
+    fn shift_clips_left_closes_gap() {
+        let (mut project, _, track, [a, b, c]) = packed_track();
+        project.shift_clips(track, rt(50), rt(30)).unwrap();
+        let first = project.shift_clips(track, rt(80), rt(-30)).unwrap();
+        assert_eq!(first, Some(rt(50)));
+        assert_eq!(project.clip(a).unwrap().start().value, 0);
+        assert_eq!(project.clip(b).unwrap().start().value, 50);
+        assert_eq!(project.clip(c).unwrap().start().value, 100);
+    }
+
+    #[test]
+    fn shift_clips_left_rejects_collision_and_negative() {
+        let (mut project, _, track, [_, b, _]) = packed_track();
+        assert_eq!(
+            project.shift_clips(track, rt(50), rt(-10)),
+            Err(ModelError::Overlap(track))
+        );
+        assert_eq!(
+            project.shift_clips(track, rt(0), rt(-1)),
+            Err(ModelError::InvalidRange)
+        );
+        // Validation failures must not mutate anything.
+        assert_eq!(project.clip(b).unwrap().start().value, 50);
+    }
+
+    #[test]
+    fn shift_clips_past_content_is_noop() {
+        let (mut project, _, track, [a, b, c]) = packed_track();
+        assert_eq!(project.shift_clips(track, rt(999), rt(40)).unwrap(), None);
+        for (clip, start) in [(a, 0), (b, 50), (c, 100)] {
+            assert_eq!(project.clip(clip).unwrap().start().value, start);
+        }
+    }
+
+    #[test]
+    fn shift_clips_rejects_zero_delta_and_unknown_track() {
+        let (mut project, _, track, _) = packed_track();
+        assert_eq!(
+            project.shift_clips(track, rt(0), rt(0)),
+            Err(ModelError::InvalidRange)
+        );
+        let missing = TrackId::from_raw(404);
+        assert_eq!(
+            project.shift_clips(missing, rt(0), rt(10)),
             Err(ModelError::UnknownTrack(missing))
         );
     }

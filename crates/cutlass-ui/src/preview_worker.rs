@@ -28,20 +28,27 @@ enum WorkerMsg {
     /// Place the full range of `media` (raw id from the Slint projection) at
     /// `start_tick` sequence ticks. `track` is the targeted video lane's raw
     /// id, or empty to create a new video lane at `drop_row` (the lane-list
-    /// row under the cursor, top-first; may be out of range).
+    /// row under the cursor, top-first; may be out of range). `insert`
+    /// (main-track magnet) ripple-inserts at `start_tick`, shifting later
+    /// clips right instead of first-fit sliding.
     AddClip {
         media: String,
         track: String,
         start_tick: i64,
         drop_row: i64,
+        insert: bool,
     },
     /// Move `clip` (raw id) to `track` at `start_tick`, or — when `track` is
     /// empty — to a new lane of the clip's kind inserted at `insert_row`.
+    /// `insert` (main-track magnet) ripple-inserts on the main lane; for
+    /// reorders `start_tick` is in post-close space (the resolver already
+    /// subtracted the clip's own span).
     MoveClip {
         clip: String,
         track: String,
         insert_row: i64,
         start_tick: i64,
+        insert: bool,
     },
     /// Re-place `clip` (raw id) at `[start_tick, start_tick + duration_ticks)`
     /// on its own lane (edge trim; the engine re-derives the source in/out).
@@ -67,6 +74,10 @@ enum WorkerMsg {
     PasteAt { tick: i64 },
     /// Place a copy of `clip` right after it on its own lane.
     DuplicateClip { clip: String },
+    /// Mirror of the UI's main-track magnet toggle. The worker needs it for
+    /// ops without a drag resolution (delete/paste/duplicate); enabling also
+    /// packs the main lane gapless (one history entry).
+    SetMainMagnet(bool),
 }
 
 /// Worker-side clipboard: everything needed to re-issue the copied clip as a
@@ -98,21 +109,37 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::Import(path));
     }
 
-    pub fn add_clip(&self, media: String, track: String, start_tick: i64, drop_row: i64) {
+    pub fn add_clip(
+        &self,
+        media: String,
+        track: String,
+        start_tick: i64,
+        drop_row: i64,
+        insert: bool,
+    ) {
         let _ = self.tx.send(WorkerMsg::AddClip {
             media,
             track,
             start_tick,
             drop_row,
+            insert,
         });
     }
 
-    pub fn move_clip(&self, clip: String, track: String, insert_row: i64, start_tick: i64) {
+    pub fn move_clip(
+        &self,
+        clip: String,
+        track: String,
+        insert_row: i64,
+        start_tick: i64,
+        insert: bool,
+    ) {
         let _ = self.tx.send(WorkerMsg::MoveClip {
             clip,
             track,
             insert_row,
             start_tick,
+            insert,
         });
     }
 
@@ -150,6 +177,10 @@ impl WorkerHandle {
 
     pub fn duplicate_clip(&self, clip: String) {
         let _ = self.tx.send(WorkerMsg::DuplicateClip { clip });
+    }
+
+    pub fn set_main_magnet(&self, enabled: bool) {
+        let _ = self.tx.send(WorkerMsg::SetMainMagnet(enabled));
     }
 }
 
@@ -243,8 +274,15 @@ fn worker_loop(
     // Clipboard lives with the loop: it's edit-session state, not project
     // state — copies survive any number of edits/undos and die with the app.
     let mut clipboard: Option<ClipboardClip> = None;
+    // Mirror of TimelineStore.main-magnet-enabled (must match its default).
+    // Drag gestures carry their resolved insert flag; this drives the ops
+    // without a drag resolution (delete/paste/duplicate) and pack-on-enable.
+    let mut main_magnet = true;
 
-    let mutate = |engine: &mut Engine, clipboard: &mut Option<ClipboardClip>, msg: WorkerMsg| {
+    let mutate = |engine: &mut Engine,
+                  clipboard: &mut Option<ClipboardClip>,
+                  main_magnet: &mut bool,
+                  msg: WorkerMsg| {
         match msg {
             WorkerMsg::Import(path) => import_and_publish(engine, &path, &editor_weak),
             WorkerMsg::AddClip {
@@ -252,19 +290,40 @@ fn worker_loop(
                 track,
                 start_tick,
                 drop_row,
-            } => add_clip_and_publish(engine, &media, &track, start_tick, drop_row, &editor_weak),
+                insert,
+            } => add_clip_and_publish(
+                engine,
+                &media,
+                &track,
+                start_tick,
+                drop_row,
+                insert,
+                &editor_weak,
+            ),
             WorkerMsg::MoveClip {
                 clip,
                 track,
                 insert_row,
                 start_tick,
-            } => move_clip_and_publish(engine, &clip, &track, insert_row, start_tick, &editor_weak),
+                insert,
+            } => move_clip_and_publish(
+                engine,
+                &clip,
+                &track,
+                insert_row,
+                start_tick,
+                insert,
+                *main_magnet,
+                &editor_weak,
+            ),
             WorkerMsg::TrimClip {
                 clip,
                 start_tick,
                 duration_ticks,
             } => trim_clip_and_publish(engine, &clip, start_tick, duration_ticks, &editor_weak),
-            WorkerMsg::RemoveClip { clip } => remove_clip_and_publish(engine, &clip, &editor_weak),
+            WorkerMsg::RemoveClip { clip } => {
+                remove_clip_and_publish(engine, &clip, *main_magnet, &editor_weak)
+            }
             WorkerMsg::SplitClip { clip, at_tick } => {
                 split_clip_and_publish(engine, &clip, at_tick, &editor_weak)
             }
@@ -277,11 +336,18 @@ fn worker_loop(
                 }
             }
             WorkerMsg::PasteAt { tick } => match clipboard {
-                Some(content) => paste_and_publish(engine, content, tick, &editor_weak),
+                Some(content) => paste_and_publish(engine, content, tick, *main_magnet, &editor_weak),
                 None => info!("paste ignored: clipboard empty"),
             },
             WorkerMsg::DuplicateClip { clip } => {
-                duplicate_clip_and_publish(engine, &clip, &editor_weak)
+                duplicate_clip_and_publish(engine, &clip, *main_magnet, &editor_weak)
+            }
+            WorkerMsg::SetMainMagnet(enabled) => {
+                *main_magnet = enabled;
+                info!(enabled, "main-track magnet toggled");
+                if enabled {
+                    pack_main_track_and_publish(engine, &editor_weak);
+                }
             }
             WorkerMsg::Frame(_) => unreachable!("frames are handled by the drain below"),
         }
@@ -293,12 +359,12 @@ fn worker_loop(
                 while let Ok(next) = req_rx.try_recv() {
                     match next {
                         WorkerMsg::Frame(latest) => tick = latest,
-                        other => mutate(engine, &mut clipboard, other),
+                        other => mutate(engine, &mut clipboard, &mut main_magnet, other),
                     }
                 }
                 render_frame(engine, tl_rate, &preview_weak, tick);
             }
-            other => mutate(engine, &mut clipboard, other),
+            other => mutate(engine, &mut clipboard, &mut main_magnet, other),
         }
     }
 }
@@ -333,13 +399,16 @@ fn import_and_publish(
 ///   that fits when the drop tick overlaps existing clips;
 /// - dropped on empty timeline space (`track` empty) → a fresh video track
 ///   inserted at `drop_row`, so the new lane appears where the user dropped
-///   (above the lanes ⇒ top of the stack, below ⇒ bottom).
+///   (above the lanes ⇒ top of the stack, below ⇒ bottom);
+/// - dropped on the main lane with the magnet on (`insert`) → ripple-insert
+///   at `start_tick`, shifting later clips right (atomic engine command).
 fn add_clip_and_publish(
     engine: &mut Engine,
     media: &str,
     track: &str,
     start_tick: i64,
     drop_row: i64,
+    insert: bool,
     editor_weak: &slint::Weak<EditorStore<'static>>,
 ) {
     let Some(media_id) = parse_raw_id(media).map(MediaId::from_raw) else {
@@ -351,11 +420,30 @@ fn add_clip_and_publish(
         return;
     };
     let tl_rate = engine.project().timeline().frame_rate;
+
+    if insert && let Some(lane) = video_lane(engine, track) {
+        match engine.apply(Command::Edit(EditCommand::RippleInsert {
+            track: lane,
+            media: media_id,
+            source,
+            at: RationalTime::new(start_tick.max(0), tl_rate),
+        })) {
+            Ok(ApplyOutcome::Edited(EditOutcome::Created(clip))) => {
+                info!(%clip, %lane, %media_id, start_tick, "ripple-inserted clip from library drop");
+            }
+            Ok(other) => error!(%media_id, "unexpected ripple-insert outcome: {other:?}"),
+            Err(e) => error!(%media_id, %lane, start_tick, "ripple insert failed: {e}"),
+        }
+        publish_projection(engine, editor_weak);
+        return;
+    }
     // Mirror Project::add_clip's source→timeline resampling so first-fit sees
     // the same extent the engine will validate.
     let duration_ticks = resample(source.duration, tl_rate).value.max(1);
     let desired = start_tick.max(0);
 
+    // One history entry per drop, even when it creates the landing lane.
+    engine.begin_group();
     let (track_id, start_value) = match video_lane(engine, track) {
         Some(lane) => {
             let lane_track = engine
@@ -369,6 +457,7 @@ fn add_clip_and_publish(
             Ok(id) => (id, desired),
             Err(e) => {
                 error!(%media_id, "drop failed creating video track: {e}");
+                engine.rollback_group();
                 return;
             }
         },
@@ -381,6 +470,7 @@ fn add_clip_and_publish(
         start: RationalTime::new(start_value, tl_rate),
     })) {
         Ok(ApplyOutcome::Edited(EditOutcome::Created(clip))) => {
+            engine.commit_group();
             info!(
                 %clip, %track_id, %media_id,
                 start_tick = start_value,
@@ -389,10 +479,19 @@ fn add_clip_and_publish(
             );
             publish_projection(engine, editor_weak);
         }
-        Ok(other) => error!(%media_id, "unexpected add-clip outcome: {other:?}"),
         // First-fit should have made the placement valid; the engine still
-        // rejects atomically if not, so just surface the reason.
-        Err(e) => error!(%media_id, %track_id, start_tick = start_value, "add clip failed: {e}"),
+        // rejects atomically if not. Surface the reason and roll the group
+        // back so a lane created for this drop doesn't linger.
+        Ok(other) => {
+            error!(%media_id, "unexpected add-clip outcome: {other:?}");
+            engine.rollback_group();
+            publish_projection(engine, editor_weak);
+        }
+        Err(e) => {
+            error!(%media_id, %track_id, start_tick = start_value, "add clip failed: {e}");
+            engine.rollback_group();
+            publish_projection(engine, editor_weak);
+        }
     }
 }
 
@@ -410,13 +509,18 @@ fn video_lane(engine: &Engine, track: &str) -> Option<TrackId> {
 /// Move a dragged clip to its resolved landing spot: an existing lane
 /// (`track` set) or a new lane of the clip's kind inserted at `insert_row`.
 /// A cross-lane move that empties its source lane removes that lane
-/// (CapCut deletes overlay tracks that empty out).
+/// (CapCut deletes overlay tracks that empty out). With `insert` (main-track
+/// magnet) the landing is an insertion on the main lane; with the magnet on,
+/// a move *off* the main lane also closes the gap it leaves. Every variant
+/// is one history group, so one undo reverts the whole gesture.
 fn move_clip_and_publish(
     engine: &mut Engine,
     clip: &str,
     track: &str,
     insert_row: i64,
     start_tick: i64,
+    insert: bool,
+    main_magnet: bool,
     editor_weak: &slint::Weak<EditorStore<'static>>,
 ) {
     let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
@@ -433,18 +537,52 @@ fn move_clip_and_publish(
         .track(source_track)
         .expect("track_of returned an existing track")
         .kind;
+    let placed = engine
+        .project()
+        .clip(clip_id)
+        .expect("track_of returned a placed clip")
+        .timeline;
     let tl_rate = engine.project().timeline().frame_rate;
+    // Decided before the gesture mutates anything: a new lane created below
+    // the stack would become the bottom video lane and steal main status.
+    let source_is_main = main_magnet && Some(source_track) == main_video_track(engine);
 
-    let mut created_lane = false;
+    if insert {
+        // Main-track magnet: the resolver targets the existing main lane.
+        let Some(to_track) = parse_raw_id(track).map(TrackId::from_raw) else {
+            error!(%clip_id, track, "insert-move ignored: unparsable track id");
+            return;
+        };
+        engine.begin_group();
+        let result = if to_track == source_track {
+            ripple_reorder(engine, clip_id, to_track, start_tick.max(0))
+        } else {
+            ripple_move_in(engine, clip_id, source_track, to_track, start_tick.max(0))
+        };
+        match result {
+            Ok(()) => {
+                engine.commit_group();
+                info!(%clip_id, %to_track, start_tick, "ripple-inserted moved clip");
+            }
+            Err(e) => {
+                error!(%clip_id, %to_track, start_tick, "insert move failed: {e}");
+                engine.rollback_group();
+            }
+        }
+        publish_projection(engine, editor_weak);
+        return;
+    }
+
+    // One history entry per move, including a created destination lane and a
+    // removed emptied source lane.
+    engine.begin_group();
     let to_track = match parse_raw_id(track).map(TrackId::from_raw) {
         Some(id) => id,
         None => match create_track(engine, kind, insert_row) {
-            Ok(id) => {
-                created_lane = true;
-                id
-            }
+            Ok(id) => id,
             Err(e) => {
                 error!(%clip_id, "move failed creating {kind:?} track: {e}");
+                engine.rollback_group();
                 return;
             }
         },
@@ -456,24 +594,130 @@ fn move_clip_and_publish(
         start: RationalTime::new(start_tick.max(0), tl_rate),
     })) {
         Ok(ApplyOutcome::Edited(EditOutcome::Updated(_))) => {
-            info!(%clip_id, %to_track, start_tick, "moved clip");
+            let mut completed = true;
             if source_track != to_track {
-                remove_track_if_empty(engine, source_track);
+                // Leaving the main lane with the magnet on closes the gap
+                // the clip vacated (CapCut ripple). Can't collide: the first
+                // shifted clip lands exactly where the moved clip started.
+                if source_is_main {
+                    completed = apply_edit(
+                        engine,
+                        EditCommand::ShiftClips {
+                            track: source_track,
+                            from: placed.start,
+                            delta: RationalTime::new(-placed.duration.value, tl_rate),
+                        },
+                    )
+                    .map_err(|e| error!(%clip_id, "move failed closing main-lane gap: {e}"))
+                    .is_ok();
+                }
+                if completed {
+                    remove_track_if_empty(engine, source_track);
+                }
+            }
+            if completed {
+                engine.commit_group();
+                info!(%clip_id, %to_track, start_tick, "moved clip");
+            } else {
+                engine.rollback_group();
             }
             publish_projection(engine, editor_weak);
         }
-        Ok(other) => error!(%clip_id, "unexpected move-clip outcome: {other:?}"),
+        Ok(other) => {
+            error!(%clip_id, "unexpected move-clip outcome: {other:?}");
+            engine.rollback_group();
+            publish_projection(engine, editor_weak);
+        }
         // The drag resolver previewed a valid spot; the engine still rejects
-        // atomically if the projection raced a concurrent edit.
+        // atomically if the projection raced a concurrent edit. Rolling back
+        // removes a lane this move just created.
         Err(e) => {
             error!(%clip_id, %to_track, start_tick, "move clip failed: {e}");
-            // Don't leave a lane we just created lingering empty.
-            if created_lane {
-                remove_track_if_empty(engine, to_track);
-            }
+            engine.rollback_group();
             publish_projection(engine, editor_weak);
         }
     }
+}
+
+/// Reorder within the main lane as one group of four commands: park the clip
+/// past the lane's content end (never rendered — the projection publishes
+/// only after the group resolves), close its old gap, open the new hole at
+/// `at` (post-close space, straight from the drag resolver), and land in it.
+fn ripple_reorder(
+    engine: &mut Engine,
+    clip_id: ClipId,
+    track: TrackId,
+    at: i64,
+) -> Result<(), String> {
+    let tl_rate = engine.project().timeline().frame_rate;
+    let placed = engine
+        .project()
+        .clip(clip_id)
+        .ok_or("clip not on the timeline")?
+        .timeline;
+    let duration = placed.duration.value;
+    let park = engine
+        .project()
+        .timeline()
+        .track(track)
+        .ok_or("main lane missing")?
+        .content_end();
+
+    apply_edit(engine, EditCommand::MoveClip {
+        clip: clip_id,
+        to_track: track,
+        start: RationalTime::new(park, tl_rate),
+    })?;
+    // Both shifts also carry the parked clip along (its start stays past the
+    // rest of the lane), so it never collides with the clips in between.
+    apply_edit(engine, EditCommand::ShiftClips {
+        track,
+        from: placed.start,
+        delta: RationalTime::new(-duration, tl_rate),
+    })?;
+    apply_edit(engine, EditCommand::ShiftClips {
+        track,
+        from: RationalTime::new(at, tl_rate),
+        delta: RationalTime::new(duration, tl_rate),
+    })?;
+    apply_edit(engine, EditCommand::MoveClip {
+        clip: clip_id,
+        to_track: track,
+        start: RationalTime::new(at, tl_rate),
+    })
+}
+
+/// Cross-lane move onto the main lane: open the hole at `at`, move the clip
+/// in, and drop the source lane when this emptied it (same overlay policy as
+/// freeform moves).
+fn ripple_move_in(
+    engine: &mut Engine,
+    clip_id: ClipId,
+    source_track: TrackId,
+    to_track: TrackId,
+    at: i64,
+) -> Result<(), String> {
+    let tl_rate = engine.project().timeline().frame_rate;
+    let duration = engine
+        .project()
+        .clip(clip_id)
+        .ok_or("clip not on the timeline")?
+        .timeline
+        .duration
+        .value;
+
+    apply_edit(engine, EditCommand::ShiftClips {
+        track: to_track,
+        from: RationalTime::new(at, tl_rate),
+        delta: RationalTime::new(duration, tl_rate),
+    })?;
+    apply_edit(engine, EditCommand::MoveClip {
+        clip: clip_id,
+        to_track,
+        start: RationalTime::new(at, tl_rate),
+    })?;
+    remove_track_if_empty(engine, source_track);
+    Ok(())
 }
 
 /// Re-place a trimmed clip at its resolved extent. The trim resolver already
@@ -508,10 +752,13 @@ fn trim_clip_and_publish(
 }
 
 /// Remove a clip; a lane the removal empties is removed with it (CapCut
-/// deletes emptied overlay tracks — same policy the drag-moves use).
+/// deletes emptied overlay tracks — same policy the drag-moves use). With
+/// the main-track magnet on, deleting from the main lane ripples the gap
+/// closed. Everything forms one history group: one undo restores it all.
 fn remove_clip_and_publish(
     engine: &mut Engine,
     clip: &str,
+    main_magnet: bool,
     editor_weak: &slint::Weak<EditorStore<'static>>,
 ) {
     let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
@@ -522,15 +769,30 @@ fn remove_clip_and_publish(
         error!(%clip_id, "delete ignored: clip not on the timeline");
         return;
     };
+    let ripple = main_magnet && Some(track) == main_video_track(engine);
 
-    match engine.apply(Command::Edit(EditCommand::RemoveClip { clip: clip_id })) {
+    // One history entry per delete, including the removal of an emptied lane.
+    engine.begin_group();
+    let command = if ripple {
+        EditCommand::RippleDelete { clip: clip_id }
+    } else {
+        EditCommand::RemoveClip { clip: clip_id }
+    };
+    match engine.apply(Command::Edit(command)) {
         Ok(ApplyOutcome::Edited(EditOutcome::Removed(_))) => {
-            info!(%clip_id, %track, "removed clip");
             remove_track_if_empty(engine, track);
+            engine.commit_group();
+            info!(%clip_id, %track, ripple, "removed clip");
             publish_projection(engine, editor_weak);
         }
-        Ok(other) => error!(%clip_id, "unexpected remove-clip outcome: {other:?}"),
-        Err(e) => error!(%clip_id, "remove clip failed: {e}"),
+        Ok(other) => {
+            error!(%clip_id, "unexpected remove-clip outcome: {other:?}");
+            engine.rollback_group();
+        }
+        Err(e) => {
+            error!(%clip_id, "remove clip failed: {e}");
+            engine.rollback_group();
+        }
     }
 }
 
@@ -591,24 +853,29 @@ fn snapshot_clip(engine: &Engine, clip: &str) -> Option<ClipboardClip> {
 
 /// Paste the clipboard at `tick`: lands on the copied clip's lane (or a new
 /// lane of its kind when that lane is gone), sliding right into the first
-/// gap that fits — the same placement policy as library drops.
+/// gap that fits — the same placement policy as library drops. With the
+/// main-track magnet on, pasting on the main lane ripple-inserts at the
+/// clip boundary nearest `tick` instead.
 fn paste_and_publish(
     engine: &mut Engine,
     content: &ClipboardClip,
     tick: i64,
+    main_magnet: bool,
     editor_weak: &slint::Weak<EditorStore<'static>>,
 ) {
-    let mut created_lane = false;
+    let tl_rate = engine.project().timeline().frame_rate;
+    let duration = content.duration_ticks.max(1);
+
+    // One history entry per paste, even when it recreates the copied lane.
+    engine.begin_group();
     let track = if engine.project().timeline().track(content.track).is_some() {
         content.track
     } else {
         match create_track(engine, content.kind, 0) {
-            Ok(id) => {
-                created_lane = true;
-                id
-            }
+            Ok(id) => id,
             Err(e) => {
                 error!("paste failed creating {:?} track: {e}", content.kind);
+                engine.rollback_group();
                 return;
             }
         }
@@ -619,28 +886,49 @@ fn paste_and_publish(
         .timeline()
         .track(track)
         .expect("paste target track exists");
-    let start = first_fit_start(lane, tick.max(0), content.duration_ticks.max(1));
+    let ripple = main_magnet && Some(track) == main_video_track(engine);
+    let start = if ripple {
+        nearest_boundary(lane, tick.max(0))
+    } else {
+        first_fit_start(lane, tick.max(0), duration)
+    };
+
+    if ripple
+        && let Err(e) = apply_edit(engine, EditCommand::ShiftClips {
+            track,
+            from: RationalTime::new(start, tl_rate),
+            delta: RationalTime::new(duration, tl_rate),
+        })
+    {
+        error!(%track, start_tick = start, "paste failed opening hole: {e}");
+        engine.rollback_group();
+        publish_projection(engine, editor_weak);
+        return;
+    }
 
     match add_clip_content(engine, track, &content.content, content.duration_ticks, start) {
         Ok(clip_id) => {
-            info!(%clip_id, %track, start_tick = start, "pasted clip");
+            engine.commit_group();
+            info!(%clip_id, %track, start_tick = start, ripple, "pasted clip");
             publish_projection(engine, editor_weak);
         }
+        // Rolling back removes a lane this paste just recreated (and closes
+        // a hole the ripple shift just opened).
         Err(e) => {
             error!(%track, start_tick = start, "paste failed: {e}");
-            if created_lane {
-                remove_track_if_empty(engine, track);
-            }
+            engine.rollback_group();
             publish_projection(engine, editor_weak);
         }
     }
 }
 
 /// Place a copy of `clip` immediately after it on its own lane (first gap
-/// that fits from the clip's end).
+/// that fits from the clip's end). With the main-track magnet on, a main-lane
+/// duplicate ripple-inserts right after the original, shifting later clips.
 fn duplicate_clip_and_publish(
     engine: &mut Engine,
     clip: &str,
+    main_magnet: bool,
     editor_weak: &slint::Weak<EditorStore<'static>>,
 ) {
     let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
@@ -658,6 +946,32 @@ fn duplicate_clip_and_publish(
     let content = original.content.clone();
     let duration_ticks = original.timeline.duration.value.max(1);
     let end_tick = original.timeline.end_tick();
+    let tl_rate = engine.project().timeline().frame_rate;
+
+    if main_magnet && Some(track) == main_video_track(engine) {
+        // Open a hole right after the original, land the copy in it — one
+        // history entry for the pair.
+        engine.begin_group();
+        let result = apply_edit(engine, EditCommand::ShiftClips {
+            track,
+            from: RationalTime::new(end_tick, tl_rate),
+            delta: RationalTime::new(duration_ticks, tl_rate),
+        })
+        .and_then(|_| add_clip_content(engine, track, &content, duration_ticks, end_tick));
+        match result {
+            Ok(copy_id) => {
+                engine.commit_group();
+                info!(%clip_id, %copy_id, %track, start_tick = end_tick, "ripple-duplicated clip");
+            }
+            Err(e) => {
+                error!(%clip_id, start_tick = end_tick, "duplicate failed: {e}");
+                engine.rollback_group();
+            }
+        }
+        publish_projection(engine, editor_weak);
+        return;
+    }
+
     let lane = engine
         .project()
         .timeline()
@@ -672,6 +986,96 @@ fn duplicate_clip_and_publish(
         }
         Err(e) => error!(%clip_id, start_tick = start, "duplicate failed: {e}"),
     }
+}
+
+/// Close every gap on the main lane, including leading space before the
+/// first clip — CapCut's lane is gapless the moment the magnet turns on.
+/// One history group: a single undo restores the gaps.
+fn pack_main_track_and_publish(
+    engine: &mut Engine,
+    editor_weak: &slint::Weak<EditorStore<'static>>,
+) {
+    let Some(track) = main_video_track(engine) else {
+        return;
+    };
+    let tl_rate = engine.project().timeline().frame_rate;
+    // (start, duration) snapshot in start order. Each shift slides the whole
+    // suffix left, so positions after it are tracked via the running offset
+    // instead of re-reading the engine.
+    let clips: Vec<(i64, i64)> = engine
+        .project()
+        .timeline()
+        .track(track)
+        .map(|t| {
+            t.clips_ordered()
+                .iter()
+                .map(|c| (c.timeline.start.value, c.timeline.duration.value))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut shifted_so_far = 0;
+    let mut expected = 0;
+    engine.begin_group();
+    for (start, duration) in clips {
+        let current = start - shifted_so_far;
+        if current > expected {
+            if let Err(e) = apply_edit(engine, EditCommand::ShiftClips {
+                track,
+                from: RationalTime::new(current, tl_rate),
+                delta: RationalTime::new(expected - current, tl_rate),
+            }) {
+                error!(%track, "magnet pack failed: {e}");
+                engine.rollback_group();
+                publish_projection(engine, editor_weak);
+                return;
+            }
+            shifted_so_far += current - expected;
+        }
+        expected += duration;
+    }
+    // An already-packed lane records nothing (empty groups are dropped).
+    engine.commit_group();
+    publish_projection(engine, editor_weak);
+}
+
+/// The main track under CapCut's magnet: the *bottom* video lane (the engine
+/// stacks bottom→top, so the first video track in stack order).
+fn main_video_track(engine: &Engine) -> Option<TrackId> {
+    let timeline = engine.project().timeline();
+    timeline
+        .order()
+        .iter()
+        .copied()
+        .find(|id| timeline.track(*id).is_some_and(|t| t.kind == TrackKind::Video))
+}
+
+/// Clip boundary on `track` nearest to `tick`: every clip start plus the
+/// content end (0 on an empty lane). Ties resolve to the earlier boundary.
+fn nearest_boundary(track: &Track, tick: i64) -> i64 {
+    let mut best = 0;
+    let mut best_distance = i64::MAX;
+    let mut consider = |boundary: i64| {
+        let distance = (tick - boundary).abs();
+        if distance < best_distance {
+            best = boundary;
+            best_distance = distance;
+        }
+    };
+    for clip in track.clips_ordered() {
+        consider(clip.timeline.start.value);
+    }
+    consider(track.content_end());
+    best
+}
+
+/// Apply a single edit command, flattening the outcome — for compositions
+/// where only success/failure matters (the group publishes once at the end).
+fn apply_edit(engine: &mut Engine, command: EditCommand) -> Result<(), String> {
+    engine
+        .apply(Command::Edit(command))
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
 /// Re-issue snapshotted clip content as a fresh engine command: `AddClip`

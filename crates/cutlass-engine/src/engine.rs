@@ -132,6 +132,34 @@ impl Engine {
         self.history.can_redo()
     }
 
+    /// Group every command applied until [`commit_group`](Self::commit_group)
+    /// into a single history entry, so a gesture that dispatches several
+    /// commands (new-lane move, drop that creates a lane, delete that empties
+    /// its lane) reverts with one undo.
+    pub fn begin_group(&mut self) {
+        self.history.begin_group();
+    }
+
+    /// Close the open group and record it as one undo entry (no-op if the
+    /// group made no edits).
+    pub fn commit_group(&mut self) {
+        self.history.commit_group();
+    }
+
+    /// Abort the open group: revert its commands in reverse order, restoring
+    /// the pre-group state. History is left untouched — a rolled-back gesture
+    /// records nothing and preserves the redo stack.
+    pub fn rollback_group(&mut self) {
+        for inverse in self.history.take_group().into_iter().rev() {
+            if self.run_action(inverse).is_err() {
+                // Inverses are written to be infallible once recorded (same
+                // policy as undo); nothing sensible to do beyond stopping.
+                tracing::error!("history group rollback failed; state may be partial");
+                return;
+            }
+        }
+    }
+
     /// Apply a wire command. On success, pushes the inverse action onto the undo stack.
     pub fn apply(&mut self, command: Command) -> Result<ApplyOutcome, EngineError> {
         if let Command::Project(ProjectCommand::Export { path }) = command {
@@ -176,6 +204,7 @@ impl Engine {
     }
 
     pub fn undo(&mut self) -> bool {
+        debug_assert!(!self.history.in_group(), "undo inside an open history group");
         let Some(action) = self.history.pop_undo() else {
             return false;
         };
@@ -193,6 +222,7 @@ impl Engine {
     }
 
     pub fn redo(&mut self) -> bool {
+        debug_assert!(!self.history.in_group(), "redo inside an open history group");
         let Some(action) = self.history.pop_redo() else {
             return false;
         };

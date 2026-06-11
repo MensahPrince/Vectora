@@ -17,13 +17,20 @@ export global EditorStore {
     // a new video track at `drop-row` (the lane-list row under the cursor; may
     // be out of range, meaning above/below the existing lanes). Drops that
     // overlap clips on the targeted lane slide right into the first gap that
-    // fits.
-    callback on-clip-dropped(media-id: string, track-id: string, start-tick: int, drop-row: int);
+    // fits. `insert` (main-track magnet) ripple-inserts at `start-tick`
+    // instead, shifting later clips right.
+    callback on-clip-dropped(media-id: string, track-id: string, start-tick: int, drop-row: int, insert: bool);
     // A clip drag-move was released. `track-id` names the destination lane,
     // or is empty when a new lane of the clip's kind must be inserted at
     // `insert-row` (lane-list row, top-first). The position was already
     // validated by the drag resolver (no overlap, kind-compatible).
-    callback on-clip-moved(clip-id: string, track-id: string, insert-row: int, start-tick: int);
+    // `insert` (main-track magnet) ripple-inserts at `start-tick` on the
+    // main lane — for reorders the tick is in post-close space (the worker
+    // closes the clip's own gap first).
+    callback on-clip-moved(clip-id: string, track-id: string, insert-row: int, start-tick: int, insert: bool);
+    // The main-track magnet toggled; the worker mirrors the flag (deletes/
+    // paste/duplicate policy) and packs the main lane when enabling.
+    callback on-main-magnet-changed(enabled: bool);
     // An edge-trim drag was released: re-place the clip at
     // `[start-tick, start-tick + duration-ticks)` on its own lane. Already
     // validated by the trim resolver (neighbors, source headroom, ≥ 1 tick).

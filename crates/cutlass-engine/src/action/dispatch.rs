@@ -108,5 +108,18 @@ fn dispatch_edit(
             let inverse = edit::ripple_delete::execute(ctx, clip)?;
             Ok((ApplyOutcome::Edited(EditOutcome::Removed(clip)), Some(inverse)))
         }
+        EditCommand::ShiftClips { track, from, delta } => {
+            let inverse = edit::shift_clips::execute(ctx, track, from, delta)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::ShiftedTrack(track)), Some(inverse)))
+        }
+        EditCommand::RippleInsert {
+            track,
+            media,
+            source,
+            at,
+        } => {
+            let (id, inverse) = edit::ripple_insert::execute(ctx, track, media, source, at)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::Created(id)), Some(inverse)))
+        }
     }
 }

@@ -12,9 +12,9 @@ import { TrackHead } from "track-head.slint";
 import { Ruler } from "ruler.slint";
 import { ClipView } from "clip.slint";
 import { TimelineViewState } from "state.slint";
-import { Sequence, TrackKind } from "../../models/index.slint";
+import { Sequence } from "../../models/index.slint";
 import { TimelineLib } from "../../lib/timeline-lib.slint";
-import { DragBackend, SnapResult, ClipDragResolution, ClipTrimResolution } from "../../lib/drag-backend.slint";
+import { DragBackend, SnapResult, ClipDragResolution, ClipTrimResolution, LibraryDropResolution } from "../../lib/drag-backend.slint";
 import { AppState } from "../../state.slint";
 
 
@@ -56,33 +56,24 @@ export component TimelinePanel inherits PanelBase {
         (AppState.library-drag-cursor-x - lanes.absolute-position.x - TimelineViewState.scroll-x)
         / TimelineStore.zoom / 1px));
 
-    // Magnet against clip edges, the playhead, and tick 0. Empty drag ids ⇒
-    // every placed clip is a snap candidate.
-    private property <SnapResult> library-drop-snap: DragBackend.snap-clip-start(
-        root.sequence,
-        "",
-        "",
-        root.library-drop-cursor-tick,
-        AppState.library-drag-duration-ticks,
-        root.snap-threshold-ticks,
-        TimelineStore.playhead-tick);
-
-    private property <int> library-drop-tick: max(0, library-drop-snap.snapped-start-value);
-
     // Lane row under the cursor: row 0 is the ForceHeadSpace spacer, tracks
     // start at row 1 (same pitch — every row is track-height + spacing tall).
     private property <int> library-drop-row: floor(
         (AppState.library-drag-cursor-y - lanes.absolute-position.y - TimelineViewState.scroll-y)
         / (root.track-height + root.track-spacing)) - 1;
 
-    // Video lane under the cursor, or empty (the engine then creates a new
-    // video track for the drop).
-    private property <string> library-drop-track-id:
-        library-drop-row >= 0
-        && library-drop-row < sequence.tracks.length
-        && sequence.tracks[library-drop-row].kind == TrackKind.video
-            ? sequence.tracks[library-drop-row].id
-            : "";
+    // Where the drop lands (src/snap.rs): the video lane under the cursor
+    // (or empty ⇒ the worker creates one at the row), position magneted to
+    // clip edges / playhead / tick 0 — or, on the main lane with the magnet
+    // on, an insertion between clips (caret preview below).
+    private property <LibraryDropResolution> library-drop-res: DragBackend.resolve-library-drop(
+        root.sequence,
+        AppState.library-drag-duration-ticks,
+        root.library-drop-cursor-tick,
+        root.library-drop-row,
+        TimelineStore.playhead-tick,
+        root.snap-threshold-ticks,
+        TimelineStore.main-magnet-enabled);
 
     // Commit the drop when the drag ends with the cursor over this panel. The
     // pointer-up fires in the library tile's TouchArea (it owns the grab), so
@@ -92,9 +83,10 @@ export component TimelinePanel inherits PanelBase {
         if (!self.library-drag-live && self.library-cursor-inside) {
             EditorStore.on-clip-dropped(
                 AppState.library-drag-media-id,
-                self.library-drop-track-id,
-                self.library-drop-tick,
-                self.library-drop-row);
+                self.library-drop-res.target-track-id,
+                self.library-drop-res.resolved-start,
+                self.library-drop-res.target-row,
+                self.library-drop-res.is-insert);
         }
     }
 
@@ -134,7 +126,8 @@ export component TimelinePanel inherits PanelBase {
         root.clip-drag-dx-ticks,
         root.clip-drag-hover-row,
         TimelineStore.playhead-tick,
-        root.snap-threshold-ticks);
+        root.snap-threshold-ticks,
+        TimelineStore.main-magnet-enabled);
 
     // ClipView raises `drag-released` on pointer-up; the commit needs the
     // dragging ids, so this panel owns the teardown.
@@ -148,7 +141,8 @@ export component TimelinePanel inherits PanelBase {
                 TimelineViewState.dragging-clip-id,
                 self.clip-drag-res.target-track-id,
                 self.clip-drag-res.target-row,
-                self.clip-drag-res.resolved-start);
+                self.clip-drag-res.resolved-start,
+                self.clip-drag-res.is-insert);
         }
         TimelineViewState.dragging-source-track-id = "";
         TimelineViewState.dragging-clip-id = "";
@@ -344,8 +338,8 @@ export component TimelinePanel inherits PanelBase {
                 // --- clip drag visuals (content space, above the lanes) ------
 
                 // Landing ghost on an existing lane: exactly where a release
-                // puts the clip.
-                if clip-dragging && clip-drag-res.valid && !clip-drag-res.is-new-lane: Rectangle {
+                // puts the clip. (Insert mode renders a caret instead.)
+                if clip-dragging && clip-drag-res.valid && !clip-drag-res.is-new-lane && !clip-drag-res.is-insert: Rectangle {
                     x: clip-drag-res.resolved-start * TimelineStore.zoom * 1px;
                     y: (clip-drag-res.target-row + 1) * row-pitch;
                     width: clip-drag-res.duration-ticks * TimelineStore.zoom * 1px;
@@ -374,6 +368,26 @@ export component TimelinePanel inherits PanelBase {
                     border-width: 1px;
                     border-color: #00E5C7;
                     border-radius: AppStore.theme.track-lane.clip.radius;
+                }
+
+                // Main-track magnet: insertion caret between clips instead
+                // of a landing ghost — the commit shifts later clips right
+                // to open the hole exactly here.
+                if clip-dragging && clip-drag-res.valid && clip-drag-res.is-insert: Rectangle {
+                    x: clip-drag-res.caret-tick * TimelineStore.zoom * 1px - self.width / 2;
+                    y: (clip-drag-res.target-row + 1) * row-pitch - 2px;
+                    width: 3px;
+                    height: track-height - 1px;
+                    background: #00E5C7;
+                }
+
+                // Same insertion caret for library drags over the main lane.
+                if library-drag-over && library-drop-res.is-insert: Rectangle {
+                    x: library-drop-res.caret-tick * TimelineStore.zoom * 1px - self.width / 2;
+                    y: (library-drop-res.target-row + 1) * row-pitch - 2px;
+                    width: 3px;
+                    height: track-height - 1px;
+                    background: #00E5C7;
                 }
 
                 // Vertical magnet guide at the snapped edge (CapCut-style).
