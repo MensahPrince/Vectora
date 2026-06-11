@@ -3,6 +3,10 @@ export global TimelineViewState {
     in-out property <length> scroll-x: 0px;
     in-out property <length> scroll-y: 0px;
 
+    // Width of the lane viewport (the scrolling Flickable), mirrored by
+    // TimelinePanel so zoom anchoring can convert viewport px ↔ ticks.
+    in-out property <length> viewport-w: 0px;
+
     // --- clip drag gesture ---------------------------------------------
     // Set by ClipView on grab; TimelinePanel resolves the landing spot each
     // frame (ghost + guides) and commits on release. Empty clip id ⇔ no drag.

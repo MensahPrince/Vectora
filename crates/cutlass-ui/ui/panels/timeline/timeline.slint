@@ -224,6 +224,37 @@ export component TimelinePanel inherits PanelBase {
         TimelineViewState.scroll-y = clamp(TimelineViewState.scroll-y, min-scroll-y, 0px);
     }
 
+    // Same stale-scroll hazard on the x axis, now reachable through the
+    // toolbar zoom slider: zooming out shrinks `content-width`, and a
+    // viewport scrolled far right would keep a `scroll-x` past the new
+    // bound (blank timeline until the next user scroll snaps it back).
+    private property <length> min-scroll-x: min(0px, lanes.width - content-width);
+
+    changed min-scroll-x => {
+        TimelineViewState.scroll-x = clamp(TimelineViewState.scroll-x, min-scroll-x, 0px);
+    }
+
+    // Mirror the lane viewport width so zoom anchoring (TimelineActions
+    // .set-zoom) can keep the playhead / view center stationary.
+    private property <length> lanes-width: lanes.width;
+
+    changed lanes-width => {
+        TimelineViewState.viewport-w = self.lanes-width;
+    }
+
+    init => {
+        TimelineViewState.viewport-w = lanes.width;
+    }
+
+    // Every playhead mutation — ruler scrub, frame-step keys, Home/End —
+    // funnels through this one watcher into a preview frame request
+    // (coalesced to the newest tick on the worker thread).
+    private property <int> playhead: TimelineStore.playhead-tick;
+
+    changed playhead => {
+        EditorStore.on-playhead-changed(self.playhead);
+    }
+
     VerticalLayout {
 
         spacing: AppStore.theme.metrics.spacing.none;
@@ -240,11 +271,9 @@ export component TimelinePanel inherits PanelBase {
                 width: 100px;
             }
 
-            Rectangle { // ruler container — clip so ticks that scroll into the head column are hidden.
+            Rectangle { // ruler container — clip so marks that scroll into the head column are hidden.
                 clip: true;
-                Ruler {
-                    content-width: root.content-width;
-                }
+                Ruler { }
             }
         }
 

@@ -7,7 +7,8 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
 use cutlass_models::{
-    ClipId, MediaId, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
+    ClipId, ClipSource, MediaId, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind,
+    resample,
 };
 use tracing::{error, info};
 
@@ -49,6 +50,35 @@ enum WorkerMsg {
         start_tick: i64,
         duration_ticks: i64,
     },
+    /// Remove `clip` (raw id); a lane this empties is removed too (same
+    /// policy as drag-moves).
+    RemoveClip { clip: String },
+    /// Split `clip` (raw id) at `at_tick` (sequence ticks). The UI gates on
+    /// the playhead being strictly inside the clip; the engine re-validates.
+    SplitClip { clip: String, at_tick: i64 },
+    /// Step the engine history one entry back / forward.
+    Undo,
+    Redo,
+    /// Snapshot `clip` (raw id) into the worker clipboard. A snapshot, not a
+    /// reference — pasting works after the original is deleted.
+    CopyClip { clip: String },
+    /// Place the clipboard content at `tick` on the copied clip's lane,
+    /// sliding right into the first gap that fits.
+    PasteAt { tick: i64 },
+    /// Place a copy of `clip` right after it on its own lane.
+    DuplicateClip { clip: String },
+}
+
+/// Worker-side clipboard: everything needed to re-issue the copied clip as a
+/// fresh `AddClip` / `AddGenerated` later, independent of the original.
+struct ClipboardClip {
+    /// Lane the clip was copied from (preferred paste target).
+    track: TrackId,
+    /// Lane kind, for recreating a lane when `track` is gone by paste time.
+    kind: TrackKind,
+    content: ClipSource,
+    /// Timeline-rate duration, for first-fit placement.
+    duration_ticks: i64,
 }
 
 /// Cheap, cloneable sender to the engine thread. Hand one clone to each UI
@@ -92,6 +122,34 @@ impl WorkerHandle {
             start_tick,
             duration_ticks,
         });
+    }
+
+    pub fn remove_clip(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::RemoveClip { clip });
+    }
+
+    pub fn split_clip(&self, clip: String, at_tick: i64) {
+        let _ = self.tx.send(WorkerMsg::SplitClip { clip, at_tick });
+    }
+
+    pub fn undo(&self) {
+        let _ = self.tx.send(WorkerMsg::Undo);
+    }
+
+    pub fn redo(&self) {
+        let _ = self.tx.send(WorkerMsg::Redo);
+    }
+
+    pub fn copy_clip(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::CopyClip { clip });
+    }
+
+    pub fn paste_at(&self, tick: i64) {
+        let _ = self.tx.send(WorkerMsg::PasteAt { tick });
+    }
+
+    pub fn duplicate_clip(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::DuplicateClip { clip });
     }
 }
 
@@ -182,26 +240,51 @@ fn worker_loop(
     editor_weak: slint::Weak<EditorStore<'static>>,
     req_rx: Receiver<WorkerMsg>,
 ) {
-    let mutate = |engine: &mut Engine, msg: WorkerMsg| match msg {
-        WorkerMsg::Import(path) => import_and_publish(engine, &path, &editor_weak),
-        WorkerMsg::AddClip {
-            media,
-            track,
-            start_tick,
-            drop_row,
-        } => add_clip_and_publish(engine, &media, &track, start_tick, drop_row, &editor_weak),
-        WorkerMsg::MoveClip {
-            clip,
-            track,
-            insert_row,
-            start_tick,
-        } => move_clip_and_publish(engine, &clip, &track, insert_row, start_tick, &editor_weak),
-        WorkerMsg::TrimClip {
-            clip,
-            start_tick,
-            duration_ticks,
-        } => trim_clip_and_publish(engine, &clip, start_tick, duration_ticks, &editor_weak),
-        WorkerMsg::Frame(_) => unreachable!("frames are handled by the drain below"),
+    // Clipboard lives with the loop: it's edit-session state, not project
+    // state — copies survive any number of edits/undos and die with the app.
+    let mut clipboard: Option<ClipboardClip> = None;
+
+    let mutate = |engine: &mut Engine, clipboard: &mut Option<ClipboardClip>, msg: WorkerMsg| {
+        match msg {
+            WorkerMsg::Import(path) => import_and_publish(engine, &path, &editor_weak),
+            WorkerMsg::AddClip {
+                media,
+                track,
+                start_tick,
+                drop_row,
+            } => add_clip_and_publish(engine, &media, &track, start_tick, drop_row, &editor_weak),
+            WorkerMsg::MoveClip {
+                clip,
+                track,
+                insert_row,
+                start_tick,
+            } => move_clip_and_publish(engine, &clip, &track, insert_row, start_tick, &editor_weak),
+            WorkerMsg::TrimClip {
+                clip,
+                start_tick,
+                duration_ticks,
+            } => trim_clip_and_publish(engine, &clip, start_tick, duration_ticks, &editor_weak),
+            WorkerMsg::RemoveClip { clip } => remove_clip_and_publish(engine, &clip, &editor_weak),
+            WorkerMsg::SplitClip { clip, at_tick } => {
+                split_clip_and_publish(engine, &clip, at_tick, &editor_weak)
+            }
+            WorkerMsg::Undo => history_step_and_publish(engine, false, &editor_weak),
+            WorkerMsg::Redo => history_step_and_publish(engine, true, &editor_weak),
+            WorkerMsg::CopyClip { clip } => {
+                if let Some(snapshot) = snapshot_clip(engine, &clip) {
+                    info!(clip, "copied clip to clipboard");
+                    *clipboard = Some(snapshot);
+                }
+            }
+            WorkerMsg::PasteAt { tick } => match clipboard {
+                Some(content) => paste_and_publish(engine, content, tick, &editor_weak),
+                None => info!("paste ignored: clipboard empty"),
+            },
+            WorkerMsg::DuplicateClip { clip } => {
+                duplicate_clip_and_publish(engine, &clip, &editor_weak)
+            }
+            WorkerMsg::Frame(_) => unreachable!("frames are handled by the drain below"),
+        }
     };
 
     while let Ok(msg) = req_rx.recv() {
@@ -210,12 +293,12 @@ fn worker_loop(
                 while let Ok(next) = req_rx.try_recv() {
                     match next {
                         WorkerMsg::Frame(latest) => tick = latest,
-                        other => mutate(engine, other),
+                        other => mutate(engine, &mut clipboard, other),
                     }
                 }
                 render_frame(engine, tl_rate, &preview_weak, tick);
             }
-            other => mutate(engine, other),
+            other => mutate(engine, &mut clipboard, other),
         }
     }
 }
@@ -374,7 +457,9 @@ fn move_clip_and_publish(
     })) {
         Ok(ApplyOutcome::Edited(EditOutcome::Updated(_))) => {
             info!(%clip_id, %to_track, start_tick, "moved clip");
-            remove_track_if_empty(engine, source_track, to_track);
+            if source_track != to_track {
+                remove_track_if_empty(engine, source_track);
+            }
             publish_projection(engine, editor_weak);
         }
         Ok(other) => error!(%clip_id, "unexpected move-clip outcome: {other:?}"),
@@ -384,7 +469,7 @@ fn move_clip_and_publish(
             error!(%clip_id, %to_track, start_tick, "move clip failed: {e}");
             // Don't leave a lane we just created lingering empty.
             if created_lane {
-                remove_track_if_empty(engine, to_track, source_track);
+                remove_track_if_empty(engine, to_track);
             }
             publish_projection(engine, editor_weak);
         }
@@ -422,12 +507,205 @@ fn trim_clip_and_publish(
     }
 }
 
-/// Remove `track` when a move left it empty (skipped if it's the lane the
-/// clip just landed on).
-fn remove_track_if_empty(engine: &mut Engine, track: TrackId, just_used: TrackId) {
-    if track == just_used {
+/// Remove a clip; a lane the removal empties is removed with it (CapCut
+/// deletes emptied overlay tracks — same policy the drag-moves use).
+fn remove_clip_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    editor_weak: &slint::Weak<EditorStore<'static>>,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "delete ignored: unparsable clip id");
         return;
+    };
+    let Some(track) = engine.project().timeline().track_of(clip_id) else {
+        error!(%clip_id, "delete ignored: clip not on the timeline");
+        return;
+    };
+
+    match engine.apply(Command::Edit(EditCommand::RemoveClip { clip: clip_id })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::Removed(_))) => {
+            info!(%clip_id, %track, "removed clip");
+            remove_track_if_empty(engine, track);
+            publish_projection(engine, editor_weak);
+        }
+        Ok(other) => error!(%clip_id, "unexpected remove-clip outcome: {other:?}"),
+        Err(e) => error!(%clip_id, "remove clip failed: {e}"),
     }
+}
+
+/// Split a clip into two abutting clips at `at_tick`. The UI only offers the
+/// split while the playhead is strictly inside the clip; the engine still
+/// validates the position atomically.
+fn split_clip_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    at_tick: i64,
+    editor_weak: &slint::Weak<EditorStore<'static>>,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "split ignored: unparsable clip id");
+        return;
+    };
+    let tl_rate = engine.project().timeline().frame_rate;
+
+    match engine.apply(Command::Edit(EditCommand::SplitClip {
+        clip: clip_id,
+        at: RationalTime::new(at_tick, tl_rate),
+    })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::Created(tail))) => {
+            info!(%clip_id, %tail, at_tick, "split clip");
+            publish_projection(engine, editor_weak);
+        }
+        Ok(other) => error!(%clip_id, "unexpected split-clip outcome: {other:?}"),
+        Err(e) => error!(%clip_id, at_tick, "split clip failed: {e}"),
+    }
+}
+
+/// Step the engine history (`redo == false` ⇒ undo). Publishes even on a
+/// no-op so the UI's can-undo / can-redo flags stay honest.
+fn history_step_and_publish(
+    engine: &mut Engine,
+    redo: bool,
+    editor_weak: &slint::Weak<EditorStore<'static>>,
+) {
+    let stepped = if redo { engine.redo() } else { engine.undo() };
+    info!(redo, stepped, "history step");
+    publish_projection(engine, editor_weak);
+}
+
+/// Snapshot `clip` (raw id) for the clipboard.
+fn snapshot_clip(engine: &Engine, clip: &str) -> Option<ClipboardClip> {
+    let clip_id = parse_raw_id(clip).map(ClipId::from_raw)?;
+    let timeline = engine.project().timeline();
+    let track = timeline.track_of(clip_id)?;
+    let kind = timeline.track(track)?.kind;
+    let clip = engine.project().clip(clip_id)?;
+    Some(ClipboardClip {
+        track,
+        kind,
+        content: clip.content.clone(),
+        duration_ticks: clip.timeline.duration.value,
+    })
+}
+
+/// Paste the clipboard at `tick`: lands on the copied clip's lane (or a new
+/// lane of its kind when that lane is gone), sliding right into the first
+/// gap that fits — the same placement policy as library drops.
+fn paste_and_publish(
+    engine: &mut Engine,
+    content: &ClipboardClip,
+    tick: i64,
+    editor_weak: &slint::Weak<EditorStore<'static>>,
+) {
+    let mut created_lane = false;
+    let track = if engine.project().timeline().track(content.track).is_some() {
+        content.track
+    } else {
+        match create_track(engine, content.kind, 0) {
+            Ok(id) => {
+                created_lane = true;
+                id
+            }
+            Err(e) => {
+                error!("paste failed creating {:?} track: {e}", content.kind);
+                return;
+            }
+        }
+    };
+
+    let lane = engine
+        .project()
+        .timeline()
+        .track(track)
+        .expect("paste target track exists");
+    let start = first_fit_start(lane, tick.max(0), content.duration_ticks.max(1));
+
+    match add_clip_content(engine, track, &content.content, content.duration_ticks, start) {
+        Ok(clip_id) => {
+            info!(%clip_id, %track, start_tick = start, "pasted clip");
+            publish_projection(engine, editor_weak);
+        }
+        Err(e) => {
+            error!(%track, start_tick = start, "paste failed: {e}");
+            if created_lane {
+                remove_track_if_empty(engine, track);
+            }
+            publish_projection(engine, editor_weak);
+        }
+    }
+}
+
+/// Place a copy of `clip` immediately after it on its own lane (first gap
+/// that fits from the clip's end).
+fn duplicate_clip_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    editor_weak: &slint::Weak<EditorStore<'static>>,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "duplicate ignored: unparsable clip id");
+        return;
+    };
+    let Some(track) = engine.project().timeline().track_of(clip_id) else {
+        error!(%clip_id, "duplicate ignored: clip not on the timeline");
+        return;
+    };
+    let original = engine
+        .project()
+        .clip(clip_id)
+        .expect("track_of returned a placed clip");
+    let content = original.content.clone();
+    let duration_ticks = original.timeline.duration.value.max(1);
+    let end_tick = original.timeline.end_tick();
+    let lane = engine
+        .project()
+        .timeline()
+        .track(track)
+        .expect("track_of returned an existing track");
+    let start = first_fit_start(lane, end_tick, duration_ticks);
+
+    match add_clip_content(engine, track, &content, duration_ticks, start) {
+        Ok(copy_id) => {
+            info!(%clip_id, %copy_id, %track, start_tick = start, "duplicated clip");
+            publish_projection(engine, editor_weak);
+        }
+        Err(e) => error!(%clip_id, start_tick = start, "duplicate failed: {e}"),
+    }
+}
+
+/// Re-issue snapshotted clip content as a fresh engine command: `AddClip`
+/// for media-backed content, `AddGenerated` for generated content.
+fn add_clip_content(
+    engine: &mut Engine,
+    track: TrackId,
+    content: &ClipSource,
+    duration_ticks: i64,
+    start_tick: i64,
+) -> Result<ClipId, String> {
+    let tl_rate = engine.project().timeline().frame_rate;
+    let command = match content {
+        ClipSource::Media { media, source } => EditCommand::AddClip {
+            track,
+            media: *media,
+            source: *source,
+            start: RationalTime::new(start_tick, tl_rate),
+        },
+        ClipSource::Generated(generator) => EditCommand::AddGenerated {
+            track,
+            generator: generator.clone(),
+            timeline: TimeRange::at_rate(start_tick, duration_ticks.max(1), tl_rate),
+        },
+    };
+    match engine.apply(Command::Edit(command)) {
+        Ok(ApplyOutcome::Edited(EditOutcome::Created(id))) => Ok(id),
+        Ok(other) => Err(format!("unexpected add outcome: {other:?}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Remove `track` when an edit left it empty (CapCut removes emptied lanes).
+fn remove_track_if_empty(engine: &mut Engine, track: TrackId) {
     let emptied = engine
         .project()
         .timeline()
@@ -497,12 +775,18 @@ fn parse_raw_id(raw: &str) -> Option<u64> {
 /// Snapshot the engine's project and hand it to the UI thread, which rebuilds
 /// the Slint view model. The snapshot crosses the thread boundary (`Send`);
 /// the `!Send` Slint model types are constructed inside the event-loop closure.
+/// History availability rides along so the toolbar's undo/redo states always
+/// match the projection they were published with.
 fn publish_projection(engine: &Engine, editor_weak: &slint::Weak<EditorStore<'static>>) {
     let project = engine.project().clone();
+    let can_undo = engine.can_undo();
+    let can_redo = engine.can_redo();
     let editor_weak = editor_weak.clone();
     if let Err(e) = slint::invoke_from_event_loop(move || {
         if let Some(store) = editor_weak.upgrade() {
             store.set_project(crate::projection::project_to_slint(&project));
+            store.set_can_undo(can_undo);
+            store.set_can_redo(can_redo);
         }
     }) {
         error!("failed to publish project projection to UI: {e}");

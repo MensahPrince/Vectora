@@ -7,7 +7,10 @@ import { Project } from "../models/index.slint";
 // projection arrives — keep `width`/`height` non-zero so preview aspect-ratio
 // math never divides by zero.
 export global EditorStore {
-    callback on-slider-changed(value: float);
+    // The playhead moved (ruler scrub, frame-step keys, Home/End) —
+    // request a preview frame for `tick`. Requests coalesce to the
+    // newest tick on the worker thread, so this can fire per-frame.
+    callback on-playhead-changed(tick: int);
     callback on-import-clicked();
     // A library tile was dropped on the timeline. `track-id` is the video lane
     // under the cursor, or empty when there is none — the engine then creates
@@ -25,6 +28,34 @@ export global EditorStore {
     // `[start-tick, start-tick + duration-ticks)` on its own lane. Already
     // validated by the trim resolver (neighbors, source headroom, ≥ 1 tick).
     callback on-clip-trimmed(clip-id: string, start-tick: int, duration-ticks: int);
+
+    // --- selection ops (Phase 5) -----------------------------------------
+    // All raw ids from the projection; the worker parses and validates, the
+    // engine applies atomically, and the projection republish is what makes
+    // the result visible. Gating (selection exists, playhead inside the
+    // clip, …) happens UI-side in `TimelineActions`.
+
+    // Delete the clip (Delete/Backspace, toolbar). The worker removes the
+    // lane too when this empties it — same policy as drag-moves.
+    callback on-clip-deleted(clip-id: string);
+    // Split the clip at `at-tick` (Ctrl/Cmd+B, toolbar). Caller guarantees
+    // the tick is strictly inside the clip.
+    callback on-clip-split(clip-id: string, at-tick: int);
+    // Engine history (Ctrl/Cmd+Z / +Shift+Z, toolbar).
+    callback on-undo();
+    callback on-redo();
+    // Clipboard: copy snapshots the clip's content on the worker (it
+    // survives the original being deleted); paste places it at `tick` on
+    // the source lane, sliding right into the first gap that fits.
+    callback on-clip-copied(clip-id: string);
+    callback on-paste-at(tick: int);
+    // Duplicate: a copy placed right after the original on its own lane.
+    callback on-clip-duplicated(clip-id: string);
+
+    // Engine history state, republished by the worker after every
+    // mutation — drives the toolbar's undo/redo enabled states.
+    in-out property <bool> can-undo: false;
+    in-out property <bool> can-redo: false;
 
     in-out property <Project> project: {
         id: "",

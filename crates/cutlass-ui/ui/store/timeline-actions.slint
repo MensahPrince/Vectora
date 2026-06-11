@@ -1,0 +1,155 @@
+// Timeline edit actions, shared by the toolbar buttons and the window
+// keyboard shortcuts so both paths gate and dispatch identically.
+//
+// Everything here is UI-side orchestration only: read the selection /
+// playhead, gate, then raise the matching `EditorStore` callback. The
+// worker thread parses ids, the engine validates atomically, and the
+// republished projection is what changes on screen — no Slint-side
+// mutation of project state, ever.
+
+import { EditorStore } from "editor-store.slint";
+import { TimelineStore } from "timeline-store.slint";
+import { TimelineViewState } from "../panels/timeline/state.slint";
+import { InspectorBackend, SelectedClipInfo } from "../lib/inspector-backend.slint";
+import { TimelineLib } from "../lib/timeline-lib.slint";
+
+export global TimelineActions {
+    // --- selection ---------------------------------------------------
+
+    public pure function has-selection() -> bool {
+        return TimelineStore.selected-clip-id != "";
+    }
+
+    public function clear-selection() {
+        TimelineStore.selected-track-id = "";
+        TimelineStore.selected-clip-id = "";
+    }
+
+    // Resolve the selected clip in the projection (found == false when
+    // nothing is selected or the selection went stale after an edit).
+    public pure function selected-clip() -> SelectedClipInfo {
+        return InspectorBackend.resolve-selection(
+            EditorStore.project.sequence,
+            TimelineStore.selected-track-id,
+            TimelineStore.selected-clip-id);
+    }
+
+    // --- edit ops ----------------------------------------------------
+
+    public function delete-selected() {
+        if (!self.has-selection()) {
+            return;
+        }
+        EditorStore.on-clip-deleted(TimelineStore.selected-clip-id);
+        self.clear-selection();
+    }
+
+    // CapCut gates Split on the playhead actually crossing the clip —
+    // splitting at (or outside) an edge is a no-op.
+    public pure function can-split() -> bool {
+        return self.selected-clip().found
+            && TimelineStore.playhead-tick
+                > self.selected-clip().clip.timeline-start.value
+            && TimelineStore.playhead-tick
+                < self.selected-clip().clip.timeline-start.value
+                    + self.selected-clip().clip.source-range.duration.value;
+    }
+
+    public function split-at-playhead() {
+        if (!self.can-split()) {
+            return;
+        }
+        // The head keeps its id, so the selection stays on the left part.
+        EditorStore.on-clip-split(TimelineStore.selected-clip-id, TimelineStore.playhead-tick);
+    }
+
+    public function copy-selected() {
+        if (self.has-selection()) {
+            EditorStore.on-clip-copied(TimelineStore.selected-clip-id);
+        }
+    }
+
+    public function paste-at-playhead() {
+        EditorStore.on-paste-at(TimelineStore.playhead-tick);
+    }
+
+    public function duplicate-selected() {
+        if (self.has-selection()) {
+            EditorStore.on-clip-duplicated(TimelineStore.selected-clip-id);
+        }
+    }
+
+    public function undo() {
+        EditorStore.on-undo();
+    }
+
+    public function redo() {
+        EditorStore.on-redo();
+    }
+
+    // --- playhead ----------------------------------------------------
+    // TimelinePanel watches playhead-tick and turns every change into a
+    // (coalesced) preview frame request, so these only set the tick.
+
+    public function step-playhead(delta-frames: int) {
+        TimelineStore.playhead-tick = max(0, TimelineStore.playhead-tick + delta-frames);
+    }
+
+    public function seek-start() {
+        TimelineStore.playhead-tick = 0;
+    }
+
+    public function seek-end() {
+        TimelineStore.playhead-tick = max(0,
+            TimelineLib.sequence-duration(EditorStore.project.sequence).value);
+    }
+
+    // --- zoom ----------------------------------------------------------
+    // `zoom` is px per sequence frame. The slider works on a log scale so
+    // each notch feels like the same relative change (CapCut's slider
+    // behaves this way too).
+
+    out property <float> min-zoom: 0.05;
+    out property <float> max-zoom: 40.0;
+
+    public pure function zoom-to-slider(zoom: float) -> float {
+        return 100 * Math.log(zoom / self.min-zoom, self.max-zoom / self.min-zoom);
+    }
+
+    public pure function slider-to-zoom(value: float) -> float {
+        return self.min-zoom * Math.pow(self.max-zoom / self.min-zoom, value / 100);
+    }
+
+    // Anchor tick for zoom changes: the playhead when it's visible in
+    // the viewport, the viewport-center tick otherwise. Anchoring keeps
+    // what the user is looking at stationary while the scale changes.
+    pure function zoom-anchor-tick() -> float {
+        return (TimelineStore.playhead-tick * TimelineStore.zoom * 1px
+                    + TimelineViewState.scroll-x >= 0px
+                && TimelineStore.playhead-tick * TimelineStore.zoom * 1px
+                    + TimelineViewState.scroll-x <= TimelineViewState.viewport-w)
+            ? TimelineStore.playhead-tick * 1.0
+            : (TimelineViewState.viewport-w / 2 - TimelineViewState.scroll-x)
+                / 1px / TimelineStore.zoom;
+    }
+
+    // New scroll-x that keeps the anchor at the same viewport pixel
+    // once zoom becomes `z1`: scroll' = scroll + anchor·(z0 − z1).
+    pure function scroll-after-zoom(z1: float) -> length {
+        return min(0px, TimelineViewState.scroll-x
+            + self.zoom-anchor-tick() * (TimelineStore.zoom - z1) * 1px);
+    }
+
+    // Scratch slot: the corrected scroll must be computed against the
+    // *old* zoom, before TimelineStore.zoom mutates (Slint functions
+    // have no local bindings).
+    private property <length> pending-scroll-x;
+
+    public function set-zoom(new-zoom: float) {
+        self.pending-scroll-x =
+            self.scroll-after-zoom(clamp(new-zoom, self.min-zoom, self.max-zoom));
+        TimelineStore.zoom = clamp(new-zoom, self.min-zoom, self.max-zoom);
+        // TimelinePanel's min-scroll-x watcher clamps the far edge.
+        TimelineViewState.scroll-x = self.pending-scroll-x;
+    }
+}

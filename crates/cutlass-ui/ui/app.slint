@@ -10,7 +10,7 @@ import {
     PreviewPanel,
     TimelinePanel,
 } from "panels/index.slint";
-import { AppStore, EditorStore, TimelineStore } from "store/index.slint";
+import { AppStore, EditorStore, TimelineStore, TimelineActions } from "store/index.slint";
 import { AppState } from "state.slint";
 import { FullscreenPreview } from "fullscreen-preview.slint";
 
@@ -48,62 +48,134 @@ export component AppWindow inherits Window {
 
     background: AppState.preview-maximized ? AppStore.theme.panel.background : AppStore.theme.surface.app-background;
 
-    if AppState.preview-maximized: FullscreenPreview {
-        width: root.width;
-        height: root.height;
+    // Window-level editing shortcuts (Phase 5). The scope wraps all
+    // content and holds focus by default (`forward-focus` below), so
+    // shortcuts work immediately; while a text input is focused, keys
+    // go there instead — timeline interactions bump the refocus nonce
+    // (AppState.refocus-shortcuts) to reclaim the keyboard.
+    forward-focus: shortcuts;
+
+    private property <int> focus-nonce: AppState.shortcut-focus-nonce;
+
+    changed focus-nonce => {
+        shortcuts.focus();
     }
 
-    if !AppState.preview-maximized: VerticalLayout {
-        padding: AppStore.theme.metrics.spacing.sm;
-        spacing: AppStore.theme.metrics.spacing.none;
-
-        Rectangle {
-            height: 40px;
-            background: AppStore.theme.surface.app-background;
-            CutlassText {
-                text: "Cutlass Head";
-                style: AppStore.theme.typography.label;
+    shortcuts := FocusScope {
+        key-pressed(event) => {
+            // Accept both Ctrl and Cmd (macOS) as the command modifier.
+            if (event.modifiers.control || event.modifiers.meta) {
+                if (event.text == "b" || event.text == "B") {
+                    TimelineActions.split-at-playhead();
+                    return accept;
+                }
+                if ((event.text == "z" || event.text == "Z") && event.modifiers.shift) {
+                    TimelineActions.redo();
+                    return accept;
+                }
+                if (event.text == "z") {
+                    TimelineActions.undo();
+                    return accept;
+                }
+                if (event.text == "c" || event.text == "C") {
+                    TimelineActions.copy-selected();
+                    return accept;
+                }
+                if (event.text == "v" || event.text == "V") {
+                    TimelineActions.paste-at-playhead();
+                    return accept;
+                }
+                if (event.text == "d" || event.text == "D") {
+                    TimelineActions.duplicate-selected();
+                    return accept;
+                }
+                return reject;
             }
+            if (event.text == Key.Delete || event.text == Key.Backspace) {
+                TimelineActions.delete-selected();
+                return accept;
+            }
+            if (event.text == Key.Escape) {
+                TimelineActions.clear-selection();
+                return accept;
+            }
+            // Phase 4 transport keys: frame-step and jump to start/end.
+            if (event.text == Key.LeftArrow) {
+                TimelineActions.step-playhead(-1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                TimelineActions.step-playhead(1);
+                return accept;
+            }
+            if (event.text == Key.Home) {
+                TimelineActions.seek-start();
+                return accept;
+            }
+            if (event.text == Key.End) {
+                TimelineActions.seek-end();
+                return accept;
+            }
+            reject
         }
 
-        HorizontalLayout {
-            vertical-stretch: 1;
-            horizontal-stretch: 1;
+        if AppState.preview-maximized: FullscreenPreview {
+            width: root.width;
+            height: root.height;
+        }
+
+        if !AppState.preview-maximized: VerticalLayout {
+            padding: AppStore.theme.metrics.spacing.sm;
             spacing: AppStore.theme.metrics.spacing.none;
 
-            LibraryPanel {
-                width: root.left-pane-width;
-                vertical-stretch: 1;
+            Rectangle {
+                height: 40px;
+                background: AppStore.theme.surface.app-background;
+                CutlassText {
+                    text: "Cutlass Head";
+                    style: AppStore.theme.typography.label;
+                }
             }
 
-            HSplitGripLead {
-                pane-width <=> root.left-pane-width;
-                vertical-stretch: 1;
-            }
-
-            PreviewPanel {
+            HorizontalLayout {
                 vertical-stretch: 1;
                 horizontal-stretch: 1;
+                spacing: AppStore.theme.metrics.spacing.none;
+
+                LibraryPanel {
+                    width: root.left-pane-width;
+                    vertical-stretch: 1;
+                }
+
+                HSplitGripLead {
+                    pane-width <=> root.left-pane-width;
+                    vertical-stretch: 1;
+                }
+
+                PreviewPanel {
+                    vertical-stretch: 1;
+                    horizontal-stretch: 1;
+                }
+
+                HSplitGripTrail {
+                    pane-width <=> root.right-pane-width;
+                    vertical-stretch: 1;
+                }
+
+                InspectorPanel {
+                    width: root.right-pane-width;
+                    vertical-stretch: 1;
+                }
             }
 
-            HSplitGripTrail {
-                pane-width <=> root.right-pane-width;
-                vertical-stretch: 1;
+            VSplitGripTimeline {
+                timeline-height <=> root.timeline-height;
             }
 
-            InspectorPanel {
-                width: root.right-pane-width;
-                vertical-stretch: 1;
+            TimelinePanel {
+                height: root.timeline-height;
+                horizontal-stretch: 1;
             }
-        }
-
-        VSplitGripTimeline {
-            timeline-height <=> root.timeline-height;
-        }
-
-        TimelinePanel {
-            height: root.timeline-height;
-            horizontal-stretch: 1;
         }
     }
 

@@ -3,6 +3,7 @@ import { Clip } from "../../models/index.slint";
 import { TimelineLib } from "../../lib/index.slint";
 import { TimelineStore } from "../../store/timeline-store.slint";
 import { TimelineViewState } from "state.slint";
+import { AppState } from "../../state.slint";
 
 // Named `model` because `clip` is a built-in Slint property on visual elements.
 //
@@ -52,6 +53,10 @@ export component ClipView inherits Rectangle {
 
         changed pressed => {
             if (self.pressed) {
+                // Grabbing a clip reclaims the keyboard so Delete /
+                // Ctrl+B act on this selection, not a stale text box.
+                AppState.refocus-shortcuts();
+
                 // Select on grab (CapCut selects the clip the moment you grab it).
                 TimelineStore.selected-track-id = track-id;
                 TimelineStore.selected-clip-id = model.id;
@@ -91,7 +96,8 @@ export component ClipView inherits Rectangle {
     // resolves the new extent (stretch preview + guide + tooltip) and commits.
 
     function begin-trim(head: bool) {
-        // Select on grab, like the move gesture.
+        // Select on grab, like the move gesture (and reclaim the keyboard).
+        AppState.refocus-shortcuts();
         TimelineStore.selected-track-id = track-id;
         TimelineStore.selected-clip-id = model.id;
 

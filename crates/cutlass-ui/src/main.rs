@@ -26,14 +26,6 @@ fn setup_tracing() {
         .init();
 }
 
-fn slider_to_timeline_tick(value: f32, duration_ticks: i64) -> i64 {
-    if duration_ticks <= 0 {
-        return 0;
-    }
-    let max_tick = duration_ticks - 1;
-    ((value.clamp(0.0, 100.0) / 100.0) * max_tick as f32).round() as i64
-}
-
 fn main() -> Result<(), slint::PlatformError> {
     setup_tracing();
     BackendSelector::new()
@@ -64,12 +56,13 @@ fn main() -> Result<(), slint::PlatformError> {
         "preview worker ready; import media to populate the timeline"
     );
 
-    let duration_ticks = session.duration_ticks;
     let editor = app.global::<EditorStore>();
 
+    // Playhead moves (ruler scrub, frame-step keys, Home/End) become preview
+    // frame requests; the worker coalesces a burst to the newest tick.
     let frame_handle = preview_worker.handle();
-    editor.on_on_slider_changed(move |value| {
-        frame_handle.request_frame(slider_to_timeline_tick(value, duration_ticks));
+    editor.on_on_playhead_changed(move |tick| {
+        frame_handle.request_frame(i64::from(tick));
     });
 
     let drop_handle = preview_worker.handle();
@@ -106,11 +99,9 @@ fn main() -> Result<(), slint::PlatformError> {
         ))
     });
 
-    app.global::<RulerBackend>().on_ticks(
-        |scroll_x, viewport_w, zoom, fps_num, fps_den, drop_frame| {
-            ruler::ticks_model(scroll_x, viewport_w, zoom, fps_num, fps_den, drop_frame)
-        },
-    );
+    app.global::<RulerBackend>().on_ticks(|scroll_x, viewport_w, zoom, fps_num, fps_den| {
+        ruler::ticks_model(scroll_x, viewport_w, zoom, fps_num, fps_den)
+    });
 
     app.global::<DragBackend>().on_snap_clip_start(
         |sequence,
@@ -177,6 +168,43 @@ fn main() -> Result<(), slint::PlatformError> {
             i64::from(start_tick),
             i64::from(duration_ticks),
         );
+    });
+
+    // --- Phase 5: selection ops & history (UI gates, engine validates) ---
+
+    let delete_handle = preview_worker.handle();
+    editor.on_on_clip_deleted(move |clip_id| {
+        delete_handle.remove_clip(clip_id.to_string());
+    });
+
+    let split_handle = preview_worker.handle();
+    editor.on_on_clip_split(move |clip_id, at_tick| {
+        split_handle.split_clip(clip_id.to_string(), i64::from(at_tick));
+    });
+
+    let undo_handle = preview_worker.handle();
+    editor.on_on_undo(move || {
+        undo_handle.undo();
+    });
+
+    let redo_handle = preview_worker.handle();
+    editor.on_on_redo(move || {
+        redo_handle.redo();
+    });
+
+    let copy_handle = preview_worker.handle();
+    editor.on_on_clip_copied(move |clip_id| {
+        copy_handle.copy_clip(clip_id.to_string());
+    });
+
+    let paste_handle = preview_worker.handle();
+    editor.on_on_paste_at(move |tick| {
+        paste_handle.paste_at(i64::from(tick));
+    });
+
+    let duplicate_handle = preview_worker.handle();
+    editor.on_on_clip_duplicated(move |clip_id| {
+        duplicate_handle.duplicate_clip(clip_id.to_string());
     });
 
     let editor_weak = app.global::<EditorStore>().as_weak();

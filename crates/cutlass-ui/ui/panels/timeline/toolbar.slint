@@ -1,54 +1,168 @@
+// Timeline toolbar (CapCut layout): edit actions on the left, magnet
+// toggle and zoom control on the right, SMPTE transport readout
+// in between. Every button routes through `TimelineActions`, the same
+// functions the keyboard shortcuts call, so gating can never diverge.
+
 import { CutlassText, HorizontalDivider } from "../../components/index.slint";
-import { AppStore, TimelineStore } from "../../store/index.slint";
+import { AppStore, EditorStore, TimelineStore, TimelineActions } from "../../store/index.slint";
+import { TimelineLib } from "../../lib/timeline-lib.slint";
 import { Slider } from "std-widgets.slint";
-import { EditorStore } from "../../store/editor-store.slint";
+
+// Compact text button. `active` renders the pressed/latched accent
+// (used by the Snap magnet); `enabled` dims and mutes the click.
+component ToolButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <bool> active: false;
+    callback clicked();
+
+    width: text.preferred-width + 2 * AppStore.theme.metrics.spacing.sm;
+    border-radius: AppStore.theme.metrics.radius.sm;
+    background: active
+        ? #00E5C733
+        : ta.has-hover && enabled ? #ffffff14 : transparent;
+    border-width: active ? 1px : 0px;
+    border-color: #00E5C7;
+    opacity: enabled ? 1.0 : 0.35;
+
+    text := CutlassText {
+        width: parent.width;
+        height: parent.height;
+        text: label;
+        style: AppStore.theme.typography.label;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        foreground: active ? #00E5C7 : AppStore.theme.text.primary;
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
 
 export component Toolbar inherits Rectangle {
     height: AppStore.theme.metrics.layout.toolbar-height;
 
-    CutlassText {
-        text: "Tools";
-        style: AppStore.theme.typography.label;
+    // Initialized from the current zoom; afterwards the slider owns the
+    // value and pushes changes through TimelineActions.set-zoom (which
+    // anchors the view on the playhead / viewport center).
+    property <float> zoom-slider-value: TimelineActions.zoom-to-slider(TimelineStore.zoom);
+
+    function nudge-zoom(delta: float) {
+        self.zoom-slider-value = clamp(self.zoom-slider-value + delta, 0, 100);
+        TimelineActions.set-zoom(TimelineActions.slider-to-zoom(self.zoom-slider-value));
     }
 
-    // CapCut's auto-snapping magnet toggle: highlighted while active.
-    snap-toggle := Rectangle {
-        x: 60px;
-        y: 4px;
-        width: 52px;
-        height: parent.height - 8px;
-        border-radius: 4px;
-        background: TimelineStore.snap-enabled ? #00E5C766 : transparent;
-        border-width: 1px;
-        border-color: TimelineStore.snap-enabled ? #00E5C7 : #ffffff40;
+    HorizontalLayout {
+        padding-left: AppStore.theme.metrics.spacing.md;
+        padding-right: AppStore.theme.metrics.spacing.md;
+        padding-top: AppStore.theme.metrics.spacing.sm;
+        padding-bottom: AppStore.theme.metrics.spacing.sm;
+        spacing: AppStore.theme.metrics.spacing.xs;
 
-        CutlassText {
-            text: "Snap";
-            style: AppStore.theme.typography.label;
-            horizontal-alignment: center;
-            vertical-alignment: center;
-            width: parent.width;
-            height: parent.height;
+        ToolButton {
+            label: "Undo";
+            enabled: EditorStore.can-undo;
+            clicked => {
+                TimelineActions.undo();
+            }
         }
 
-        TouchArea {
+        ToolButton {
+            label: "Redo";
+            enabled: EditorStore.can-redo;
+            clicked => {
+                TimelineActions.redo();
+            }
+        }
+
+        Rectangle {
+            width: AppStore.theme.metrics.spacing.sm;
+        }
+
+        ToolButton {
+            label: "Split";
+            enabled: TimelineActions.can-split();
+            clicked => {
+                TimelineActions.split-at-playhead();
+            }
+        }
+
+        ToolButton {
+            label: "Delete";
+            enabled: TimelineActions.has-selection();
+            clicked => {
+                TimelineActions.delete-selected();
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+
+            // Transport readout — the ruler's compact labels don't show
+            // full SMPTE, this does: playhead / sequence duration.
+            CutlassText {
+                width: parent.width;
+                height: parent.height;
+                mono: true;
+                style: AppStore.theme.typography.caption;
+                foreground: AppStore.theme.text.secondary;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                text: TimelineLib.format-timecode(
+                        TimelineStore.playhead-tick,
+                        EditorStore.project.sequence.fps.num,
+                        EditorStore.project.sequence.fps.den,
+                        EditorStore.project.sequence.drop-frame)
+                    + " / "
+                    + TimelineLib.format-timecode(
+                        TimelineLib.sequence-duration(EditorStore.project.sequence).value,
+                        EditorStore.project.sequence.fps.num,
+                        EditorStore.project.sequence.fps.den,
+                        EditorStore.project.sequence.drop-frame);
+            }
+        }
+
+        // CapCut's auto-snapping magnet toggle: latched while active.
+        ToolButton {
+            label: "Snap";
+            active: TimelineStore.snap-enabled;
             clicked => {
                 TimelineStore.snap-enabled = !TimelineStore.snap-enabled;
             }
         }
-    }
 
-    Slider {
-        minimum: 0;
-        maximum: 100;
-        value: 0;
-        step: 1;
-        y: 10px;
-        x: 150px;
-        width: 90%;
+        Rectangle {
+            width: AppStore.theme.metrics.spacing.sm;
+        }
 
-        changed(value) => {
-            EditorStore.on-slider-changed(value);
+        // Zoom: − / slider / + (log scale; see TimelineActions).
+        ToolButton {
+            label: "−";
+            clicked => {
+                root.nudge-zoom(-8);
+            }
+        }
+
+        Slider {
+            width: 110px;
+            minimum: 0;
+            maximum: 100;
+            value <=> root.zoom-slider-value;
+
+            changed(value) => {
+                TimelineActions.set-zoom(TimelineActions.slider-to-zoom(value));
+            }
+        }
+
+        ToolButton {
+            label: "+";
+            clicked => {
+                root.nudge-zoom(8);
+            }
         }
     }
 

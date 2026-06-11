@@ -92,33 +92,55 @@ The next gesture CapCut users reach for.
       validates source-out-of-bounds and overlap atomically).
 - [x] CapCut detail: duration + signed-delta tooltip above the dragged edge.
 
-## Phase 4 — Playhead, ruler, scrubbing
+## Phase 4 — Playhead, ruler, scrubbing ✅
 
-- [ ] Click/drag on the ruler moves the playhead (replaces the temporary
-      toolbar slider as the primary scrub control).
-- [ ] Drag the playhead head; snap the playhead to clip edges when the magnet
-      is on (CapCut snaps the playhead too).
-- [ ] Keyboard: ←/→ frame step, Home/End.
-- [ ] Preview frame requests keep coalescing through the worker (already true:
-      `WorkerMsg::Frame`).
+- [x] CapCut-style ruler, rebuilt from scratch (`src/ruler.rs` +
+      `ruler.slint`): compact `MM:SS` labels centered on their position
+      (no tick line — the text is the marker), `Nf` frame labels between
+      second boundaries at deep zoom, dot subdivisions instead of hash
+      marks, pin-shaped playhead head. Adaptive ladder runs on integer
+      frames against the *nominal* fps (frame steps must divide it, so
+      second boundaries always stay labeled); marks are virtualized to
+      the viewport and capped.
+- [x] Click/drag on the ruler moves the playhead (replaced the temporary
+      toolbar slider as the scrub control; playhead changes funnel
+      through one `TimelinePanel` watcher into coalesced frame requests).
+- [x] Scrubbing snaps the playhead to clip edges / tick 0 when the magnet
+      is on (same resolver as clip drags, zero-width span).
+- [x] Keyboard: ←/→ frame step, Home/End.
+- [x] Toolbar zoom slider (log scale, anchored on the playhead / viewport
+      center) so the adaptive ruler is reachable; Ctrl+scroll zoom stays
+      in Phase 9.
+- [x] Preview frame requests keep coalescing through the worker
+      (`WorkerMsg::Frame`).
 
-## Phase 5 — Selection ops & shortcuts
+## Phase 5 — Selection ops & shortcuts ✅
 
-Commands exist in the engine; this is UI wiring.
+Commands existed in the engine; this was UI wiring. All shortcuts accept
+Ctrl and Cmd (macOS); they live in a window-level `FocusScope`
+(`app.slint`) and route through `TimelineActions`, the same functions
+the toolbar buttons call, so gating can never diverge. Timeline
+interactions bump a refocus nonce so shortcuts reclaim the keyboard
+after a text input had it.
 
-- [ ] Delete key → `RemoveClip` (+ auto-remove emptied lane, same helper as
-      moves).
-- [ ] Split at playhead: toolbar button + Ctrl+B → `SplitClip` (only when the
-      playhead crosses the selected clip).
-- [ ] Undo/redo: Ctrl+Z / Ctrl+Shift+Z → engine history (`can_undo` exists;
-      needs worker messages + shortcuts).
-- [ ] Duplicate / copy-paste at playhead.
-- [ ] Click empty lane space clears selection (done) — extend with Esc.
+- [x] Delete/Backspace → `RemoveClip` (+ auto-remove emptied lane, same
+      helper as moves); toolbar **Delete** button.
+- [x] Split at playhead: toolbar button + Ctrl/Cmd+B → `SplitClip`, gated
+      on the playhead being strictly inside the selected clip.
+- [x] Undo/redo: Ctrl/Cmd+Z / +Shift+Z → engine history; toolbar buttons
+      driven by `can-undo`/`can-redo` republished with every projection.
+- [x] Copy/paste/duplicate: Ctrl/Cmd+C/V/D. Copy snapshots the clip's
+      *content* on the worker (survives deleting the original); paste
+      lands at the playhead on the source lane, first-fit sliding right
+      (same policy as drops; recreates the lane if it's gone); duplicate
+      places the copy right after the original.
+- [x] Esc clears selection (empty-lane click already did).
 
 ## Phase 6 — Compound undo (one gesture = one history entry)
 
 A new-lane move currently records up to three entries (`AddTrack` + `MoveClip`
-+ `RemoveTrack`); one Ctrl+Z should revert the whole gesture.
++ `RemoveTrack`), and a delete that empties its lane records two
+(`RemoveClip` + `RemoveTrack`); one Ctrl+Z should revert the whole gesture.
 
 - [ ] Engine: transaction/grouping in `history` (begin/commit around a
       dispatched batch, inverses applied in reverse order).
@@ -158,7 +180,8 @@ Perf-sensitive; everything decoded off the UI thread and cached.
       drops).
 - [ ] Snap guides for library drags (the window-level ghost currently doesn't
       show the vertical guide the resolver already computes).
-- [ ] Zoom-to-fit button + Ctrl+scroll zoom centered on the cursor.
+- [ ] Zoom-to-fit button + Ctrl+scroll zoom centered on the cursor (the
+      toolbar slider with playhead/center anchoring landed in Phase 4).
 - [ ] Timecode tooltip while dragging/trimming.
 - [ ] Track headers: mute/lock/hide toggles (engine `Track.enabled` exists).
 
@@ -187,5 +210,8 @@ Perf-sensitive; everything decoded off the UI thread and cached.
   realistic timelines, revisit if hour-scale 120fps projects appear.
 - Selection is keyed `(track-id, clip-id)`; engine clip ids are globally
   unique, so this can simplify to clip id alone.
-- The toolbar is placeholder layout (absolute x positions); rebuild as a real
-  `HorizontalLayout` when it grows more buttons (split, undo, magnets, zoom).
+- Selection can go stale after undo/redo (the projection republish doesn't
+  touch `TimelineStore`); stale ids resolve to "nothing selected"
+  everywhere, but clearing selection on history steps would be cleaner.
+- The clipboard lives on the worker thread (content snapshot, not a
+  reference) — fine for clips, revisit when multi-select copy lands.

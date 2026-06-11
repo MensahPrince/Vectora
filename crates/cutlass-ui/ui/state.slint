@@ -4,6 +4,17 @@
 export global AppState {
     in-out property <bool> preview-maximized: false;
 
+    // Bumped to pull keyboard focus back to the window's shortcut
+    // FocusScope (app.slint watches it). Text inputs legitimately take
+    // focus while editing; timeline interactions (clip grab, lane
+    // click, ruler scrub) call this so Delete / Ctrl+B / … always act
+    // on the timeline right after a click — never on a stale text box.
+    in-out property <int> shortcut-focus-nonce: 0;
+
+    public function refocus-shortcuts() {
+        self.shortcut-focus-nonce += 1;
+    }
+
     // Window-space ghost while dragging a library tile onto the timeline.
     in-out property <bool> library-drag-active: false;
     // Identity + length (sequence ticks) of the media being dragged — set at

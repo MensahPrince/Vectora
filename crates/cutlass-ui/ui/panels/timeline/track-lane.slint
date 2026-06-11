@@ -1,5 +1,6 @@
 import { AppStore, TimelineStore } from "../../store/index.slint";
 import { TrackKind } from "../../models/index.slint";
+import { AppState } from "../../state.slint";
 
 // Backdrop for one track lane. Clip drag gestures live in `clip.slint`.
 export component TrackLane inherits Rectangle {
@@ -11,12 +12,14 @@ export component TrackLane inherits Rectangle {
 
     background: AppStore.theme.track-lane.background;
 
-    // Behind clip views — clicking empty lane space clears selection.
+    // Behind clip views — clicking empty lane space clears selection
+    // (and reclaims the keyboard for the timeline shortcuts).
     lane-ta := TouchArea {
         width: parent.width;
         height: parent.height;
 
         clicked => {
+            AppState.refocus-shortcuts();
             TimelineStore.selected-track-id = "";
             TimelineStore.selected-clip-id = "";
         }
