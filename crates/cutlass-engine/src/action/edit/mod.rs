@@ -8,6 +8,7 @@ pub mod insert_media;
 pub mod move_clip;
 pub mod remove_clip;
 pub mod remove_media;
+pub mod set_track_flags;
 pub mod restore_clip;
 pub mod ripple_delete;
 pub mod ripple_insert;

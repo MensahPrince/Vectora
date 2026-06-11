@@ -124,6 +124,9 @@ fn track_to_slint(project: &EngineProject, track: &EngineTrack) -> Track {
         kind: track_kind(track.kind),
         color: kind_color(track.kind),
         clips: model(clips),
+        enabled: track.enabled,
+        muted: track.muted,
+        locked: track.locked,
     }
 }
 

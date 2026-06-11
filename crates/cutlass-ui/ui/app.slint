@@ -182,19 +182,16 @@ export component AppWindow inherits Window {
 
     // Library drag ghost — must live at window scope so it paints above all
     // panels. `z` on a nested element only stacks within its parent; PanelBase
-    // also clips children to the panel bounds.
-    private property <length> library-ghost-clip-h:
-        AppStore.theme.track-lane.clip.height - 5px;
-    private property <length> library-ghost-clip-w:
-        AppState.library-drag-duration-ticks * TimelineStore.zoom * 1px;
-
-    if AppState.library-drag-active: Rectangle {
-        width: AppState.library-drag-over-timeline ? root.library-ghost-clip-w : AppState.library-drag-w;
-        height: AppState.library-drag-over-timeline ? root.library-ghost-clip-h : AppState.library-drag-h;
-        x: AppState.library-drag-cursor-x - (AppState.library-drag-over-timeline ? 0px : AppState.library-drag-tile-anchor-x);
-        y: AppState.library-drag-cursor-y - (AppState.library-drag-over-timeline ? root.library-ghost-clip-h / 2 : AppState.library-drag-tile-anchor-y);
-        background: AppState.library-drag-over-timeline ? green : red;
+    // also clips children to the panel bounds. Once the cursor enters the
+    // timeline, the panel takes over with an honest snapped/row-aligned landing
+    // ghost (and snap guide), so this window ghost only tracks the loose tile
+    // while it's still outside the timeline.
+    if AppState.library-drag-active && !AppState.library-drag-over-timeline: Rectangle {
+        width: AppState.library-drag-w;
+        height: AppState.library-drag-h;
+        x: AppState.library-drag-cursor-x - AppState.library-drag-tile-anchor-x;
+        y: AppState.library-drag-cursor-y - AppState.library-drag-tile-anchor-y;
+        background: #C83A3A;
         border-radius: AppStore.theme.track-lane.clip.radius;
-        animate width, height { duration: 120ms; easing: ease-out; }
     }
 }

@@ -5,7 +5,7 @@ import {
     CutlassScrollView,
     VerticalDivider,
 } from "../../components/index.slint";
-import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
+import { AppStore, EditorStore, TimelineStore, TimelineActions } from "../../store/index.slint";
 import { Toolbar } from "toolbar.slint";
 import { TrackLane } from "track-lane.slint";
 import { TrackHead } from "track-head.slint";
@@ -24,6 +24,24 @@ component ForceHeadSpace inherits Rectangle {
     height: AppStore.theme.track-lane.height;
 
     background: transparent;
+}
+
+// CapCut's drag readout bubble: a dark pill that hovers above the dragged
+// edge/clip. Shared by trims (duration + signed delta) and moves/library
+// drops (landing timecode). The caller positions it (usually centered on an
+// edge via `x: edge - self.width / 2`).
+component DragTooltip inherits Rectangle {
+    in property <string> text;
+
+    width: tip-text.preferred-width + 12px;
+    height: tip-text.preferred-height + 6px;
+    background: #000000d0;
+    border-radius: 4px;
+
+    tip-text := Text {
+        color: #ffffff;
+        text: root.text;
+    }
 }
 
 export component TimelinePanel inherits PanelBase {
@@ -187,6 +205,77 @@ export component TimelinePanel inherits PanelBase {
         TimelineViewState.trim-released = false;
     }
 
+    // --- edge auto-scroll (drags near the viewport edge) --------------------
+    // CapCut scrolls the timeline under a drag held near an edge. A ~16ms
+    // Timer steps the scroll while the cursor sits in the edge zone; the speed
+    // ramps with depth into the zone. Applies to clip moves, trims (x only),
+    // and library drops. Clip/trim gestures record px deltas in TouchArea-local
+    // space and Slint fires no `moved` while the cursor is still and content
+    // scrolls under it, so each step compensates the recorded deltas by the
+    // actual scroll applied — keeping the ghost glued to the cursor. Library
+    // drops recompute their cursor tick reactively from scroll-x, so they need
+    // no compensation.
+    private property <bool> gesture-active: clip-dragging || clip-trimming || library-drag-over;
+    private property <bool> gesture-vertical: clip-dragging || library-drag-over;
+
+    // Unified window-space cursor for the active gesture.
+    private property <length> gesture-px:
+        library-drag-over ? AppState.library-drag-cursor-x : TimelineViewState.pointer-window-x;
+    private property <length> gesture-py:
+        library-drag-over ? AppState.library-drag-cursor-y : TimelineViewState.pointer-window-y;
+
+    private property <length> autoscroll-margin: 32px;
+    private property <length> autoscroll-max: 16px; // per tick at the edge
+
+    // Per-tick scroll velocity: + pulls toward tick 0 (cursor near the
+    // left/top), − reveals later content (cursor near the right/bottom).
+    private property <length> autoscroll-dx:
+        !gesture-active ? 0px
+        : gesture-px < lanes.absolute-position.x + autoscroll-margin
+            ? autoscroll-max * clamp(
+                (lanes.absolute-position.x + autoscroll-margin - gesture-px) / autoscroll-margin, 0, 1)
+        : gesture-px > lanes.absolute-position.x + lanes.width - autoscroll-margin
+            ? -autoscroll-max * clamp(
+                (gesture-px - (lanes.absolute-position.x + lanes.width - autoscroll-margin)) / autoscroll-margin, 0, 1)
+        : 0px;
+    private property <length> autoscroll-dy:
+        !gesture-active || !gesture-vertical ? 0px
+        : gesture-py < lanes.absolute-position.y + autoscroll-margin
+            ? autoscroll-max * clamp(
+                (lanes.absolute-position.y + autoscroll-margin - gesture-py) / autoscroll-margin, 0, 1)
+        : gesture-py > lanes.absolute-position.y + lanes.height - autoscroll-margin
+            ? -autoscroll-max * clamp(
+                (gesture-py - (lanes.absolute-position.y + lanes.height - autoscroll-margin)) / autoscroll-margin, 0, 1)
+        : 0px;
+
+    autoscroll-timer := Timer {
+        interval: 16ms;
+        running: gesture-active && (autoscroll-dx != 0px || autoscroll-dy != 0px);
+        triggered => {
+            // Clamp to the scroll bounds and measure what actually moved, so
+            // the delta compensation matches the real scroll (no drift at the
+            // far edges).
+            root.autoscroll-applied-x =
+                clamp(TimelineViewState.scroll-x + root.autoscroll-dx, root.min-scroll-x, 0px)
+                    - TimelineViewState.scroll-x;
+            root.autoscroll-applied-y =
+                clamp(TimelineViewState.scroll-y + root.autoscroll-dy, root.min-scroll-y, 0px)
+                    - TimelineViewState.scroll-y;
+            TimelineViewState.scroll-x += root.autoscroll-applied-x;
+            TimelineViewState.scroll-y += root.autoscroll-applied-y;
+            if (clip-dragging) {
+                TimelineViewState.drag-dx-px -= root.autoscroll-applied-x;
+                TimelineViewState.drag-dy-px -= root.autoscroll-applied-y;
+            }
+            if (clip-trimming) {
+                TimelineViewState.trim-dx-px -= root.autoscroll-applied-x;
+            }
+        }
+    }
+
+    private property <length> autoscroll-applied-x;
+    private property <length> autoscroll-applied-y;
+
     // Available height for the scrolling rows (everything below toolbar+ruler).
     // Both flickables below share this — it's the row's own `height`.
     private property <length> row-height: root.height - tb.height - rl.height;
@@ -296,7 +385,9 @@ export component TimelinePanel inherits PanelBase {
 
                         ForceHeadSpace { }
 
-                        for t in sequence.tracks: TrackHead { }
+                        for t in sequence.tracks: TrackHead {
+                            track: t;
+                        }
                     }
                 }
 
@@ -306,15 +397,52 @@ export component TimelinePanel inherits PanelBase {
                 }
             }
 
-            lanes := Flickable {
-                interactive: false;
-                viewport-width: max(content-width, self.width);
-                viewport-height: max(self.height, content-height);
+            // Wraps the lanes so wheel/trackpad scroll has somewhere to land:
+            // the lane Flickable is `interactive: false` (it would fight clip
+            // drags), and scroll events bubble out of the clip TouchAreas to
+            // this ancestor. Plain wheel scrolls the lanes; Ctrl/Cmd+wheel
+            // zooms anchored on the cursor tick. Pointer grabs still go to the
+            // innermost clip/lane TouchArea, so dragging is unaffected.
+            wheel-area := TouchArea {
+                horizontal-stretch: 1;
 
-                viewport-y <=> TimelineViewState.scroll-y;
-                viewport-x <=> TimelineViewState.scroll-x;
+                scroll-event(e) => {
+                    if (e.modifiers.control || e.modifiers.meta) {
+                        // Cursor-anchored zoom in log/slider space.
+                        TimelineActions.set-zoom-anchored(
+                            TimelineActions.slider-to-zoom(clamp(
+                                TimelineActions.zoom-to-slider(TimelineStore.zoom)
+                                    + e.delta-y / 1px * 0.15,
+                                0, 100)),
+                            (self.mouse-x - TimelineViewState.scroll-x) / 1px / TimelineStore.zoom);
+                        return accept;
+                    }
+                    // Shift (or a horizontal trackpad swipe) scrolls the
+                    // timeline sideways; otherwise the wheel scrolls lanes.
+                    if (e.modifiers.shift) {
+                        TimelineViewState.scroll-x = clamp(
+                            TimelineViewState.scroll-x + e.delta-y, root.min-scroll-x, 0px);
+                    } else if (abs(e.delta-x / 1px) > abs(e.delta-y / 1px)) {
+                        TimelineViewState.scroll-x = clamp(
+                            TimelineViewState.scroll-x + e.delta-x, root.min-scroll-x, 0px);
+                    } else {
+                        TimelineViewState.scroll-y = clamp(
+                            TimelineViewState.scroll-y + e.delta-y, root.min-scroll-y, 0px);
+                    }
+                    return accept;
+                }
 
-                VerticalLayout {
+                lanes := Flickable {
+                    width: 100%;
+                    height: 100%;
+                    interactive: false;
+                    viewport-width: max(content-width, self.width);
+                    viewport-height: max(self.height, content-height);
+
+                    viewport-y <=> TimelineViewState.scroll-y;
+                    viewport-x <=> TimelineViewState.scroll-x;
+
+                    VerticalLayout {
                     vertical-stretch: 1;
                     horizontal-stretch: 1;
                     spacing: track-spacing;
@@ -330,6 +458,8 @@ export component TimelinePanel inherits PanelBase {
                             track-row: lane-idx;
                             track-kind: t.kind;
                             track-color: t.color;
+                            track-enabled: t.enabled;
+                            track-locked: t.locked;
                             height: parent.height - 5px;
                             zoom: TimelineStore.zoom;
                         }
@@ -391,6 +521,29 @@ export component TimelinePanel inherits PanelBase {
                     background: #00E5C7;
                 }
 
+                // Honest landing ghost for a freeform library drop: the snapped,
+                // row-aligned spot the drop actually commits to (the window-level
+                // ghost in app.slint hides while over the timeline).
+                if library-drag-over && !library-drop-res.is-insert: Rectangle {
+                    x: library-drop-res.resolved-start * TimelineStore.zoom * 1px;
+                    y: (library-drop-res.target-row + 1) * row-pitch;
+                    width: AppState.library-drag-duration-ticks * TimelineStore.zoom * 1px;
+                    height: track-height - 5px;
+                    background: #00E5C74D;
+                    border-width: 1px;
+                    border-color: #00E5C7;
+                    border-radius: AppStore.theme.track-lane.clip.radius;
+                }
+
+                // Vertical magnet guide for library drags (mirrors clip drags).
+                if library-drag-over && library-drop-res.has-snap: Rectangle {
+                    x: library-drop-res.snap-line-tick * TimelineStore.zoom * 1px;
+                    y: 0;
+                    width: 1px;
+                    height: max(parent.height, content-height);
+                    background: #00E5C7;
+                }
+
                 // Vertical magnet guide at the snapped edge (CapCut-style).
                 if clip-dragging && clip-drag-res.valid && clip-drag-res.has-snap: Rectangle {
                     x: clip-drag-res.snap-line-tick * TimelineStore.zoom * 1px;
@@ -425,28 +578,20 @@ export component TimelinePanel inherits PanelBase {
                 }
 
                 // CapCut detail: duration + delta readout above the dragged edge.
-                if clip-trimming && clip-trim-res.valid: Rectangle {
+                if clip-trimming && clip-trim-res.valid: DragTooltip {
                     x: (TimelineViewState.trimming-head
                             ? clip-trim-res.new-start
                             : clip-trim-res.new-start + clip-trim-res.new-duration)
                         * TimelineStore.zoom * 1px - self.width / 2;
                     y: (TimelineViewState.trimming-source-row + 1) * row-pitch - self.height - 4px;
-                    width: trim-tip.preferred-width + 12px;
-                    height: trim-tip.preferred-height + 6px;
-                    background: #000000d0;
-                    border-radius: 4px;
-
-                    trim-tip := Text {
-                        color: #ffffff;
-                        text: TimelineLib.format-timecode(
-                                clip-trim-res.new-duration,
-                                sequence.fps.num,
-                                sequence.fps.den,
-                                sequence.drop-frame)
-                            + "  "
-                            + (clip-trim-res.new-duration >= TimelineViewState.trimming-duration-ticks ? "+" : "")
-                            + (clip-trim-res.new-duration - TimelineViewState.trimming-duration-ticks);
-                    }
+                    text: TimelineLib.format-timecode(
+                            clip-trim-res.new-duration,
+                            sequence.fps.num,
+                            sequence.fps.den,
+                            sequence.drop-frame)
+                        + "  "
+                        + (clip-trim-res.new-duration >= TimelineViewState.trimming-duration-ticks ? "+" : "")
+                        + (clip-trim-res.new-duration - TimelineViewState.trimming-duration-ticks);
                 }
 
                 // Same magnet guide as the move, driven by the trim resolution.
@@ -477,6 +622,32 @@ export component TimelinePanel inherits PanelBase {
                     }
                 }
 
+                // Landing timecode above the moved clip (insert mode reads the
+                // caret slot, otherwise the resolved start).
+                if clip-dragging && clip-drag-res.valid: DragTooltip {
+                    x: (TimelineViewState.dragging-start-value * TimelineStore.zoom * 1px
+                            + TimelineViewState.drag-dx-px) + self.width / 2;
+                    y: (TimelineViewState.dragging-source-row + 1) * row-pitch
+                        + TimelineViewState.drag-dy-px - self.height - 4px;
+                    text: TimelineLib.format-timecode(
+                        clip-drag-res.is-insert ? clip-drag-res.caret-tick : clip-drag-res.resolved-start,
+                        sequence.fps.num,
+                        sequence.fps.den,
+                        sequence.drop-frame);
+                }
+
+                // Landing timecode for a library drag (above the ghost / caret).
+                if library-drag-over: DragTooltip {
+                    x: (library-drop-res.is-insert ? library-drop-res.caret-tick : library-drop-res.resolved-start)
+                        * TimelineStore.zoom * 1px - self.width / 2;
+                    y: (library-drop-res.target-row + 1) * row-pitch - self.height - 4px;
+                    text: TimelineLib.format-timecode(
+                        library-drop-res.is-insert ? library-drop-res.caret-tick : library-drop-res.resolved-start,
+                        sequence.fps.num,
+                        sequence.fps.den,
+                        sequence.drop-frame);
+                }
+
                 // Playhead line — content-space x; scrolls with the lanes.
                 Rectangle {
                     x: TimelineStore.playhead-tick * TimelineStore.zoom * 1px;
@@ -484,6 +655,7 @@ export component TimelinePanel inherits PanelBase {
                     width: 1px;
                     height: max(parent.height, content-height);
                     background: #ffffff;
+                }
                 }
             }
         }

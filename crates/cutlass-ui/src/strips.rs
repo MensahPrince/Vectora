@@ -701,10 +701,13 @@ fn render_wave_tile(
     for bar in 0..bars {
         let start_s = t0_s + bar as f64 * bar_span_s;
         let lo = (start_s * per_second).floor().max(0.0) as usize;
-        let hi = (((start_s + bar_span_s) * per_second).ceil() as usize).clamp(lo + 1, peaks.len());
         if lo >= peaks.len() {
-            break; // tile extends past the audio (shouldn't happen mid-clip)
+            // Tile extends past the audio — happens when the clip's tick
+            // duration outlives the decoded peaks (container vs stream
+            // duration). Must check before the clamp below or it panics.
+            break;
         }
+        let hi = (((start_s + bar_span_s) * per_second).ceil() as usize).clamp(lo + 1, peaks.len());
         let peak = peaks[lo..hi].iter().copied().fold(0.0f32, f32::max);
 
         // Quiet audio keeps a visible 1px center line, like CapCut.
@@ -837,6 +840,21 @@ mod tests {
         assert_eq!(&rgba[center..center + 4], &WAVE_BAR_RGBA);
         let top = 16 * 4_usize;
         assert_eq!(&rgba[top..top + 4], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn wave_tile_past_the_end_of_audio_does_not_panic() {
+        // 115 peaks ≈ 1.15s of audio at 100/s, but the tile spans [1.0, 2.0)s:
+        // later bars start past the last peak (a clip whose tick duration
+        // outlives its decoded audio). Used to panic in clamp() with
+        // `min > max. min = 119, max = 115`.
+        let peaks = vec![0.5f32; 115];
+        let rgba = render_wave_tile(&peaks, 100.0, 1.0, 1.0, 64, 32);
+        assert_eq!(rgba.len(), 64 * 32 * 4);
+        // Bars fully past the audio stay transparent.
+        let last_bar_x = 60; // bar 15 of 16 covers [1.9375, 2.0)s
+        let center = (16 * 64 + last_bar_x) * 4;
+        assert_eq!(&rgba[center..center + 4], &[0, 0, 0, 0]);
     }
 
     #[test]

@@ -58,6 +58,9 @@ export global EditorStore {
     callback on-paste-at(tick: int);
     // Duplicate: a copy placed right after the original on its own lane.
     callback on-clip-duplicated(clip-id: string);
+    // A track header toggle was clicked. `flag` is "enabled" | "muted" |
+    // "locked"; `value` is the new state. The worker applies it undoably.
+    callback on-track-flag-toggled(track-id: string, flag: string, value: bool);
 
     // Engine history state, republished by the worker after every
     // mutation — drives the toolbar's undo/redo enabled states.

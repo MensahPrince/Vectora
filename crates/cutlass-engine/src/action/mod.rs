@@ -161,7 +161,7 @@ mod tests {
     use super::*;
     use crate::action::edit::{
         add_clip, add_generated, add_track, move_clip, remove_media, ripple_delete,
-        ripple_insert, shift_clips, split_clip, trim_clip,
+        ripple_insert, set_track_flags, shift_clips, split_clip, trim_clip,
     };
     use cutlass_cache::FrameCache;
     use cutlass_models::{
@@ -671,6 +671,41 @@ mod tests {
         let _ = undo.apply(&mut ctx).unwrap();
         assert_eq!(ctx.project.timeline().track_count(), 0);
         assert_eq!(ctx.project.timeline().clip_count(), 0);
+    }
+
+    #[test]
+    fn set_track_flags_inverse_oscillates() {
+        let (_dir, mut project, cache) = setup();
+        let track = project.add_track(TrackKind::Video, "V1");
+        assert!(project.timeline().track(track).unwrap().enabled);
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+
+        // Disable the track; only `enabled` changes, the rest stay put.
+        let inv1 = set_track_flags::execute(&mut ctx, track, Some(false), None, None).unwrap();
+        assert!(!ctx.project.timeline().track(track).unwrap().enabled);
+        assert!(!ctx.project.timeline().track(track).unwrap().muted);
+        assert!(!ctx.project.timeline().track(track).unwrap().locked);
+
+        // Undo restores the full snapshot.
+        let inv2 = inv1.apply(&mut ctx).unwrap();
+        assert!(ctx.project.timeline().track(track).unwrap().enabled);
+
+        // Redo disables again.
+        let _ = inv2.apply(&mut ctx).unwrap();
+        assert!(!ctx.project.timeline().track(track).unwrap().enabled);
+    }
+
+    #[test]
+    fn set_track_flags_unknown_track_errors() {
+        let (_dir, mut project, cache) = setup();
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let missing = cutlass_models::TrackId::from_raw(999);
+        assert!(set_track_flags::execute(&mut ctx, missing, Some(false), None, None).is_err());
     }
 
     /// Inert action for history bookkeeping tests.

@@ -151,6 +151,14 @@ export component Toolbar inherits Rectangle {
             width: AppStore.theme.metrics.spacing.sm;
         }
 
+        // Fit the whole sequence into the viewport (CapCut's zoom-to-fit).
+        ToolButton {
+            label: "Fit";
+            clicked => {
+                TimelineActions.zoom-to-fit();
+            }
+        }
+
         // Zoom: − / slider / + (log scale; see TimelineActions).
         ToolButton {
             label: "−";

@@ -113,6 +113,7 @@ pub fn resolve_clip_drag(
         && source_kind == TrackKind::Video
         && main_video_row(sequence) == Some(hover_row)
         && let Some(track) = sequence.tracks.row_data(hover_row as usize)
+        && !track.locked
     {
         let exclude = (track.id == source_track_id).then_some(dragging_clip_id);
         let ins = resolve_insertion(&track, exclude, desired);
@@ -142,12 +143,12 @@ pub fn resolve_clip_drag(
     );
     let snapped = snap.snapped_start_value.max(0);
 
-    // Hovered lane accepts the clip only when kinds match.
+    // Hovered lane accepts the clip only when kinds match and it isn't locked.
     let hover_track = (0..track_count)
         .contains(&hover_row)
         .then(|| sequence.tracks.row_data(hover_row as usize))
         .flatten()
-        .filter(|t| t.kind == source_kind);
+        .filter(|t| t.kind == source_kind && !t.locked);
 
     if let Some(track) = hover_track {
         let exclude = (track.id == source_track_id).then_some(dragging_clip_id);
@@ -223,7 +224,7 @@ pub fn resolve_library_drop(
         .contains(&drop_row)
         .then(|| sequence.tracks.row_data(drop_row as usize))
         .flatten()
-        .filter(|t| t.kind == TrackKind::Video);
+        .filter(|t| t.kind == TrackKind::Video && !t.locked);
 
     if main_magnet
         && main_video_row(sequence) == Some(drop_row)
@@ -236,6 +237,8 @@ pub fn resolve_library_drop(
             resolved_start: ins.commit_tick,
             is_insert: true,
             caret_tick: ins.display_tick,
+            has_snap: false,
+            snap_line_tick: 0,
         };
     }
 
@@ -250,12 +253,17 @@ pub fn resolve_library_drop(
         snap_threshold_ticks,
         playhead_tick,
     );
+    // A snap pulled below tick 0 is clamped away (no guide there).
+    let resolved_start = snap.snapped_start_value.max(0);
+    let has_snap = snap.has_snap && resolved_start == snap.snapped_start_value;
     LibraryDropResolution {
         target_track_id: row_track.map(|t| t.id.clone()).unwrap_or_default(),
         target_row: drop_row,
-        resolved_start: snap.snapped_start_value.max(0),
+        resolved_start,
         is_insert: false,
         caret_tick: 0,
+        has_snap,
+        snap_line_tick: if has_snap { snap.snap_line_tick } else { 0 },
     }
 }
 
@@ -604,6 +612,9 @@ mod tests {
             kind,
             color: slint::Color::from_rgb_u8(0x4A, 0x6F, 0xA5),
             clips: ModelRc::from(Rc::new(VecModel::from(clips))),
+            enabled: true,
+            muted: false,
+            locked: false,
         }
     }
 
@@ -725,6 +736,33 @@ mod tests {
         assert!(!r.valid);
     }
 
+    #[test]
+    fn locked_lane_is_skipped_into_new_lane() {
+        // Row 0 is a locked video lane; dragging clip "1" up onto it must not
+        // land there (it resolves to a new lane inserted at the row instead).
+        let mut locked = track("2", TrackKind::Video, vec![]);
+        locked.locked = true;
+        let seq = sequence(vec![
+            locked,
+            track("1", TrackKind::Video, vec![clip("1", 10, 100)]),
+        ]);
+        let r = resolve_clip_drag(&seq, "1", "1", 0, 0, 0, 0, false);
+        assert!(r.valid && r.is_new_lane);
+        assert_eq!(r.target_row, 0);
+    }
+
+    #[test]
+    fn locked_video_lane_rejects_library_drop() {
+        let mut locked = track("2", TrackKind::Video, vec![]);
+        locked.locked = true;
+        let seq = sequence(vec![locked]);
+        // No unlocked video lane under the cursor → empty target (worker makes
+        // a new lane), and no insertion even with the magnet on.
+        let r = resolve_library_drop(&seq, 48, 10, 0, 0, 5, true);
+        assert_eq!(r.target_track_id, "");
+        assert!(!r.is_insert);
+    }
+
     // --- main-track magnet (insertion) --------------------------------------
     // sample_sequence rows: 0 = V2 (overlay video), 1 = V1 (main: bottom
     // video lane, clip "1" [10,110)), 2 = A1 (audio).
@@ -819,6 +857,20 @@ mod tests {
         assert_eq!(foreign.target_track_id, "");
         assert_eq!(foreign.target_row, 2);
         assert!(!foreign.is_insert);
+    }
+
+    #[test]
+    fn library_drop_exposes_snap_guide() {
+        let seq = sample_sequence();
+        // Overlay video lane (row 0): cursor 78 magnets to clip "2"'s end (80).
+        let r = resolve_library_drop(&seq, 48, 78, 0, 0, 5, false);
+        assert!(r.has_snap);
+        assert_eq!(r.snap_line_tick, 80);
+
+        // Out of threshold: no snap, no guide.
+        let no = resolve_library_drop(&seq, 48, 130, 0, 0, 5, false);
+        assert!(!no.has_snap);
+        assert_eq!(no.snap_line_tick, 0);
     }
 
     // --- resolve_clip_trim ----------------------------------------------------

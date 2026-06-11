@@ -85,6 +85,10 @@ pub struct Track {
     pub enabled: bool,
     /// Audio: whether the track is silenced. Video: unused.
     pub muted: bool,
+    /// Whether the lane is locked: its clips can't be selected, moved, or
+    /// trimmed. Compositing/playback are unaffected (CapCut semantics).
+    #[serde(default)]
+    pub locked: bool,
     #[serde(with = "crate::serde_map")]
     clips: Map<ClipId, Clip>,
 }
@@ -98,6 +102,7 @@ impl Track {
             name: name.into(),
             enabled: true,
             muted: false,
+            locked: false,
             clips: Map::default(),
         }
     }
@@ -210,6 +215,7 @@ mod tests {
         assert_eq!(track.name, "V1");
         assert!(track.enabled);
         assert!(!track.muted);
+        assert!(!track.locked);
         assert!(track.is_empty());
         assert!(track.id.raw() >= 1);
     }
@@ -414,12 +420,14 @@ mod tests {
     // --- flags / Clone ----------------------------------------------------
 
     #[test]
-    fn enabled_and_muted_are_mutable() {
+    fn enabled_muted_and_locked_are_mutable() {
         let mut track = Track::new(TrackKind::Audio, "A1");
         track.enabled = false;
         track.muted = true;
+        track.locked = true;
         assert!(!track.enabled);
         assert!(track.muted);
+        assert!(track.locked);
     }
 
     #[test]

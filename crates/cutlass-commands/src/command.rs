@@ -60,6 +60,12 @@ pub enum EditCommand {
     RemoveClip { clip: ClipId },
     /// Remove a track (and any clips still on it) from the stack.
     RemoveTrack { track: TrackId },
+    /// Toggle whether a (visual) track contributes to the composite.
+    SetTrackEnabled { track: TrackId, enabled: bool },
+    /// Toggle whether an audio track is silenced.
+    SetTrackMuted { track: TrackId, muted: bool },
+    /// Toggle whether a track's clips are editable (selection/move/trim).
+    SetTrackLocked { track: TrackId, locked: bool },
     /// Remove a clip and slide later clips on its track left to close the gap.
     RippleDelete { clip: ClipId },
     /// Shift every clip on `track` whose start is ≥ `from` by `delta` ticks
@@ -99,4 +105,6 @@ pub enum EditOutcome {
     RemovedTrack(TrackId),
     /// Clips on the track were ripple-shifted (no single clip to point at).
     ShiftedTrack(TrackId),
+    /// A track flag (enabled / muted / locked) was changed.
+    UpdatedTrack(TrackId),
 }

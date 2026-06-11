@@ -80,6 +80,23 @@ enum WorkerMsg {
     /// ops without a drag resolution (delete/paste/duplicate); enabling also
     /// packs the main lane gapless (one history entry).
     SetMainMagnet(bool),
+    /// Set a track header flag (hide/mute/lock) on `track` (raw id). Undoable.
+    SetTrackFlag {
+        track: String,
+        flag: TrackFlag,
+        value: bool,
+    },
+}
+
+/// Which track header toggle a [`WorkerMsg::SetTrackFlag`] addresses.
+#[derive(Clone, Copy)]
+pub enum TrackFlag {
+    /// Video: contributes to the composite (the eye toggle).
+    Enabled,
+    /// Audio: silenced (the speaker toggle).
+    Muted,
+    /// Clips can't be selected / moved / trimmed (the lock toggle).
+    Locked,
 }
 
 /// Worker-side clipboard: everything needed to re-issue the copied clip as a
@@ -183,6 +200,10 @@ impl WorkerHandle {
 
     pub fn set_main_magnet(&self, enabled: bool) {
         let _ = self.tx.send(WorkerMsg::SetMainMagnet(enabled));
+    }
+
+    pub fn set_track_flag(&self, track: String, flag: TrackFlag, value: bool) {
+        let _ = self.tx.send(WorkerMsg::SetTrackFlag { track, flag, value });
     }
 }
 
@@ -366,6 +387,9 @@ fn worker_loop(
                 if enabled {
                     pack_main_track_and_publish(engine, &editor_weak);
                 }
+            }
+            WorkerMsg::SetTrackFlag { track, flag, value } => {
+                set_track_flag_and_publish(engine, &track, flag, value, &editor_weak)
             }
             WorkerMsg::Frame(_) => unreachable!("frames are handled by the drain below"),
         }
@@ -796,6 +820,45 @@ fn trim_clip_and_publish(
         }
         Ok(other) => error!(%clip_id, "unexpected trim-clip outcome: {other:?}"),
         Err(e) => error!(%clip_id, start_tick, duration_ticks, "trim clip failed: {e}"),
+    }
+}
+
+/// Toggle a track header flag (hide/mute/lock). Undoable like any edit; the
+/// republished projection carries the new flag to the lane header. Disabling
+/// a visual track drops it from the composite (the engine skips `!enabled`
+/// visual tracks), so the preview catches up on the next scrub.
+fn set_track_flag_and_publish(
+    engine: &mut Engine,
+    track: &str,
+    flag: TrackFlag,
+    value: bool,
+    editor_weak: &slint::Weak<EditorStore<'static>>,
+) {
+    let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
+        error!(track, "set-track-flag ignored: unparsable track id");
+        return;
+    };
+    let command = match flag {
+        TrackFlag::Enabled => EditCommand::SetTrackEnabled {
+            track: track_id,
+            enabled: value,
+        },
+        TrackFlag::Muted => EditCommand::SetTrackMuted {
+            track: track_id,
+            muted: value,
+        },
+        TrackFlag::Locked => EditCommand::SetTrackLocked {
+            track: track_id,
+            locked: value,
+        },
+    };
+    match engine.apply(Command::Edit(command)) {
+        Ok(ApplyOutcome::Edited(EditOutcome::UpdatedTrack(_))) => {
+            info!(%track_id, value, "set track flag");
+            publish_projection(engine, editor_weak);
+        }
+        Ok(other) => error!(%track_id, "unexpected set-track-flag outcome: {other:?}"),
+        Err(e) => error!(%track_id, "set track flag failed: {e}"),
     }
 }
 

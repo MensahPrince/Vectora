@@ -288,6 +288,20 @@ fn main() -> Result<(), slint::PlatformError> {
         duplicate_handle.duplicate_clip(clip_id.to_string());
     });
 
+    let track_flag_handle = preview_worker.handle();
+    editor.on_on_track_flag_toggled(move |track_id, flag, value| {
+        let flag = match flag.as_str() {
+            "enabled" => preview_worker::TrackFlag::Enabled,
+            "muted" => preview_worker::TrackFlag::Muted,
+            "locked" => preview_worker::TrackFlag::Locked,
+            other => {
+                tracing::error!(flag = other, "ignoring unknown track flag");
+                return;
+            }
+        };
+        track_flag_handle.set_track_flag(track_id.to_string(), flag, value);
+    });
+
     let editor_weak = app.global::<EditorStore>().as_weak();
     app.global::<InspectorBackend>()
         .on_resolve_selection(|sequence, track_id, clip_id| {

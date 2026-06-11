@@ -46,6 +46,10 @@ export struct LibraryDropResolution {
     resolved-start: int,
     is-insert: bool,
     caret-tick: int,
+    // Magnet guide: vertical line at `snap-line-tick` while snapped (freeform
+    // drops only; insertion mode shows a caret instead).
+    has-snap: bool,
+    snap-line-tick: int,
 }
 
 // Where a trimmed clip edge would settle if released right now. The dragged

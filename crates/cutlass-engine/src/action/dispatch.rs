@@ -104,6 +104,18 @@ fn dispatch_edit(
             let inverse = Box::new(RemoveTrackAction { track_id: track }).apply(ctx)?;
             Ok((ApplyOutcome::Edited(EditOutcome::RemovedTrack(track)), Some(inverse)))
         }
+        EditCommand::SetTrackEnabled { track, enabled } => {
+            let inverse = edit::set_track_flags::execute(ctx, track, Some(enabled), None, None)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)), Some(inverse)))
+        }
+        EditCommand::SetTrackMuted { track, muted } => {
+            let inverse = edit::set_track_flags::execute(ctx, track, None, Some(muted), None)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)), Some(inverse)))
+        }
+        EditCommand::SetTrackLocked { track, locked } => {
+            let inverse = edit::set_track_flags::execute(ctx, track, None, None, Some(locked))?;
+            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)), Some(inverse)))
+        }
         EditCommand::RippleDelete { clip } => {
             let inverse = edit::ripple_delete::execute(ctx, clip)?;
             Ok((ApplyOutcome::Edited(EditOutcome::Removed(clip)), Some(inverse)))

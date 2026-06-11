@@ -7,6 +7,13 @@ export global TimelineViewState {
     // TimelinePanel so zoom anchoring can convert viewport px ↔ ticks.
     in-out property <length> viewport-w: 0px;
 
+    // Window-space cursor during a clip move/trim gesture (library drags use
+    // AppState.library-drag-cursor-*). Recorded by ClipView; read by the
+    // panel's edge auto-scroll so it can scroll while the cursor sits in the
+    // viewport's edge zone without a fresh pointer-move event.
+    in-out property <length> pointer-window-x: 0px;
+    in-out property <length> pointer-window-y: 0px;
+
     // --- clip drag gesture ---------------------------------------------
     // Set by ClipView on grab; TimelinePanel resolves the landing spot each
     // frame (ghost + guides) and commits on release. Empty clip id ⇔ no drag.

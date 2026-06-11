@@ -140,11 +140,11 @@ export global TimelineActions {
                 / 1px / TimelineStore.zoom;
     }
 
-    // New scroll-x that keeps the anchor at the same viewport pixel
+    // New scroll-x that keeps `anchor-tick` at the same viewport pixel
     // once zoom becomes `z1`: scroll' = scroll + anchor·(z0 − z1).
-    pure function scroll-after-zoom(z1: float) -> length {
+    pure function scroll-after-zoom(z1: float, anchor-tick: float) -> length {
         return min(0px, TimelineViewState.scroll-x
-            + self.zoom-anchor-tick() * (TimelineStore.zoom - z1) * 1px);
+            + anchor-tick * (TimelineStore.zoom - z1) * 1px);
     }
 
     // Scratch slot: the corrected scroll must be computed against the
@@ -152,11 +152,35 @@ export global TimelineActions {
     // have no local bindings).
     private property <length> pending-scroll-x;
 
-    public function set-zoom(new-zoom: float) {
+    // Zoom while keeping `anchor-tick` pinned to its current viewport pixel.
+    // The toolbar slider anchors on the playhead/center; Ctrl+scroll anchors
+    // on the cursor tick.
+    public function set-zoom-anchored(new-zoom: float, anchor-tick: float) {
         self.pending-scroll-x =
-            self.scroll-after-zoom(clamp(new-zoom, self.min-zoom, self.max-zoom));
+            self.scroll-after-zoom(clamp(new-zoom, self.min-zoom, self.max-zoom), anchor-tick);
         TimelineStore.zoom = clamp(new-zoom, self.min-zoom, self.max-zoom);
         // TimelinePanel's min-scroll-x watcher clamps the far edge.
         TimelineViewState.scroll-x = self.pending-scroll-x;
+    }
+
+    public function set-zoom(new-zoom: float) {
+        self.set-zoom-anchored(new-zoom, self.zoom-anchor-tick());
+    }
+
+    // Fit the whole sequence into the lane viewport (CapCut's zoom-to-fit),
+    // with a small tail margin so the last clip isn't flush to the edge.
+    public function zoom-to-fit() {
+        // Empty timeline (or viewport not measured yet): reset to default.
+        if (TimelineLib.sequence-duration(EditorStore.project.sequence).value <= 0
+                || TimelineViewState.viewport-w <= 0px) {
+            TimelineStore.zoom = 3;
+            TimelineViewState.scroll-x = 0px;
+            return;
+        }
+        TimelineStore.zoom = clamp(
+            TimelineViewState.viewport-w / 1px
+                / (TimelineLib.sequence-duration(EditorStore.project.sequence).value * 1.05),
+            self.min-zoom, self.max-zoom);
+        TimelineViewState.scroll-x = 0px;
     }
 }

@@ -226,17 +226,54 @@ Deliberate gap: **no speed/volume badges yet** (no model fields). The drag
 floating copy and trim stretch preview stay flat color — content in those
 gestures is a polish item for later.
 
-## Phase 9 — Drag & viewport polish
+## Phase 9 — Drag & viewport polish ✅
 
-- [ ] Auto-scroll when dragging near the viewport edges (CapCut scrolls the
-      timeline under the drag; applies to clip moves, trims, and library
-      drops).
-- [ ] Snap guides for library drags (the window-level ghost currently doesn't
-      show the vertical guide the resolver already computes).
-- [ ] Zoom-to-fit button + Ctrl+scroll zoom centered on the cursor (the
-      toolbar slider with playhead/center anchoring landed in Phase 4).
-- [ ] Timecode tooltip while dragging/trimming.
-- [ ] Track headers: mute/lock/hide toggles (engine `Track.enabled` exists).
+- [x] Auto-scroll when dragging near the viewport edges. A ~16ms `Timer` in
+      `TimelinePanel` steps `scroll-x`/`scroll-y` while the cursor sits in a
+      32px edge zone (speed ramps with depth), for clip moves, trims (x only),
+      and library drops. Clip/trim deltas are TouchArea-local and Slint fires
+      no `moved` while the cursor is still and content scrolls under it, so
+      each step compensates `drag-dx/dy-px` / `trim-dx-px` by the scroll it
+      actually applied (clamped at the bounds) — the ghost stays glued to the
+      cursor. Library drops recompute their cursor tick reactively from
+      `scroll-x`, so they need no compensation. `ClipView` records the
+      window-space pointer (`TimelineViewState.pointer-window-*`).
+- [x] Snap guides for library drags. `LibraryDropResolution` now carries
+      `has-snap`/`snap-line-tick` (the freeform path already called
+      `compute_drag_snap`), and the timeline draws the same `#00E5C7` vertical
+      guide as clip drags. The over-timeline ghost is now *honest*: a
+      content-space landing rectangle at the snapped, row-aligned spot inside
+      the lanes — the window-level ghost (`app.slint`) only tracks the loose
+      tile while outside the timeline.
+- [x] Zoom-to-fit button + Ctrl/Cmd+scroll zoom centered on the cursor.
+      `set-zoom` refactored into `set-zoom-anchored(zoom, anchor-tick)` (the
+      Phase 4 anchoring math, now parameterized); the toolbar **Fit** button
+      calls `zoom-to-fit` (viewport-w ÷ sequence duration, +5% tail margin).
+      A `TouchArea` wrapping the lanes Flickable handles `scroll-event`:
+      Ctrl/Cmd+wheel zooms anchored on the cursor tick, plain wheel scrolls
+      lanes, Shift/horizontal-delta scrolls sideways (the lanes Flickable is
+      `interactive: false`, so scroll bubbles out of the clip TouchAreas to
+      this ancestor).
+- [x] Timecode tooltip while dragging/trimming. The Phase 3 trim bubble is now
+      a shared `DragTooltip`; clip moves and library drops show the landing
+      timecode (`TimelineLib.format-timecode`, insert mode reads the caret
+      slot), trim keeps its duration + signed-delta readout.
+- [x] Track headers: hide/mute/lock toggles. Engine gained
+      `SetTrackEnabled`/`SetTrackMuted`/`SetTrackLocked` commands over a shared
+      `SetTrackFlagsAction` (snapshots all three flags → oscillating inverse)
+      and a new `Track.locked` field; the worker applies them via
+      `WorkerMsg::SetTrackFlag`. `TrackHead` renders the lane name + eye
+      (visual) / speaker (audio) / lock toggles, projected from the engine
+      (`enabled`/`muted`/`locked`). Hidden lanes dim their clips (folded into
+      the existing per-element dim, never group `opacity`); locked lanes are
+      read-only (clip TouchAreas disabled, resolvers skip them like a
+      foreign-kind row, locking clears a selection living on the lane).
+      `enabled=false` already drops visual tracks from `resolve_layers`, so the
+      preview updates on the next scrub.
+
+Deliberate gap: **mute is persisted + shown but silent-in-name only** — there
+is no audio playback path yet (`Track.muted` is honored by no one), so the
+speaker toggle is a stored flag awaiting the mixer.
 
 ## Phase 10 — Multi-clip & linking
 

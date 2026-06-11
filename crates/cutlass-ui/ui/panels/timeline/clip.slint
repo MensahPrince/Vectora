@@ -17,6 +17,10 @@ export component ClipView inherits Rectangle {
     in property <int> track-row;
     in property <TrackKind> track-kind;
     in property <color> track-color;
+    // Lane header flags. Hidden (`!track-enabled`) lanes dim their clips;
+    // locked lanes can't be selected, moved, or trimmed.
+    in property <bool> track-enabled: true;
+    in property <bool> track-locked: false;
     in property <float> zoom;
 
     private property <bool> is-active-drag:
@@ -36,14 +40,15 @@ export component ClipView inherits Rectangle {
     private property <length> handle-width: min(6px, self.width / 3);
 
     // CapCut dims the source position while the floating copy (move) or the
-    // stretch preview (trim) shows the live result.
+    // stretch preview (trim) shows the live result; a hidden lane
+    // (`!track-enabled`) stays dimmed for as long as it's off.
     //
     // Dim via per-element colors, NOT the group `opacity` property: opacity on
     // an element with children makes Slint composite the subtree into an
     // intermediate GPU texture sized to the element's full geometry. A long
     // clip at high zoom exceeds the GPU max texture dimension (16384 px) and
     // aborts the app inside wgpu.
-    private property <bool> dimmed: is-active-drag || is-active-trim;
+    private property <bool> dimmed: is-active-drag || is-active-trim || !track-enabled;
 
     // --- Phase 8: clip content (filmstrip / waveform / inline text) ------
 
@@ -70,7 +75,13 @@ export component ClipView inherits Rectangle {
     width: TimelineLib.clip-timeline-width(model, zoom);
     height: AppStore.theme.track-lane.clip.height;
     background: dimmed ? track-color.with-alpha(0.35) : track-color;
-    border-radius: AppStore.theme.track-lane.clip.radius;
+    // Rounded clipping is the same GPU-layer trap as group `opacity` above:
+    // `clip: true` with a non-zero radius composites the subtree into a
+    // texture sized to the full card, which at frame-level zoom exceeds the
+    // 16384px GPU texture limit and aborts in wgpu. Past a few thousand px
+    // the 4px corners are imperceptible anyway — drop the radius so the clip
+    // degrades to a plain scissor rect (no layer allocated at all).
+    border-radius: root.width < 4096px ? AppStore.theme.track-lane.clip.radius : 0;
     // Tiles are grid-aligned to media time, so the first one usually starts
     // left of the clip edge — crop everything to the rounded card.
     clip: true;
@@ -126,6 +137,8 @@ export component ClipView inherits Rectangle {
     ta := TouchArea {
         width: parent.width;
         height: parent.height;
+        // Locked lanes are read-only: no select / move on their clips.
+        enabled: !root.track-locked;
 
         changed pressed => {
             if (self.pressed) {
@@ -146,6 +159,8 @@ export component ClipView inherits Rectangle {
                 TimelineViewState.dragging-name = model.name;
                 TimelineViewState.drag-dx-px = 0px;
                 TimelineViewState.drag-dy-px = 0px;
+                TimelineViewState.pointer-window-x = self.absolute-position.x + self.mouse-x;
+                TimelineViewState.pointer-window-y = self.absolute-position.y + self.mouse-y;
             } else if (is-active-drag) {
                 // TimelinePanel commits (if the drag moved) and clears the state.
                 TimelineViewState.drag-released = true;
@@ -160,6 +175,8 @@ export component ClipView inherits Rectangle {
             // offsets from the press point.
             TimelineViewState.drag-dx-px = self.mouse-x - self.pressed-x;
             TimelineViewState.drag-dy-px = self.mouse-y - self.pressed-y;
+            TimelineViewState.pointer-window-x = self.absolute-position.x + self.mouse-x;
+            TimelineViewState.pointer-window-y = self.absolute-position.y + self.mouse-y;
         }
     }
 
@@ -237,10 +254,13 @@ export component ClipView inherits Rectangle {
         width: root.handle-width;
         height: parent.height;
         mouse-cursor: ew-resize;
+        enabled: !root.track-locked;
 
         changed pressed => {
             if (self.pressed) {
                 begin-trim(true);
+                TimelineViewState.pointer-window-x = self.absolute-position.x + self.mouse-x;
+                TimelineViewState.pointer-window-y = self.absolute-position.y + self.mouse-y;
             } else if (is-active-trim) {
                 TimelineViewState.trim-released = true;
             }
@@ -249,6 +269,8 @@ export component ClipView inherits Rectangle {
         moved => {
             if (is-active-trim) {
                 TimelineViewState.trim-dx-px = self.mouse-x - self.pressed-x;
+                TimelineViewState.pointer-window-x = self.absolute-position.x + self.mouse-x;
+                TimelineViewState.pointer-window-y = self.absolute-position.y + self.mouse-y;
             }
         }
     }
@@ -258,10 +280,13 @@ export component ClipView inherits Rectangle {
         width: root.handle-width;
         height: parent.height;
         mouse-cursor: ew-resize;
+        enabled: !root.track-locked;
 
         changed pressed => {
             if (self.pressed) {
                 begin-trim(false);
+                TimelineViewState.pointer-window-x = self.absolute-position.x + self.mouse-x;
+                TimelineViewState.pointer-window-y = self.absolute-position.y + self.mouse-y;
             } else if (is-active-trim) {
                 TimelineViewState.trim-released = true;
             }
@@ -270,6 +295,8 @@ export component ClipView inherits Rectangle {
         moved => {
             if (is-active-trim) {
                 TimelineViewState.trim-dx-px = self.mouse-x - self.pressed-x;
+                TimelineViewState.pointer-window-x = self.absolute-position.x + self.mouse-x;
+                TimelineViewState.pointer-window-y = self.absolute-position.y + self.mouse-y;
             }
         }
     }

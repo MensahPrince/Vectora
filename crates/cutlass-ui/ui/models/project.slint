@@ -107,6 +107,13 @@ export struct Track {
     // moves to a different lane.
     color: color,
     clips: [Clip],
+    // Track header flags (engine state, projected read-only). `enabled`:
+    // a visual track contributes to the composite (the eye toggle).
+    // `muted`: an audio track is silenced. `locked`: clips can't be
+    // selected / moved / trimmed (drags resolve past the lane).
+    enabled: bool,
+    muted: bool,
+    locked: bool,
 }
 
 @rust-attr(derive(serde::Serialize, serde::Deserialize))
