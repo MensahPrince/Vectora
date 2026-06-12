@@ -190,6 +190,17 @@ export struct Clip {
     transform-scale: float,
     transform-rotation: float,
     transform-opacity: float,
+    // Framing (M1 crop): the normalized kept-region window into the
+    // content (x/y top-left corner, w/h extent; 0,0,1,1 ⇔ uncropped) plus
+    // mirroring. Projected read-only — edits go through
+    // `EditCommand::SetClipCrop` on the worker. Constant per clip (not
+    // animatable), unlike the transform above.
+    crop-x: float,
+    crop-y: float,
+    crop-w: float,
+    crop-h: float,
+    flip-h: bool,
+    flip-v: bool,
     // Keyframe curves per animatable property (M2), in tick order with
     // ABSOLUTE sequence ticks. Empty ⇔ the property is a constant (read it
     // from `transform-*` above). Edits go through

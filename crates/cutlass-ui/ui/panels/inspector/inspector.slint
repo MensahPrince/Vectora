@@ -15,6 +15,7 @@ import {
 import { Clip, TrackKind } from "../../models/index.slint";
 import { TextInspector } from "text-inspector.slint";
 import { TransformInspector } from "transform-inspector.slint";
+import { CropInspector } from "crop-inspector.slint";
 
 struct InspectorField {
     label: string,
@@ -414,6 +415,10 @@ component VisualClipInspector inherits VerticalLayout {
             }
 
             TransformInspector {
+                model: root.model;
+            }
+
+            CropInspector {
                 model: root.model;
             }
 

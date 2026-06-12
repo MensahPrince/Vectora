@@ -10,8 +10,8 @@
 //! clip's placement in viewport coordinates.
 
 use cutlass_compositor::{CompositorConfig, LayerPlacement};
-use cutlass_engine::layer_placement;
-use cutlass_models::ClipTransform;
+use cutlass_engine::cropped_layer_placement;
+use cutlass_models::{ClipTransform, CropRect};
 use slint::Model;
 
 use crate::{Clip, PreviewDragResolution, PreviewHit, PreviewSelectionBox, Sequence, TrackKind};
@@ -69,6 +69,7 @@ pub(crate) fn clip_placement(clip: &Clip, canvas: &CompositorConfig) -> LayerPla
         rotation: clip.transform_rotation,
         opacity: clip.transform_opacity,
     };
+    let crop = clip_crop(clip);
     let has_size = clip.media_width > 0 && clip.media_height > 0;
     if !clip.media_id.is_empty() {
         let (w, h) = if has_size {
@@ -77,16 +78,36 @@ pub(crate) fn clip_placement(clip: &Clip, canvas: &CompositorConfig) -> LayerPla
             // Media that vanished from the pool: degrade to canvas size.
             (canvas.width, canvas.height)
         };
-        return layer_placement(&transform, w, h, canvas);
+        return cropped_layer_placement(&transform, w, h, &crop, canvas);
     }
-    let mut placement = layer_placement(&transform, canvas.width, canvas.height, canvas);
-    if has_size {
+    let mut placement =
+        cropped_layer_placement(&transform, canvas.width, canvas.height, &crop, canvas);
+    if has_size && crop.is_full() {
+        // Uncropped generators hug their drawn-content bounds. A cropped
+        // generator keeps the compositor's kept-region quad instead — the
+        // measured bounds describe the uncropped raster.
         placement.size = [
             clip.media_width as f32 * transform.scale,
             clip.media_height as f32 * transform.scale,
         ];
     }
     placement
+}
+
+/// The clip's crop window. Projections written before crop existed (and
+/// default-constructed test rows) carry an all-zero rect, which means "no
+/// crop", not "keep nothing".
+pub(crate) fn clip_crop(clip: &Clip) -> CropRect {
+    if clip.crop_w > 0.0 && clip.crop_h > 0.0 {
+        CropRect {
+            x: clip.crop_x,
+            y: clip.crop_y,
+            w: clip.crop_w,
+            h: clip.crop_h,
+        }
+    } else {
+        CropRect::FULL
+    }
 }
 
 fn covers_tick(clip: &Clip, tick: i32) -> bool {
@@ -537,6 +558,49 @@ mod tests {
         );
         assert_eq!(hit_test(&seq, 0, 100.0, 60.0, VW, VH).clip_id.as_str(), "A");
         assert_eq!(hit_test(&seq, 40, 100.0, 60.0, VW, VH).clip_id.as_str(), "");
+    }
+
+    #[test]
+    fn cropped_clip_hits_and_outlines_the_kept_region() {
+        // Keep the right half of full-frame media. The kept 960×1080 slice
+        // re-fits the canvas centered (CapCut recenters cropped content):
+        // aspect-fit scale min(1920/960, 1080/1080) = 1 ⇒ a centered
+        // 960×1080 pillarbox, half that in the viewport.
+        let mut clip = media_clip("A", 0, 100, 1920, 1080);
+        clip.crop_x = 0.5;
+        clip.crop_y = 0.0;
+        clip.crop_w = 0.5;
+        clip.crop_h = 1.0;
+        let seq = sequence(vec![track("1", TrackKind::Video, vec![clip])]);
+
+        // Outside the pillarbox (full-frame would hit here) vs inside it.
+        assert_eq!(hit_test(&seq, 10, 100.0, 270.0, VW, VH).clip_id.as_str(), "");
+        assert_eq!(hit_test(&seq, 10, 480.0, 270.0, VW, VH).clip_id.as_str(), "A");
+
+        let b = selection_box(&seq, "A", 10, VW, VH, None);
+        assert!(b.visible);
+        assert_eq!(
+            corners(&b),
+            [(240.0, 0.0), (720.0, 0.0), (720.0, 540.0), (240.0, 540.0)]
+        );
+    }
+
+    #[test]
+    fn zeroed_crop_fields_mean_uncropped() {
+        // Default-constructed rows (and projections written before crop
+        // existed) carry an all-zero rect: full-frame geometry, not a
+        // degenerate window.
+        let seq = sequence(vec![track(
+            "1",
+            TrackKind::Video,
+            vec![media_clip("A", 0, 100, 1920, 1080)],
+        )]);
+        assert_eq!(hit_test(&seq, 10, 480.0, 270.0, VW, VH).clip_id.as_str(), "A");
+        let b = selection_box(&seq, "A", 10, VW, VH, None);
+        assert_eq!(
+            corners(&b),
+            [(0.0, 0.0), (960.0, 0.0), (960.0, 540.0), (0.0, 540.0)]
+        );
     }
 
     #[test]

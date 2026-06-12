@@ -95,6 +95,21 @@ export global InspectorBackend {
         fade-out-s: float,
     );
 
+    // Set a visual clip's crop window + mirroring (CapCut crop, M1):
+    // normalized inset fractions measured in from each content edge
+    // (0,0,0,0 ⇔ uncropped) plus flip flags. main.rs converts insets to the
+    // model's kept-region rect; the engine validates (visual lanes only,
+    // non-degenerate window). One undoable edit.
+    callback set-clip-crop(
+        clip-id: string,
+        left: float,
+        top: float,
+        right: float,
+        bottom: float,
+        flip-h: bool,
+        flip-v: bool,
+    );
+
     // Replace a text clip's content and/or styling in one undoable edit. The
     // inspector always sends the full current style with the single changed
     // field, so the engine writes one coherent `Generator::Text`.

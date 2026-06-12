@@ -1348,6 +1348,21 @@ fn main() -> Result<(), slint::PlatformError> {
         .on_set_clip_audio(move |clip_id, volume, fade_in_s, fade_out_s| {
             set_audio_handle.set_clip_audio(clip_id.to_string(), volume, fade_in_s, fade_out_s);
         });
+    let set_crop_handle = preview_worker.handle();
+    app.global::<InspectorBackend>().on_set_clip_crop(
+        move |clip_id, left, top, right, bottom, flip_h, flip_v| {
+            // Insets (UI/agent shape) → kept-region rect (model shape). The
+            // sliders cap each inset at 49%, so the window stays valid; the
+            // floor only guards float dust against the engine's minimum.
+            let crop = cutlass_models::CropRect {
+                x: left,
+                y: top,
+                w: (1.0 - left - right).max(cutlass_models::MIN_CROP_FRACTION),
+                h: (1.0 - top - bottom).max(cutlass_models::MIN_CROP_FRACTION),
+            };
+            set_crop_handle.set_clip_crop(clip_id.to_string(), crop, flip_h, flip_v);
+        },
+    );
 
     let set_text_handle = preview_worker.handle();
     app.global::<InspectorBackend>()

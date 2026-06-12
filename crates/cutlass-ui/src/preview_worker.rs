@@ -11,9 +11,9 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, EngineError, ExportSettings};
 use cutlass_models::{
-    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, Easing, Generator, LinkId,
-    MarkerColor, MarkerId, MediaId, ParamValue, Project, Rational, RationalTime, TimeRange, Track,
-    TrackId, TrackKind, resample,
+    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, CropRect, Easing, Generator,
+    LinkId, MarkerColor, MarkerId, MediaId, ParamValue, Project, Rational, RationalTime, TimeRange,
+    Track, TrackId, TrackKind, resample,
 };
 use tracing::{error, info, warn};
 
@@ -115,6 +115,15 @@ enum WorkerMsg {
         volume: f32,
         fade_in_s: f32,
         fade_out_s: f32,
+    },
+    /// Set a visual clip's crop window + mirroring (CapCut crop, M1): the
+    /// normalized kept-region rect plus flip flags. One undoable history
+    /// entry; the engine rejects audio-lane clips and degenerate rects.
+    SetClipCrop {
+        clip: String,
+        crop: CropRect,
+        flip_h: bool,
+        flip_v: bool,
     },
     /// Live drag override (preview roadmap Phase 3): render `tick` with
     /// `clip`'s transform replaced — session state on the engine, no history
@@ -486,6 +495,15 @@ impl WorkerHandle {
         });
     }
 
+    pub fn set_clip_crop(&self, clip: String, crop: CropRect, flip_h: bool, flip_v: bool) {
+        let _ = self.tx.send(WorkerMsg::SetClipCrop {
+            clip,
+            crop,
+            flip_h,
+            flip_v,
+        });
+    }
+
     pub fn transform_override(&self, clip: String, transform: ClipTransform, tick: i64) {
         let _ = self.tx.send(WorkerMsg::TransformOverride {
             clip,
@@ -844,6 +862,12 @@ fn worker_loop(
                 fade_in_s,
                 fade_out_s,
             } => set_clip_audio_and_publish(engine, &clip, volume, fade_in_s, fade_out_s, &ui),
+            WorkerMsg::SetClipCrop {
+                clip,
+                crop,
+                flip_h,
+                flip_v,
+            } => set_clip_crop_and_publish(engine, &clip, crop, flip_h, flip_v, &ui),
             WorkerMsg::ClearTransformOverride { tick } => {
                 engine.set_transform_override(None);
                 render_frame(engine, tl_rate, &preview_weak, tick);
@@ -1105,6 +1129,7 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::RemoveClips { .. }
             | WorkerMsg::SetGenerator { .. }
             | WorkerMsg::SetClipSpeed { .. }
+            | WorkerMsg::SetClipCrop { .. }
             | WorkerMsg::SetParamKeyframe { .. }
             | WorkerMsg::RemoveParamKeyframe { .. }
             | WorkerMsg::RetimeKeyframes { .. }
@@ -2039,6 +2064,39 @@ fn set_clip_audio_and_publish(
     }
     engine.commit_group();
     info!(%clip_id, volume, fade_in_s, fade_out_s, clips = targets.len(), "set clip audio");
+    publish_projection(engine, ui);
+}
+
+/// Set a visual clip's crop window + mirroring (CapCut crop, M1). One
+/// undoable history entry; the engine validates the rect and rejects
+/// audio-lane clips, so a failure here just logs (the inspector only shows
+/// crop controls for visual clips — a rejection is a stale-projection race).
+fn set_clip_crop_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    crop: CropRect,
+    flip_h: bool,
+    flip_v: bool,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-crop ignored: unparsable clip id");
+        return;
+    };
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipCrop {
+        clip: clip_id,
+        crop,
+        flip_h,
+        flip_v,
+    })) {
+        error!(%clip_id, "set clip crop failed: {e}");
+        return;
+    }
+    info!(
+        %clip_id,
+        x = crop.x, y = crop.y, w = crop.w, h = crop.h, flip_h, flip_v,
+        "set clip crop"
+    );
     publish_projection(engine, ui);
 }
 
