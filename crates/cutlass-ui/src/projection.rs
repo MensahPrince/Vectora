@@ -15,12 +15,16 @@ use std::rc::Rc;
 
 use cutlass_models::{
     Clip as EngineClip, ClipSource, Generator, MediaSource, Project as EngineProject,
-    Rational as EngineRational, RationalTime as EngineTime, TimeRange as EngineRange,
-    Track as EngineTrack, TrackKind as EngineKind, rate_eq, resample,
+    Rational as EngineRational, RationalTime as EngineTime, TextAlignH, TextAlignV, TextCase,
+    TextStyle as EngineTextStyle, TimeRange as EngineRange, Track as EngineTrack,
+    TrackKind as EngineKind, rate_eq, resample,
 };
 use slint::{Color, ModelRc, VecModel};
 
-use crate::{Clip, Media, Project, Rational, RationalTime, Sequence, TimeRange, Track, TrackKind};
+use crate::{
+    Clip, Media, Project, Rational, RationalTime, Sequence, TextClipStyle, TimeRange, Track,
+    TrackKind,
+};
 
 /// Fallback canvas size when no video media has been imported yet. Mirrors the
 /// engine's `composite_canvas_size` default so preview aspect ratio is stable.
@@ -194,6 +198,7 @@ fn clip_to_slint(
         source_in_s,
         duration_label: clip_duration_label(clip.timeline.duration).into(),
         text_content: text_content.into(),
+        text_style: clip_text_style(clip),
         generator_kind: generator_kind.into(),
         fill_color,
         head_room_ticks: head_room,
@@ -300,7 +305,7 @@ fn clip_labels(project: &EngineProject, clip: &EngineClip) -> (String, String) {
             (name, String::new())
         }
         ClipSource::Generated(generator) => match generator {
-            Generator::Text { content } => ("Text".to_owned(), content.clone()),
+            Generator::Text { content, .. } => ("Text".to_owned(), content.clone()),
             Generator::SolidColor { .. } => ("Solid".to_owned(), String::new()),
             Generator::Shape { .. } => ("Shape".to_owned(), String::new()),
             Generator::Sticker => ("Sticker".to_owned(), String::new()),
@@ -332,6 +337,78 @@ fn clip_generator_visual(clip: &EngineClip) -> (&'static str, Color) {
 
 fn rgba_color(rgba: [u8; 4]) -> Color {
     Color::from_argb_u8(rgba[3], rgba[0], rgba[1], rgba[2])
+}
+
+/// Project a clip's text styling into the Slint `TextStyle`. Non-text clips
+/// (and text clips written before styling existed) get the engine default
+/// look, so the inspector always has a coherent style to edit.
+fn clip_text_style(clip: &EngineClip) -> TextClipStyle {
+    let style = match &clip.content {
+        ClipSource::Generated(Generator::Text { style, .. }) => style.clone(),
+        _ => EngineTextStyle::default(),
+    };
+    text_style_to_ui(&style)
+}
+
+/// Convert an engine `TextStyle` to the Slint struct. Effect opacities are
+/// pulled out of their rgba alpha into a dedicated 0..=1 control, and the
+/// swatch colors are made opaque so the picker preview reads cleanly.
+fn text_style_to_ui(style: &EngineTextStyle) -> TextClipStyle {
+    let opaque = |rgba: [u8; 4]| Color::from_rgb_u8(rgba[0], rgba[1], rgba[2]);
+    let alpha01 = |rgba: [u8; 4]| rgba[3] as f32 / 255.0;
+    let stroke = style.stroke.unwrap_or_default();
+    let background = style.background.unwrap_or_default();
+    let shadow = style.shadow.unwrap_or_default();
+    TextClipStyle {
+        font: style.font.clone().into(),
+        size: style.size,
+        bold: style.bold,
+        italic: style.italic,
+        underline: style.underline,
+        case: text_case_to_int(style.case),
+        fill: Color::from_argb_u8(style.fill[3], style.fill[0], style.fill[1], style.fill[2]),
+        letter_spacing: style.letter_spacing,
+        line_spacing: style.line_spacing,
+        align_h: align_h_to_int(style.align_h),
+        align_v: align_v_to_int(style.align_v),
+        stroke_enabled: style.stroke.is_some(),
+        stroke_color: opaque(stroke.rgba),
+        stroke_width: stroke.width,
+        background_enabled: style.background.is_some(),
+        background_color: opaque(background.rgba),
+        background_opacity: alpha01(background.rgba),
+        background_radius: background.radius,
+        shadow_enabled: style.shadow.is_some(),
+        shadow_color: opaque(shadow.rgba),
+        shadow_opacity: alpha01(shadow.rgba),
+        shadow_blur: shadow.blur,
+        shadow_distance: shadow.distance,
+    }
+}
+
+fn text_case_to_int(case: TextCase) -> i32 {
+    match case {
+        TextCase::Normal => 0,
+        TextCase::Upper => 1,
+        TextCase::Lower => 2,
+        TextCase::Title => 3,
+    }
+}
+
+fn align_h_to_int(align: TextAlignH) -> i32 {
+    match align {
+        TextAlignH::Left => 0,
+        TextAlignH::Center => 1,
+        TextAlignH::Right => 2,
+    }
+}
+
+fn align_v_to_int(align: TextAlignV) -> i32 {
+    match align {
+        TextAlignV::Top => 0,
+        TextAlignV::Middle => 1,
+        TextAlignV::Bottom => 2,
+    }
 }
 
 /// Largest video-media resolution in the project, or the default canvas.

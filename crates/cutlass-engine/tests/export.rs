@@ -142,9 +142,7 @@ fn export_text_clip_renders_visible_pixels() {
     add_generated(
         &mut engine,
         track,
-        Generator::Text {
-            content: "HELLO".into(),
-        },
+        Generator::text("HELLO"),
         tr(0, 24),
     );
 

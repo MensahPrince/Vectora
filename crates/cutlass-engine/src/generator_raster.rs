@@ -9,9 +9,32 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use cosmic_text::{Attrs, Buffer, Color as TextColor, FontSystem, Metrics, Shaping, SwashCache};
-use cutlass_models::{Generator, Shape};
+use cosmic_text::{
+    Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, Style as FontStyle,
+    SwashCache, Weight,
+};
+use cutlass_models::{Generator, Shape, TextAlignH, TextAlignV, TextStyle};
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
+
+/// Reference canvas height the style's pixel sizes are authored against; the
+/// rasterizer scales every length by `height / REFERENCE_HEIGHT` so a title
+/// looks identical at any output resolution. Matches [`cutlass_models`].
+const REFERENCE_HEIGHT: f32 = 1080.0;
+
+/// Enumerate installed font family names (deduped, sorted) for the text
+/// inspector's font picker. Scanning the system font directories is slow
+/// (hundreds of ms), so callers should run this off the UI thread once.
+pub fn system_font_families() -> Vec<String> {
+    let mut db = cosmic_text::fontdb::Database::new();
+    db.load_system_fonts();
+    let mut names: Vec<String> = db
+        .faces()
+        .filter_map(|face| face.families.first().map(|(name, _)| name.clone()))
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
+}
 
 /// Most timelines stack only a handful of generated clips; a small cache keeps
 /// every visible text/shape raster warm without unbounded growth.
@@ -21,8 +44,57 @@ const CACHE_CAP: usize = 24;
 /// the canvas size (a resize invalidates the bitmap).
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum RasterKey {
-    Text { content: String, w: u32, h: u32 },
+    Text {
+        content: String,
+        style: TextStyleKey,
+        w: u32,
+        h: u32,
+    },
     Shape { shape: ShapeKey, rgba: [u8; 4], w: u32, h: u32 },
+}
+
+/// Hashable mirror of [`TextStyle`]: `f32` fields are stored as their IEEE bit
+/// patterns so the whole style participates in the raster cache key (two
+/// styles that differ only in, say, stroke width must raster separately).
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct TextStyleKey {
+    font: String,
+    size_bits: u32,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    case: cutlass_models::TextCase,
+    fill: [u8; 4],
+    letter_spacing_bits: u32,
+    line_spacing_bits: u32,
+    align_h: TextAlignH,
+    align_v: TextAlignV,
+    stroke: Option<([u8; 4], u32)>,
+    background: Option<([u8; 4], u32)>,
+    shadow: Option<([u8; 4], u32, u32)>,
+}
+
+impl TextStyleKey {
+    fn new(style: &TextStyle) -> Self {
+        Self {
+            font: style.font.clone(),
+            size_bits: style.size.to_bits(),
+            bold: style.bold,
+            italic: style.italic,
+            underline: style.underline,
+            case: style.case,
+            fill: style.fill,
+            letter_spacing_bits: style.letter_spacing.to_bits(),
+            line_spacing_bits: style.line_spacing.to_bits(),
+            align_h: style.align_h,
+            align_v: style.align_v,
+            stroke: style.stroke.map(|s| (s.rgba, s.width.to_bits())),
+            background: style.background.map(|b| (b.rgba, b.radius.to_bits())),
+            shadow: style
+                .shadow
+                .map(|s| (s.rgba, s.blur.to_bits(), s.distance.to_bits())),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -108,8 +180,9 @@ impl GeneratorRaster {
             return None;
         }
         let key = match generator {
-            Generator::Text { content } => RasterKey::Text {
+            Generator::Text { content, style } => RasterKey::Text {
                 content: content.clone(),
+                style: TextStyleKey::new(style),
                 w: width,
                 h: height,
             },
@@ -127,7 +200,7 @@ impl GeneratorRaster {
         }
 
         let bytes = match generator {
-            Generator::Text { content } => self.raster_text(content, width, height),
+            Generator::Text { content, style } => self.raster_text(content, style, width, height),
             Generator::Shape { shape, rgba } => raster_shape(*shape, *rgba, width, height),
             _ => unreachable!("filtered above"),
         };
@@ -153,53 +226,181 @@ impl GeneratorRaster {
         self.cache.push_back((key, value));
     }
 
-    fn raster_text(&mut self, content: &str, width: u32, height: u32) -> Vec<u8> {
+    fn raster_text(&mut self, content: &str, style: &TextStyle, width: u32, height: u32) -> Vec<u8> {
         let mut out = vec![0u8; (width as usize) * (height as usize) * 4];
-        if content.trim().is_empty() {
+
+        // The string actually shaped: the casing transform is applied up front
+        // so cosmic-text measures the displayed glyphs.
+        let shaped = style.case.apply(content);
+        if shaped.trim().is_empty() {
             return out;
         }
+
+        let w = width as usize;
+        let h = height as usize;
+        let scale = height as f32 / REFERENCE_HEIGHT;
+        let font_size = (style.size * scale).max(4.0);
+        let line_height = (font_size * style.line_spacing.max(0.1)).max(font_size);
+        let letter_spacing = style.letter_spacing * scale;
+
+        // Coverage of the glyph/underline shapes (canvas-sized, 0..=255). Built
+        // once, then reused as the source for the fill, stroke (dilated) and
+        // shadow (blurred) passes so they stay perfectly registered.
+        let coverage = self.text_coverage(
+            &shaped,
+            style,
+            font_size,
+            line_height,
+            letter_spacing,
+            width,
+            height,
+        );
+        let Some(bbox) = coverage_bbox(&coverage, w) else {
+            return out;
+        };
+
+        // Background card sits behind everything, hugging the text block.
+        if let Some(bg) = style.background {
+            let pad = (font_size * 0.3).round() as i32;
+            let (x0, y0, x1, y1) = bbox;
+            let rx = (x0 as i32 - pad).max(0);
+            let ry = (y0 as i32 - pad).max(0);
+            let rw = ((x1 as i32 + pad).min(w as i32 - 1) - rx + 1).max(0);
+            let rh = ((y1 as i32 + pad).min(h as i32 - 1) - ry + 1).max(0);
+            if rw > 0 && rh > 0 {
+                let radius = (bg.radius.clamp(0.0, 1.0)) * (rh as f32 / 2.0);
+                fill_rounded_rect(&mut out, w, h, rx, ry, rw, rh, radius, bg.rgba);
+            }
+        }
+
+        // Drop shadow: blurred coverage, tinted, offset down-right at 45°.
+        if let Some(shadow) = style.shadow {
+            let blur_r = (shadow.blur.clamp(0.0, 1.0) * font_size).round() as usize;
+            let blurred = box_blur(&coverage, w, h, blur_r);
+            let off = (shadow.distance * scale / std::f32::consts::SQRT_2).round() as i32;
+            composite_mask(&mut out, w, h, &blurred, shadow.rgba, off, off);
+        }
+
+        // Outline: coverage dilated by the stroke width, drawn under the fill
+        // so only the ring outside the glyphs shows.
+        if let Some(stroke) = style.stroke {
+            let r = (stroke.width * scale).round().max(0.0) as usize;
+            if r > 0 {
+                let dilated = dilate(&coverage, w, h, r);
+                composite_mask(&mut out, w, h, &dilated, stroke.rgba, 0, 0);
+            }
+        }
+
+        // Fill on top.
+        composite_mask(&mut out, w, h, &coverage, style.fill, 0, 0);
+
+        out
+    }
+
+    /// Lay out `text` and accumulate its glyph (and underline) alpha coverage
+    /// into a canvas-sized 0..=255 mask. Centering, alignment, letter spacing
+    /// and underline are all resolved here; effect passes only reshape this
+    /// mask.
+    fn text_coverage(
+        &mut self,
+        text: &str,
+        style: &TextStyle,
+        font_size: f32,
+        line_height: f32,
+        letter_spacing: f32,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
+        let w = width as usize;
+        let h = height as usize;
+        let mut mask = vec![0u8; w * h];
 
         let font_system = self.font_system.get_or_insert_with(FontSystem::new);
         let swash = &mut self.swash_cache;
 
-        // CapCut-like default title styling: white, centered, sized to the
-        // canvas, wrapped at 90% width.
-        let font_size = (height as f32 / 12.0).max(8.0);
-        let line_height = font_size * 1.2;
-        let metrics = Metrics::new(font_size, line_height);
+        let mut attrs = Attrs::new();
+        if !style.font.is_empty() {
+            attrs = attrs.family(Family::Name(&style.font));
+        }
+        if style.bold {
+            attrs = attrs.weight(Weight::BOLD);
+        }
+        if style.italic {
+            attrs = attrs.style(FontStyle::Italic);
+        }
 
+        let metrics = Metrics::new(font_size, line_height);
         let mut buffer = Buffer::new(font_system, metrics);
-        let wrap_w = width as f32 * 0.9;
+        // Wrap inside the canvas with a small margin so descenders/ascenders of
+        // big titles don't clip against the edge.
+        let margin = width as f32 * 0.05;
+        let wrap_w = (width as f32 - 2.0 * margin).max(1.0);
         buffer.set_size(font_system, Some(wrap_w), Some(height as f32));
-        buffer.set_text(font_system, content, &Attrs::new(), Shaping::Advanced);
+        buffer.set_text(font_system, text, &attrs, Shaping::Advanced);
         buffer.shape_until_scroll(font_system, false);
 
-        // Vertically center the laid-out block within the canvas.
+        // Block height (for vertical alignment).
         let text_h = buffer
             .layout_runs()
             .fold(0.0_f32, |m, run| m.max(run.line_top + run.line_height));
-        let y_off = (((height as f32) - text_h) / 2.0).round() as i32;
+        let y_off = match style.align_v {
+            TextAlignV::Top => margin.round() as i32,
+            TextAlignV::Middle => (((height as f32) - text_h) / 2.0).round() as i32,
+            TextAlignV::Bottom => ((height as f32) - text_h - margin).round() as i32,
+        };
 
-        let text_color = TextColor::rgba(255, 255, 255, 255);
-        let canvas_w = width as i32;
-        let canvas_h = height as i32;
+        let white = TextColor::rgba(255, 255, 255, 255);
+        let canvas_w = w as i32;
+        let canvas_h = h as i32;
+        let underline_thickness = (font_size * 0.06).max(1.0);
 
         for run in buffer.layout_runs() {
-            // Horizontally center each line within the full canvas width.
-            let line_x_off = (((width as f32) - run.line_w) / 2.0).round() as i32;
+            let glyph_count = run.glyphs.len();
+            // Total extra width letter spacing adds to this line (between
+            // glyphs only), so alignment accounts for it.
+            let extra = if glyph_count > 1 {
+                letter_spacing * (glyph_count as f32 - 1.0)
+            } else {
+                0.0
+            };
+            let line_w = run.line_w + extra.max(0.0);
+            let line_x_off = match style.align_h {
+                TextAlignH::Left => margin,
+                TextAlignH::Center => ((width as f32) - line_w) / 2.0,
+                TextAlignH::Right => (width as f32) - margin - line_w,
+            }
+            .round() as i32;
             let base_y = run.line_y as i32 + y_off;
-            for glyph in run.glyphs.iter() {
+
+            let mut min_gx = i32::MAX;
+            let mut max_gx = i32::MIN;
+            for (i, glyph) in run.glyphs.iter().enumerate() {
+                let spacing = (letter_spacing * i as f32).round() as i32;
                 let physical = glyph.physical((0.0, 0.0), 1.0);
-                let glyph_color = glyph.color_opt.unwrap_or(text_color);
-                swash.with_pixels(font_system, physical.cache_key, glyph_color, |x, y, color| {
-                    let px = line_x_off + physical.x + x;
-                    let py = base_y + physical.y + y;
-                    blend_over(&mut out, canvas_w, canvas_h, px, py, color);
+                let gx = line_x_off + spacing + physical.x;
+                let gy = base_y + physical.y;
+                swash.with_pixels(font_system, physical.cache_key, white, |x, y, color| {
+                    add_coverage(&mut mask, canvas_w, canvas_h, gx + x, gy + y, color.a());
                 });
+                let left = line_x_off + spacing + glyph.x.round() as i32;
+                let right = left + glyph.w.round() as i32;
+                min_gx = min_gx.min(left);
+                max_gx = max_gx.max(right);
+            }
+
+            if style.underline && max_gx > min_gx {
+                // Sit the underline just below the baseline.
+                let uy = base_y + (font_size * 0.12).round() as i32;
+                let ut = underline_thickness.round().max(1.0) as i32;
+                for dy in 0..ut {
+                    for x in min_gx..max_gx {
+                        add_coverage(&mut mask, canvas_w, canvas_h, x, uy + dy, 255);
+                    }
+                }
             }
         }
 
-        out
+        mask
     }
 }
 
@@ -229,31 +430,237 @@ fn alpha_bbox_size(bytes: &[u8], width: u32) -> (u32, u32) {
     ((max_x - min_x + 1) as u32, (max_y - min_y + 1) as u32)
 }
 
-/// Straight-alpha src-over of a coverage-weighted glyph pixel onto the buffer.
-fn blend_over(buf: &mut [u8], w: i32, h: i32, x: i32, y: i32, src: TextColor) {
-    if x < 0 || y < 0 || x >= w || y >= h {
+/// Accumulate glyph coverage into a single-channel mask, keeping the maximum
+/// where shapes overlap (so antialiased edges of adjacent glyphs don't double
+/// up into a visible seam).
+fn add_coverage(mask: &mut [u8], w: i32, h: i32, x: i32, y: i32, cov: u8) {
+    if x < 0 || y < 0 || x >= w || y >= h || cov == 0 {
         return;
     }
-    let sa = src.a() as f32 / 255.0;
+    let idx = (y * w + x) as usize;
+    mask[idx] = mask[idx].max(cov);
+}
+
+/// Straight-alpha src-over of a flat `rgba` color, weighted per-pixel by a
+/// coverage `mask`, onto `out`. `(dx, dy)` shifts the mask sample (used by the
+/// shadow pass), with off-canvas samples treated as zero coverage.
+fn composite_mask(out: &mut [u8], w: usize, h: usize, mask: &[u8], rgba: [u8; 4], dx: i32, dy: i32) {
+    let src_a = rgba[3] as f32 / 255.0;
+    if src_a <= 0.0 {
+        return;
+    }
+    for y in 0..h {
+        let sy = y as i32 - dy;
+        if sy < 0 || sy >= h as i32 {
+            continue;
+        }
+        for x in 0..w {
+            let sx = x as i32 - dx;
+            if sx < 0 || sx >= w as i32 {
+                continue;
+            }
+            let cov = mask[sy as usize * w + sx as usize];
+            if cov == 0 {
+                continue;
+            }
+            let sa = src_a * (cov as f32 / 255.0);
+            blend_rgba_over(out, (y * w + x) * 4, rgba, sa);
+        }
+    }
+}
+
+/// Straight-alpha src-over of a premultiplied-by-coverage color (`sa` is the
+/// effective source alpha) onto pixel `idx` of an RGBA buffer.
+fn blend_rgba_over(buf: &mut [u8], idx: usize, src: [u8; 4], sa: f32) {
     if sa <= 0.0 {
         return;
     }
-    let idx = ((y * w + x) * 4) as usize;
     let da = buf[idx + 3] as f32 / 255.0;
     let out_a = sa + da * (1.0 - sa);
     if out_a <= 0.0 {
         return;
     }
-    let blend = |s: u8, d: u8| -> u8 {
-        let s = s as f32 / 255.0;
-        let d = d as f32 / 255.0;
+    for c in 0..3 {
+        let s = src[c] as f32 / 255.0;
+        let d = buf[idx + c] as f32 / 255.0;
         let v = (s * sa + d * da * (1.0 - sa)) / out_a;
-        (v * 255.0).round().clamp(0.0, 255.0) as u8
-    };
-    buf[idx] = blend(src.r(), buf[idx]);
-    buf[idx + 1] = blend(src.g(), buf[idx + 1]);
-    buf[idx + 2] = blend(src.b(), buf[idx + 2]);
+        buf[idx + c] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+    }
     buf[idx + 3] = (out_a * 255.0).round().clamp(0.0, 255.0) as u8;
+}
+
+/// Tight `(min_x, min_y, max_x, max_y)` of non-zero coverage, or `None` if the
+/// mask is empty.
+fn coverage_bbox(mask: &[u8], w: usize) -> Option<(u32, u32, u32, u32)> {
+    let (mut min_x, mut min_y) = (usize::MAX, usize::MAX);
+    let (mut max_x, mut max_y) = (0usize, 0usize);
+    let mut any = false;
+    for (i, &c) in mask.iter().enumerate() {
+        if c == 0 {
+            continue;
+        }
+        let (x, y) = (i % w, i / w);
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
+        any = true;
+    }
+    any.then_some((min_x as u32, min_y as u32, max_x as u32, max_y as u32))
+}
+
+/// Morphological dilation (separable max filter) of a coverage mask by a square
+/// of radius `r`. Grows the glyph coverage outward — the basis for the stroke
+/// outline. O(w·h·r); cold path only (rasters are cached).
+fn dilate(mask: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
+    if r == 0 {
+        return mask.to_vec();
+    }
+    let r = r as i32;
+    let (wi, hi) = (w as i32, h as i32);
+    let mut tmp = vec![0u8; mask.len()];
+    for y in 0..h {
+        let row = y * w;
+        for x in 0..wi {
+            let mut m = 0u8;
+            for dx in -r..=r {
+                let xx = x + dx;
+                if xx >= 0 && xx < wi {
+                    m = m.max(mask[row + xx as usize]);
+                }
+            }
+            tmp[row + x as usize] = m;
+        }
+    }
+    let mut out = vec![0u8; mask.len()];
+    for y in 0..hi {
+        for x in 0..w {
+            let mut m = 0u8;
+            for dy in -r..=r {
+                let yy = y + dy;
+                if yy >= 0 && yy < hi {
+                    m = m.max(tmp[yy as usize * w + x]);
+                }
+            }
+            out[y as usize * w + x] = m;
+        }
+    }
+    out
+}
+
+/// Approximate Gaussian blur (three passes of a separable box blur with edge
+/// clamping) of a coverage mask. Each pass is a sliding-window average, so the
+/// whole thing is O(w·h) regardless of radius.
+fn box_blur(mask: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
+    if r == 0 {
+        return mask.to_vec();
+    }
+    let mut buf = mask.to_vec();
+    for _ in 0..3 {
+        buf = box_blur_h(&buf, w, h, r);
+        buf = transpose(&buf, w, h);
+        buf = box_blur_h(&buf, h, w, r);
+        buf = transpose(&buf, h, w);
+    }
+    buf
+}
+
+/// One horizontal sliding-window average pass with edge replication.
+fn box_blur_h(src: &[u8], w: usize, h: usize, r: usize) -> Vec<u8> {
+    let mut out = vec![0u8; src.len()];
+    let win = (2 * r + 1) as u32;
+    let last = w as i64 - 1;
+    let clamp = |i: i64| -> usize { i.clamp(0, last) as usize };
+    for y in 0..h {
+        let row = y * w;
+        let mut sum: u32 = 0;
+        for k in -(r as i64)..=(r as i64) {
+            sum += src[row + clamp(k)] as u32;
+        }
+        for x in 0..w {
+            out[row + x] = (sum / win) as u8;
+            let add = src[row + clamp(x as i64 + r as i64 + 1)] as u32;
+            let sub = src[row + clamp(x as i64 - r as i64)] as u32;
+            sum = sum + add - sub;
+        }
+    }
+    out
+}
+
+/// Transpose a `w`×`h` single-channel buffer to `h`×`w`, so the vertical blur
+/// pass can reuse the horizontal kernel with cache-friendly row access.
+fn transpose(src: &[u8], w: usize, h: usize) -> Vec<u8> {
+    let mut out = vec![0u8; src.len()];
+    for y in 0..h {
+        for x in 0..w {
+            out[x * h + y] = src[y * w + x];
+        }
+    }
+    out
+}
+
+/// Fill an axis-aligned rounded rectangle (straight-alpha src-over) using
+/// tiny-skia, then composite onto `out`. Used for the text background card.
+fn fill_rounded_rect(
+    out: &mut [u8],
+    w: usize,
+    h: usize,
+    x: i32,
+    y: i32,
+    rw: i32,
+    rh: i32,
+    radius: f32,
+    rgba: [u8; 4],
+) {
+    let Some(mut pixmap) = Pixmap::new(w as u32, h as u32) else {
+        return;
+    };
+    let mut paint = Paint::default();
+    paint.set_color_rgba8(rgba[0], rgba[1], rgba[2], rgba[3]);
+    paint.anti_alias = true;
+
+    let Some(rect) = Rect::from_xywh(x as f32, y as f32, rw as f32, rh as f32) else {
+        return;
+    };
+    let radius = radius.clamp(0.0, (rw.min(rh) as f32) / 2.0);
+    let mut pb = PathBuilder::new();
+    if radius <= 0.5 {
+        pb.push_rect(rect);
+    } else {
+        push_round_rect(&mut pb, rect, radius);
+    }
+    let Some(path) = pb.finish() else {
+        return;
+    };
+    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+
+    for (i, px) in pixmap.pixels().iter().enumerate() {
+        let c = px.demultiply();
+        if c.alpha() == 0 {
+            continue;
+        }
+        blend_rgba_over(
+            out,
+            i * 4,
+            [c.red(), c.green(), c.blue(), c.alpha()],
+            c.alpha() as f32 / 255.0,
+        );
+    }
+}
+
+/// Append a rounded-rectangle subpath (four quadratic corners) to `pb`.
+fn push_round_rect(pb: &mut PathBuilder, rect: Rect, r: f32) {
+    let (l, t, right, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    pb.move_to(l + r, t);
+    pb.line_to(right - r, t);
+    pb.quad_to(right, t, right, t + r);
+    pb.line_to(right, b - r);
+    pb.quad_to(right, b, right - r, b);
+    pb.line_to(l + r, b);
+    pb.quad_to(l, b, l, b - r);
+    pb.line_to(l, t + r);
+    pb.quad_to(l, t, l + r, t);
+    pb.close();
 }
 
 /// Rasterize a centered shape covering the middle 50% of the canvas.
@@ -371,12 +778,12 @@ mod tests {
         let solid = Generator::SolidColor { rgba: [1, 2, 3, 255] };
         assert_eq!(raster.content_size(&solid, 64, 48), Some((64, 48)));
         // Text measures its laid-out block — smaller than the canvas.
-        let text = Generator::Text { content: "Hi".into() };
+        let text = Generator::text("Hi");
         let (tw, th) = raster.content_size(&text, 256, 128).unwrap();
         assert!(tw > 0 && tw < 256, "text width {tw}");
         assert!(th > 0 && th < 128, "text height {th}");
         // Empty text draws nothing.
-        let empty = Generator::Text { content: " ".into() };
+        let empty = Generator::text(" ");
         assert_eq!(raster.content_size(&empty, 256, 128), Some((0, 0)));
         // Unsupported generators have no raster, hence no content.
         assert_eq!(raster.content_size(&Generator::Sticker, 64, 64), None);
@@ -387,32 +794,116 @@ mod tests {
     fn unsupported_generators_return_none() {
         let mut raster = GeneratorRaster::new();
         assert!(raster.raster(&Generator::Sticker, 32, 32).is_none());
-        assert!(
-            raster
-                .raster(
-                    &Generator::Text {
-                        content: "x".into()
-                    },
-                    0,
-                    0
-                )
-                .is_none()
-        );
+        assert!(raster.raster(&Generator::text("x"), 0, 0).is_none());
     }
 
     #[test]
     fn text_draws_pixels() {
         let mut raster = GeneratorRaster::new();
-        let buf = raster
+        let buf = raster.raster(&Generator::text("Hi"), 256, 128).unwrap();
+        let any_opaque = buf.chunks_exact(4).any(|p| p[3] > 0);
+        assert!(any_opaque, "text raster produced no visible pixels");
+    }
+
+    fn styled(content: &str, style: TextStyle) -> Generator {
+        Generator::Text {
+            content: content.into(),
+            style,
+        }
+    }
+
+    #[test]
+    fn text_fill_color_is_honored() {
+        let mut raster = GeneratorRaster::new();
+        let style = TextStyle {
+            fill: [255, 0, 0, 255],
+            ..TextStyle::default()
+        };
+        let buf = raster.raster(&styled("Hi", style), 256, 128).unwrap();
+        // A solid glyph interior is the requested red.
+        let px = buf
+            .chunks_exact(4)
+            .find(|p| p[3] > 220)
+            .expect("an opaque glyph pixel");
+        assert!(px[0] > 180 && px[1] < 80 && px[2] < 80, "fill not red: {px:?}");
+    }
+
+    #[test]
+    fn distinct_styles_get_distinct_rasters() {
+        let mut raster = GeneratorRaster::new();
+        let plain = Generator::text("Hi");
+        let bold = styled(
+            "Hi",
+            TextStyle {
+                bold: true,
+                ..TextStyle::default()
+            },
+        );
+        let a = raster.raster(&plain, 160, 80).unwrap();
+        let b = raster.raster(&bold, 160, 80).unwrap();
+        // Different style ⇒ separate cache entry (and almost certainly
+        // different pixels).
+        assert!(!Arc::ptr_eq(&a, &b));
+        // Same style ⇒ cache hit.
+        let a2 = raster.raster(&plain, 160, 80).unwrap();
+        assert!(Arc::ptr_eq(&a, &a2));
+    }
+
+    #[test]
+    fn case_transform_changes_raster() {
+        let mut raster = GeneratorRaster::new();
+        let lower = raster.raster(&Generator::text("hi"), 256, 128).unwrap();
+        let upper = raster
             .raster(
-                &Generator::Text {
-                    content: "Hi".into(),
-                },
+                &styled(
+                    "hi",
+                    TextStyle {
+                        case: cutlass_models::TextCase::Upper,
+                        ..TextStyle::default()
+                    },
+                ),
                 256,
                 128,
             )
             .unwrap();
-        let any_opaque = buf.chunks_exact(4).any(|p| p[3] > 0);
-        assert!(any_opaque, "text raster produced no visible pixels");
+        assert_ne!(lower, upper, "uppercasing should change the raster");
+    }
+
+    #[test]
+    fn stroke_grows_content_box() {
+        let mut raster = GeneratorRaster::new();
+        let base = raster.content_size(&Generator::text("Hi"), 512, 256).unwrap();
+        let stroked = styled(
+            "Hi",
+            TextStyle {
+                stroke: Some(cutlass_models::TextStroke {
+                    rgba: [0, 0, 0, 255],
+                    width: 16.0,
+                }),
+                ..TextStyle::default()
+            },
+        );
+        let grown = raster.content_size(&stroked, 512, 256).unwrap();
+        assert!(
+            grown.0 > base.0 && grown.1 > base.1,
+            "stroke should enlarge the content box: {base:?} -> {grown:?}"
+        );
+    }
+
+    #[test]
+    fn background_card_adds_its_color() {
+        let mut raster = GeneratorRaster::new();
+        let style = TextStyle {
+            background: Some(cutlass_models::TextBackground {
+                rgba: [0, 0, 255, 255],
+                radius: 0.0,
+            }),
+            ..TextStyle::default()
+        };
+        let buf = raster.raster(&styled("Hi", style), 256, 128).unwrap();
+        let has_blue = buf
+            .chunks_exact(4)
+            .any(|p| p[3] > 220 && p[2] > 180 && p[0] < 80 && p[1] < 80);
+        assert!(has_blue, "background card should paint blue pixels behind the text");
     }
 }

@@ -18,8 +18,10 @@ mod transport;
 
 use slint::BackendSelector;
 use slint::Model;
+use slint::ModelRc;
 use slint::Global;
 use slint::SharedString;
+use slint::VecModel;
 use slint::wgpu_28::WGPUConfiguration;
 use slint::winit_030::WinitWindowAccessor;
 use tracing::info;
@@ -44,9 +46,7 @@ fn defer_main_thread(f: impl FnOnce() + Send + 'static) {
 fn generator_from_key(key: &str) -> Option<cutlass_models::Generator> {
     use cutlass_models::{Generator, Shape};
     Some(match key {
-        "text" => Generator::Text {
-            content: "Title".to_owned(),
-        },
+        "text" => Generator::text("Title"),
         "solid" => Generator::SolidColor {
             rgba: [30, 30, 30, 255],
         },
@@ -1111,16 +1111,64 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     let set_text_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
-        .on_set_text_content(move |_track_id, clip_id, content| {
+        .on_set_text_generator(move |_track_id, clip_id, content, style| {
             // Route the edit through the engine (undoable) rather than mutating
             // the Slint model, which the next projection republish would revert.
+            // The inspector sends the full style each time, so one committed
+            // edit == one coherent `Generator::Text`.
             set_text_handle.set_generator(
                 clip_id.to_string(),
                 cutlass_models::Generator::Text {
                     content: content.to_string(),
+                    style: inspector::text_style_from_ui(&style),
                 },
             );
         });
+
+    let preview_text_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_preview_text_generator(move |clip_id, content, style, tick| {
+            // Live, uncommitted preview (e.g. font-size drag): render the clip
+            // from this generator without touching history. Release commits.
+            preview_text_handle.generator_override(
+                clip_id.to_string(),
+                cutlass_models::Generator::Text {
+                    content: content.to_string(),
+                    style: inspector::text_style_from_ui(&style),
+                },
+                i64::from(tick),
+            );
+        });
+
+    let clear_text_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_clear_text_generator(move |tick| {
+            clear_text_handle.clear_generator_override(i64::from(tick));
+        });
+
+    app.global::<InspectorBackend>()
+        .on_filter_fonts(|query, items| {
+            let needle = query.to_lowercase();
+            let filtered: Vec<SharedString> = items
+                .iter()
+                .filter(|family| needle.is_empty() || family.as_str().to_lowercase().contains(&needle))
+                .collect();
+            ModelRc::new(VecModel::from(filtered))
+        });
+
+    // Enumerate system fonts off the UI thread (the scan is slow) and feed the
+    // Font picker once ready.
+    let font_app = app.as_weak();
+    std::thread::spawn(move || {
+        let families = cutlass_engine::system_font_families();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = font_app.upgrade() {
+                let model: Vec<SharedString> = families.into_iter().map(Into::into).collect();
+                app.global::<InspectorBackend>()
+                    .set_font_families(ModelRc::new(VecModel::from(model)));
+            }
+        });
+    });
 
     app.run()
 }

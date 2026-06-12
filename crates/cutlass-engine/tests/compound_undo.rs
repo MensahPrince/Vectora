@@ -9,9 +9,7 @@ use cutlass_commands::{Command, EditCommand};
 use cutlass_models::{Generator, TrackKind};
 
 fn text(content: &str) -> Generator {
-    Generator::Text {
-        content: content.into(),
-    }
+    Generator::text(content)
 }
 
 #[test]

@@ -1,4 +1,4 @@
-import { Clip, Sequence, TrackKind } from "../models/index.slint";
+import { Clip, Sequence, TrackKind, TextClipStyle } from "../models/index.slint";
 
 export struct SelectedClipInfo {
     found: bool,
@@ -16,9 +16,37 @@ export global InspectorBackend {
         clip-id: string,
     ) -> SelectedClipInfo;
 
-    callback set-text-content(
+    // Replace a text clip's content and/or styling in one undoable edit. The
+    // inspector always sends the full current style with the single changed
+    // field, so the engine writes one coherent `Generator::Text`.
+    callback set-text-generator(
         track-id: string,
         clip-id: string,
         content: string,
+        style: TextClipStyle,
     );
+
+    // Live preview of an uncommitted text edit (e.g. dragging the font-size
+    // slider): render `tick` with the clip's generator replaced, no history
+    // entry. The matching `commit`/`clear` arrives on release.
+    callback preview-text-generator(
+        clip-id: string,
+        content: string,
+        style: TextClipStyle,
+        tick: int,
+    );
+
+    // Drop the live preview override and repaint `tick` from committed state
+    // (control released with no net change).
+    callback clear-text-generator(tick: int);
+
+    // Installed font family names for the Font picker, populated once at
+    // startup (system font enumeration is slow, so it runs off the UI thread).
+    in-out property <[string]> font-families: [];
+
+    // Case-insensitive substring filter over `items`, used by the font
+    // dropdown's search box. Implemented in Rust because Slint's string type
+    // has no `contains`. `items` is passed in (rather than read globally) so
+    // the binding re-runs when the font list finishes loading.
+    pure callback filter-fonts(query: string, items: [string]) -> [string];
 }

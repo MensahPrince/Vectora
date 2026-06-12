@@ -1,7 +1,80 @@
 //! Inspector helpers: resolve the selected clip for the property sheet.
 
-use crate::{Clip, SelectedClipInfo, Sequence, TrackKind};
+use crate::{Clip, SelectedClipInfo, Sequence, TextClipStyle, TrackKind};
+use cutlass_models::{
+    TextAlignH, TextAlignV, TextBackground, TextCase, TextShadow, TextStroke,
+    TextStyle as ModelTextStyle,
+};
 use slint::Model;
+
+/// Convert the inspector's Slint `TextClipStyle` into the engine model.
+///
+/// The inverse of `projection::text_style_to_ui`: effect opacity (a separate
+/// 0..=1 control) is folded back into the rgba alpha, and the disabled flags
+/// collapse to `None`. The inspector always sends the complete style, so the
+/// engine writes one coherent `Generator::Text`.
+pub fn text_style_from_ui(style: &TextClipStyle) -> ModelTextStyle {
+    let rgba = |c: slint::Color| [c.red(), c.green(), c.blue(), c.alpha()];
+    let rgb_alpha = |c: slint::Color, a: f32| {
+        [
+            c.red(),
+            c.green(),
+            c.blue(),
+            (a.clamp(0.0, 1.0) * 255.0).round() as u8,
+        ]
+    };
+    ModelTextStyle {
+        font: style.font.to_string(),
+        size: style.size,
+        bold: style.bold,
+        italic: style.italic,
+        underline: style.underline,
+        case: text_case_from_int(style.case),
+        fill: rgba(style.fill),
+        letter_spacing: style.letter_spacing,
+        line_spacing: style.line_spacing,
+        align_h: align_h_from_int(style.align_h),
+        align_v: align_v_from_int(style.align_v),
+        stroke: style.stroke_enabled.then(|| TextStroke {
+            rgba: rgba(style.stroke_color),
+            width: style.stroke_width,
+        }),
+        background: style.background_enabled.then(|| TextBackground {
+            rgba: rgb_alpha(style.background_color, style.background_opacity),
+            radius: style.background_radius,
+        }),
+        shadow: style.shadow_enabled.then(|| TextShadow {
+            rgba: rgb_alpha(style.shadow_color, style.shadow_opacity),
+            blur: style.shadow_blur,
+            distance: style.shadow_distance,
+        }),
+    }
+}
+
+fn text_case_from_int(case: i32) -> TextCase {
+    match case {
+        1 => TextCase::Upper,
+        2 => TextCase::Lower,
+        3 => TextCase::Title,
+        _ => TextCase::Normal,
+    }
+}
+
+fn align_h_from_int(align: i32) -> TextAlignH {
+    match align {
+        0 => TextAlignH::Left,
+        2 => TextAlignH::Right,
+        _ => TextAlignH::Center,
+    }
+}
+
+fn align_v_from_int(align: i32) -> TextAlignV {
+    match align {
+        0 => TextAlignV::Top,
+        2 => TextAlignV::Bottom,
+        _ => TextAlignV::Middle,
+    }
+}
 
 pub fn resolve_selection(
     sequence: Sequence,

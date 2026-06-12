@@ -72,6 +72,11 @@ pub struct Engine {
     /// with this transform instead of its committed one. Session state —
     /// never serialized, never in history, never seen by export.
     transform_override: Option<(ClipId, ClipTransform)>,
+    /// Live edit override (inspector live preview): one generated clip
+    /// rasterized from this generator instead of its committed one — e.g.
+    /// dragging the font-size slider repaints without an undo entry per tick.
+    /// Session state — never serialized, never in history, never seen by export.
+    generator_override: Option<(ClipId, cutlass_models::Generator)>,
     /// Session revision: bumped on every successful project mutation
     /// (edits, imports, open/load, undo, redo). Never serialized.
     revision: u64,
@@ -97,6 +102,7 @@ impl Engine {
             compositor,
             config,
             transform_override: None,
+            generator_override: None,
             revision: 0,
             saved_revision: 0,
         })
@@ -118,6 +124,7 @@ impl Engine {
             compositor,
             config,
             transform_override: None,
+            generator_override: None,
             revision: 0,
             saved_revision: 0,
         })
@@ -206,6 +213,7 @@ impl Engine {
         self.history.clear();
         self.decoder_pool.clear();
         self.transform_override = None;
+        self.generator_override = None;
         self.project_path = None;
         self.revision += 1;
         self.saved_revision = self.revision;
@@ -228,6 +236,7 @@ impl Engine {
         self.history.clear();
         self.decoder_pool.clear();
         self.transform_override = None;
+        self.generator_override = None;
         self.project_path = bind_to;
         self.saved_revision = self.revision;
         self.revision += 1;
@@ -300,6 +309,9 @@ impl Engine {
             time,
             self.config.color_convert,
             self.transform_override,
+            self.generator_override
+                .as_ref()
+                .map(|(id, generator)| (*id, generator)),
         )
     }
 
@@ -309,6 +321,18 @@ impl Engine {
     /// clears it and applies one `SetClipTransform` instead.
     pub fn set_transform_override(&mut self, override_transform: Option<(ClipId, ClipTransform)>) {
         self.transform_override = override_transform;
+    }
+
+    /// Replace (or clear) the live generator override. Preview frames raster
+    /// the overridden clip from this generator until cleared; project state,
+    /// history, and export are untouched. The control-release commit clears it
+    /// and applies one `SetGenerator` instead. Used for live inspector edits
+    /// (e.g. dragging the font-size slider) without flooding the undo history.
+    pub fn set_generator_override(
+        &mut self,
+        override_generator: Option<(ClipId, cutlass_models::Generator)>,
+    ) {
+        self.generator_override = override_generator;
     }
 
     /// Tight size (canvas px) of the content `generator` draws on the current

@@ -423,7 +423,7 @@ mod tests {
             .timeline_mut()
             .add_clip(
                 v1,
-                Clip::generated(Generator::Text { content: "x".into() }, tr(5, 15)),
+                Clip::generated(Generator::text("x"), tr(5, 15)),
             )
             .unwrap();
 
@@ -482,9 +482,7 @@ mod tests {
             .add_clip(
                 track,
                 Clip::generated(
-                    Generator::Text {
-                        content: "split me".into(),
-                    },
+                    Generator::text("split me"),
                     tr(0, 20),
                 ),
             )
@@ -651,7 +649,7 @@ mod tests {
         let (clip, inv_clip) = add_generated::execute(
             &mut ctx,
             track,
-            Generator::Text { content: "x".into() },
+            Generator::text("x"),
             tr(0, 10),
         )
         .unwrap();

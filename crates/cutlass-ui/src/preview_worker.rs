@@ -107,6 +107,18 @@ enum WorkerMsg {
     /// Drop the gesture override (no-op release / cancelled drag) and
     /// re-render `tick` from committed state.
     ClearTransformOverride { tick: i64 },
+    /// Live inspector edit preview (e.g. font-size slider drag): render `tick`
+    /// with `clip`'s generator replaced — session state on the engine, no
+    /// history entry, no projection republish. Coalesces with `Frame`/itself
+    /// like `TransformOverride` so a fast drag can't back the queue up.
+    GeneratorOverride {
+        clip: String,
+        generator: Generator,
+        tick: i64,
+    },
+    /// Drop the generator override (control released with no net change) and
+    /// re-render `tick` from committed state.
+    ClearGeneratorOverride { tick: i64 },
     /// Commit a transform gesture: clear any override and apply one undoable
     /// `SetClipTransform`, then re-render `tick` (a nudge has no preceding
     /// override, so the frame must refresh here).
@@ -349,6 +361,18 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::ClearTransformOverride { tick });
     }
 
+    pub fn generator_override(&self, clip: String, generator: Generator, tick: i64) {
+        let _ = self.tx.send(WorkerMsg::GeneratorOverride {
+            clip,
+            generator,
+            tick,
+        });
+    }
+
+    pub fn clear_generator_override(&self, tick: i64) {
+        let _ = self.tx.send(WorkerMsg::ClearGeneratorOverride { tick });
+    }
+
     pub fn set_transform(&self, clip: String, transform: ClipTransform, tick: i64) {
         let _ = self.tx.send(WorkerMsg::SetTransform {
             clip,
@@ -529,6 +553,10 @@ fn worker_loop(
     // a dirty-but-idle session skips the redundant rewrite, and a session
     // identity change (Save As / Open / New) cleans the orphaned slot up.
     let mut autosave_slot: Option<(PathBuf, u64)> = None;
+    // Last tick the preview rendered (the playhead). Scrub/seek `Frame`s keep
+    // it current; edits re-render here so the composite reflects a delete,
+    // generator change, etc. without waiting for the user to move the playhead.
+    let mut last_tick: i64 = 0;
 
     let mutate = |engine: &mut Engine,
                   clipboard: &mut Option<ClipboardClip>,
@@ -610,6 +638,22 @@ fn worker_loop(
             }
             WorkerMsg::ClearTransformOverride { tick } => {
                 engine.set_transform_override(None);
+                render_frame(engine, tl_rate, &preview_weak, tick);
+            }
+            WorkerMsg::ClearGeneratorOverride { tick } => {
+                engine.set_generator_override(None);
+                render_frame(engine, tl_rate, &preview_weak, tick);
+            }
+            // Only reached if a generator-override burst interleaves with
+            // another coalesced gesture's drain (practically impossible — you
+            // can't drag two controls at once). The dedicated loop arm handles
+            // the common case with coalescing.
+            WorkerMsg::GeneratorOverride {
+                clip,
+                generator,
+                tick,
+            } => {
+                apply_generator_override(engine, &clip, generator);
                 render_frame(engine, tl_rate, &preview_weak, tick);
             }
             WorkerMsg::SetTransform {
@@ -702,6 +746,7 @@ fn worker_loop(
                         }
                     }
                 }
+                last_tick = tick;
                 render_frame(engine, tl_rate, &preview_weak, tick);
                 prefetch_ahead(engine, tl_rate, tick, &req_rx);
             }
@@ -730,12 +775,79 @@ fn worker_loop(
                         }
                     }
                 }
+                last_tick = tick;
                 apply_transform_override(engine, &clip, transform);
                 render_frame(engine, tl_rate, &preview_weak, tick);
             }
-            other => mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other),
+            // Live inspector edits (font-size drag) arrive at pointer-move
+            // rate; coalesce to the newest like transform overrides do.
+            WorkerMsg::GeneratorOverride {
+                mut clip,
+                mut generator,
+                mut tick,
+            } => {
+                while let Ok(next) = req_rx.try_recv() {
+                    match next {
+                        WorkerMsg::Frame(latest) => tick = latest,
+                        WorkerMsg::GeneratorOverride {
+                            clip: c,
+                            generator: g,
+                            tick: at,
+                        } => {
+                            clip = c;
+                            generator = g;
+                            tick = at;
+                        }
+                        other => {
+                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
+                        }
+                    }
+                }
+                last_tick = tick;
+                apply_generator_override(engine, &clip, generator);
+                render_frame(engine, tl_rate, &preview_weak, tick);
+            }
+            other => {
+                let redraw = mutation_redraws_preview(&other);
+                mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other);
+                // Edits otherwise only repaint when the playhead moves; refresh
+                // the current frame so the change is visible immediately.
+                if redraw {
+                    render_frame(engine, tl_rate, &preview_weak, last_tick);
+                }
+            }
         }
     }
+}
+
+/// Whether an executed mutation changes the visible composite at the current
+/// playhead and should therefore trigger a preview re-render. The only frame
+/// trigger used to be playhead movement, so edits (delete, generator/font
+/// change, …) looked stale until the user scrubbed. `SetTransform` and
+/// `ClearTransformOverride` render themselves with their own tick, so they're
+/// excluded here to avoid a redundant second composite; pure session ops
+/// (import, copy, save, autosave, export, linkage) don't alter the canvas.
+fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
+    matches!(
+        msg,
+        WorkerMsg::AddClip { .. }
+            | WorkerMsg::AddGenerated { .. }
+            | WorkerMsg::MoveClip { .. }
+            | WorkerMsg::MoveGroup { .. }
+            | WorkerMsg::TrimClip { .. }
+            | WorkerMsg::RemoveClips { .. }
+            | WorkerMsg::SetGenerator { .. }
+            | WorkerMsg::SplitClip { .. }
+            | WorkerMsg::PasteAt { .. }
+            | WorkerMsg::DuplicateClip { .. }
+            | WorkerMsg::Undo
+            | WorkerMsg::Redo
+            | WorkerMsg::SetMainMagnet(_)
+            | WorkerMsg::SetTrackFlag { .. }
+            | WorkerMsg::OpenProject { .. }
+            | WorkerMsg::NewProject
+            | WorkerMsg::RestoreAutosave { .. }
+    )
 }
 
 /// Point the engine's session override at `clip` (raw id) for the next
@@ -745,6 +857,16 @@ fn apply_transform_override(engine: &mut Engine, clip: &str, transform: ClipTran
     match parse_raw_id(clip).map(ClipId::from_raw) {
         Some(id) => engine.set_transform_override(Some((id, transform))),
         None => error!(clip, "transform override ignored: unparsable clip id"),
+    }
+}
+
+/// Point the engine's generator override at `clip` (raw id) for the next
+/// renders — the live preview of an uncommitted inspector edit. Unparsable
+/// ids are dropped (stale projection race), same as the transform override.
+fn apply_generator_override(engine: &mut Engine, clip: &str, generator: Generator) {
+    match parse_raw_id(clip).map(ClipId::from_raw) {
+        Some(id) => engine.set_generator_override(Some((id, generator))),
+        None => error!(clip, "generator override ignored: unparsable clip id"),
     }
 }
 
@@ -1219,6 +1341,10 @@ fn add_generated_and_publish(
 /// Replace a generated clip's content (inspector title edit). One history
 /// entry per committed edit; the engine rejects non-generated clips.
 fn set_generator_and_publish(engine: &mut Engine, clip: &str, generator: Generator, ui: &UiSink) {
+    // A live font-size drag may have left an override in place; the commit is
+    // the authoritative value, so clear it (the next render is identical — no
+    // flicker between drag end and commit, mirroring `SetTransform`).
+    engine.set_generator_override(None);
     let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
         error!(clip, "set-generator ignored: unparsable clip id");
         return;

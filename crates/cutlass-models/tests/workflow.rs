@@ -105,9 +105,7 @@ fn mixed_generated_and_media_layers() {
     let title = project
         .add_generated(
             titles,
-            Generator::Text {
-                content: "Act I".into(),
-            },
+            Generator::text("Act I"),
             tr(0, 48),
         )
         .unwrap();

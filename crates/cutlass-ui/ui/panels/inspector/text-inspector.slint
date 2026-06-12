@@ -2,6 +2,8 @@ import {
     CutlassScrollView,
     CutlassSlider,
     CutlassText,
+    CutlassDropdown,
+    CutlassColorSwatch,
     PanelHeader,
 } from "../../components/index.slint";
 import {
@@ -11,7 +13,7 @@ import {
     PreviewStore,
 } from "../../store/index.slint";
 import { InspectorBackend } from "../../lib/inspector-backend.slint";
-import { Clip } from "../../models/index.slint";
+import { Clip, TextClipStyle } from "../../models/index.slint";
 import { AppState } from "../../state.slint";
 
 component InspectorDivider inherits Rectangle {
@@ -81,11 +83,17 @@ component SectionHeader inherits HorizontalLayout {
     in property <string> title;
     in property <bool> active: true;
     in property <bool> checkable: false;
+    // When true the checkbox/title toggles the section (fires `toggled`) and
+    // the "reset" affordance fires `reset`.
+    in property <bool> interactive: false;
+
+    callback toggled();
+    callback reset();
 
     spacing: AppStore.theme.metrics.spacing.sm;
     height: 24px;
     vertical-stretch: 0;
-    opacity: active ? 1.0 : 0.45;
+    opacity: active || root.interactive ? 1.0 : 0.45;
 
     if checkable: Rectangle {
         width: 14px;
@@ -96,24 +104,55 @@ component SectionHeader inherits HorizontalLayout {
         background: active ? #00E5C7 : #ffffff14;
         vertical-stretch: 0;
         y: 5px;
+
+        check-ta := TouchArea {
+            enabled: root.interactive;
+            clicked => {
+                root.toggled();
+                AppState.refocus-shortcuts();
+            }
+        }
     }
 
-    CutlassText {
-        text: root.title + " ^";
-        style: AppStore.theme.typography.heading-sm;
-        foreground: active ? AppStore.theme.text.primary : AppStore.theme.text.secondary;
-        vertical-alignment: TextVerticalAlignment.center;
-    }
-
-    Rectangle {
+    title-area := TouchArea {
         horizontal-stretch: 1;
+        enabled: root.interactive;
+        clicked => {
+            root.toggled();
+            AppState.refocus-shortcuts();
+        }
+
+        HorizontalLayout {
+            CutlassText {
+                text: root.title + " ^";
+                style: AppStore.theme.typography.heading-sm;
+                foreground: active ? AppStore.theme.text.primary : AppStore.theme.text.secondary;
+                vertical-alignment: TextVerticalAlignment.center;
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+        }
     }
 
-    CutlassText {
-        text: active ? "reset" : "";
-        style: AppStore.theme.typography.caption;
-        foreground: AppStore.theme.text.muted;
-        vertical-alignment: TextVerticalAlignment.center;
+    reset-area := TouchArea {
+        width: reset-label.preferred-width + AppStore.theme.metrics.spacing.sm;
+        enabled: root.interactive && root.active;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            root.reset();
+            AppState.refocus-shortcuts();
+        }
+
+        reset-label := CutlassText {
+            width: 100%;
+            text: active ? "reset" : "";
+            style: AppStore.theme.typography.caption;
+            foreground: AppStore.theme.text.muted;
+            horizontal-alignment: TextHorizontalAlignment.right;
+            vertical-alignment: TextVerticalAlignment.center;
+        }
     }
 }
 
@@ -332,10 +371,14 @@ component IconButton inherits Rectangle {
     in property <bool> selected: false;
     in property <bool> enabled: false;
 
+    callback clicked();
+
     width: 32px;
     height: 28px;
     border-radius: AppStore.theme.metrics.radius.sm;
-    background: selected ? #4a4a4a : #ffffff10;
+    background: selected
+        ? #4a4a4a
+        : (ta.has-hover && enabled ? #ffffff1c : #ffffff10);
     opacity: enabled ? 1.0 : 0.45;
 
     CutlassText {
@@ -347,35 +390,13 @@ component IconButton inherits Rectangle {
         horizontal-alignment: center;
         vertical-alignment: center;
     }
-}
 
-component DisabledSwatch inherits Rectangle {
-    in property <color> swatch-color: #ffffff;
-
-    width: 104px;
-    height: 28px;
-    border-radius: AppStore.theme.metrics.radius.sm;
-    background: #ffffff10;
-    opacity: 0.45;
-
-    Rectangle {
-        x: 3px;
-        y: 3px;
-        width: parent.width - 28px;
-        height: parent.height - 6px;
-        border-radius: AppStore.theme.metrics.radius.sm;
-        background: root.swatch-color;
-    }
-
-    CutlassText {
-        x: parent.width - 22px;
-        width: 18px;
-        height: parent.height;
-        text: "v";
-        style: AppStore.theme.typography.caption;
-        foreground: AppStore.theme.text.muted;
-        horizontal-alignment: center;
-        vertical-alignment: center;
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => {
+            root.clicked();
+            AppState.refocus-shortcuts();
+        }
     }
 }
 
@@ -497,6 +518,9 @@ component SliderRow inherits HorizontalLayout {
         value: clamp(root.value, root.minimum, root.maximum);
 
         changed(v) => {
+            // `root.value` only moves on commit, so drive the readout off the
+            // live slider value — otherwise the number lags behind the cap.
+            num.text = Math.round(v) + "";
             root.preview(v);
         }
 
@@ -664,6 +688,10 @@ export component TextInspector inherits VerticalLayout {
 
     private property <string> bound-clip-id: model.id;
     private property <string> edit-text: model.text-content;
+    // Scratch style used to build an edit: each control seeds it from the
+    // authoritative `model.text-style`, overrides one field, and commits — so
+    // concurrent fields are never stale and we never need to mirror the model.
+    private property <TextClipStyle> style;
     private property <float> canvas-w: EditorStore.project.sequence.width / 1px;
     private property <float> canvas-h: EditorStore.project.sequence.height / 1px;
     private property <bool> live: PreviewStore.gesture-active
@@ -677,6 +705,38 @@ export component TextInspector inherits VerticalLayout {
 
     changed bound-clip-id => {
         edit-text = model.text-content;
+    }
+
+    // Push the current text + scratch style through one undoable engine edit.
+    // Guarded so a control firing with no net change (e.g. a slider released
+    // without moving) doesn't spam the undo history.
+    function commit-style() {
+        if (root.edit-text != model.text-content || root.style != model.text-style) {
+            InspectorBackend.set-text-generator(root.track-id, model.id, root.edit-text, root.style);
+        }
+    }
+
+    // Seed the scratch style from the model, ready for a control to override a
+    // single field before calling `commit-style()`.
+    function begin-edit() {
+        root.style = model.text-style;
+    }
+
+    // Release handler for a control that ran live previews (e.g. the font-size
+    // slider): commit the scratch style if it differs, otherwise drop the
+    // lingering preview override so it can't leak onto later renders.
+    function commit-or-clear-style() {
+        if (root.edit-text != model.text-content || root.style != model.text-style) {
+            InspectorBackend.set-text-generator(root.track-id, model.id, root.edit-text, root.style);
+        } else {
+            InspectorBackend.clear-text-generator(TimelineStore.playhead-tick);
+        }
+    }
+
+    // Push the scratch style through a live, uncommitted preview render at the
+    // playhead — no history entry. Used while dragging a slider.
+    function preview-style() {
+        InspectorBackend.preview-text-generator(model.id, root.edit-text, root.style, TimelineStore.playhead-tick);
     }
 
     function apply(px: float, py: float, s: float, r: float, o: float, commit: bool) {
@@ -832,9 +892,8 @@ export component TextInspector inherits VerticalLayout {
 
                 commit(new-text) => {
                     root.edit-text = new-text;
-                    if (new-text != model.text-content) {
-                        InspectorBackend.set-text-content(track-id, model.id, new-text);
-                    }
+                    root.begin-edit();
+                    root.commit-style();
                 }
             }
 
@@ -845,14 +904,65 @@ export component TextInspector inherits VerticalLayout {
                     label: "Font";
                 }
 
-                FakeField {
-                    text: "System";
+                font-drop := CutlassDropdown {
+                    searchable: true;
+                    placeholder: "System";
+                    current: model.text-style.font;
+                    items: InspectorBackend.filter-fonts(self.query, InspectorBackend.font-families);
+                    selected(value) => {
+                        root.begin-edit();
+                        root.style.font = value;
+                        root.commit-style();
+                    }
                 }
             }
 
-            DisabledPropertyRow {
-                label: "Font size";
-                value: "15";
+            HorizontalLayout {
+                spacing: AppStore.theme.metrics.spacing.md;
+
+                LabelCell {
+                    label: "Font size";
+                }
+
+                CutlassSlider {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    vertical-stretch: 0;
+                    minimum: 8;
+                    maximum: 240;
+                    value: clamp(model.text-style.size, 8, 240);
+                    changed(v) => {
+                        // Track the live value while dragging; the model size
+                        // only changes on commit (release).
+                        size-num.text = Math.round(v) + "";
+                        // Live-preview the new size on the canvas without
+                        // committing — seed the scratch style and override size.
+                        root.begin-edit();
+                        root.style.size = v;
+                        root.preview-style();
+                    }
+                    released(v) => {
+                        root.begin-edit();
+                        root.style.size = v;
+                        root.commit-or-clear-style();
+                    }
+                }
+
+                size-num := LineTextInput {
+                    width: 56px;
+                    height: 28px;
+                    vertical-stretch: 0;
+                    horizontal-alignment: TextHorizontalAlignment.right;
+                    text: Math.round(model.text-style.size) + "";
+                    accepted(entered) => {
+                        if (entered.is-float()) {
+                            root.begin-edit();
+                            root.style.size = entered.to-float();
+                            root.commit-style();
+                        }
+                        self.text = Math.round(model.text-style.size) + "";
+                    }
+                }
             }
 
             HorizontalLayout {
@@ -864,14 +974,35 @@ export component TextInspector inherits VerticalLayout {
 
                 IconButton {
                     label: "B";
+                    enabled: true;
+                    selected: model.text-style.bold;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.bold = !model.text-style.bold;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: "U";
+                    enabled: true;
+                    selected: model.text-style.underline;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.underline = !model.text-style.underline;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: "I";
+                    enabled: true;
+                    selected: model.text-style.italic;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.italic = !model.text-style.italic;
+                        root.commit-style();
+                    }
                 }
 
                 Rectangle {
@@ -888,14 +1019,35 @@ export component TextInspector inherits VerticalLayout {
 
                 IconButton {
                     label: "TT";
+                    enabled: true;
+                    selected: model.text-style.case == 1;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.case = model.text-style.case == 1 ? 0 : 1;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: "tt";
+                    enabled: true;
+                    selected: model.text-style.case == 2;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.case = model.text-style.case == 2 ? 0 : 2;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: "Tt";
+                    enabled: true;
+                    selected: model.text-style.case == 3;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.case = model.text-style.case == 3 ? 0 : 3;
+                        root.commit-style();
+                    }
                 }
 
                 Rectangle {
@@ -910,8 +1062,13 @@ export component TextInspector inherits VerticalLayout {
                     label: "Color";
                 }
 
-                DisabledSwatch {
-                    swatch-color: #ffffff;
+                CutlassColorSwatch {
+                    value: model.text-style.fill;
+                    changed(c) => {
+                        root.begin-edit();
+                        root.style.fill = c;
+                        root.commit-style();
+                    }
                 }
 
                 Rectangle {
@@ -921,7 +1078,6 @@ export component TextInspector inherits VerticalLayout {
 
             HorizontalLayout {
                 spacing: AppStore.theme.metrics.spacing.md;
-                opacity: 0.55;
 
                 LabelCell {
                     label: "Spacing";
@@ -929,12 +1085,22 @@ export component TextInspector inherits VerticalLayout {
 
                 NumberBox {
                     prefix: "C";
-                    value: 0;
+                    value: model.text-style.letter-spacing;
+                    commit(v) => {
+                        root.begin-edit();
+                        root.style.letter-spacing = v;
+                        root.commit-style();
+                    }
                 }
 
                 NumberBox {
                     prefix: "L";
-                    value: 0;
+                    value: model.text-style.line-spacing * 100;
+                    commit(v) => {
+                        root.begin-edit();
+                        root.style.line-spacing = max(v, 10) / 100;
+                        root.commit-style();
+                    }
                 }
 
                 Rectangle {
@@ -944,7 +1110,6 @@ export component TextInspector inherits VerticalLayout {
 
             HorizontalLayout {
                 spacing: AppStore.theme.metrics.spacing.md;
-                opacity: 0.55;
 
                 LabelCell {
                     label: "Alignment";
@@ -952,27 +1117,68 @@ export component TextInspector inherits VerticalLayout {
 
                 IconButton {
                     label: "|<";
-                    selected: true;
+                    enabled: true;
+                    selected: model.text-style.align-h == 0;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.align-h = 0;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: "-";
+                    enabled: true;
+                    selected: model.text-style.align-h == 1;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.align-h = 1;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: ">|";
+                    enabled: true;
+                    selected: model.text-style.align-h == 2;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.align-h = 2;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: "T";
+                    enabled: true;
+                    selected: model.text-style.align-v == 0;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.align-v = 0;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: "M";
+                    enabled: true;
+                    selected: model.text-style.align-v == 1;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.align-v = 1;
+                        root.commit-style();
+                    }
                 }
 
                 IconButton {
                     label: "B";
+                    enabled: true;
+                    selected: model.text-style.align-v == 2;
+                    clicked => {
+                        root.begin-edit();
+                        root.style.align-v = 2;
+                        root.commit-style();
+                    }
                 }
 
                 Rectangle {
@@ -1163,53 +1369,122 @@ export component TextInspector inherits VerticalLayout {
 
             SectionHeader {
                 title: "Stroke";
-                active: false;
+                active: model.text-style.stroke-enabled;
                 checkable: true;
+                interactive: true;
+                toggled => {
+                    root.begin-edit();
+                    root.style.stroke-enabled = !model.text-style.stroke-enabled;
+                    root.commit-style();
+                }
+                reset => {
+                    root.begin-edit();
+                    root.style.stroke-enabled = false;
+                    root.commit-style();
+                }
             }
 
-            DisabledPropertyRow {
-                label: "Color";
-                value: "Hidden";
+            if model.text-style.stroke-enabled: HorizontalLayout {
+                spacing: AppStore.theme.metrics.spacing.md;
+
+                LabelCell {
+                    label: "Color";
+                }
+
+                CutlassColorSwatch {
+                    value: model.text-style.stroke-color;
+                    changed(c) => {
+                        root.begin-edit();
+                        root.style.stroke-color = c;
+                        root.commit-style();
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
             }
 
-            DisabledPropertyRow {
+            if model.text-style.stroke-enabled: SliderRow {
                 label: "Thickness";
-                value: "40";
+                suffix: "";
+                value: model.text-style.stroke-width;
+                minimum: 0;
+                maximum: 40;
+                reset-value: 6;
+                commit(v) => {
+                    root.begin-edit();
+                    root.style.stroke-width = v;
+                    root.commit-style();
+                }
             }
 
             InspectorDivider { }
 
             SectionHeader {
                 title: "Background";
-                active: false;
+                active: model.text-style.background-enabled;
                 checkable: true;
+                interactive: true;
+                toggled => {
+                    root.begin-edit();
+                    root.style.background-enabled = !model.text-style.background-enabled;
+                    root.commit-style();
+                }
+                reset => {
+                    root.begin-edit();
+                    root.style.background-enabled = false;
+                    root.commit-style();
+                }
             }
 
-            HorizontalLayout {
+            if model.text-style.background-enabled: HorizontalLayout {
                 spacing: AppStore.theme.metrics.spacing.md;
 
-                DisabledEffectCard {
-                    label: "ABC";
+                LabelCell {
+                    label: "Color";
                 }
 
-                DisabledEffectCard {
-                    label: "AB";
+                CutlassColorSwatch {
+                    value: model.text-style.background-color;
+                    changed(c) => {
+                        root.begin-edit();
+                        root.style.background-color = c;
+                        root.commit-style();
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
                 }
             }
 
-            DisabledPropertyRow {
-                label: "Color";
-                value: "Hidden";
-            }
-
-            DisabledPropertyRow {
+            if model.text-style.background-enabled: SliderRow {
                 label: "Opacity";
-                value: "100%";
+                suffix: "%";
+                value: model.text-style.background-opacity * 100;
+                minimum: 0;
+                maximum: 100;
+                reset-value: 100;
+                commit(v) => {
+                    root.begin-edit();
+                    root.style.background-opacity = clamp(v, 0, 100) / 100;
+                    root.commit-style();
+                }
             }
 
-            DisabledPropertyRow {
+            if model.text-style.background-enabled: SliderRow {
                 label: "Rounded";
-                value: "0%";
+                suffix: "%";
+                value: model.text-style.background-radius * 100;
+                minimum: 0;
+                maximum: 100;
+                reset-value: 0;
+                commit(v) => {
+                    root.begin-edit();
+                    root.style.background-radius = clamp(v, 0, 100) / 100;
+                    root.commit-style();
+                }
             }
 
             InspectorDivider { }
@@ -1247,23 +1522,82 @@ export component TextInspector inherits VerticalLayout {
 
             SectionHeader {
                 title: "Shadow";
-                active: false;
+                active: model.text-style.shadow-enabled;
                 checkable: true;
+                interactive: true;
+                toggled => {
+                    root.begin-edit();
+                    root.style.shadow-enabled = !model.text-style.shadow-enabled;
+                    root.commit-style();
+                }
+                reset => {
+                    root.begin-edit();
+                    root.style.shadow-enabled = false;
+                    root.commit-style();
+                }
             }
 
-            DisabledPropertyRow {
+            if model.text-style.shadow-enabled: HorizontalLayout {
+                spacing: AppStore.theme.metrics.spacing.md;
+
+                LabelCell {
+                    label: "Color";
+                }
+
+                CutlassColorSwatch {
+                    value: model.text-style.shadow-color;
+                    changed(c) => {
+                        root.begin-edit();
+                        root.style.shadow-color = c;
+                        root.commit-style();
+                    }
+                }
+
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+
+            if model.text-style.shadow-enabled: SliderRow {
                 label: "Opacity";
-                value: "90%";
+                suffix: "%";
+                value: model.text-style.shadow-opacity * 100;
+                minimum: 0;
+                maximum: 100;
+                reset-value: 90;
+                commit(v) => {
+                    root.begin-edit();
+                    root.style.shadow-opacity = clamp(v, 0, 100) / 100;
+                    root.commit-style();
+                }
             }
 
-            DisabledPropertyRow {
+            if model.text-style.shadow-enabled: SliderRow {
                 label: "Blur";
-                value: "15%";
+                suffix: "%";
+                value: model.text-style.shadow-blur * 100;
+                minimum: 0;
+                maximum: 100;
+                reset-value: 15;
+                commit(v) => {
+                    root.begin-edit();
+                    root.style.shadow-blur = clamp(v, 0, 100) / 100;
+                    root.commit-style();
+                }
             }
 
-            DisabledPropertyRow {
+            if model.text-style.shadow-enabled: SliderRow {
                 label: "Distance";
-                value: "5";
+                suffix: "";
+                value: model.text-style.shadow-distance;
+                minimum: 0;
+                maximum: 50;
+                reset-value: 5;
+                commit(v) => {
+                    root.begin-edit();
+                    root.style.shadow-distance = v;
+                    root.commit-style();
+                }
             }
 
             HorizontalLayout {

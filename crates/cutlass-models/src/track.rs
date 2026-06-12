@@ -464,12 +464,7 @@ mod tests {
             tr(0, 10),
             tr(0, 10),
         );
-        let text = Clip::generated(
-            Generator::Text {
-                content: "hi".into(),
-            },
-            tr(0, 10),
-        );
+        let text = Clip::generated(Generator::text("hi"), tr(0, 10));
         let sticker = Clip::generated(
             Generator::SolidColor {
                 rgba: [1, 2, 3, 4],

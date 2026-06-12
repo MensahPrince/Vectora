@@ -111,7 +111,7 @@ mod tests {
             .timeline_mut()
             .add_clip(
                 overlay,
-                Clip::generated(Generator::Text { content: "hi".into() }, TimeRange::at_rate(48, 24, R24)),
+                Clip::generated(Generator::text("hi"), TimeRange::at_rate(48, 24, R24)),
             )
             .unwrap();
 

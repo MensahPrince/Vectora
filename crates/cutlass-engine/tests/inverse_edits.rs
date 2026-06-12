@@ -237,9 +237,7 @@ fn undo_move_across_tracks() {
         engine
             .apply(Command::Edit(EditCommand::AddGenerated {
                 track: v1,
-                generator: Generator::Text {
-                    content: "title".into(),
-                },
+                generator: Generator::text("title"),
                 timeline: tr(5, 20),
             }))
             .expect("add"),
@@ -331,9 +329,7 @@ fn undo_redo_set_generator_oscillates_content() {
         engine
             .apply(Command::Edit(EditCommand::AddGenerated {
                 track,
-                generator: Generator::Text {
-                    content: "before".into(),
-                },
+                generator: Generator::text("before"),
                 timeline: tr(0, 24),
             }))
             .expect("add"),
@@ -342,14 +338,12 @@ fn undo_redo_set_generator_oscillates_content() {
     engine
         .apply(Command::Edit(EditCommand::SetGenerator {
             clip: clip_id,
-            generator: Generator::Text {
-                content: "after".into(),
-            },
+            generator: Generator::text("after"),
         }))
         .expect("set generator");
 
     let content = |engine: &cutlass_engine::Engine| match &engine.project().clip(clip_id).unwrap().content {
-        cutlass_models::ClipSource::Generated(Generator::Text { content }) => content.clone(),
+        cutlass_models::ClipSource::Generated(Generator::Text { content, .. }) => content.clone(),
         other => panic!("expected text generator, got {other:?}"),
     };
     assert_eq!(content(&engine), "after");
@@ -359,6 +353,55 @@ fn undo_redo_set_generator_oscillates_content() {
 
     assert!(engine.redo());
     assert_eq!(content(&engine), "after");
+}
+
+#[test]
+fn undo_redo_set_generator_oscillates_style() {
+    let (_dir, mut engine) = temp_engine();
+    let track = common::add_track(&mut engine, TrackKind::Text, "T1");
+
+    let clip_id = created(
+        engine
+            .apply(Command::Edit(EditCommand::AddGenerated {
+                track,
+                generator: Generator::text("hi"),
+                timeline: tr(0, 24),
+            }))
+            .expect("add"),
+    );
+
+    let styled = cutlass_models::TextStyle {
+        bold: true,
+        size: 120.0,
+        fill: [10, 20, 30, 255],
+        stroke: Some(cutlass_models::TextStroke {
+            rgba: [0, 0, 0, 255],
+            width: 8.0,
+        }),
+        ..Default::default()
+    };
+    engine
+        .apply(Command::Edit(EditCommand::SetGenerator {
+            clip: clip_id,
+            generator: Generator::Text {
+                content: "hi".into(),
+                style: styled.clone(),
+            },
+        }))
+        .expect("set generator");
+
+    let style = |engine: &cutlass_engine::Engine| match &engine.project().clip(clip_id).unwrap().content {
+        cutlass_models::ClipSource::Generated(Generator::Text { style, .. }) => style.clone(),
+        other => panic!("expected text generator, got {other:?}"),
+    };
+
+    assert_eq!(style(&engine), styled);
+
+    assert!(engine.undo());
+    assert_eq!(style(&engine), cutlass_models::TextStyle::default());
+
+    assert!(engine.redo());
+    assert_eq!(style(&engine), styled);
 }
 
 #[test]
@@ -386,9 +429,7 @@ fn set_generator_rejects_media_clip() {
         engine
             .apply(Command::Edit(EditCommand::SetGenerator {
                 clip: clip_id,
-                generator: Generator::Text {
-                    content: "nope".into(),
-                },
+                generator: Generator::text("nope"),
             }))
             .is_err()
     );
@@ -403,9 +444,7 @@ fn undo_redo_set_clip_transform_oscillates() {
         engine
             .apply(Command::Edit(EditCommand::AddGenerated {
                 track,
-                generator: Generator::Text {
-                    content: "title".into(),
-                },
+                generator: Generator::text("title"),
                 timeline: tr(0, 24),
             }))
             .expect("add"),
@@ -444,9 +483,7 @@ fn invalid_transform_rejected_and_state_unchanged() {
         engine
             .apply(Command::Edit(EditCommand::AddGenerated {
                 track,
-                generator: Generator::Text {
-                    content: "title".into(),
-                },
+                generator: Generator::text("title"),
                 timeline: tr(0, 24),
             }))
             .expect("add"),

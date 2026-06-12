@@ -87,6 +87,10 @@ pub fn layer_placement(
 /// `override_transform` substitutes one clip's transform for this resolve
 /// only — the live preview of an uncommitted drag gesture (preview roadmap
 /// Phase 3). Session state, never project state: export passes `None`.
+///
+/// `override_generator` likewise substitutes one generated clip's generator
+/// (e.g. a live inspector font-size drag) for this resolve only; export and
+/// prefetch pass `None`.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_layers(
     project: &Project,
@@ -97,6 +101,7 @@ pub fn resolve_layers(
     canvas: &CompositorConfig,
     color_convert: ColorConvertPath,
     override_transform: Option<(ClipId, ClipTransform)>,
+    override_generator: Option<(ClipId, &Generator)>,
 ) -> Result<Vec<CompositeLayer>, EngineError> {
     let mut layers = Vec::new();
 
@@ -139,6 +144,12 @@ pub fn resolve_layers(
                 layers.push(layer);
             }
             cutlass_models::ClipSource::Generated(generator) => {
+                // A live inspector edit (e.g. font-size drag) renders this clip
+                // from the override generator instead of its committed one.
+                let generator = match override_generator {
+                    Some((id, g)) if id == clip.id => g,
+                    _ => generator,
+                };
                 // Generators raster at canvas size, so their fit is 1:1 and
                 // the clip transform applies on top of the full canvas.
                 let placement =
@@ -317,9 +328,7 @@ mod tests {
         project
             .add_generated(
                 track,
-                Generator::Text {
-                    content: "Hi".into(),
-                },
+                Generator::text("Hi"),
                 TimeRange::at_rate(0, 24, cutlass_models::Rational::FPS_24),
             )
             .unwrap();
@@ -335,6 +344,7 @@ mod tests {
             RationalTime::new(0, cutlass_models::Rational::FPS_24),
             &canvas,
             ColorConvertPath::Gpu,
+            None,
             None,
         )
         .unwrap();
@@ -373,6 +383,7 @@ mod tests {
                 RationalTime::new(tick, cutlass_models::Rational::FPS_24),
                 &canvas,
                 ColorConvertPath::Gpu,
+                None,
                 None,
             )
             .unwrap()

@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use cutlass_compositor::{Compositor, GpuContext, Yuv420pImage};
 use cutlass_cache::FrameCache;
-use cutlass_models::{ClipId, ClipTransform, ModelError, Project, RationalTime};
+use cutlass_models::{ClipId, ClipTransform, Generator, ModelError, Project, RationalTime};
 use tracing::debug;
 
 use crate::ColorConvertPath;
@@ -25,6 +25,7 @@ pub fn get_frame(
     time: RationalTime,
     color_convert: ColorConvertPath,
     override_transform: Option<(ClipId, ClipTransform)>,
+    override_generator: Option<(ClipId, &Generator)>,
 ) -> Result<RgbaFrame, EngineError> {
     let tl_rate = project.timeline().frame_rate;
     if time.rate != tl_rate {
@@ -50,6 +51,7 @@ pub fn get_frame(
         &config,
         color_convert,
         override_transform,
+        override_generator,
     )?;
     let resolve_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -89,7 +91,7 @@ pub fn prefetch_frame(
 ) -> Result<(), EngineError> {
     let (width, height) = composite_canvas_size(project);
     let config = cutlass_compositor::CompositorConfig::new(width, height);
-    resolve_layers(project, Some(cache), pool, raster, time, &config, color_convert, None)?;
+    resolve_layers(project, Some(cache), pool, raster, time, &config, color_convert, None, None)?;
     Ok(())
 }
 
@@ -116,7 +118,7 @@ pub fn get_export_yuv_frame(
     let (width, height) = composite_canvas_size(project);
     let config = cutlass_compositor::CompositorConfig::new(width, height);
     // Export never sees a gesture override: committed project state only.
-    let layers = resolve_layers(project, None, pool, raster, time, &config, color_convert, None)?;
+    let layers = resolve_layers(project, None, pool, raster, time, &config, color_convert, None, None)?;
 
     // Same gap policy as preview: a tick no clip covers exports as black.
     if layers.is_empty() {

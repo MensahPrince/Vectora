@@ -44,9 +44,7 @@ fn generated_clips_need_no_media() {
     let text = project
         .add_generated(
             title,
-            Generator::Text {
-                content: "Hello".into(),
-            },
+            Generator::text("Hello"),
             tr(0, 48),
         )
         .unwrap();
@@ -366,9 +364,7 @@ fn generated_clip_rejects_wrong_track_kind() {
     assert_eq!(
         project.add_generated(
             video,
-            Generator::Text {
-                content: "nope".into(),
-            },
+            Generator::text("nope"),
             tr(0, 24),
         ),
         Err(ModelError::IncompatibleTrackKind {

@@ -770,13 +770,7 @@ mod tests {
         let mut project = Project::new("test", R24);
         let track = project.add_track(TrackKind::Text, "Titles");
         let clip = project
-            .add_generated(
-                track,
-                Generator::Text {
-                    content: "Hi".into(),
-                },
-                tr(0, 24),
-            )
+            .add_generated(track, Generator::text("Hi"), tr(0, 24))
             .unwrap();
 
         assert!(project.clip(clip).unwrap().is_generated());

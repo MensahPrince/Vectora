@@ -24,6 +24,42 @@ export struct RationalTime {
     duration: RationalTime,
 }
 
+// Visual treatment of a text/title clip, mirroring the engine's `TextStyle`.
+// Sizes are in reference pixels (1080px-tall canvas). Enum-like fields are
+// encoded as ints to keep the Slint <-> Rust bridge trivial:
+//   case:    0 normal, 1 UPPER, 2 lower, 3 Title
+//   align-h: 0 left, 1 center, 2 right
+//   align-v: 0 top, 1 middle, 2 bottom
+// Effect sections carry an `*-enabled` flag (the section checkbox) plus their
+// parameters. Background/shadow opacity is a separate 0..=1 control; the swatch
+// colors are opaque so the picker preview reads cleanly.
+@rust-attr(derive(serde::Serialize, serde::Deserialize))
+export struct TextClipStyle {
+    font: string,
+    size: float,
+    bold: bool,
+    italic: bool,
+    underline: bool,
+    case: int,
+    fill: color,
+    letter-spacing: float,
+    line-spacing: float,
+    align-h: int,
+    align-v: int,
+    stroke-enabled: bool,
+    stroke-color: color,
+    stroke-width: float,
+    background-enabled: bool,
+    background-color: color,
+    background-opacity: float,
+    background-radius: float,
+    shadow-enabled: bool,
+    shadow-color: color,
+    shadow-opacity: float,
+    shadow-blur: float,
+    shadow-distance: float,
+}
+
 @rust-attr(derive(serde::Serialize, serde::Deserialize))
 export struct Clip {
     id: string,
@@ -73,6 +109,10 @@ export struct Clip {
     duration-label: string,
     // Text / title generator content. Empty on non-text clips.
     text-content: string,
+    // Full visual treatment for text/title clips (font, color, stroke, …).
+    // Default-valued for non-text clips. Edits round-trip through
+    // `InspectorBackend.set-text-generator`.
+    text-style: TextClipStyle,
     // Generator kind for synthetic clips: "" (media), "text", "solid",
     // "rect", or "ellipse". Drives the timeline card's preview rendering.
     generator-kind: string,

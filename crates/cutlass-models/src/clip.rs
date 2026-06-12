@@ -22,7 +22,15 @@ pub enum ClipSource {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Generator {
     /// A title / text layer.
-    Text { content: String },
+    ///
+    /// `style` carries the full visual treatment (font, size, color, stroke,
+    /// background, shadow, …). It is `#[serde(default)]` so projects written
+    /// before styling existed load with the default look.
+    Text {
+        content: String,
+        #[serde(default)]
+        style: TextStyle,
+    },
     /// A solid fill (RGBA, 0-255).
     SolidColor { rgba: [u8; 4] },
     /// A vector shape with a fill color (RGBA, 0-255). Geometry (a centered
@@ -52,6 +60,220 @@ pub enum Shape {
 /// Default fill color for a shape without one (opaque white).
 fn default_shape_rgba() -> [u8; 4] {
     [255, 255, 255, 255]
+}
+
+impl Generator {
+    /// A text generator with the default style. Convenience for the common
+    /// case of creating a freshly-dropped title.
+    pub fn text(content: impl Into<String>) -> Self {
+        Generator::Text {
+            content: content.into(),
+            style: TextStyle::default(),
+        }
+    }
+}
+
+/// Letter-casing transform applied to a title before shaping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum TextCase {
+    /// Render the text as authored.
+    #[default]
+    Normal,
+    /// UPPERCASE.
+    Upper,
+    /// lowercase.
+    Lower,
+    /// Title Case (first letter of each word).
+    Title,
+}
+
+impl TextCase {
+    /// Apply the casing transform to `s`.
+    pub fn apply(self, s: &str) -> String {
+        match self {
+            TextCase::Normal => s.to_owned(),
+            TextCase::Upper => s.to_uppercase(),
+            TextCase::Lower => s.to_lowercase(),
+            TextCase::Title => title_case(s),
+        }
+    }
+}
+
+/// Capitalize the first letter of every whitespace-separated word.
+fn title_case(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut at_word_start = true;
+    for ch in s.chars() {
+        if ch.is_whitespace() {
+            at_word_start = true;
+            out.push(ch);
+        } else if at_word_start {
+            at_word_start = false;
+            out.extend(ch.to_uppercase());
+        } else {
+            out.extend(ch.to_lowercase());
+        }
+    }
+    out
+}
+
+/// Horizontal alignment of the laid-out title within the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum TextAlignH {
+    Left,
+    #[default]
+    Center,
+    Right,
+}
+
+/// Vertical alignment of the title block within the canvas.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum TextAlignV {
+    Top,
+    #[default]
+    Middle,
+    Bottom,
+}
+
+/// Outline drawn around glyphs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextStroke {
+    /// Stroke color (RGBA, 0-255).
+    pub rgba: [u8; 4],
+    /// Stroke width in reference pixels (see [`TextStyle::size`]).
+    pub width: f32,
+}
+
+impl Default for TextStroke {
+    fn default() -> Self {
+        Self {
+            rgba: [0, 0, 0, 255],
+            width: 6.0,
+        }
+    }
+}
+
+/// A filled card drawn behind the title block.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextBackground {
+    /// Card color (RGBA, 0-255); the alpha doubles as the opacity slider.
+    pub rgba: [u8; 4],
+    /// Corner rounding, `0.0` (square) ..= `1.0` (pill).
+    pub radius: f32,
+}
+
+impl Default for TextBackground {
+    fn default() -> Self {
+        Self {
+            rgba: [0, 0, 0, 255],
+            radius: 0.0,
+        }
+    }
+}
+
+/// A soft drop shadow behind the title, offset down-right at 45°.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct TextShadow {
+    /// Shadow color (RGBA, 0-255); the alpha doubles as the opacity slider.
+    pub rgba: [u8; 4],
+    /// Blur radius as a fraction of the effective font size, `0.0`..=`1.0`.
+    pub blur: f32,
+    /// Offset distance in reference pixels (see [`TextStyle::size`]).
+    pub distance: f32,
+}
+
+impl Default for TextShadow {
+    fn default() -> Self {
+        Self {
+            rgba: [0, 0, 0, 230],
+            blur: 0.15,
+            distance: 5.0,
+        }
+    }
+}
+
+/// The full visual treatment of a [`Generator::Text`] layer.
+///
+/// Sizes (`size`, `letter_spacing`, stroke width, shadow distance) are in
+/// *reference pixels* relative to a 1080px-tall canvas; the rasterizer scales
+/// them by `canvas_height / 1080` so a project looks the same regardless of
+/// output resolution. Every field is `#[serde(default)]` so older projects
+/// (which only stored `content`) deserialize to the legacy default look.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TextStyle {
+    /// Font family name (`""` ⇒ the system default font).
+    #[serde(default)]
+    pub font: String,
+    /// Font size in reference pixels (1080px-tall canvas).
+    #[serde(default = "default_font_size")]
+    pub size: f32,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub case: TextCase,
+    /// Fill color (RGBA, 0-255).
+    #[serde(default = "default_text_fill")]
+    pub fill: [u8; 4],
+    /// Extra space between glyphs, in reference pixels (can be negative).
+    #[serde(default)]
+    pub letter_spacing: f32,
+    /// Line-height multiplier (`1.2` ⇒ 120% of the font size).
+    #[serde(default = "default_line_spacing")]
+    pub line_spacing: f32,
+    #[serde(default)]
+    pub align_h: TextAlignH,
+    #[serde(default)]
+    pub align_v: TextAlignV,
+    /// Optional glyph outline.
+    #[serde(default)]
+    pub stroke: Option<TextStroke>,
+    /// Optional background card.
+    #[serde(default)]
+    pub background: Option<TextBackground>,
+    /// Optional drop shadow.
+    #[serde(default)]
+    pub shadow: Option<TextShadow>,
+}
+
+/// Default font size in reference pixels — matches the legacy `height / 12`
+/// look at a 1080px canvas.
+fn default_font_size() -> f32 {
+    90.0
+}
+
+/// Default fill color for a title (opaque white), matching the legacy raster.
+fn default_text_fill() -> [u8; 4] {
+    [255, 255, 255, 255]
+}
+
+/// Default line-height multiplier (matches the legacy `font_size * 1.2`).
+fn default_line_spacing() -> f32 {
+    1.2
+}
+
+impl Default for TextStyle {
+    fn default() -> Self {
+        Self {
+            font: String::new(),
+            size: default_font_size(),
+            bold: false,
+            italic: false,
+            underline: false,
+            case: TextCase::Normal,
+            fill: default_text_fill(),
+            letter_spacing: 0.0,
+            line_spacing: default_line_spacing(),
+            align_h: TextAlignH::Center,
+            align_v: TextAlignV::Middle,
+            stroke: None,
+            background: None,
+            shadow: None,
+        }
+    }
 }
 
 /// Spatial placement of a clip's content on the canvas (CapCut "Basic"
@@ -260,17 +482,10 @@ mod tests {
     #[test]
     fn generated_text_clip() {
         let timeline = tr(0, 48, R24);
-        let clip = Clip::generated(
-            Generator::Text {
-                content: "Hello".into(),
-            },
-            timeline,
-        );
+        let clip = Clip::generated(Generator::text("Hello"), timeline);
         assert_eq!(
             clip.content,
-            ClipSource::Generated(Generator::Text {
-                content: "Hello".into(),
-            })
+            ClipSource::Generated(Generator::text("Hello"))
         );
         assert_eq!(clip.timeline, timeline);
         assert!(clip.is_generated());
@@ -338,12 +553,7 @@ mod tests {
 
     #[test]
     fn generated_clip_accessors_are_none() {
-        let clip = Clip::generated(
-            Generator::Text {
-                content: "x".into(),
-            },
-            tr(5, 10, R24),
-        );
+        let clip = Clip::generated(Generator::text("x"), tr(5, 10, R24));
         assert_eq!(clip.media(), None);
         assert_eq!(clip.source_range(), None);
         assert_eq!(clip.start().value, 5);
@@ -404,12 +614,7 @@ mod tests {
 
     #[test]
     fn source_time_at_generated_always_none() {
-        let clip = Clip::generated(
-            Generator::Text {
-                content: "title".into(),
-            },
-            tr(0, 100, R24),
-        );
+        let clip = Clip::generated(Generator::text("title"), tr(0, 100, R24));
         assert_eq!(clip.source_time_at(rt(50, R24)).unwrap(), None);
     }
 
@@ -466,12 +671,7 @@ mod tests {
     #[test]
     fn clip_without_transform_field_deserializes_to_identity() {
         // A clip serialized before transforms existed: no `transform` key.
-        let clip = Clip::generated(
-            Generator::Text {
-                content: "old".into(),
-            },
-            tr(0, 10, R24),
-        );
+        let clip = Clip::generated(Generator::text("old"), tr(0, 10, R24));
         let mut value = serde_json::to_value(&clip).expect("serialize");
         value
             .as_object_mut()
@@ -496,6 +696,83 @@ mod tests {
         let json = serde_json::to_string(&clip).expect("serialize");
         let loaded: Clip = serde_json::from_str(&json).expect("deserialize");
         assert_eq!(loaded.transform, clip.transform);
+    }
+
+    // --- text style ---------------------------------------------------------
+
+    #[test]
+    fn legacy_text_clip_without_style_loads_default() {
+        // A title serialized before styling existed: the Text variant only had
+        // a `content` field.
+        let json = r#"{
+            "id": 1,
+            "content": { "Generated": { "Text": { "content": "old title" } } },
+            "timeline": { "start": { "value": 0, "rate": { "num": 24, "den": 1 } },
+                          "duration": { "value": 24, "rate": { "num": 24, "den": 1 } } }
+        }"#;
+        let clip: Clip = serde_json::from_str(json).expect("deserialize legacy text clip");
+        match clip.content {
+            ClipSource::Generated(Generator::Text { content, style }) => {
+                assert_eq!(content, "old title");
+                assert_eq!(style, TextStyle::default());
+            }
+            other => panic!("expected text generator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_style_roundtrips_through_serde() {
+        let style = TextStyle {
+            font: "Helvetica".into(),
+            size: 120.0,
+            bold: true,
+            italic: true,
+            underline: true,
+            case: TextCase::Upper,
+            fill: [10, 20, 30, 255],
+            letter_spacing: 3.0,
+            line_spacing: 1.5,
+            align_h: TextAlignH::Right,
+            align_v: TextAlignV::Bottom,
+            stroke: Some(TextStroke {
+                rgba: [0, 0, 0, 255],
+                width: 8.0,
+            }),
+            background: Some(TextBackground {
+                rgba: [255, 255, 0, 200],
+                radius: 0.5,
+            }),
+            shadow: Some(TextShadow {
+                rgba: [0, 0, 0, 230],
+                blur: 0.25,
+                distance: 12.0,
+            }),
+        };
+        let clip = Clip::generated(
+            Generator::Text {
+                content: "Styled".into(),
+                style: style.clone(),
+            },
+            tr(0, 24, R24),
+        );
+        let json = serde_json::to_string(&clip).expect("serialize");
+        let loaded: Clip = serde_json::from_str(&json).expect("deserialize");
+        match loaded.content {
+            ClipSource::Generated(Generator::Text { content, style: got }) => {
+                assert_eq!(content, "Styled");
+                assert_eq!(got, style);
+            }
+            other => panic!("expected text generator, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_case_apply() {
+        assert_eq!(TextCase::Normal.apply("Hello World"), "Hello World");
+        assert_eq!(TextCase::Upper.apply("Hello World"), "HELLO WORLD");
+        assert_eq!(TextCase::Lower.apply("Hello World"), "hello world");
+        assert_eq!(TextCase::Title.apply("hello world"), "Hello World");
+        assert_eq!(TextCase::Title.apply("hELLO  wORLD"), "Hello  World");
     }
 
     #[test]
