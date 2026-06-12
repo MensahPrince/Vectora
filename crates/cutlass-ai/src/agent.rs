@@ -534,6 +534,19 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             }
             format!("set marker {} {}", a.marker, parts.join(", "))
         }
+        WireCommand::SetCanvas(a) => {
+            let mut parts = Vec::new();
+            if let Some(aspect) = a.aspect {
+                parts.push(format!("aspect {}", aspect.name()));
+            }
+            if let Some([r, g, b]) = a.background {
+                parts.push(format!("background rgb({r}, {g}, {b})"));
+            }
+            if parts.is_empty() {
+                parts.push("unchanged".into());
+            }
+            format!("set canvas {}", parts.join(", "))
+        }
     };
     match outcome {
         Some(EditOutcome::Created(id)) => line.push_str(&format!(" (new clip {})", id.raw())),
@@ -579,6 +592,15 @@ mod tests {
             describe_action(&title, None),
             "added text 'INTRO' at 0.00s for 3.00s on track 3"
         );
+
+        let canvas = WireCommand::SetCanvas(wire::SetCanvas {
+            aspect: Some(wire::WireCanvasAspect::Tall9x16),
+            background: Some([20, 20, 28]),
+        });
+        assert_eq!(
+            describe_action(&canvas, Some(&EditOutcome::UpdatedCanvas)),
+            "set canvas aspect 9:16, background rgb(20, 20, 28)"
+        );
     }
 
     #[test]
@@ -589,6 +611,7 @@ mod tests {
             duration_seconds: 10.0,
             tracks: vec![],
             markers: vec![],
+            canvas: None,
             media: vec![],
         };
         let ctx = EditorContext {

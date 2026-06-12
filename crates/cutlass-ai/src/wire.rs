@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 /// 6: M1 crop + flip (`set_clip_crop`).
 /// 7: subschemas inlined (no `$defs`/`$ref`) + `generator` field examples,
 ///    so small local models stop guessing nested argument shapes.
-pub const TOOL_SCHEMA_VERSION: u32 = 7;
+/// 8: M1 canvas settings (`set_canvas`).
+pub const TOOL_SCHEMA_VERSION: u32 = 8;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -461,6 +462,55 @@ pub struct SetMarker {
     pub color: Option<WireMarkerColor>,
 }
 
+/// Canvas aspect-ratio presets the agent may pick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub enum WireCanvasAspect {
+    /// Follow the footage: canvas shape and size derive from the largest
+    /// video media on the timeline (the default).
+    #[serde(rename = "auto")]
+    Auto,
+    #[serde(rename = "16:9")]
+    Wide16x9,
+    #[serde(rename = "9:16")]
+    Tall9x16,
+    #[serde(rename = "1:1")]
+    Square1x1,
+    #[serde(rename = "4:5")]
+    Portrait4x5,
+    #[serde(rename = "21:9")]
+    Cinema21x9,
+}
+
+impl WireCanvasAspect {
+    /// The serialized name (`"auto"`, `"16:9"`, …), for transcripts.
+    pub fn name(self) -> &'static str {
+        match self {
+            WireCanvasAspect::Auto => "auto",
+            WireCanvasAspect::Wide16x9 => "16:9",
+            WireCanvasAspect::Tall9x16 => "9:16",
+            WireCanvasAspect::Square1x1 => "1:1",
+            WireCanvasAspect::Portrait4x5 => "4:5",
+            WireCanvasAspect::Cinema21x9 => "21:9",
+        }
+    }
+}
+
+/// Set the project canvas: the aspect-ratio preset the composite renders
+/// at, and/or the background color shown where no clip covers the canvas.
+/// Omitted fields keep their current value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetCanvas {
+    /// Canvas aspect preset: "auto" follows the footage; "16:9", "9:16",
+    /// "1:1", "4:5", and "21:9" fix the shape (clips re-fit automatically).
+    /// Omit to keep the current preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aspect: Option<WireCanvasAspect>,
+    /// Canvas background color as `[red, green, blue]`, each 0-255. Omit
+    /// to keep the current background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<[u8; 3]>,
+}
+
 /// Every timeline edit the agent may request, as one tagged value.
 ///
 /// Tool calls arrive as `(name, arguments)` pairs and convert through
@@ -495,6 +545,7 @@ pub enum WireCommand {
     AddMarker(AddMarker),
     RemoveMarker(RemoveMarker),
     SetMarker(SetMarker),
+    SetCanvas(SetCanvas),
 }
 
 impl WireCommand {
@@ -557,6 +608,7 @@ impl WireCommand {
             WireCommand::AddMarker(_) => {}
             WireCommand::RemoveMarker(a) => marker(&mut a.marker),
             WireCommand::SetMarker(a) => marker(&mut a.marker),
+            WireCommand::SetCanvas(_) => {}
         }
     }
 }
@@ -713,6 +765,8 @@ tools! {
         "Remove a ruler marker by id.";
     "set_marker" => SetMarker(SetMarker),
         "Move, rename, or recolor a ruler marker. Omitted fields keep their current value.";
+    "set_canvas" => SetCanvas(SetCanvas),
+        "Set the project canvas: aspect ratio preset ('auto' follows the footage; '16:9', '9:16', '1:1', '4:5', '21:9' reshape it) and/or the background color shown where no clip covers the canvas. Omitted fields keep their current value.";
 }
 
 #[cfg(test)]
@@ -868,7 +922,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 26);
+        assert_eq!(specs.len(), 27);
         for spec in &specs {
             assert!(!spec.description.is_empty(), "{} missing description", spec.name);
             assert_eq!(

@@ -39,8 +39,20 @@ pub struct ProjectSummary {
     /// Ruler markers in tick order (M1). Omitted when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub markers: Vec<MarkerSummary>,
+    /// Canvas settings (set_canvas). Omitted at the default (auto aspect,
+    /// black background).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canvas: Option<CanvasSummary>,
     /// The media pool, id-ascending.
     pub media: Vec<MediaSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanvasSummary {
+    /// Aspect preset name: auto, 16:9, 9:16, 1:1, 4:5, 21:9.
+    pub aspect: String,
+    /// Background color as `[red, green, blue]`, each 0-255.
+    pub background: [u8; 3],
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,12 +308,19 @@ pub fn summarize(project: &Project) -> ProjectSummary {
         })
         .collect();
 
+    let canvas = project.timeline().canvas();
+    let canvas = (!canvas.is_default()).then(|| CanvasSummary {
+        aspect: canvas.aspect.name().to_string(),
+        background: canvas.background,
+    });
+
     ProjectSummary {
         name: project.name.clone(),
         frame_rate_fps: rate.as_f64(),
         duration_seconds: seconds(duration_ticks, rate),
         tracks,
         markers,
+        canvas,
         media,
     }
 }
@@ -398,6 +417,24 @@ mod tests {
             ClipContent::Other {
                 kind: "adjustment".to_string()
             }
+        );
+    }
+
+    #[test]
+    fn canvas_surfaces_only_when_not_default() {
+        let mut project = Project::new("canvas", R24);
+        assert_eq!(summarize(&project).canvas, None);
+
+        project.timeline_mut().set_canvas(cutlass_models::CanvasSettings {
+            aspect: cutlass_models::CanvasAspect::Tall9x16,
+            background: [20, 20, 28],
+        });
+        assert_eq!(
+            summarize(&project).canvas,
+            Some(CanvasSummary {
+                aspect: "9:16".to_string(),
+                background: [20, 20, 28],
+            })
         );
     }
 

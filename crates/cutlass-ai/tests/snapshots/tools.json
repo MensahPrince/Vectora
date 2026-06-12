@@ -1183,6 +1183,61 @@
       }
     },
     {
+      "description": "Set the project canvas: aspect ratio preset ('auto' follows the footage; '16:9', '9:16', '1:1', '4:5', '21:9' reshape it) and/or the background color shown where no clip covers the canvas. Omitted fields keep their current value.",
+      "name": "set_canvas",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Set the project canvas: the aspect-ratio preset the composite renders\nat, and/or the background color shown where no clip covers the canvas.\nOmitted fields keep their current value.",
+        "properties": {
+          "aspect": {
+            "anyOf": [
+              {
+                "description": "Canvas aspect-ratio presets the agent may pick.",
+                "oneOf": [
+                  {
+                    "enum": [
+                      "16:9",
+                      "9:16",
+                      "1:1",
+                      "4:5",
+                      "21:9"
+                    ],
+                    "type": "string"
+                  },
+                  {
+                    "const": "auto",
+                    "description": "Follow the footage: canvas shape and size derive from the largest\nvideo media on the timeline (the default).",
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canvas aspect preset: \"auto\" follows the footage; \"16:9\", \"9:16\",\n\"1:1\", \"4:5\", and \"21:9\" fix the shape (clips re-fit automatically).\nOmit to keep the current preset."
+          },
+          "background": {
+            "description": "Canvas background color as `[red, green, blue]`, each 0-255. Omit\nto keep the current background.",
+            "items": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 3,
+            "minItems": 3,
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "title": "SetCanvas",
+        "type": "object"
+      }
+    },
+    {
       "description": "Get the current state of the project: tracks, clips with ids and times in seconds, the media pool, and the user's selection and playhead. Call this whenever you are unsure about ids or timing.",
       "name": "describe_project",
       "parameters": {
@@ -1191,5 +1246,5 @@
       }
     }
   ],
-  "version": 7
+  "version": 8
 }

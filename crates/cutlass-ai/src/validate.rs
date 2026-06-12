@@ -10,13 +10,14 @@
 
 use cutlass_commands::{Command, EditCommand};
 use cutlass_models::{
-    Clip, ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, Marker, MarkerColor,
-    MarkerId, MediaId, ParamValue, Project, Rational, RationalTime, TimeRange, TrackId, TrackKind,
+    CanvasAspect, Clip, ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, Marker,
+    MarkerColor, MarkerId, MediaId, ParamValue, Project, Rational, RationalTime, TimeRange,
+    TrackId, TrackKind,
 };
 
 use crate::wire::{
-    WireClipParam, WireCommand, WireEasing, WireGenerator, WireMarkerColor, WireShape,
-    WireTrackKind,
+    WireCanvasAspect, WireClipParam, WireCommand, WireEasing, WireGenerator, WireMarkerColor,
+    WireShape, WireTrackKind,
 };
 
 /// A wire command the project as it stands cannot accept. The message is
@@ -437,6 +438,13 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 color: args.color.map(marker_color).unwrap_or(marker.color),
             }
         }
+        WireCommand::SetCanvas(args) => {
+            let current = project.timeline().canvas();
+            EditCommand::SetCanvas {
+                aspect: args.aspect.map(canvas_aspect).unwrap_or(current.aspect),
+                background: args.background.unwrap_or(current.background),
+            }
+        }
     };
     Ok(Command::Edit(edit))
 }
@@ -530,6 +538,17 @@ fn marker_color(color: WireMarkerColor) -> MarkerColor {
         WireMarkerColor::Orange => MarkerColor::Orange,
         WireMarkerColor::Yellow => MarkerColor::Yellow,
         WireMarkerColor::Green => MarkerColor::Green,
+    }
+}
+
+fn canvas_aspect(aspect: WireCanvasAspect) -> CanvasAspect {
+    match aspect {
+        WireCanvasAspect::Auto => CanvasAspect::Auto,
+        WireCanvasAspect::Wide16x9 => CanvasAspect::Wide16x9,
+        WireCanvasAspect::Tall9x16 => CanvasAspect::Tall9x16,
+        WireCanvasAspect::Square1x1 => CanvasAspect::Square1x1,
+        WireCanvasAspect::Portrait4x5 => CanvasAspect::Portrait4x5,
+        WireCanvasAspect::Cinema21x9 => CanvasAspect::Cinema21x9,
     }
 }
 
@@ -1548,6 +1567,59 @@ mod tests {
         );
         assert!(msg.contains("marker 404 does not exist"), "{msg}");
         assert!(msg.contains(&id.raw().to_string()), "{msg}");
+    }
+
+    #[test]
+    fn set_canvas_lowers_and_keeps_omitted_fields() {
+        let (mut project, _, _, _, _, _) = fixture();
+        let edit = lower(
+            &project,
+            WireCommand::SetCanvas(wire::SetCanvas {
+                aspect: Some(wire::WireCanvasAspect::Tall9x16),
+                background: Some([20, 20, 28]),
+            }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::SetCanvas {
+                aspect: CanvasAspect::Tall9x16,
+                background: [20, 20, 28],
+            }
+        );
+
+        // Omitted fields keep the project's current canvas settings.
+        project.timeline_mut().set_canvas(cutlass_models::CanvasSettings {
+            aspect: CanvasAspect::Square1x1,
+            background: [255, 0, 0],
+        });
+        let edit = lower(
+            &project,
+            WireCommand::SetCanvas(wire::SetCanvas {
+                aspect: None,
+                background: Some([0, 0, 0]),
+            }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::SetCanvas {
+                aspect: CanvasAspect::Square1x1,
+                background: [0, 0, 0],
+            }
+        );
+        let edit = lower(
+            &project,
+            WireCommand::SetCanvas(wire::SetCanvas {
+                aspect: Some(wire::WireCanvasAspect::Auto),
+                background: None,
+            }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::SetCanvas {
+                aspect: CanvasAspect::Auto,
+                background: [255, 0, 0],
+            }
+        );
     }
 
     #[test]
