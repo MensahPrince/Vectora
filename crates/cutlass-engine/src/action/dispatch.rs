@@ -214,5 +214,9 @@ fn dispatch_edit(
             let inverse = edit::marker::set(ctx, marker, at, name, color)?;
             Ok((ApplyOutcome::Edited(EditOutcome::UpdatedMarker(marker)), Some(inverse)))
         }
+        EditCommand::SetCanvas { aspect, background } => {
+            let inverse = edit::set_canvas::set_canvas(ctx, aspect, background)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedCanvas), Some(inverse)))
+        }
     }
 }

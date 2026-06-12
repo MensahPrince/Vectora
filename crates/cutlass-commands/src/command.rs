@@ -6,8 +6,8 @@
 use std::path::PathBuf;
 
 use cutlass_models::{
-    ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, MarkerColor, MarkerId, MediaId,
-    ParamValue, Rational, RationalTime, TimeRange, TrackId, TrackKind,
+    CanvasAspect, ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, MarkerColor,
+    MarkerId, MediaId, ParamValue, Rational, RationalTime, TimeRange, TrackId, TrackKind,
 };
 
 /// A project-level action (media pool, not timeline placement).
@@ -195,6 +195,13 @@ pub enum EditCommand {
         name: String,
         color: MarkerColor,
     },
+    /// Set the project canvas (M1 canvas settings): aspect-ratio preset +
+    /// opaque background color, in one shot (callers resolve "keep current"
+    /// before dispatch). The inverse restores the previous settings.
+    SetCanvas {
+        aspect: CanvasAspect,
+        background: [u8; 3],
+    },
 }
 
 /// Top-level command surface: media registration or a timeline edit.
@@ -220,4 +227,6 @@ pub enum EditOutcome {
     CreatedMarker(MarkerId),
     UpdatedMarker(MarkerId),
     RemovedMarker(MarkerId),
+    /// The project canvas settings changed (M1 canvas settings).
+    UpdatedCanvas,
 }

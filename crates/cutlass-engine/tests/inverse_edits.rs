@@ -6,7 +6,7 @@ use common::{image_asset, import_asset, rt, small_video_asset, temp_engine, tr};
 use cutlass_commands::{Command, EditCommand, EditOutcome};
 use cutlass_engine::ApplyOutcome;
 use cutlass_models::{
-    ClipParam, ClipTransform, CropRect, Easing, Generator, ParamValue, TrackKind,
+    CanvasAspect, ClipParam, ClipTransform, CropRect, Easing, Generator, ParamValue, TrackKind,
 };
 
 fn created(outcome: ApplyOutcome) -> cutlass_models::ClipId {
@@ -775,6 +775,43 @@ fn set_clip_crop_undo_redo_roundtrip() {
     assert!(engine.redo());
     assert_eq!(clip(&engine).crop, crop);
     assert!(clip(&engine).flip_h);
+}
+
+#[test]
+fn set_canvas_undo_redo_roundtrip() {
+    let (_dir, mut engine) = temp_engine();
+    assert!(engine.project().timeline().canvas().is_default());
+
+    let outcome = engine
+        .apply(Command::Edit(EditCommand::SetCanvas {
+            aspect: CanvasAspect::Tall9x16,
+            background: [12, 34, 56],
+        }))
+        .expect("set canvas");
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Edited(EditOutcome::UpdatedCanvas)
+    ));
+    let canvas = |engine: &cutlass_engine::Engine| engine.project().timeline().canvas();
+    assert_eq!(canvas(&engine).aspect, CanvasAspect::Tall9x16);
+    assert_eq!(canvas(&engine).background, [12, 34, 56]);
+    // The composite canvas reshapes immediately (empty project: 1080 tier).
+    assert_eq!(
+        cutlass_engine::composite_canvas_size(engine.project()),
+        (1080, 1920)
+    );
+
+    // One undo restores both fields.
+    assert!(engine.undo());
+    assert!(canvas(&engine).is_default());
+    assert_eq!(
+        cutlass_engine::composite_canvas_size(engine.project()),
+        (1920, 1080)
+    );
+
+    assert!(engine.redo());
+    assert_eq!(canvas(&engine).aspect, CanvasAspect::Tall9x16);
+    assert_eq!(canvas(&engine).background, [12, 34, 56]);
 }
 
 #[test]
