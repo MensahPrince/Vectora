@@ -70,6 +70,121 @@ const CATALOG: &[EffectSpec] = &[
             max: 1.0,
         }],
     },
+    EffectSpec {
+        id: "sharpen",
+        label: "Sharpen",
+        params: &[EffectParamSpec {
+            name: "amount",
+            label: "Amount",
+            default: 0.5,
+            min: 0.0,
+            max: 3.0,
+        }],
+    },
+    EffectSpec {
+        id: "pixelate",
+        label: "Pixelate",
+        params: &[EffectParamSpec {
+            name: "size",
+            label: "Cell Size",
+            default: 8.0,
+            min: 1.0,
+            max: 256.0,
+        }],
+    },
+    EffectSpec {
+        id: "glitch",
+        label: "Glitch",
+        params: &[
+            EffectParamSpec {
+                name: "amount",
+                label: "Amount",
+                default: 0.5,
+                min: 0.0,
+                max: 1.0,
+            },
+            EffectParamSpec {
+                name: "seed",
+                label: "Seed",
+                default: 0.0,
+                min: 0.0,
+                max: 1000.0,
+            },
+        ],
+    },
+    EffectSpec {
+        id: "chromatic_aberration",
+        label: "Chromatic Aberration",
+        params: &[EffectParamSpec {
+            name: "amount",
+            label: "Amount",
+            default: 0.4,
+            min: 0.0,
+            max: 1.0,
+        }],
+    },
+    EffectSpec {
+        id: "grain",
+        label: "Film Grain",
+        params: &[
+            EffectParamSpec {
+                name: "amount",
+                label: "Amount",
+                default: 0.3,
+                min: 0.0,
+                max: 1.0,
+            },
+            EffectParamSpec {
+                name: "seed",
+                label: "Seed",
+                default: 0.0,
+                min: 0.0,
+                max: 1000.0,
+            },
+        ],
+    },
+    EffectSpec {
+        id: "glow",
+        label: "Glow",
+        params: &[
+            EffectParamSpec {
+                name: "threshold",
+                label: "Threshold",
+                default: 0.7,
+                min: 0.0,
+                max: 1.0,
+            },
+            EffectParamSpec {
+                name: "intensity",
+                label: "Intensity",
+                default: 0.8,
+                min: 0.0,
+                max: 4.0,
+            },
+        ],
+    },
+    EffectSpec {
+        id: "zoom_blur",
+        label: "Zoom Blur",
+        params: &[EffectParamSpec {
+            name: "amount",
+            label: "Amount",
+            default: 0.5,
+            min: 0.0,
+            max: 1.0,
+        }],
+    },
+    EffectSpec {
+        id: "mirror",
+        label: "Mirror",
+        params: &[EffectParamSpec {
+            name: "mode",
+            label: "Mode",
+            default: 0.0,
+            min: 0.0,
+            max: 3.0,
+        }],
+    },
 ];
 
 /// Every effect the model knows about (validation + UI browsing).

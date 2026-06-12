@@ -38,9 +38,17 @@ struct EffectBlueprint {
 
 const BLUR_FS: &str = include_str!("../shaders/effect_blur.wgsl");
 const VIGNETTE_FS: &str = include_str!("../shaders/effect_vignette.wgsl");
+const SHARPEN_FS: &str = include_str!("../shaders/effect_sharpen.wgsl");
+const PIXELATE_FS: &str = include_str!("../shaders/effect_pixelate.wgsl");
+const GLITCH_FS: &str = include_str!("../shaders/effect_glitch.wgsl");
+const CHROMATIC_FS: &str = include_str!("../shaders/effect_chromatic.wgsl");
+const GRAIN_FS: &str = include_str!("../shaders/effect_grain.wgsl");
+const GLOW_FS: &str = include_str!("../shaders/effect_glow.wgsl");
+const ZOOM_BLUR_FS: &str = include_str!("../shaders/effect_zoom_blur.wgsl");
+const MIRROR_FS: &str = include_str!("../shaders/effect_mirror.wgsl");
 
-/// The starter pack. Phase 3 of M4 extends this list; each addition lands
-/// with a golden frame and a bench.
+/// The starter pack (M4). Ids and parameter names/order are drift-checked
+/// against the `cutlass-models` catalog from the engine.
 const BLUEPRINTS: &[EffectBlueprint] = &[
     EffectBlueprint {
         id: "gaussian_blur",
@@ -51,6 +59,46 @@ const BLUEPRINTS: &[EffectBlueprint] = &[
         id: "vignette",
         params: &["amount"],
         passes: &[VIGNETTE_FS],
+    },
+    EffectBlueprint {
+        id: "sharpen",
+        params: &["amount"],
+        passes: &[SHARPEN_FS],
+    },
+    EffectBlueprint {
+        id: "pixelate",
+        params: &["size"],
+        passes: &[PIXELATE_FS],
+    },
+    EffectBlueprint {
+        id: "glitch",
+        params: &["amount", "seed"],
+        passes: &[GLITCH_FS],
+    },
+    EffectBlueprint {
+        id: "chromatic_aberration",
+        params: &["amount"],
+        passes: &[CHROMATIC_FS],
+    },
+    EffectBlueprint {
+        id: "grain",
+        params: &["amount", "seed"],
+        passes: &[GRAIN_FS],
+    },
+    EffectBlueprint {
+        id: "glow",
+        params: &["threshold", "intensity"],
+        passes: &[GLOW_FS, GLOW_FS],
+    },
+    EffectBlueprint {
+        id: "zoom_blur",
+        params: &["amount"],
+        passes: &[ZOOM_BLUR_FS],
+    },
+    EffectBlueprint {
+        id: "mirror",
+        params: &["mode"],
+        passes: &[MIRROR_FS],
     },
 ];
 
