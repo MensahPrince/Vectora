@@ -4,6 +4,13 @@
 
 ### Fixed
 
+- **Preview no longer freezes keyframed motion after a drag.** Releasing a
+  transform gesture (or an inspector slider) could race the preview worker's
+  message coalescing: the commit was processed mid-drain and the stale
+  gesture override re-applied after it, pinning the clip at the release
+  transform on every later frame — animation only showed up in the exported
+  file. The coalescing loops now preserve queue order, so a commit or clear
+  is never followed by a stale override.
 - **Animated clips no longer shake.** Moving a keyframed layer (e.g. a
   title gliding across the canvas) shimmered in preview and export: the
   layer was translated by sub-pixel amounts every frame through the

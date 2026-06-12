@@ -1049,6 +1049,14 @@ fn worker_loop(
                 mut transform,
                 mut tick,
             } => {
+                // Queue order must hold against drained mutations: the
+                // release's SetTransform often lands right behind the last
+                // pointer-move, and it commits + clears the override. Apply
+                // the coalesced override *before* such a mutation and never
+                // after it, or the stale gesture override outlives the commit
+                // and pins the clip's transform on every later frame
+                // (keyframed animation freezes in preview until re-cleared).
+                let mut pending = true;
                 while let Ok(next) = req_rx.try_recv() {
                     match next {
                         WorkerMsg::Frame(latest) => tick = latest,
@@ -1060,14 +1068,20 @@ fn worker_loop(
                             clip = c;
                             transform = t;
                             tick = at;
+                            pending = true;
                         }
                         other => {
+                            if std::mem::take(&mut pending) {
+                                apply_transform_override(engine, &clip, transform);
+                            }
                             mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
                         }
                     }
                 }
                 last_tick = tick;
-                apply_transform_override(engine, &clip, transform);
+                if pending {
+                    apply_transform_override(engine, &clip, transform);
+                }
                 render_frame(engine, tl_rate, &preview_weak, tick);
             }
             // Live inspector edits (font-size drag) arrive at pointer-move
@@ -1077,6 +1091,10 @@ fn worker_loop(
                 mut generator,
                 mut tick,
             } => {
+                // Same ordering rule as TransformOverride above: a drained
+                // mutation (the release's SetGenerator / ClearGeneratorOverride)
+                // must not be followed by a re-apply of the override it ended.
+                let mut pending = true;
                 while let Ok(next) = req_rx.try_recv() {
                     match next {
                         WorkerMsg::Frame(latest) => tick = latest,
@@ -1088,14 +1106,20 @@ fn worker_loop(
                             clip = c;
                             generator = g;
                             tick = at;
+                            pending = true;
                         }
                         other => {
+                            if std::mem::take(&mut pending) {
+                                apply_generator_override(engine, &clip, generator.clone());
+                            }
                             mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
                         }
                     }
                 }
                 last_tick = tick;
-                apply_generator_override(engine, &clip, generator);
+                if pending {
+                    apply_generator_override(engine, &clip, generator);
+                }
                 render_frame(engine, tl_rate, &preview_weak, tick);
             }
             other => {
