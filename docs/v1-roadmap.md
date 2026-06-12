@@ -167,7 +167,7 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 | Keyframes (position/scale/rotation/opacity/volume/effects) | ✅ transform + opacity (volume/effects ride M1/M4 fields) | **M2** — the keystone |
 | Speed: constant, reverse | ✅ (audio mutes until M8 varispeed) | M1 |
 | Speed: curves / velocity ramps | ❌ | M2 (rides keyframes) |
-| Crop / flip / non-uniform scale | ❌ | M1 |
+| Crop / flip / non-uniform scale | ✅ crop + flip H/V (non-uniform scale open) | M1 |
 | Image (stills) import | ✅ (PNG/JPEG/WebP) | — |
 | Compound clips / nested timelines | ❌ | post-v1 |
 | Multi-cam | ❌ | non-goal for v1 |
@@ -398,8 +398,16 @@ Goal: the everyday CapCut edit vocabulary, minus animation.
       video-lane targets to the linked audio companion). Constant volume
       now; envelopes ride M8. Fade = first-class fields like CapCut, not
       keyframe sugar.
-- [ ] **Crop** (normalized rect on `ClipTransform`) + **flip H/V** —
-      compositor samples the sub-rect; preview gets crop handles mode.
+- [x] **Crop** + **flip H/V** — *shipped*: `CropRect` (normalized
+      kept-region x/y/w/h, optional serde field) + `flip_h`/`flip_v` on
+      clips; `SetClipCrop` command with full-clip-restore inverse; the
+      compositor samples a UV sub-rect per layer (u0>u1 / v0>v1 encodes
+      mirroring, so flips are free); the kept region re-fits the canvas
+      centered (CapCut reframe); splits inherit crop+flips; inspector
+      Crop section (per-edge inset % rows + Flip H/V chips), crop-aware
+      preview hit-test/selection box; `set_clip_crop` agent tool
+      (inset-based, schema v6). Deliberate gap: no draggable crop-handles
+      mode in the preview yet — numeric insets only.
 - [ ] **Canvas settings**: project resolution/aspect presets (16:9, 9:16,
       1:1, 4:5, 21:9), background color per project; "fit/fill" clip
       helpers.

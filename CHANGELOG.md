@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Crop & flip (M1)
+
+- Clips can be **cropped** (trim a fraction off each edge; the kept region
+  re-fits the canvas centered, CapCut-style) and **mirrored** horizontally
+  / vertically. Works on any visual clip — video, image, text, shapes.
+- Inspector grows a Crop section: per-edge inset rows (slider + numeric
+  entry, double-click to reset) and Flip H / Flip V chips; the preview's
+  hit-test and selection box follow the cropped region.
+- One undoable edit per change (`SetClipCrop`); splitting a cropped clip
+  keeps the framing on both halves.
+- The AI agent can crop too: `set_clip_crop` tool (tool schema v6) —
+  "crop 25% off both sides and mirror it" works, with omitted edges left
+  unchanged.
+- Rendering is free: the compositor samples a per-layer UV sub-rect, and
+  reversed UVs encode the flips — no extra passes, preview and export
+  share the path.
+- Deliberate gap: no draggable crop-handles mode in the preview yet —
+  numeric insets only.
+
 ## [alpha-0.2.0] — 2026-06-12
 
 The first **AI alpha**: prompt-to-edit ships. This release also lands the

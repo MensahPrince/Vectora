@@ -19,6 +19,7 @@ This is an early-stage project. The headless editing core is real and tested, a 
 - **Multi-lane timeline editing**: snap, main-track magnet, linked A/V, trim (ripple trim on the magnet lane included), split, ripple-delete, multi-select, group drag/copy/duplicate, link/unlink, undo/redo — with filmstrips, waveforms, ruler markers, and speed/volume badges on clips.
 - **Clip speed**: any constant rate (0.05×–100×) plus reverse, honored by preview, export, trim, and split. Audio on retimed clips is muted until varispeed lands.
 - **Clip audio**: volume + fade in/out per clip, with sample-accurate ramps in both playback and export.
+- **Crop + flip**: trim a fraction off any edge of a visual clip (the kept region re-fits the canvas, CapCut-style) and mirror H/V — inspector controls, agent tool, and free at render time (UV sub-rect sampling in the compositor).
 - **Keyframes** on clip transforms (position / scale / rotation / opacity) with easing curves; CapCut-style diamond UI in the inspector and draggable keyframe markers on timeline clips. Preview and export sample the same curves.
 - **Styled titles**: text clips with font, size, color, stroke, shadow, background, spacing, case, and alignment controls.
 - **Live GPU preview** (WGPU compositor) with real-time playback, audio sync, JKL transport, fullscreen mode, and on-canvas move/scale/rotate gestures.
@@ -28,7 +29,7 @@ This is an early-stage project. The headless editing core is real and tested, a 
 
 **Not shipped yet**
 
-- Crop / flip, canvas and aspect presets, speed curves.
+- Canvas and aspect presets, speed curves, draggable crop handles in the preview.
 - The look stack: effects, transitions, filters, color correction / LUTs, masks, chroma key, blend modes.
 - The audio suite: volume envelopes, ducking, noise reduction, varispeed.
 - AI media tools: auto captions, transcript-based editing, silence removal, TTS, background removal.
