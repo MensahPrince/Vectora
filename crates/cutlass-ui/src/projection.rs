@@ -28,10 +28,6 @@ use crate::{
     TimeRange, TimelineMarker, Track, TrackKind,
 };
 
-/// Fallback canvas size when no video media has been imported yet. Mirrors the
-/// engine's `composite_canvas_size` default so preview aspect ratio is stable.
-const DEFAULT_CANVAS_W: f32 = 1920.0;
-const DEFAULT_CANVAS_H: f32 = 1080.0;
 
 /// Project the engine's project state into the Slint view model.
 ///
@@ -51,6 +47,7 @@ pub fn project_to_slint(
 ) -> Project {
     let timeline = project.timeline();
     let (width, height) = canvas_size(project);
+    let canvas = timeline.canvas();
 
     // The engine stacks bottom→top (last track composites in front); the lane
     // list shows the stack top-first so the top lane is the front layer, like
@@ -87,6 +84,12 @@ pub fn project_to_slint(
                     .iter()
                     .map(marker_to_slint)
                     .collect::<Vec<_>>(),
+            ),
+            aspect_index: aspect_to_index(canvas.aspect),
+            background: Color::from_rgb_u8(
+                canvas.background[0],
+                canvas.background[1],
+                canvas.background[2],
             ),
         },
         media: model(pool),
@@ -522,37 +525,23 @@ fn align_v_to_int(align: TextAlignV) -> i32 {
     }
 }
 
-/// Largest video-media resolution in the project, or the default canvas.
-/// Mirrors `cutlass_engine`'s `composite_canvas_size`.
+/// The engine's composite canvas size, as Slint lengths. Delegating to
+/// `composite_canvas_size` (rather than mirroring it, as this module used
+/// to) keeps preview hit-test geometry pixel-identical to the composited
+/// frame by construction — including the M1 aspect presets. It also fixes a
+/// drift the old mirror had: it let still images vote on the canvas size,
+/// the engine never did.
 fn canvas_size(project: &EngineProject) -> (f32, f32) {
-    let mut max_w = 0u32;
-    let mut max_h = 0u32;
-
-    for track in project.timeline().tracks_ordered() {
-        if track.kind != EngineKind::Video {
-            continue;
-        }
-        for clip in track.clips() {
-            if let Some(media_id) = clip.media()
-                && let Some(media) = project.media(media_id)
-            {
-                max_w = max_w.max(media.width);
-                max_h = max_h.max(media.height);
-            }
-        }
-    }
-
-    if max_w == 0 || max_h == 0 {
-        (DEFAULT_CANVAS_W, DEFAULT_CANVAS_H)
-    } else {
-        // Mirror the engine's even-rounding (H.264 requirement) so preview
-        // hit-test geometry matches the composited frame exactly.
-        (to_even(max_w) as f32, to_even(max_h) as f32)
-    }
+    let (w, h) = cutlass_engine::composite_canvas_size(project);
+    (w as f32, h as f32)
 }
 
-fn to_even(v: u32) -> u32 {
-    if v.is_multiple_of(2) { v } else { v + 1 }
+/// `CanvasAspect` as the preset index the canvas dialog's ratio list uses.
+fn aspect_to_index(aspect: cutlass_models::CanvasAspect) -> i32 {
+    cutlass_models::CanvasAspect::ALL
+        .iter()
+        .position(|a| *a == aspect)
+        .map_or(0, |i| i as i32)
 }
 
 /// Lane kinds the UI surfaces today. Effect / filter / adjustment lanes are

@@ -166,6 +166,13 @@ export component TitleBar inherits Rectangle {
                             EditorStore.on-save-requested(true);
                         }
                     }
+                    MenuSeparator { }
+                    MenuItem {
+                        title: "Canvas Settings…";
+                        activated => {
+                            AppState.canvas-dialog-open = true;
+                        }
+                    }
                 }
 
                 file-button := SubtleButton {

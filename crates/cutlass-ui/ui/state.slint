@@ -13,6 +13,10 @@ export global AppState {
     // Export settings dialog (modal overlay; see shell/export-dialog.slint).
     in-out property <bool> export-dialog-open: false;
 
+    // Canvas settings dialog (M1: ratio preset + background; see
+    // shell/canvas-dialog.slint).
+    in-out property <bool> canvas-dialog-open: false;
+
     // Missing-media relink dialog (modal overlay; see
     // shell/relink-dialog.slint). Raised by app.slint when a freshly
     // opened/restored session has pool entries whose file is gone;

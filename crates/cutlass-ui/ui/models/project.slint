@@ -272,6 +272,10 @@ export struct Sequence {
     markers: [TimelineMarker],
     width: length,
     height: length,
+    // Canvas settings (M1): preset index in `CanvasAspect::ALL` order
+    // (0 = auto / match footage) and the opaque canvas background.
+    aspect-index: int,
+    background: color,
 }
 
 // An imported source in the project's media pool (the Library bin). This is the

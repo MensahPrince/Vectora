@@ -345,6 +345,8 @@ mod tests {
             markers: Default::default(),
             width: 1920.0,
             height: 1080.0,
+            aspect_index: 0,
+            background: Default::default(),
         }
     }
 

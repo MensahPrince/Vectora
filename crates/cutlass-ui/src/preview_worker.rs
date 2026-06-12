@@ -125,6 +125,13 @@ enum WorkerMsg {
         flip_h: bool,
         flip_v: bool,
     },
+    /// Set the project canvas (M1 canvas settings): preset index in
+    /// `CanvasAspect::ALL` order plus the opaque background color. One
+    /// undoable history entry.
+    SetCanvas {
+        aspect_index: i32,
+        background: [u8; 3],
+    },
     /// Live drag override (preview roadmap Phase 3): render `tick` with
     /// `clip`'s transform replaced — session state on the engine, no history
     /// entry, no projection republish. Bursts coalesce to the newest value
@@ -504,6 +511,13 @@ impl WorkerHandle {
         });
     }
 
+    pub fn set_canvas(&self, aspect_index: i32, background: [u8; 3]) {
+        let _ = self.tx.send(WorkerMsg::SetCanvas {
+            aspect_index,
+            background,
+        });
+    }
+
     pub fn transform_override(&self, clip: String, transform: ClipTransform, tick: i64) {
         let _ = self.tx.send(WorkerMsg::TransformOverride {
             clip,
@@ -868,6 +882,10 @@ fn worker_loop(
                 flip_h,
                 flip_v,
             } => set_clip_crop_and_publish(engine, &clip, crop, flip_h, flip_v, &ui),
+            WorkerMsg::SetCanvas {
+                aspect_index,
+                background,
+            } => set_canvas_and_publish(engine, aspect_index, background, &ui),
             WorkerMsg::ClearTransformOverride { tick } => {
                 engine.set_transform_override(None);
                 render_frame(engine, tl_rate, &preview_weak, tick);
@@ -1154,6 +1172,8 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::SetGenerator { .. }
             | WorkerMsg::SetClipSpeed { .. }
             | WorkerMsg::SetClipCrop { .. }
+            // Aspect reshapes the composite, background recolors it.
+            | WorkerMsg::SetCanvas { .. }
             | WorkerMsg::SetParamKeyframe { .. }
             | WorkerMsg::RemoveParamKeyframe { .. }
             | WorkerMsg::RetimeKeyframes { .. }
@@ -2089,6 +2109,23 @@ fn set_clip_audio_and_publish(
     engine.commit_group();
     info!(%clip_id, volume, fade_in_s, fade_out_s, clips = targets.len(), "set clip audio");
     publish_projection(engine, ui);
+}
+
+/// Set the project canvas settings (M1): aspect preset + background color
+/// in one undoable history entry. An out-of-range preset index falls back
+/// to auto (defensive — the dialog's list is index-aligned with the model).
+fn set_canvas_and_publish(engine: &mut Engine, aspect_index: i32, background: [u8; 3], ui: &UiSink) {
+    let aspect = usize::try_from(aspect_index)
+        .ok()
+        .and_then(|i| cutlass_models::CanvasAspect::ALL.get(i).copied())
+        .unwrap_or_default();
+    match engine.apply(Command::Edit(EditCommand::SetCanvas { aspect, background })) {
+        Ok(_) => {
+            info!(aspect = aspect.name(), ?background, "set canvas settings");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!("set canvas failed: {e}"),
+    }
 }
 
 /// Set a visual clip's crop window + mirroring (CapCut crop, M1). One

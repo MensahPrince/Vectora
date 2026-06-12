@@ -824,6 +824,17 @@ fn main() -> Result<(), slint::PlatformError> {
         export_cancel_handle.cancel_export();
     });
 
+    // --- canvas settings (title bar → dialog → engine thread) ------------
+
+    let set_canvas_handle = preview_worker.handle();
+    app.global::<CanvasBackend>()
+        .on_set_canvas(move |aspect_index, background| {
+            set_canvas_handle.set_canvas(
+                aspect_index,
+                [background.red(), background.green(), background.blue()],
+            );
+        });
+
     let timeline = app.global::<TimelineLib>();
     timeline.on_sequence_duration(timeline::sequence_duration);
     timeline.on_format_timecode(|frame, fps_num, fps_den, drop_frame| {
