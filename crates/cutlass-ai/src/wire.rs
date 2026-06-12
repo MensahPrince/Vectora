@@ -26,7 +26,8 @@ use serde::{Deserialize, Serialize};
 /// 7: subschemas inlined (no `$defs`/`$ref`) + `generator` field examples,
 ///    so small local models stop guessing nested argument shapes.
 /// 8: M1 canvas settings (`set_canvas`).
-pub const TOOL_SCHEMA_VERSION: u32 = 8;
+/// 9: M4 effects (`add_effect`, `remove_effect`, `set_effect_param`).
+pub const TOOL_SCHEMA_VERSION: u32 = 9;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -186,6 +187,40 @@ pub struct SetClipCrop {
     /// Mirror the content top-bottom. Omit to keep the current state.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flip_v: Option<bool>,
+}
+
+/// Add a visual effect to the end of a clip's effect chain. Effects run on
+/// the placed layer before it composites, in chain order. Use
+/// `describe_project` to see a clip's current effects and their indices.
+/// Rejected for clips on audio tracks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AddEffect {
+    pub clip: u64,
+    /// Effect id from the catalog, e.g. `gaussian_blur` or `vignette`.
+    pub effect: String,
+}
+
+/// Remove an effect from a clip's chain by its position (0 = the first
+/// effect). See `describe_project` for the current chain order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoveEffect {
+    pub clip: u64,
+    /// Index of the effect in the clip's chain (0 = first).
+    pub index: u32,
+}
+
+/// Set one parameter of an effect already on a clip to a fixed value. The
+/// value is range-checked against the catalog. Use `set_param_keyframe`
+/// with an effect param to animate it instead.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetEffectParam {
+    pub clip: u64,
+    /// Index of the effect in the clip's chain (0 = first).
+    pub index: u32,
+    /// Parameter name, e.g. `radius` (gaussian_blur) or `amount` (vignette).
+    pub param: String,
+    /// New value (clamped to the parameter's catalog range).
+    pub value: f64,
 }
 
 /// An animatable clip property the keyframe commands can address.
@@ -525,6 +560,9 @@ pub enum WireCommand {
     SetGenerator(SetGenerator),
     SetClipTransform(SetClipTransform),
     SetClipCrop(SetClipCrop),
+    AddEffect(AddEffect),
+    RemoveEffect(RemoveEffect),
+    SetEffectParam(SetEffectParam),
     SetParamKeyframe(SetParamKeyframe),
     RemoveParamKeyframe(RemoveParamKeyframe),
     SetParamConstant(SetParamConstant),
@@ -585,6 +623,9 @@ impl WireCommand {
             WireCommand::SetGenerator(a) => clip(&mut a.clip),
             WireCommand::SetClipTransform(a) => clip(&mut a.clip),
             WireCommand::SetClipCrop(a) => clip(&mut a.clip),
+            WireCommand::AddEffect(a) => clip(&mut a.clip),
+            WireCommand::RemoveEffect(a) => clip(&mut a.clip),
+            WireCommand::SetEffectParam(a) => clip(&mut a.clip),
             WireCommand::SetParamKeyframe(a) => clip(&mut a.clip),
             WireCommand::RemoveParamKeyframe(a) => clip(&mut a.clip),
             WireCommand::SetParamConstant(a) => clip(&mut a.clip),
@@ -725,6 +766,12 @@ tools! {
         "Change a clip's placement on the canvas: position, scale, rotation, opacity. Omitted fields keep their current value. Not valid on audio tracks.";
     "set_clip_crop" => SetClipCrop(SetClipCrop),
         "Crop a clip to a sub-region of its frame (fractions trimmed off each edge; 0 restores an edge) and/or mirror it with flip_h / flip_v. Omitted fields keep their current value. Not valid on audio tracks.";
+    "add_effect" => AddEffect(AddEffect),
+        "Add a visual effect to a clip's effect chain. Available effects: gaussian_blur (param 'radius'), vignette (param 'amount'). Effects render on the placed layer, in chain order. Not valid on audio tracks.";
+    "remove_effect" => RemoveEffect(RemoveEffect),
+        "Remove an effect from a clip's chain by its index (0 = first). See describe_project for a clip's current effects.";
+    "set_effect_param" => SetEffectParam(SetEffectParam),
+        "Set a parameter of an effect on a clip to a value (e.g. gaussian_blur 'radius', vignette 'amount'). Use describe_project to see effect indices and current params.";
     "set_param_keyframe" => SetParamKeyframe(SetParamKeyframe),
         "Add or replace a keyframe on a clip property (position, scale, rotation, opacity) at a timeline position in seconds, animating it over time. Use 'value' for scalar params, 'position' for position.";
     "remove_param_keyframe" => RemoveParamKeyframe(RemoveParamKeyframe),
@@ -922,7 +969,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 27);
+        assert_eq!(specs.len(), 30);
         for spec in &specs {
             assert!(!spec.description.is_empty(), "{} missing description", spec.name);
             assert_eq!(

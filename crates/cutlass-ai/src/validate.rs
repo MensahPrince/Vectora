@@ -169,6 +169,67 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 flip_v: args.flip_v.unwrap_or(clip.flip_v),
             }
         }
+        WireCommand::AddEffect(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            reject_audio_lane(project, clip, "effects need a visual frame", args.clip)?;
+            if cutlass_models::effect_spec(&args.effect).is_none() {
+                return Err(Rejection::new(format!(
+                    "unknown effect '{}'; available effects: {}",
+                    args.effect,
+                    effect_ids()
+                )));
+            }
+            EditCommand::AddEffect {
+                clip: clip.id,
+                effect_id: args.effect.clone(),
+            }
+        }
+        WireCommand::RemoveEffect(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            let index = effect_index(clip, args.index, args.clip)?;
+            EditCommand::RemoveEffect {
+                clip: clip.id,
+                index,
+            }
+        }
+        WireCommand::SetEffectParam(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            let index = effect_index(clip, args.index, args.clip)?;
+            let instance = &clip.effects[index];
+            let spec = cutlass_models::effect_spec(&instance.effect_id).ok_or_else(|| {
+                Rejection::new(format!(
+                    "effect '{}' on clip {} is not in the catalog",
+                    instance.effect_id, args.clip
+                ))
+            })?;
+            let slot = spec
+                .params
+                .iter()
+                .position(|p| p.name == args.param)
+                .ok_or_else(|| {
+                    let names: Vec<&str> = spec.params.iter().map(|p| p.name).collect();
+                    Rejection::new(format!(
+                        "effect '{}' has no parameter '{}'; parameters: {}",
+                        instance.effect_id,
+                        args.param,
+                        names.join(", ")
+                    ))
+                })?;
+            let p = &spec.params[slot];
+            let v = args.value;
+            if !v.is_finite() || v < f64::from(p.min) || v > f64::from(p.max) {
+                return Err(Rejection::new(format!(
+                    "{} must be between {} and {} (got {})",
+                    args.param, p.min, p.max, v
+                )));
+            }
+            EditCommand::SetEffectParam {
+                clip: clip.id,
+                index,
+                param: slot,
+                value: v as f32,
+            }
+        }
         WireCommand::SetParamKeyframe(args) => {
             let clip = clip_ref(project, args.clip)?;
             let at = keyframe_position(project, clip, args.at)?;
@@ -484,6 +545,48 @@ fn clip_ref(project: &Project, raw: u64) -> Result<&Clip, Rejection> {
             list_ids(existing)
         ))
     })
+}
+
+/// Comma-separated catalog effect ids, for rejection messages.
+fn effect_ids() -> String {
+    cutlass_models::effect_catalog()
+        .iter()
+        .map(|s| s.id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Resolve a wire effect-chain index against a clip, rejecting out-of-range
+/// indices with the clip's current chain length.
+fn effect_index(clip: &Clip, index: u32, raw_clip: u64) -> Result<usize, Rejection> {
+    let index = index as usize;
+    if index >= clip.effects.len() {
+        return Err(Rejection::new(format!(
+            "clip {raw_clip} has no effect at index {index} ({} on the chain)",
+            clip.effects.len()
+        )));
+    }
+    Ok(index)
+}
+
+/// Reject clips on an audio lane, which have no frame to operate on.
+fn reject_audio_lane(
+    project: &Project,
+    clip: &Clip,
+    why: &str,
+    raw_clip: u64,
+) -> Result<(), Rejection> {
+    let timeline = project.timeline();
+    let on_audio = timeline
+        .track_of(clip.id)
+        .and_then(|id| timeline.track(id))
+        .is_some_and(|t| t.kind == TrackKind::Audio);
+    if on_audio {
+        return Err(Rejection::new(format!(
+            "clip {raw_clip} is on an audio lane; {why}"
+        )));
+    }
+    Ok(())
 }
 
 fn track_ref(project: &Project, raw: u64) -> Result<&cutlass_models::Track, Rejection> {

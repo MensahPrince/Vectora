@@ -123,6 +123,19 @@ pub struct ClipSummary {
     /// Mirrored top-bottom (set_clip_crop); absent when not flipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flip_v: Option<bool>,
+    /// Visual effects in chain order (add_effect); the index of each entry
+    /// is what remove_effect / set_effect_param address. Absent when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effects: Vec<EffectSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EffectSummary {
+    /// Catalog id, e.g. "gaussian_blur".
+    pub effect: String,
+    /// Current parameter values, sampled at the clip start, by name.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub params: std::collections::BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -269,6 +282,25 @@ pub fn summarize(project: &Project) -> ProjectSummary {
                     }),
                     flip_h: clip.flip_h.then_some(true),
                     flip_v: clip.flip_v.then_some(true),
+                    effects: clip
+                        .effects
+                        .iter()
+                        .map(|fx| EffectSummary {
+                            effect: fx.effect_id.clone(),
+                            params: fx
+                                .spec()
+                                .map(|spec| {
+                                    spec.params
+                                        .iter()
+                                        .filter_map(|p| {
+                                            fx.sample_param(p.name, 0.0)
+                                                .map(|v| (p.name.to_string(), f64::from(v)))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        })
+                        .collect(),
                 })
                 .collect(),
         })

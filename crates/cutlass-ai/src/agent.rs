@@ -458,6 +458,13 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             }
             format!("set clip {} {}", a.clip, parts.join(", "))
         }
+        WireCommand::AddEffect(a) => format!("added {} effect to clip {}", a.effect, a.clip),
+        WireCommand::RemoveEffect(a) => {
+            format!("removed effect {} from clip {}", a.index, a.clip)
+        }
+        WireCommand::SetEffectParam(a) => {
+            format!("set clip {} effect {} {} = {}", a.clip, a.index, a.param, a.value)
+        }
         WireCommand::SplitClip(a) => format!("split clip {} at {}", a.clip, secs(a.at)),
         WireCommand::TrimClip(a) => format!(
             "trimmed clip {} to {}–{}",

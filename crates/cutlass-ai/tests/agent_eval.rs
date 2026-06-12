@@ -881,6 +881,70 @@ fn crop_to_center_and_mirror_clip() {
 }
 
 #[test]
+fn add_a_blur_to_the_clip() {
+    let (mut host, _, _, clip) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![
+            (
+                "call_1",
+                "add_effect",
+                serde_json::json!({ "clip": clip, "effect": "gaussian_blur" }),
+            ),
+            (
+                "call_2",
+                "set_effect_param",
+                serde_json::json!({ "clip": clip, "index": 0, "param": "radius", "value": 6.0 }),
+            ),
+        ]),
+        text_turn("Added a gaussian blur and set its radius to 6."),
+    ]);
+
+    let context = EditorContext {
+        selected_clips: vec![clip],
+        ..Default::default()
+    };
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &context,
+        "add a blur to the clip",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 2);
+    assert_eq!(
+        outcome.actions[0].description,
+        format!("added gaussian_blur effect to clip {clip}")
+    );
+
+    // The effect landed and surfaces in the summary the next prompt sees,
+    // with the index the model would address.
+    let placed = host
+        .engine
+        .project()
+        .clip(cutlass_models::ClipId::from_raw(clip))
+        .unwrap();
+    assert_eq!(placed.effects.len(), 1);
+    assert_eq!(placed.effects[0].effect_id, "gaussian_blur");
+    let summary = summarize(host.engine.project());
+    let described = &summary.tracks[0].clips[0];
+    assert_eq!(described.effects.len(), 1);
+    assert_eq!(described.effects[0].effect, "gaussian_blur");
+    assert_eq!(described.effects[0].params.get("radius"), Some(&6.0));
+
+    // One prompt = one undo: the whole effect disappears as a unit.
+    assert!(host.engine.undo());
+    let restored = host
+        .engine
+        .project()
+        .clip(cutlass_models::ClipId::from_raw(clip))
+        .unwrap();
+    assert!(restored.effects.is_empty());
+    assert!(!host.engine.undo());
+}
+
+#[test]
 fn add_marker_at_playhead() {
     let (mut host, _, _, _) = fixture();
     let provider = ScriptedProvider::new(vec![

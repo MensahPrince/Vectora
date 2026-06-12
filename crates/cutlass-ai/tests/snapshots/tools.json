@@ -451,6 +451,96 @@
       }
     },
     {
+      "description": "Add a visual effect to a clip's effect chain. Available effects: gaussian_blur (param 'radius'), vignette (param 'amount'). Effects render on the placed layer, in chain order. Not valid on audio tracks.",
+      "name": "add_effect",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Add a visual effect to the end of a clip's effect chain. Effects run on\nthe placed layer before it composites, in chain order. Use\n`describe_project` to see a clip's current effects and their indices.\nRejected for clips on audio tracks.",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "effect": {
+            "description": "Effect id from the catalog, e.g. `gaussian_blur` or `vignette`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clip",
+          "effect"
+        ],
+        "title": "AddEffect",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Remove an effect from a clip's chain by its index (0 = first). See describe_project for a clip's current effects.",
+      "name": "remove_effect",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Remove an effect from a clip's chain by its position (0 = the first\neffect). See `describe_project` for the current chain order.",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "index": {
+            "description": "Index of the effect in the clip's chain (0 = first).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clip",
+          "index"
+        ],
+        "title": "RemoveEffect",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Set a parameter of an effect on a clip to a value (e.g. gaussian_blur 'radius', vignette 'amount'). Use describe_project to see effect indices and current params.",
+      "name": "set_effect_param",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Set one parameter of an effect already on a clip to a fixed value. The\nvalue is range-checked against the catalog. Use `set_param_keyframe`\nwith an effect param to animate it instead.",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "index": {
+            "description": "Index of the effect in the clip's chain (0 = first).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "param": {
+            "description": "Parameter name, e.g. `radius` (gaussian_blur) or `amount` (vignette).",
+            "type": "string"
+          },
+          "value": {
+            "description": "New value (clamped to the parameter's catalog range).",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "clip",
+          "index",
+          "param",
+          "value"
+        ],
+        "title": "SetEffectParam",
+        "type": "object"
+      }
+    },
+    {
       "description": "Add or replace a keyframe on a clip property (position, scale, rotation, opacity) at a timeline position in seconds, animating it over time. Use 'value' for scalar params, 'position' for position.",
       "name": "set_param_keyframe",
       "parameters": {
@@ -1246,5 +1336,5 @@
       }
     }
   ],
-  "version": 8
+  "version": 9
 }
