@@ -502,11 +502,18 @@ impl AnimatedTransform {
     /// The transform value at a clip-relative `tick` — the per-frame hot
     /// path (pure, allocation-free).
     pub fn sample(&self, tick: i64) -> ClipTransform {
+        self.sample_at(tick as f64)
+    }
+
+    /// [`sample`](Self::sample) at a fractional clip-relative tick:
+    /// sub-frame animation sampling for export at rates above the timeline
+    /// rate (see [`Param::sample_at`]).
+    pub fn sample_at(&self, tick: f64) -> ClipTransform {
         ClipTransform {
-            position: self.position.sample(tick),
-            scale: self.scale.sample(tick),
-            rotation: self.rotation.sample(tick),
-            opacity: self.opacity.sample(tick),
+            position: self.position.sample_at(tick),
+            scale: self.scale.sample_at(tick),
+            rotation: self.rotation.sample_at(tick),
+            opacity: self.opacity.sample_at(tick),
         }
     }
 
@@ -887,6 +894,15 @@ impl Clip {
     pub fn animation_tick(&self, timeline_tick: i64) -> i64 {
         let offset = timeline_tick - self.timeline.start.value;
         offset.clamp(0, (self.timeline.duration.value - 1).max(0))
+    }
+
+    /// [`animation_tick`](Self::animation_tick) for a fractional timeline
+    /// position — sub-frame export sampling. Clamps into the same
+    /// `[0, duration - 1]` range, so the last frame's value holds through
+    /// any trailing output frames.
+    pub fn animation_tick_f(&self, timeline_tick: f64) -> f64 {
+        let offset = timeline_tick - self.timeline.start.value as f64;
+        offset.clamp(0.0, (self.timeline.duration.value - 1).max(0) as f64)
     }
 
     /// Timeline start position.
@@ -1577,6 +1593,11 @@ mod tests {
         assert_eq!(clip.animation_tick(149), 49);
         assert_eq!(clip.animation_tick(90), 0);
         assert_eq!(clip.animation_tick(500), 49);
+        // The fractional variant keeps sub-frame offsets and clamps the
+        // same way.
+        assert!((clip.animation_tick_f(125.4) - 25.4).abs() < 1e-9);
+        assert_eq!(clip.animation_tick_f(99.5), 0.0);
+        assert_eq!(clip.animation_tick_f(149.6), 49.0);
     }
 
     // --- text style ---------------------------------------------------------

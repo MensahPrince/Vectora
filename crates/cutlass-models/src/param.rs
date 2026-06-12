@@ -189,27 +189,37 @@ impl<T: Lerp> Param<T> {
     ///
     /// Hot path: pure, allocation-free, O(log k).
     pub fn sample(&self, tick: i64) -> T {
+        self.sample_at(tick as f64)
+    }
+
+    /// [`sample`](Self::sample) at a fractional clip-relative tick. Curves
+    /// are continuous in time between keyframes, so they can be evaluated
+    /// between timeline frames — what export uses when the output rate
+    /// exceeds the timeline rate (a 60 fps export of a 24 fps timeline
+    /// samples animation at the exact output frame times instead of
+    /// repeating the 24 fps values in an uneven 3-2 cadence).
+    pub fn sample_at(&self, tick: f64) -> T {
         match self {
             Param::Constant(value) => *value,
             Param::Keyframed { keyframes } => {
                 // Invariant: non-empty (mutators preserve it; deserialization
                 // is checked through `validate_shape`).
                 let first = &keyframes[0];
-                if tick <= first.tick {
+                if tick <= first.tick as f64 {
                     return first.value;
                 }
                 let last = &keyframes[keyframes.len() - 1];
-                if tick >= last.tick {
+                if tick >= last.tick as f64 {
                     return last.value;
                 }
                 // Index of the first keyframe with kf.tick > tick; the
                 // segment is [idx-1, idx]. Bounds hold: first.tick < tick <
                 // last.tick.
-                let idx = keyframes.partition_point(|kf| kf.tick <= tick);
+                let idx = keyframes.partition_point(|kf| (kf.tick as f64) <= tick);
                 let k0 = &keyframes[idx - 1];
                 let k1 = &keyframes[idx];
-                let span = (k1.tick - k0.tick) as f32;
-                let t = (tick - k0.tick) as f32 / span;
+                let span = (k1.tick - k0.tick) as f64;
+                let t = ((tick - k0.tick as f64) / span) as f32;
                 T::lerp(k0.value, k1.value, k0.easing.apply(t))
             }
         }
@@ -374,6 +384,20 @@ mod tests {
         assert_eq!(p.sample(5), 50.0);
         assert_eq!(p.sample(10), 100.0);
         assert_eq!(p.sample(20), 50.0);
+    }
+
+    #[test]
+    fn fractional_sampling_interpolates_between_ticks() {
+        let p = Param::Keyframed { keyframes: vec![kf(0, 0.0), kf(10, 10.0)] };
+        // Whole ticks agree with the integer path.
+        assert_eq!(p.sample_at(5.0), p.sample(5));
+        // Sub-tick positions land between frame values.
+        assert_eq!(p.sample_at(5.5), 5.5);
+        assert_eq!(p.sample_at(0.25), 0.25);
+        // Clamping matches the integer path on both sides.
+        assert_eq!(p.sample_at(-3.7), 0.0);
+        assert_eq!(p.sample_at(10.4), 10.0);
+        assert_eq!(Param::Constant(2.5f32).sample_at(1.5), 2.5);
     }
 
     #[test]
