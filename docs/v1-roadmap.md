@@ -212,7 +212,7 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 
 | CapCut feature | Cutlass today | v1 plan |
 | --- | --- | --- |
-| **Prompt-to-edit agent** (our identity; CapCut has no real equivalent) | ❌ | **M3** foundation, grows every milestone |
+| **Prompt-to-edit agent** (our identity; CapCut has no real equivalent) | ✅ (M3 foundation: chat panel, sandbox + atomic replay, dry-run preview, one undo per prompt) | vocabulary grows every milestone |
 | Auto captions + translation | ❌ | M9 (whisper local; cloud later) |
 | Transcript-based editing (edit video by editing text) | ❌ | M9 — flagship |
 | AutoCut / silence removal | ❌ | M9 (energy-based, local) |
@@ -398,35 +398,41 @@ Goal: the reason Cutlass exists. Ships early because the command layer is
 ready today, then grows its vocabulary with each later milestone for free.
 Detailed plan: `ai-agent-roadmap.md`.
 
-- [ ] **`cutlass-ai` crate**: `ChatProvider` trait (chat + tool-calling,
+- [x] **`cutlass-ai` crate**: `ChatProvider` trait (chat + tool-calling,
       streaming); first providers: **local** (Ollama / llama.cpp-server
       HTTP, OpenAI-compatible) and a **generic OpenAI-compatible remote**
       (covers OpenAI/compatible gateways day one — "cloud providers
       later" is then config, not code). Keys/config in
       `~/.cutlass/config.toml`; never in project files.
-- [ ] **Tool schema from the command layer**: derive JSON Schema for
-      every `EditCommand`/`ProjectCommand` (serde-derived, versioned with
-      the crate). A `describe_project()` tool gives the model a compact
-      timeline summary (tracks, clips, ids, times, media metadata).
-- [ ] **Agent loop**: prompt → provider tool-calls → validate → dispatch
-      on the worker thread inside **one history group per prompt** with
-      `rollback_group` on failure — an AI edit is exactly as safe and as
-      undoable as a drag.
-- [ ] **Chat panel in `cutlass-ui`**: prompt box + transcript; streamed
+- [x] **Tool schema from the command layer**: JSON Schema for every
+      command in the vocabulary, versioned with the crate — landed as a
+      dedicated wire layer (LLM-shaped DTOs; edit commands only) rather
+      than serde derives on `cutlass-commands`; see `ai-agent-roadmap.md`
+      Phase 1 for the rationale. A `describe_project()` tool gives the
+      model a compact timeline summary (tracks, clips, ids, times,
+      media metadata).
+- [x] **Agent loop**: prompt → provider tool-calls → validate → dispatch
+      inside **one history group per prompt** with `rollback_group` on
+      failure — an AI edit is exactly as safe and as undoable as a drag.
+      (Landed as sandbox-rehearse-then-atomic-replay; see
+      `ai-agent-roadmap.md` Phase 4.)
+- [x] **Chat panel in `cutlass-ui`**: prompt box + transcript; streamed
       plan/status; each applied edit rendered as a human-readable action
       list ("split clip at 00:12, deleted 3 clips, added text 'INTRO'");
       one-click undo per prompt.
-- [ ] **Read-only Q&A**: "how long is the timeline?", "which clips have
+- [x] **Read-only Q&A**: "how long is the timeline?", "which clips have
       no audio?" — `describe_project` answers without mutating.
-- [ ] **Guardrails**: command whitelist (no `Open`/`Save`/`Export`
-      without explicit user confirmation), max-commands-per-prompt cap,
+- [x] **Guardrails**: command whitelist (no `Open`/`Save`/`Export` in
+      the vocabulary at all for M3), max-commands-per-prompt cap,
       dry-run mode that previews the action list before applying.
-- [ ] **Eval harness**: scripted prompt → expected-timeline tests against
+- [x] **Eval harness**: scripted prompt → expected-timeline tests against
       a stub provider, so agent regressions are caught in CI without a
       live model.
 
 Exit: "cut the first 3 seconds, add a title that says INTRO, speed up the
 middle clip 2x" works against a local model — undoable, auditable.
+*(Shipped minus the speed change: clip speed isn't an engine command yet —
+it joins the vocabulary via the Phase 5 checklist when M2 lands it.)*
 
 ### M4 — Effect engine & transitions
 

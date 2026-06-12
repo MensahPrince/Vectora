@@ -306,22 +306,34 @@ Exit: "cut the first 3 seconds and add a title that says INTRO" works
 end-to-end against local Ollama — watched live, listed as actions,
 undone with one click. The M3 exit criterion, shipped.
 
-## Phase 5 — Read-only Q&A + vocabulary growth policy
+## Phase 5 — Read-only Q&A + vocabulary growth policy ✅ (stretch deferred)
 
-- [ ] **Q&A without mutation**: "how long is the timeline?", "which
+- [x] **Q&A without mutation**: "how long is the timeline?", "which
       clips have no audio?" — the model answers from `describe_project`
-      and finishes without tool calls; the loop already supports it,
-      this item is prompt-tuning + transcript rendering for
-      answer-only turns (no empty action list).
-- [ ] **Vocabulary growth checklist**, documented in `cutlass-ai`:
+      and finishes without tool calls. Shipped as prompt-tuning plus
+      eval coverage: the system prompt now teaches that the pushed
+      state is a fresh send-time snapshot — answer questions directly
+      from it (no redundant `describe_project` round-trip, which
+      matters on slow local models), name clips/tracks by id so
+      answers are checkable, and admit when the state can't answer
+      rather than guess. Eval cases lock it in: "which clips have no
+      audio?" answered in **one turn** from the pushed summary
+      (`has_audio` reaches the prompt), and an answer-only turn under
+      dry-run yields zero actions — so the preview card and the
+      "Applied N edits" line never render for a question (the Phase 4
+      empty-plan guard, now contract-tested).
+- [x] **Vocabulary growth checklist**, documented in `cutlass-ai`:
       every new `EditCommand` lands with (1) wire DTO + validation,
       (2) schema snapshot update, (3) action-log line, (4) one eval
       case. M2's keyframe commands and M4's effect commands join this
-      way — the "grows for free" promise made enforceable.
+      way — the "grows for free" promise made enforceable. Lives as
+      the "Growing the vocabulary" section of the crate docs
+      (`cutlass-ai/src/lib.rs`), next to the code it governs.
 - [ ] **Guarded project commands (stretch)**: `Import` behind an
       explicit per-prompt user confirmation card — the first crack in
       the edit-only wall, deliberately after the trust model is proven.
-      `Open`/`Save`/`Export` stay human-only through v1.
+      `Open`/`Save`/`Export` stay human-only through v1. *Deferred
+      past M3 on purpose: let the alpha prove the trust model first.*
 
 ---
 

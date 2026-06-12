@@ -23,6 +23,33 @@
 //! mutates a project; output is validated commands for the caller to apply
 //! through normal dispatch (one history group per prompt, rollback on
 //! abort).
+//!
+//! # Growing the vocabulary (the checklist)
+//!
+//! The tool schema is closed and versioned; engine commands join the
+//! agent's vocabulary deliberately, never by accident. Every new
+//! `EditCommand` lands with **all four** of:
+//!
+//! 1. **Wire DTO + validation** — a serde DTO in [`wire`] shaped for LLM
+//!    ergonomics (times as fractional seconds, ids as plain integers,
+//!    enums as lowercase strings) and a lowering arm in [`validate`] with
+//!    a model-readable rejection for every way the call can be wrong.
+//! 2. **Schema snapshot update** — re-bless `tests/snapshots/tools.json`
+//!    (`BLESS_TOOL_SCHEMA=1 cargo test -p cutlass-ai`) and bump
+//!    [`TOOL_SCHEMA_VERSION`] when the surface changes shape, so the
+//!    prompt-visible schema only ever changes as a reviewed diff.
+//! 3. **Action-log line** — a [`agent::describe_action`] arm rendering
+//!    the command in editor language ("split clip 7 at 12.40s"); it is
+//!    the transcript entry, the undo tooltip, and the eval assertion
+//!    format, all at once.
+//! 4. **One eval case** — a scripted-provider test in
+//!    `tests/agent_eval.rs` driving the new command through the full
+//!    loop against a real engine, asserting the final timeline, the
+//!    action log, and single-undo behavior.
+//!
+//! This is how M2's keyframe commands and M4's effect commands join:
+//! "the vocabulary grows for free" is this checklist, enforced in
+//! review. A command missing any step is not in the vocabulary.
 
 pub mod agent;
 pub mod config;

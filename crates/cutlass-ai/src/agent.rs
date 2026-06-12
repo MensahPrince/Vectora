@@ -112,8 +112,13 @@ pub fn system_prompt(summary: &ProjectSummary, context: &EditorContext) -> Strin
          track; solids and shapes need a sticker track.\n\
          - If a tool call is rejected, read the error and correct course; \
          do not repeat the identical call.\n\
-         - When the user asks a question, answer in text from the project \
-         state without editing anything.\n\
+         - The state below is a fresh snapshot from the moment the user \
+         sent this prompt. When the user asks a question, answer in text \
+         directly from it — make no edits, and do not call \
+         describe_project first (it would return the same state). Name \
+         clips and tracks by id and content so the answer is checkable. \
+         If the state cannot answer the question, say what is missing \
+         instead of guessing.\n\
          \n\
          Current state (the user's selection and playhead are in \
          'editor'):\n{state}"
@@ -458,5 +463,7 @@ mod tests {
         assert!(prompt.contains("\"selected_clips\":[12]"));
         assert!(prompt.contains("INCREASE start"));
         assert!(prompt.contains("\"name\":\"demo\""));
+        // The Q&A rule: answer from the pushed state, no tool calls.
+        assert!(prompt.contains("answer in text directly from it"));
     }
 }

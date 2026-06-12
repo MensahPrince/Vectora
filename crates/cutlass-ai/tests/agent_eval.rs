@@ -321,6 +321,102 @@ fn questions_answer_without_editing() {
 }
 
 #[test]
+fn which_clips_have_no_audio_answers_from_pushed_state() {
+    // Two sources, one silent. The summary pushed into the system prompt
+    // must already carry the facts ("which clips have no audio?" is the
+    // roadmap's canonical Q&A example) so the model answers in one turn,
+    // no tool calls.
+    let mut project = Project::new("eval-audio", R24);
+    let talk = project.add_media(MediaSource::new(
+        "/tmp/talk.mp4",
+        1920,
+        1080,
+        R24,
+        60 * 24,
+        true,
+    ));
+    let broll = project.add_media(MediaSource::new(
+        "/tmp/broll.mp4",
+        1920,
+        1080,
+        R24,
+        60 * 24,
+        false,
+    ));
+    let track = project.add_track(TrackKind::Video, "V1");
+    project
+        .add_clip(track, talk, TimeRange::at_rate(0, 120, R24), RationalTime::new(0, R24))
+        .unwrap();
+    let silent_clip = project
+        .add_clip(
+            track,
+            broll,
+            TimeRange::at_rate(0, 120, R24),
+            RationalTime::new(120, R24),
+        )
+        .unwrap()
+        .raw();
+    let mut host = EngineHost::new(project);
+
+    let provider = ScriptedProvider::new(vec![text_turn(&format!(
+        "Only clip {silent_clip} (broll.mp4, 5.00s–10.00s) has no audio."
+    ))]);
+
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "which clips have no audio?",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert!(outcome.actions.is_empty());
+    assert!(outcome.text.contains("broll.mp4"));
+    assert!(!host.engine.undo(), "answering records no history");
+
+    // One provider turn was enough, and the pushed state held the facts
+    // plus the rule that says to answer from it.
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1, "answered without tool calls");
+    match &requests[0][0] {
+        Message::System { content } => {
+            assert!(content.contains("\"has_audio\":false"), "{content}");
+            assert!(content.contains("broll.mp4"), "{content}");
+            assert!(content.contains("answer in text directly from it"));
+        }
+        other => panic!("expected system message, got {other:?}"),
+    }
+}
+
+#[test]
+fn answer_only_turn_in_dry_run_yields_no_plan() {
+    // With the preview toggle on, the UI shows an Apply/Discard card only
+    // for a non-empty plan; a question must come back as zero actions so
+    // no empty card (and no "Applied 0 edits") ever renders.
+    let (mut host, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![text_turn("The timeline runs 10.00s.")]);
+
+    let config = AgentConfig {
+        dry_run: true,
+        ..Default::default()
+    };
+    let (outcome, events) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "how long is the timeline?",
+        &config,
+    );
+
+    assert_eq!(outcome.status, PromptStatus::DryRun);
+    assert!(outcome.actions.is_empty());
+    assert_eq!(outcome.text, "The timeline runs 10.00s.");
+    assert!(events.iter().all(|e| matches!(e, AgentEvent::TextDelta(_))));
+    assert!(!host.engine.undo(), "dry-run Q&A records no history");
+}
+
+#[test]
 fn describe_project_feeds_state_back_without_counting_as_an_edit() {
     let (mut host, _, _, _) = fixture();
     let provider = ScriptedProvider::new(vec![
