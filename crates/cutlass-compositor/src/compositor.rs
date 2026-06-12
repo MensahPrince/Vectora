@@ -7,7 +7,7 @@ use crate::effects::EffectRegistry;
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
 use crate::image::RgbaImage;
-use crate::layer::{CompositeLayer, CompositorConfig, LayerContent, LayerPlacement};
+use crate::layer::{CompositeLayer, CompositorConfig, LayerContent, LayerEffect, LayerPlacement};
 use crate::yuv::{Yuv420pImage, Yuv420pLayer};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -413,9 +413,24 @@ impl Compositor {
         let mut first = true;
         let mut i = 0;
         while i < layers.len() {
-            if layers[i].effects.is_empty() {
+            let layer = &layers[i];
+            if matches!(layer.content, LayerContent::Adjustment) {
+                // An adjustment filters everything below it. Ensure there is a
+                // cleared canvas to work on even when it is the first layer.
+                if first {
+                    self.clear_target(encoder, config);
+                    first = false;
+                }
+                if !layer.effects.is_empty() {
+                    self.apply_adjustment(encoder, gpu, config, layer);
+                }
+                i += 1;
+            } else if layer.effects.is_empty() {
                 let start = i;
-                while i < layers.len() && layers[i].effects.is_empty() {
+                while i < layers.len()
+                    && layers[i].effects.is_empty()
+                    && !matches!(layers[i].content, LayerContent::Adjustment)
+                {
                     i += 1;
                 }
                 self.draw_plain_run(encoder, gpu, config, &layers[start..i], first);
@@ -619,6 +634,9 @@ impl Compositor {
                 pass.set_bind_group(0, &bind, &[]);
                 pass.draw(0..6, 0..1);
             }
+            // Adjustment layers carry no pixels; they are handled out of band
+            // in render_layers_into and never reach a plain run.
+            LayerContent::Adjustment => {}
         }
     }
 
@@ -655,9 +673,91 @@ impl Compositor {
             self.encode_layer(&mut pass, gpu, config, layer, 1.0);
         }
 
-        // 2. Effect chain. `input` is the texture the next pass samples; it
-        // ping-pongs orig → a → b → a … while `orig` stays available to
-        // combine-style passes.
+        // 2. Run the effect chain over the placed scratch.
+        let input = self.run_effect_chain(encoder, gpu, config, &layer.effects, scratch);
+
+        // 3. Composite the finished scratch onto the target with the layer
+        // opacity (premultiplied src-over).
+        self.composite_view_to_target(encoder, gpu, config, input, layer.placement.opacity, first);
+    }
+
+    /// Apply an adjustment layer: filter the accumulated canvas through the
+    /// layer's effect chain and write it back (CapCut adjustment-layer
+    /// semantics). The canvas below is copied into `scratch.orig`, run through
+    /// the chain, then composited back over itself — at opacity 1 the adjusted
+    /// result fully replaces the canvas; below 1 it blends for a partial
+    /// strength. Called only with a non-empty chain and after the target has
+    /// been cleared, so there is always content below to adjust.
+    fn apply_adjustment(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+        layer: &CompositeLayer,
+    ) {
+        let scratch = self.scratch.as_ref().expect("scratch initialized");
+
+        // 1. Snapshot the accumulated canvas into scratch.orig (premultiplied
+        // copy over a transparent clear).
+        let target = self.target.as_ref().expect("target initialized");
+        let full = LayerPlacement::full_canvas(config);
+        let placement = placement_uniforms(config, &full, crate::layer::FULL_UV);
+        let buffer = uniform_buffer(gpu, "adjustment_copy", &placement);
+        let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("adjustment_copy_bind"),
+            layout: &self.blit_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&target.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: buffer.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("adjustment_copy_pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scratch.orig,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.composite_pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..6, 0..1);
+        }
+
+        // 2. Run the chain, then 3. composite the result back over the canvas.
+        let input = self.run_effect_chain(encoder, gpu, config, &layer.effects, scratch);
+        self.composite_view_to_target(encoder, gpu, config, input, layer.placement.opacity, false);
+    }
+
+    /// Run an effect chain starting from `scratch.orig`, ping-ponging through
+    /// `scratch.a`/`scratch.b`; returns the view holding the final result
+    /// (`scratch.orig` if the chain contributed no pass). `scratch.orig` stays
+    /// bound as `orig_tex` for combine-style passes (e.g. glow).
+    fn run_effect_chain<'s>(
+        &'s self,
+        encoder: &mut wgpu::CommandEncoder,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+        effects: &[LayerEffect],
+        scratch: &'s ScratchTargets,
+    ) -> &'s wgpu::TextureView {
         let resolution = [
             config.width as f32,
             config.height as f32,
@@ -666,7 +766,7 @@ impl Compositor {
         ];
         let mut input = &scratch.orig;
         let mut use_a = true;
-        for fx in &layer.effects {
+        for fx in effects {
             let Some(passes) = self.effects.passes(&fx.effect_id) else {
                 continue;
             };
@@ -724,12 +824,23 @@ impl Compositor {
                 use_a = !use_a;
             }
         }
+        input
+    }
 
-        // 3. Composite the finished scratch onto the target with the layer
-        // opacity (premultiplied src-over).
+    /// Composite a full-canvas scratch view onto the target with `opacity`
+    /// (premultiplied src-over). Clears to the background when `first`.
+    fn composite_view_to_target(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+        input: &wgpu::TextureView,
+        opacity: f32,
+        first: bool,
+    ) {
         let target = self.target.as_ref().expect("target initialized");
         let mut full = LayerPlacement::full_canvas(config);
-        full.opacity = layer.placement.opacity;
+        full.opacity = opacity;
         let placement = placement_uniforms(config, &full, crate::layer::FULL_UV);
         let buffer = uniform_buffer(gpu, "composite_placement", &placement);
         let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -998,7 +1109,7 @@ fn validate_layers(
                 }
             }
             LayerContent::Yuv420p(yuv) => validate_yuv_layer(yuv)?,
-            LayerContent::Solid { .. } => {}
+            LayerContent::Solid { .. } | LayerContent::Adjustment => {}
         }
     }
     Ok(())

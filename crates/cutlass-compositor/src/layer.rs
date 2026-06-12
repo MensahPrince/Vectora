@@ -138,6 +138,24 @@ impl CompositeLayer {
         }
     }
 
+    /// An adjustment layer: its `effects` chain applies to the accumulated
+    /// canvas below it (CapCut semantics), not to any content of its own. The
+    /// placement opacity scales how strongly the adjusted result replaces the
+    /// canvas. With an empty chain it is a no-op.
+    pub fn adjustment(effects: Vec<LayerEffect>, opacity: f32) -> Self {
+        Self {
+            content: LayerContent::Adjustment,
+            placement: LayerPlacement {
+                center: [0.0, 0.0],
+                size: [0.0, 0.0],
+                rotation: 0.0,
+                opacity,
+            },
+            uv: FULL_UV,
+            effects,
+        }
+    }
+
     /// Replace the sampled UV rect (crop / mirror).
     pub fn with_uv(mut self, uv: [f32; 4]) -> Self {
         self.uv = uv;
@@ -166,4 +184,7 @@ pub enum LayerContent {
     },
     /// Solid fill (RGBA 0–255) across the placed quad.
     Solid { rgba: [u8; 4] },
+    /// An adjustment marker: no pixels of its own. The compositor applies the
+    /// layer's effect chain to the accumulated canvas below it.
+    Adjustment,
 }
