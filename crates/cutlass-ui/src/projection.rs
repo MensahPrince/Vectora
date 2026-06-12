@@ -544,16 +544,13 @@ fn aspect_to_index(aspect: cutlass_models::CanvasAspect) -> i32 {
         .map_or(0, |i| i as i32)
 }
 
-/// Lane kinds the UI surfaces today. Effect / filter / adjustment lanes are
-/// phantom until their engines land (v1 roadmap M0 "hide phantom kinds",
-/// M4/M5): the model keeps them — they round-trip through save/load
-/// untouched and composite nothing — but the projection skips them so users
-/// never see lanes that do nothing.
+/// Lane kinds the UI surfaces today. Effect / filter lanes are still phantom
+/// until their engines land (v1 roadmap M0 "hide phantom kinds", M5): the
+/// model keeps them — they round-trip through save/load untouched and
+/// composite nothing — but the projection skips them so users never see lanes
+/// that do nothing. Adjustment lanes became real in M4 and are now shown.
 fn kind_visible(kind: EngineKind) -> bool {
-    !matches!(
-        kind,
-        EngineKind::Effect | EngineKind::Filter | EngineKind::Adjustment
-    )
+    !matches!(kind, EngineKind::Effect | EngineKind::Filter)
 }
 
 fn track_kind(kind: EngineKind) -> TrackKind {
@@ -695,12 +692,13 @@ mod tests {
 
         let projected = project_to_slint(&project, &HashMap::new(), &HashSet::new());
         let tracks = &projected.sequence.tracks;
-        // Top-first: the sticker lane (real) above the video lane; the
-        // effect / filter / adjustment lanes stay model-only (M0 "hide
-        // phantom kinds").
-        assert_eq!(tracks.row_count(), 2);
+        // Top-first: sticker, then the now-real adjustment lane (M4), then
+        // video; the effect / filter lanes stay model-only (M0 "hide phantom
+        // kinds", their engines land in M5).
+        assert_eq!(tracks.row_count(), 3);
         assert_eq!(tracks.row_data(0).unwrap().kind, TrackKind::Sticker);
-        assert_eq!(tracks.row_data(1).unwrap().kind, TrackKind::Video);
+        assert_eq!(tracks.row_data(1).unwrap().kind, TrackKind::Adjustment);
+        assert_eq!(tracks.row_data(2).unwrap().kind, TrackKind::Video);
     }
 
     #[test]
