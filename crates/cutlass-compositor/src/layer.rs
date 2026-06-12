@@ -44,12 +44,20 @@ impl LayerPlacement {
     }
 }
 
+/// Content UV rect covering the whole texture (no crop, no mirroring).
+pub const FULL_UV: [f32; 4] = [0.0, 0.0, 1.0, 1.0];
+
 /// One layer in bottom-to-top stacking order: pixel content plus where it
 /// lands on the canvas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompositeLayer {
     pub content: LayerContent,
     pub placement: LayerPlacement,
+    /// Content UV rect `[u0, v0, u1, v1]` sampled across the placed quad:
+    /// `(u0, v0)` lands on the quad's top-left corner, `(u1, v1)` on the
+    /// bottom-right. A sub-rect crops; a reversed axis (`u0 > u1` or
+    /// `v0 > v1`) mirrors. Ignored by solid fills.
+    pub uv: [f32; 4],
 }
 
 impl CompositeLayer {
@@ -57,6 +65,7 @@ impl CompositeLayer {
         Self {
             content: LayerContent::Yuv420p(layer),
             placement,
+            uv: FULL_UV,
         }
     }
 
@@ -68,6 +77,7 @@ impl CompositeLayer {
                 height,
             },
             placement,
+            uv: FULL_UV,
         }
     }
 
@@ -75,7 +85,14 @@ impl CompositeLayer {
         Self {
             content: LayerContent::Solid { rgba },
             placement,
+            uv: FULL_UV,
         }
+    }
+
+    /// Replace the sampled UV rect (crop / mirror).
+    pub fn with_uv(mut self, uv: [f32; 4]) -> Self {
+        self.uv = uv;
+        self
     }
 }
 

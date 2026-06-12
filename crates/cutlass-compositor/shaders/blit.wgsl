@@ -20,6 +20,9 @@ struct Placement {
     linear: vec4<f32>,
     // Clip-space translation (x, y), layer opacity, pad.
     trans_opacity: vec4<f32>,
+    // Content UV rect (u0, v0, u1, v1) interpolated across the quad:
+    // sub-rects crop, reversed axes mirror (flip H/V).
+    uv_rect: vec4<f32>,
 }
 
 @group(0) @binding(0) var layer_tex: texture_2d<f32>;
@@ -51,7 +54,7 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
         0.0,
         1.0,
     );
-    out.uv = c + vec2(0.5, 0.5);
+    out.uv = mix(placement.uv_rect.xy, placement.uv_rect.zw, c + vec2(0.5, 0.5));
     return out;
 }
 

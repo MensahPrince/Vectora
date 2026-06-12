@@ -19,7 +19,7 @@ pub use compositor::Compositor;
 pub use error::CompositorError;
 pub use gpu::GpuContext;
 pub use image::RgbaImage;
-pub use layer::{CompositeLayer, CompositorConfig, LayerContent, LayerPlacement};
+pub use layer::{CompositeLayer, CompositorConfig, FULL_UV, LayerContent, LayerPlacement};
 pub use yuv::{Yuv420pImage, Yuv420pLayer, legacy_rgba_to_yuv420p};
 
 use tracing::info;

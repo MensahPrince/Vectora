@@ -5,7 +5,9 @@ mod common;
 use common::{image_asset, import_asset, rt, small_video_asset, temp_engine, tr};
 use cutlass_commands::{Command, EditCommand, EditOutcome};
 use cutlass_engine::ApplyOutcome;
-use cutlass_models::{ClipParam, ClipTransform, Easing, Generator, ParamValue, TrackKind};
+use cutlass_models::{
+    ClipParam, ClipTransform, CropRect, Easing, Generator, ParamValue, TrackKind,
+};
 
 fn created(outcome: ApplyOutcome) -> cutlass_models::ClipId {
     match outcome {
@@ -740,6 +742,91 @@ fn set_clip_audio_rejects_generated_clips_and_long_fades() {
     );
     // The rejection left the clip untouched.
     assert_eq!(engine.project().clip(clip_id).unwrap(), &before);
+}
+
+#[test]
+fn set_clip_crop_undo_redo_roundtrip() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+    let crop = CropRect {
+        x: 0.25,
+        y: 0.1,
+        w: 0.5,
+        h: 0.8,
+    };
+
+    engine
+        .apply(Command::Edit(EditCommand::SetClipCrop {
+            clip: clip_id,
+            crop,
+            flip_h: true,
+            flip_v: false,
+        }))
+        .expect("set crop");
+    let clip = |engine: &cutlass_engine::Engine| engine.project().clip(clip_id).unwrap().clone();
+    assert_eq!(clip(&engine).crop, crop);
+    assert!(clip(&engine).flip_h && !clip(&engine).flip_v);
+
+    // One undo restores the full frame and both flips.
+    assert!(engine.undo());
+    let restored = clip(&engine);
+    assert!(!restored.has_custom_crop());
+
+    assert!(engine.redo());
+    assert_eq!(clip(&engine).crop, crop);
+    assert!(clip(&engine).flip_h);
+}
+
+#[test]
+fn set_clip_crop_rejects_invalid_rects_and_audio_lanes() {
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = common::add_track(&mut engine, TrackKind::Audio, "A1");
+    let audio_clip = created(
+        engine
+            .apply(Command::Edit(EditCommand::AddClip {
+                track,
+                media: media_id,
+                source: tr(0, 48),
+                start: rt(0),
+            }))
+            .expect("add"),
+    );
+
+    // Audio lanes have no frame to crop.
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetClipCrop {
+                clip: audio_clip,
+                crop: CropRect::FULL,
+                flip_h: true,
+                flip_v: false,
+            }))
+            .is_err()
+    );
+
+    // Out-of-frame rects bounce without touching the clip.
+    let text = text_clip(&mut engine);
+    let before = engine.project().clip(text).unwrap().clone();
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetClipCrop {
+                clip: text,
+                crop: CropRect {
+                    x: 0.8,
+                    y: 0.0,
+                    w: 0.5,
+                    h: 1.0
+                },
+                flip_h: false,
+                flip_v: false,
+            }))
+            .is_err()
+    );
+    assert_eq!(engine.project().clip(text).unwrap(), &before);
 }
 
 #[test]

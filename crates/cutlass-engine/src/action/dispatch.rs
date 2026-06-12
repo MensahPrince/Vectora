@@ -119,6 +119,15 @@ fn dispatch_edit(
             let inverse = edit::set_speed::set_speed(ctx, clip, speed, reversed)?;
             Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
         }
+        EditCommand::SetClipCrop {
+            clip,
+            crop,
+            flip_h,
+            flip_v,
+        } => {
+            let inverse = edit::set_crop::set_crop(ctx, clip, crop, flip_h, flip_v)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+        }
         EditCommand::SetClipAudio {
             clip,
             volume,

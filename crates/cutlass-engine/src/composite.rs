@@ -6,7 +6,7 @@ use cutlass_cache::{FrameCache, SourceFingerprint};
 use cutlass_compositor::{CompositeLayer, CompositorConfig, LayerPlacement};
 use cutlass_decoder::DecodedFrame;
 use cutlass_models::{
-    Clip, ClipId, ClipTransform, Generator, ModelError, Project, RationalTime, TrackKind,
+    Clip, ClipId, ClipTransform, CropRect, Generator, ModelError, Project, RationalTime, TrackKind,
 };
 use tracing::debug;
 
@@ -63,8 +63,23 @@ pub fn layer_placement(
     content_h: u32,
     canvas: &CompositorConfig,
 ) -> LayerPlacement {
+    cropped_layer_placement(transform, content_w, content_h, &CropRect::FULL, canvas)
+}
+
+/// [`layer_placement`] for cropped content (CapCut crop, M1): the kept
+/// region is the content — it aspect-fits the canvas at scale 1.0 and
+/// transforms exactly like a full frame of that shape would. Preview
+/// hit-testing applies the same crop, so the selection box hugs the kept
+/// pixels.
+pub fn cropped_layer_placement(
+    transform: &ClipTransform,
+    content_w: u32,
+    content_h: u32,
+    crop: &CropRect,
+    canvas: &CompositorConfig,
+) -> LayerPlacement {
     let (cw, ch) = (canvas.width as f32, canvas.height as f32);
-    let (w, h) = (content_w as f32, content_h as f32);
+    let (w, h) = (content_w as f32 * crop.w, content_h as f32 * crop.h);
     let fit = if w > 0.0 && h > 0.0 {
         (cw / w).min(ch / h)
     } else {
@@ -80,6 +95,20 @@ pub fn layer_placement(
         rotation: transform.rotation.to_radians(),
         opacity: transform.opacity.clamp(0.0, 1.0),
     }
+}
+
+/// The compositor UV rect sampling a clip's kept region: the crop window,
+/// with a flipped axis encoded as a reversed UV span.
+pub fn content_uv(crop: &CropRect, flip_h: bool, flip_v: bool) -> [f32; 4] {
+    let (mut u0, mut u1) = (crop.x, crop.x + crop.w);
+    let (mut v0, mut v1) = (crop.y, crop.y + crop.h);
+    if flip_h {
+        std::mem::swap(&mut u0, &mut u1);
+    }
+    if flip_v {
+        std::mem::swap(&mut v0, &mut v1);
+    }
+    [u0, v0, u1, v1]
 }
 
 /// Resolve enabled video layers at `time`, bottom to top.
@@ -125,6 +154,10 @@ pub fn resolve_layers(
             _ => clip.transform.sample(clip.animation_tick(time.value)),
         };
         let transform = &transform;
+        // Framing (M1): the kept region shapes the placement, the UV rect
+        // samples it (flips reverse the sampled axis).
+        let crop = &clip.crop;
+        let uv = content_uv(crop, clip.flip_h, clip.flip_v);
         match &clip.content {
             cutlass_models::ClipSource::Media { .. } => {
                 // Still images bypass the decode/cache pipeline entirely:
@@ -135,8 +168,11 @@ pub fn resolve_layers(
                     && media.is_image
                 {
                     let (bytes, width, height) = pool.still(media_id, media.path())?;
-                    let placement = layer_placement(transform, width, height, canvas);
-                    layers.push(CompositeLayer::rgba(bytes, width, height, placement));
+                    let placement =
+                        cropped_layer_placement(transform, width, height, crop, canvas);
+                    layers.push(
+                        CompositeLayer::rgba(bytes, width, height, placement).with_uv(uv),
+                    );
                     continue;
                 }
                 let layer = match color_convert {
@@ -144,21 +180,27 @@ pub fn resolve_layers(
                         let decoded = decode_media_frame(project, cache, pool, clip, time)?;
                         let yuv = decoded_to_yuv_layer(&decoded)?;
                         let placement =
-                            layer_placement(transform, yuv.width, yuv.height, canvas);
-                        CompositeLayer::yuv420p(yuv, placement)
+                            cropped_layer_placement(transform, yuv.width, yuv.height, crop, canvas);
+                        CompositeLayer::yuv420p(yuv, placement).with_uv(uv)
                     }
                     ColorConvertPath::LegacyCpu => {
                         // Native-size upload; the GPU scales it into place
                         // (the old CPU bilinear resize-to-canvas is gone).
                         let frame = decode_media_rgba_legacy(project, cache, pool, clip, time)?;
-                        let placement =
-                            layer_placement(transform, frame.width, frame.height, canvas);
+                        let placement = cropped_layer_placement(
+                            transform,
+                            frame.width,
+                            frame.height,
+                            crop,
+                            canvas,
+                        );
                         CompositeLayer::rgba(
                             std::sync::Arc::new(frame.bytes),
                             frame.width,
                             frame.height,
                             placement,
                         )
+                        .with_uv(uv)
                     }
                 };
                 layers.push(layer);
@@ -173,19 +215,24 @@ pub fn resolve_layers(
                 // Generators raster at canvas size, so their fit is 1:1 and
                 // the clip transform applies on top of the full canvas.
                 let placement =
-                    layer_placement(transform, canvas.width, canvas.height, canvas);
+                    cropped_layer_placement(transform, canvas.width, canvas.height, crop, canvas);
                 match generator {
                     Generator::SolidColor { rgba } => {
+                        // Solids have no texture to sample: crop shrinks the
+                        // quad, flips are invisible.
                         layers.push(CompositeLayer::solid(*rgba, placement));
                     }
                     Generator::Text { .. } | Generator::Shape { .. } => {
                         match raster.raster(generator, canvas.width, canvas.height) {
-                            Some(bytes) => layers.push(CompositeLayer::rgba(
-                                bytes,
-                                canvas.width,
-                                canvas.height,
-                                placement,
-                            )),
+                            Some(bytes) => layers.push(
+                                CompositeLayer::rgba(
+                                    bytes,
+                                    canvas.width,
+                                    canvas.height,
+                                    placement,
+                                )
+                                .with_uv(uv),
+                            ),
                             None => {
                                 debug!(?generator, "generator produced no raster");
                             }
@@ -338,6 +385,72 @@ mod tests {
         assert_eq!(p.size, [960.0, 540.0]);
         assert!((p.rotation - std::f32::consts::FRAC_PI_2).abs() < 1e-6);
         assert_eq!(p.opacity, 0.4);
+    }
+
+    #[test]
+    fn cropped_placement_fits_the_kept_region() {
+        // Keep the center half horizontally of 1920×1080 content: the kept
+        // region is 960×1080 (portrait-ish), so the fit is height-limited
+        // on the 1920×1080 canvas — no stretch, aspect preserved.
+        let crop = CropRect { x: 0.25, y: 0.0, w: 0.5, h: 1.0 };
+        let p = cropped_layer_placement(&ClipTransform::IDENTITY, 1920, 1080, &crop, &CANVAS);
+        assert_eq!(p.center, [960.0, 540.0]);
+        assert_eq!(p.size, [960.0, 1080.0]);
+
+        // Full crop matches the uncropped geometry exactly.
+        let full = cropped_layer_placement(
+            &ClipTransform::IDENTITY,
+            1920,
+            1080,
+            &CropRect::FULL,
+            &CANVAS,
+        );
+        assert_eq!(full, layer_placement(&ClipTransform::IDENTITY, 1920, 1080, &CANVAS));
+    }
+
+    #[test]
+    fn content_uv_crops_and_mirrors() {
+        let crop = CropRect { x: 0.1, y: 0.2, w: 0.5, h: 0.25 };
+        assert_eq!(content_uv(&crop, false, false), [0.1, 0.2, 0.6, 0.45]);
+        // Flips reverse the sampled axis, keeping the same window.
+        assert_eq!(content_uv(&crop, true, false), [0.6, 0.2, 0.1, 0.45]);
+        assert_eq!(content_uv(&crop, false, true), [0.1, 0.45, 0.6, 0.2]);
+        assert_eq!(content_uv(&CropRect::FULL, true, true), [1.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn resolve_applies_crop_to_placement_and_uv() {
+        use cutlass_models::TimeRange;
+        let rate = cutlass_models::Rational::FPS_24;
+        let mut project = Project::new("t", rate);
+        let track = project.add_track(TrackKind::Text, "T1");
+        let clip = project
+            .add_generated(track, Generator::text("Hi"), TimeRange::at_rate(0, 24, rate))
+            .unwrap();
+        let crop = CropRect { x: 0.0, y: 0.25, w: 1.0, h: 0.5 };
+        project.set_clip_crop(clip, crop, true, false).unwrap();
+
+        let mut pool = DecoderPool::new();
+        let mut raster = GeneratorRaster::new();
+        let canvas = CompositorConfig::new(320, 240);
+        let layers = resolve_layers(
+            &project,
+            None,
+            &mut pool,
+            &mut raster,
+            RationalTime::new(0, rate),
+            &canvas,
+            ColorConvertPath::Gpu,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(layers.len(), 1);
+        // Kept region of the 320×240 raster is 320×120 → width-limited fit
+        // fills the canvas width at half height.
+        assert_eq!(layers[0].placement.size, [320.0, 120.0]);
+        // UV samples the kept band, mirrored horizontally.
+        assert_eq!(layers[0].uv, [1.0, 0.25, 0.0, 0.75]);
     }
 
     #[test]

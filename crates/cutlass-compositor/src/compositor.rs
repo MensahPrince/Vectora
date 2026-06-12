@@ -22,6 +22,9 @@ struct PlacementUniforms {
     linear: [f32; 4],
     /// Clip-space translation (x, y), opacity, pad.
     trans_opacity: [f32; 4],
+    /// Content UV rect (u0, v0, u1, v1) interpolated across the quad:
+    /// sub-rects crop, reversed axes mirror. Unused by the solid shader.
+    uv_rect: [f32; 4],
 }
 
 #[repr(C)]
@@ -32,7 +35,11 @@ struct SolidUniforms {
 }
 
 /// Build the unit-quad → clip-space affine for a placement on this canvas.
-fn placement_uniforms(config: &CompositorConfig, p: &LayerPlacement) -> PlacementUniforms {
+fn placement_uniforms(
+    config: &CompositorConfig,
+    p: &LayerPlacement,
+    uv: [f32; 4],
+) -> PlacementUniforms {
     let (cw, ch) = (config.width as f32, config.height as f32);
     let (cos, sin) = (p.rotation.cos(), p.rotation.sin());
     // Canvas space (+y down): pos = center + R·(corner ⊙ size), with R the
@@ -55,6 +62,7 @@ fn placement_uniforms(config: &CompositorConfig, p: &LayerPlacement) -> Placemen
             p.opacity,
             0.0,
         ],
+        uv_rect: uv,
     }
 }
 
@@ -344,7 +352,7 @@ impl Compositor {
                 // Per-layer uniform buffer: each draw needs its own values
                 // alive at submit time (a single reused buffer would be
                 // clobbered by later `write_buffer` calls in the same pass).
-                let placement = placement_uniforms(config, &layer.placement);
+                let placement = placement_uniforms(config, &layer.placement, layer.uv);
                 match &layer.content {
                     LayerContent::Solid { rgba } => {
                         let uniforms = SolidUniforms {

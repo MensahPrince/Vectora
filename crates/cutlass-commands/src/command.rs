@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use cutlass_models::{
-    ClipId, ClipParam, ClipTransform, Easing, Generator, MarkerColor, MarkerId, MediaId,
+    ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, MarkerColor, MarkerId, MediaId,
     ParamValue, Rational, RationalTime, TimeRange, TrackId, TrackKind,
 };
 
@@ -108,6 +108,18 @@ pub enum EditCommand {
         clip: ClipId,
         speed: Rational,
         reversed: bool,
+    },
+    /// Set a clip's framing (CapCut crop, M1): `crop` is the normalized
+    /// kept region of the content (applied before placement, so the kept
+    /// pixels aspect-fit and transform exactly like the full frame did);
+    /// `flip_h`/`flip_v` mirror the content. Rejected on audio-track clips
+    /// and on degenerate/out-of-frame rects. The inverse restores the
+    /// previous framing.
+    SetClipCrop {
+        clip: ClipId,
+        crop: CropRect,
+        flip_h: bool,
+        flip_v: bool,
     },
     /// Set a media clip's audio mix (CapCut volume + fades, M1): constant
     /// gain `volume` (`0` mutes, `1` = unchanged, up to 10× boost) plus

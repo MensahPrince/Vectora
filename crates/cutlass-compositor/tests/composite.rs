@@ -91,6 +91,50 @@ fn pixel(image: &cutlass_compositor::RgbaImage, x: u32, y: u32) -> [u8; 4] {
 }
 
 #[test]
+fn uv_rect_crops_and_mirrors_sampled_content() {
+    let Some(gpu) = try_gpu() else {
+        eprintln!("skipping uv_rect_crops_and_mirrors_sampled_content: no GPU adapter");
+        return;
+    };
+    let mut compositor = Compositor::new(&gpu).expect("compositor");
+    let config = CompositorConfig::new(8, 8);
+
+    // Content: left half red, right half blue.
+    let mut bytes = vec![0u8; 8 * 8 * 4];
+    for y in 0..8u32 {
+        for x in 0..8u32 {
+            let i = ((y * 8 + x) * 4) as usize;
+            let color = if x < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+            bytes[i..i + 4].copy_from_slice(&color);
+        }
+    }
+    let bytes = std::sync::Arc::new(bytes);
+    let full = LayerPlacement::full_canvas(&config);
+
+    // Crop to the right half: the whole canvas samples blue.
+    let cropped = compositor
+        .composite(
+            &gpu,
+            &config,
+            &[CompositeLayer::rgba(bytes.clone(), 8, 8, full).with_uv([0.5, 0.0, 1.0, 1.0])],
+        )
+        .expect("composite");
+    assert_eq!(pixel(&cropped, 1, 4)[2], 255, "left of canvas shows cropped blue");
+    assert_eq!(pixel(&cropped, 6, 4)[2], 255, "right of canvas shows cropped blue");
+
+    // Horizontal mirror: red lands on the right, blue on the left.
+    let flipped = compositor
+        .composite(
+            &gpu,
+            &config,
+            &[CompositeLayer::rgba(bytes, 8, 8, full).with_uv([1.0, 0.0, 0.0, 1.0])],
+        )
+        .expect("composite");
+    assert_eq!(pixel(&flipped, 1, 4)[2], 255, "blue mirrored to the left");
+    assert_eq!(pixel(&flipped, 6, 4)[0], 255, "red mirrored to the right");
+}
+
+#[test]
 fn placed_solid_covers_only_its_rect() {
     let Some(gpu) = try_gpu() else {
         eprintln!("skipping placed_solid_covers_only_its_rect: no GPU adapter");

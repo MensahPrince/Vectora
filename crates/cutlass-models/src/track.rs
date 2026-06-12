@@ -185,7 +185,7 @@ impl Track {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clip::{Clip, ClipSource, ClipTransform, Generator};
+    use crate::clip::{Clip, ClipSource, Generator};
     use crate::time::Rational;
 
     const R24: Rational = Rational::FPS_24;

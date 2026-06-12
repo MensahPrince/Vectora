@@ -22,6 +22,9 @@ struct Uniforms {
     linear: vec4<f32>,
     // Clip-space translation (x, y), layer opacity, pad.
     trans_opacity: vec4<f32>,
+    // Content UV rect — unused for solid fills, present so the uniform
+    // layout matches `PlacementUniforms` embedded in Rust's SolidUniforms.
+    uv_rect: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
