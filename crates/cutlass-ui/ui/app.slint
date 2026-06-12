@@ -118,6 +118,10 @@ export component AppWindow inherits Window {
     private property <int> projection-revision: EditorStore.projection-revision;
 
     changed projection-revision => {
+        // Selection can go stale when a history step or agent edit removes
+        // clips it points at (timeline roadmap debt) — reconcile the set
+        // against the new projection instead of leaving dead ids behind.
+        TimelineActions.prune-selection();
         if (PreviewStore.gesture-commit-pending) {
             PreviewStore.gesture-active = false;
             PreviewStore.gesture-commit-pending = false;

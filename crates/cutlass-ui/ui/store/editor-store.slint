@@ -71,13 +71,18 @@ export global EditorStore {
     // Engine history (Ctrl/Cmd+Z / +Shift+Z, toolbar).
     callback on-undo();
     callback on-redo();
-    // Clipboard: copy snapshots the clip's content on the worker (it
-    // survives the original being deleted); paste places it at `tick` on
-    // the source lane, sliding right into the first gap that fits.
-    callback on-clip-copied(clip-id: string);
+    // Clipboard: copy snapshots the selection's content as one block on the
+    // worker (it survives the originals being deleted); paste places the
+    // block at `tick` on the source lanes, keeping relative placement and
+    // sliding the whole block right until every member fits.
+    callback on-clips-copied(clip-ids: [string]);
     callback on-paste-at(tick: int);
-    // Duplicate: a copy placed right after the original on its own lane.
-    callback on-clip-duplicated(clip-id: string);
+    // Duplicate: copies of the selection placed right after the block they
+    // form, lanes and relative placement preserved (one history entry).
+    callback on-clips-duplicated(clip-ids: [string]);
+    // Dissolve the link groups the selected clips belong to (whole groups,
+    // selected or not). The worker applies it as one undoable entry.
+    callback on-clips-unlinked(clip-ids: [string]);
     // A track header toggle was clicked. `flag` is "enabled" | "muted" |
     // "locked"; `value` is the new state. The worker applies it undoably.
     callback on-track-flag-toggled(track-id: string, flag: string, value: bool);

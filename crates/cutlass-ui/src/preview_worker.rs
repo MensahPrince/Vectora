@@ -11,8 +11,9 @@ use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, EngineError, ExportSettings};
 use cutlass_models::{
-    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, Easing, Generator, MediaId,
-    ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
+    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, Easing, Generator, LinkId,
+    MediaId, ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind,
+    resample,
 };
 use tracing::{error, info, warn};
 
@@ -185,14 +186,20 @@ enum WorkerMsg {
     /// Step the engine history one entry back / forward.
     Undo,
     Redo,
-    /// Snapshot `clip` (raw id) into the worker clipboard. A snapshot, not a
-    /// reference — pasting works after the original is deleted.
-    CopyClip { clip: String },
-    /// Place the clipboard content at `tick` on the copied clip's lane,
-    /// sliding right into the first gap that fits.
+    /// Snapshot `clips` (raw ids — the whole selection) into the worker
+    /// clipboard as one block. A snapshot, not a reference — pasting works
+    /// after the originals are deleted.
+    CopyClips { clips: Vec<String> },
+    /// Place the clipboard block at `tick`: members keep their lanes and
+    /// relative placement, the whole block slides right as one unit until
+    /// every member fits.
     PasteAt { tick: i64 },
-    /// Place a copy of `clip` right after it on its own lane.
-    DuplicateClip { clip: String },
+    /// Place copies of `clips` (the whole selection) right after the block
+    /// they form, keeping lanes and relative placement.
+    DuplicateClips { clips: Vec<String> },
+    /// Dissolve the link group of every clip in `clips` (raw ids): all
+    /// members of the touched groups — selected or not — end up unlinked.
+    UnlinkClips { clips: Vec<String> },
     /// Mirror of the UI's main-track magnet toggle. The worker needs it for
     /// ops without a drag resolution (delete/paste/duplicate); enabling also
     /// packs the main lane gapless (one history entry).
@@ -288,8 +295,10 @@ pub enum TrackFlag {
     Locked,
 }
 
-/// Worker-side clipboard: everything needed to re-issue the copied clip as a
-/// fresh `AddClip` / `AddGenerated` later, independent of the original.
+/// Worker-side clipboard: one member of the copied block, everything needed
+/// to re-issue it as a fresh `AddClip` / `AddGenerated` later, independent
+/// of the original. A copy snapshots the whole selection as a `Vec` of these
+/// (single-clip copy ⇒ a block of one).
 struct ClipboardClip {
     /// Lane the clip was copied from (preferred paste target).
     track: TrackId,
@@ -298,6 +307,12 @@ struct ClipboardClip {
     content: ClipSource,
     /// Timeline-rate duration, for first-fit placement.
     duration_ticks: i64,
+    /// Start offset from the block's earliest member — paste keeps the
+    /// members' relative placement.
+    offset_ticks: i64,
+    /// The original's link group, as a grouping key only: members copied
+    /// from the same group are re-linked as a fresh group on paste.
+    link: Option<LinkId>,
 }
 
 /// Cheap, cloneable sender to the engine thread. Hand one clone to each UI
@@ -505,16 +520,20 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::Redo);
     }
 
-    pub fn copy_clip(&self, clip: String) {
-        let _ = self.tx.send(WorkerMsg::CopyClip { clip });
+    pub fn copy_clips(&self, clips: Vec<String>) {
+        let _ = self.tx.send(WorkerMsg::CopyClips { clips });
     }
 
     pub fn paste_at(&self, tick: i64) {
         let _ = self.tx.send(WorkerMsg::PasteAt { tick });
     }
 
-    pub fn duplicate_clip(&self, clip: String) {
-        let _ = self.tx.send(WorkerMsg::DuplicateClip { clip });
+    pub fn duplicate_clips(&self, clips: Vec<String>) {
+        let _ = self.tx.send(WorkerMsg::DuplicateClips { clips });
+    }
+
+    pub fn unlink_clips(&self, clips: Vec<String>) {
+        let _ = self.tx.send(WorkerMsg::UnlinkClips { clips });
     }
 
     pub fn set_main_magnet(&self, enabled: bool) {
@@ -671,7 +690,8 @@ fn worker_loop(
 ) {
     // Clipboard lives with the loop: it's edit-session state, not project
     // state — copies survive any number of edits/undos and die with the app.
-    let mut clipboard: Option<ClipboardClip> = None;
+    // One block per copy (the whole selection); never empty when `Some`.
+    let mut clipboard: Option<Vec<ClipboardClip>> = None;
     // Mirror of TimelineStore.main-magnet-enabled (must match its default).
     // Drag gestures carry their resolved insert flag; this drives the ops
     // without a drag resolution (delete/paste/duplicate) and pack-on-enable.
@@ -693,7 +713,7 @@ fn worker_loop(
     let mut last_tick: i64 = 0;
 
     let mutate = |engine: &mut Engine,
-                  clipboard: &mut Option<ClipboardClip>,
+                  clipboard: &mut Option<Vec<ClipboardClip>>,
                   main_magnet: &mut bool,
                   linkage: &mut bool,
                   autosave_slot: &mut Option<(PathBuf, u64)>,
@@ -855,19 +875,22 @@ fn worker_loop(
             }
             WorkerMsg::Undo => history_step_and_publish(engine, false, &ui),
             WorkerMsg::Redo => history_step_and_publish(engine, true, &ui),
-            WorkerMsg::CopyClip { clip } => {
-                if let Some(snapshot) = snapshot_clip(engine, &clip) {
-                    info!(clip, "copied clip to clipboard");
-                    *clipboard = Some(snapshot);
+            WorkerMsg::CopyClips { clips } => {
+                // The block origin only matters to duplicate; paste re-bases
+                // on the playhead tick.
+                if let Some((_, block)) = snapshot_block(engine, &clips) {
+                    info!(count = block.len(), "copied clips to clipboard");
+                    *clipboard = Some(block);
                 }
             }
             WorkerMsg::PasteAt { tick } => match clipboard {
-                Some(content) => paste_and_publish(engine, content, tick, *main_magnet, &ui),
+                Some(block) => paste_and_publish(engine, block, tick, *main_magnet, &ui),
                 None => info!("paste ignored: clipboard empty"),
             },
-            WorkerMsg::DuplicateClip { clip } => {
-                duplicate_clip_and_publish(engine, &clip, *main_magnet, &ui)
+            WorkerMsg::DuplicateClips { clips } => {
+                duplicate_clips_and_publish(engine, &clips, *main_magnet, &ui)
             }
+            WorkerMsg::UnlinkClips { clips } => unlink_clips_and_publish(engine, &clips, &ui),
             WorkerMsg::SetMainMagnet(enabled) => {
                 *main_magnet = enabled;
                 info!(enabled, "main-track magnet toggled");
@@ -1032,7 +1055,7 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::RemoveKeyframesAt { .. }
             | WorkerMsg::SplitClip { .. }
             | WorkerMsg::PasteAt { .. }
-            | WorkerMsg::DuplicateClip { .. }
+            | WorkerMsg::DuplicateClips { .. }
             | WorkerMsg::Undo
             | WorkerMsg::Redo
             | WorkerMsg::SetMainMagnet(_)
@@ -2685,90 +2708,309 @@ fn history_step_and_publish(
     publish_projection(engine, ui);
 }
 
-/// Snapshot `clip` (raw id) for the clipboard.
-fn snapshot_clip(engine: &Engine, clip: &str) -> Option<ClipboardClip> {
-    let clip_id = parse_raw_id(clip).map(ClipId::from_raw)?;
+/// Snapshot `clips` (raw ids — the selection) as one clipboard block:
+/// members in start order, offsets rebased to the earliest start. Returns
+/// the block origin (that earliest start) alongside, for callers that place
+/// relative to the originals (duplicate). Ids that no longer resolve are
+/// skipped; an empty result is `None`.
+fn snapshot_block(engine: &Engine, clips: &[String]) -> Option<(i64, Vec<ClipboardClip>)> {
     let timeline = engine.project().timeline();
-    let track = timeline.track_of(clip_id)?;
-    let kind = timeline.track(track)?.kind;
-    let clip = engine.project().clip(clip_id)?;
-    Some(ClipboardClip {
-        track,
-        kind,
-        content: clip.content.clone(),
-        duration_ticks: clip.timeline.duration.value,
-    })
+    let mut members = Vec::with_capacity(clips.len());
+    for raw in clips {
+        let Some(clip_id) = parse_raw_id(raw).map(ClipId::from_raw) else {
+            continue;
+        };
+        let Some(track) = timeline.track_of(clip_id) else {
+            continue;
+        };
+        let Some(kind) = timeline.track(track).map(|t| t.kind) else {
+            continue;
+        };
+        let Some(clip) = engine.project().clip(clip_id) else {
+            continue;
+        };
+        members.push(ClipboardClip {
+            track,
+            kind,
+            content: clip.content.clone(),
+            duration_ticks: clip.timeline.duration.value,
+            // Absolute start for now; rebased to the block origin below.
+            offset_ticks: clip.timeline.start.value,
+            link: clip.link,
+        });
+    }
+    if members.is_empty() {
+        return None;
+    }
+    members.sort_by_key(|m| m.offset_ticks);
+    let origin = members[0].offset_ticks;
+    for member in &mut members {
+        member.offset_ticks -= origin;
+    }
+    Some((origin, members))
 }
 
-/// Paste the clipboard at `tick`: lands on the copied clip's lane (or a new
-/// lane of its kind when that lane is gone), sliding right into the first
-/// gap that fits — the same placement policy as library drops. With the
-/// main-track magnet on, pasting on the main lane ripple-inserts at the
-/// clip boundary nearest `tick` instead.
+/// Smallest uniform right-shift (≥ 0) that lets every `(lane, start,
+/// duration)` span land without overlapping existing clips. Members can't
+/// collide with each other (a uniform shift preserves their relative,
+/// originally disjoint placement), so only 0 and the "blocked member
+/// becomes left-flush against an existing clip's end" shifts can be the
+/// minimum — the group analogue of `first_fit_start`'s gap scan. O(n·m)
+/// per candidate on this cold, user-triggered path.
+fn block_fit_dx(engine: &Engine, spans: &[(TrackId, i64, i64)]) -> i64 {
+    let timeline = engine.project().timeline();
+    let fits = |dx: i64| {
+        spans.iter().all(|&(track, start, duration)| {
+            timeline
+                .track(track)
+                .is_some_and(|t| span_free(t, start + dx, duration))
+        })
+    };
+    let mut candidates: Vec<i64> = vec![0];
+    for &(track, start, _) in spans {
+        let Some(track) = timeline.track(track) else {
+            continue;
+        };
+        for clip in track.clips_ordered() {
+            let dx = clip.timeline.end_tick() - start;
+            if dx > 0 {
+                candidates.push(dx);
+            }
+        }
+    }
+    candidates.sort_unstable();
+    candidates.dedup();
+    // The largest candidate parks every member at/after the last clip on
+    // its lane, so a fit always exists; 0 covers the all-lanes-empty case.
+    candidates.into_iter().find(|&dx| fits(dx)).unwrap_or(0)
+}
+
+/// Place every member of a resolved block — `(landing lane, desired start,
+/// member)` — inside the caller's open history group: one uniform
+/// right-shift until everything fits, then re-issue each member's content
+/// and re-link copies whose originals shared a link group (singleton
+/// leftovers of partially copied groups stay unlinked).
+fn place_block(
+    engine: &mut Engine,
+    members: &[(TrackId, i64, &ClipboardClip)],
+) -> Result<(), String> {
+    let spans: Vec<(TrackId, i64, i64)> = members
+        .iter()
+        .map(|&(track, start, member)| (track, start, member.duration_ticks.max(1)))
+        .collect();
+    let dx = block_fit_dx(engine, &spans);
+
+    let mut created: Vec<(Option<LinkId>, ClipId)> = Vec::with_capacity(members.len());
+    for &(track, start, member) in members {
+        let id = add_clip_content(engine, track, &member.content, member.duration_ticks, start + dx)?;
+        created.push((member.link, id));
+    }
+
+    let mut seen: Vec<LinkId> = Vec::new();
+    for &(link, _) in &created {
+        let Some(link) = link else { continue };
+        if seen.contains(&link) {
+            continue;
+        }
+        seen.push(link);
+        let group: Vec<ClipId> = created
+            .iter()
+            .filter(|(l, _)| *l == Some(link))
+            .map(|&(_, id)| id)
+            .collect();
+        if group.len() >= 2 {
+            apply_edit(engine, EditCommand::LinkClips { clips: group })?;
+        }
+    }
+    Ok(())
+}
+
+/// Paste the clipboard block at `tick`: members land on the lanes they were
+/// copied from (recreated by kind when gone), keeping relative placement;
+/// the whole block slides right as one unit until every member fits — the
+/// group analogue of the library-drop policy. A single-member block keeps
+/// the magnet behavior: pasted on the main lane with the magnet on, it
+/// ripple-inserts at the clip boundary nearest `tick` instead (groups stay
+/// freeform, same policy as group drags).
 fn paste_and_publish(
     engine: &mut Engine,
-    content: &ClipboardClip,
+    block: &[ClipboardClip],
     tick: i64,
     main_magnet: bool,
     ui: &UiSink,
 ) {
     let tl_rate = engine.project().timeline().frame_rate;
-    let duration = content.duration_ticks.max(1);
 
-    // One history entry per paste, even when it recreates the copied lane.
+    // One history entry per paste, even when it recreates copied lanes.
     engine.begin_group();
-    let track = if engine.project().timeline().track(content.track).is_some() {
-        content.track
-    } else {
-        match create_track(engine, content.kind, 0) {
-            Ok(id) => id,
-            Err(e) => {
-                error!("paste failed creating {:?} track: {e}", content.kind);
-                engine.rollback_group();
-                return;
-            }
+
+    // Landing lane per source lane: the original when it still exists, one
+    // fresh lane of its kind (top of the stack, as single-paste always did)
+    // per vanished track id.
+    let mut lanes: HashMap<TrackId, TrackId> = HashMap::new();
+    for member in block {
+        if lanes.contains_key(&member.track) {
+            continue;
         }
-    };
+        let landing = if engine.project().timeline().track(member.track).is_some() {
+            member.track
+        } else {
+            match create_track(engine, member.kind, 0) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("paste failed creating {:?} track: {e}", member.kind);
+                    engine.rollback_group();
+                    return;
+                }
+            }
+        };
+        lanes.insert(member.track, landing);
+    }
 
-    let lane = engine
-        .project()
-        .timeline()
-        .track(track)
-        .expect("paste target track exists");
-    let ripple = main_magnet && Some(track) == main_video_track(engine);
-    let start = if ripple {
-        nearest_boundary(lane, tick.max(0))
-    } else {
-        first_fit_start(lane, tick.max(0), duration)
-    };
+    // Single-clip ripple-insert (magnet) keeps its dedicated path.
+    if let [only] = block {
+        let track = lanes[&only.track];
+        if main_magnet && Some(track) == main_video_track(engine) {
+            let duration = only.duration_ticks.max(1);
+            let lane = engine
+                .project()
+                .timeline()
+                .track(track)
+                .expect("paste target track exists");
+            let start = nearest_boundary(lane, tick.max(0));
+            let result = apply_edit(engine, EditCommand::ShiftClips {
+                track,
+                from: RationalTime::new(start, tl_rate),
+                delta: RationalTime::new(duration, tl_rate),
+            })
+            .and_then(|_| add_clip_content(engine, track, &only.content, only.duration_ticks, start));
+            match result {
+                Ok(clip_id) => {
+                    engine.commit_group();
+                    info!(%clip_id, %track, start_tick = start, "ripple-pasted clip");
+                }
+                Err(e) => {
+                    error!(%track, start_tick = start, "paste failed: {e}");
+                    engine.rollback_group();
+                }
+            }
+            publish_projection(engine, ui);
+            return;
+        }
+    }
 
-    if ripple
-        && let Err(e) = apply_edit(engine, EditCommand::ShiftClips {
-            track,
-            from: RationalTime::new(start, tl_rate),
-            delta: RationalTime::new(duration, tl_rate),
-        })
-    {
-        error!(%track, start_tick = start, "paste failed opening hole: {e}");
-        engine.rollback_group();
-        publish_projection(engine, ui);
+    let members: Vec<(TrackId, i64, &ClipboardClip)> = block
+        .iter()
+        .map(|member| (lanes[&member.track], tick.max(0) + member.offset_ticks, member))
+        .collect();
+    match place_block(engine, &members) {
+        Ok(()) => {
+            engine.commit_group();
+            info!(count = block.len(), tick, "pasted clipboard block");
+        }
+        // Rolling back also removes lanes this paste just recreated.
+        Err(e) => {
+            error!(tick, "paste failed: {e}");
+            engine.rollback_group();
+        }
+    }
+    publish_projection(engine, ui);
+}
+
+/// Duplicate the selection as one block: copies keep their lanes and
+/// relative placement, landing right after the block's end — slid further
+/// right as one unit when something is in the way. Copies of linked members
+/// re-link as fresh groups; one history entry for everything. Freeform like
+/// group drags (no group ripple-insert) — a single clip keeps the
+/// magnet-aware single-duplicate path below.
+fn duplicate_clips_and_publish(
+    engine: &mut Engine,
+    clips: &[String],
+    main_magnet: bool,
+    ui: &UiSink,
+) {
+    if let [only] = clips {
+        duplicate_clip_and_publish(engine, only, main_magnet, ui);
         return;
     }
+    let Some((origin, block)) = snapshot_block(engine, clips) else {
+        info!("duplicate ignored: no valid clips in selection");
+        return;
+    };
+    let span = block
+        .iter()
+        .map(|m| m.offset_ticks + m.duration_ticks.max(1))
+        .max()
+        .unwrap_or(1);
+    // Copies land right after the originals' span; lanes all exist (the
+    // originals are live), so no lane resolution is needed.
+    let base = origin + span;
+    let members: Vec<(TrackId, i64, &ClipboardClip)> = block
+        .iter()
+        .map(|member| (member.track, base + member.offset_ticks, member))
+        .collect();
 
-    match add_clip_content(engine, track, &content.content, content.duration_ticks, start) {
-        Ok(clip_id) => {
+    engine.begin_group();
+    match place_block(engine, &members) {
+        Ok(()) => {
             engine.commit_group();
-            info!(%clip_id, %track, start_tick = start, ripple, "pasted clip");
-            publish_projection(engine, ui);
+            info!(count = block.len(), "duplicated clip block");
         }
-        // Rolling back removes a lane this paste just recreated (and closes
-        // a hole the ripple shift just opened).
         Err(e) => {
-            error!(%track, start_tick = start, "paste failed: {e}");
+            error!("duplicate failed: {e}");
             engine.rollback_group();
-            publish_projection(engine, ui);
         }
     }
+    publish_projection(engine, ui);
+}
+
+/// Dissolve the link groups of `clips` (raw ids): every member of every
+/// touched group — selected or not — ends up unlinked. Implemented with the
+/// existing `LinkClips` command by giving each member a fresh *singleton*
+/// group, which behaves exactly like no link everywhere links are read
+/// (selection expansion, linked trims/splits, drops). One history entry;
+/// undo restores the old groups (the link action snapshots prior values).
+/// A dedicated `UnlinkClips` (link = None) can replace the singleton trick
+/// once the command surface is open again post-M1.
+fn unlink_clips_and_publish(engine: &mut Engine, clips: &[String], ui: &UiSink) {
+    // Link ids represented in the selection…
+    let mut links: Vec<LinkId> = Vec::new();
+    for raw in clips {
+        let Some(clip_id) = parse_raw_id(raw).map(ClipId::from_raw) else {
+            continue;
+        };
+        if let Some(link) = engine.project().clip(clip_id).and_then(|c| c.link)
+            && !links.contains(&link)
+        {
+            links.push(link);
+        }
+    }
+    if links.is_empty() {
+        info!("unlink ignored: selection has no linked clips");
+        return;
+    }
+    // …expanded to full membership, so groups dissolve as a whole.
+    let members: Vec<ClipId> = engine
+        .project()
+        .timeline()
+        .tracks_ordered()
+        .flat_map(|t| t.clips_ordered())
+        .filter(|c| c.link.is_some_and(|l| links.contains(&l)))
+        .map(|c| c.id)
+        .collect();
+
+    engine.begin_group();
+    for member in &members {
+        if let Err(e) = apply_edit(engine, EditCommand::LinkClips { clips: vec![*member] }) {
+            error!(%member, "unlink failed: {e}");
+            engine.rollback_group();
+            publish_projection(engine, ui);
+            return;
+        }
+    }
+    engine.commit_group();
+    info!(groups = links.len(), members = members.len(), "unlinked clip groups");
+    publish_projection(engine, ui);
 }
 
 /// Place a copy of `clip` immediately after it on its own lane (first gap

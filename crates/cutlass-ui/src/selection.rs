@@ -183,6 +183,51 @@ pub fn resolve_marquee(
     }
 }
 
+/// Whether any selected clip carries a link-group id — gates the toolbar's
+/// Unlink button.
+pub fn selection_has_link(sequence: &Sequence, ids: &ModelRc<SharedString>) -> bool {
+    placed_clips(sequence)
+        .iter()
+        .any(|c| !c.link_id.is_empty() && selection_contains(ids, c.clip_id.as_str()))
+}
+
+/// Reconcile the selection with a freshly published projection (undo/redo,
+/// agent edits — the tracked debt from the timeline roadmap): ids whose
+/// clips no longer exist are dropped (set order preserved), and the primary
+/// anchor follows its clip's current lane — or re-anchors on the first
+/// surviving member in (row, start) order when its own clip vanished.
+pub fn prune_selection(
+    sequence: &Sequence,
+    ids: &ModelRc<SharedString>,
+    primary_clip_id: &str,
+) -> SelectionUpdate {
+    let clips = placed_clips(sequence);
+    let kept: Vec<SharedString> = (0..ids.row_count())
+        .filter_map(|i| ids.row_data(i))
+        .filter(|id| clips.iter().any(|c| &c.clip_id == id))
+        .collect();
+
+    let anchor = |c: &PlacedClip| (c.track_id.clone(), c.clip_id.clone());
+    let primary = clips
+        .iter()
+        .find(|c| c.clip_id == primary_clip_id && kept.iter().any(|id| *id == c.clip_id))
+        .map(anchor)
+        .or_else(|| {
+            clips
+                .iter()
+                .filter(|c| kept.iter().any(|id| *id == c.clip_id))
+                .min_by_key(|c| (c.row, c.start))
+                .map(anchor)
+        })
+        .unwrap_or_default();
+
+    SelectionUpdate {
+        ids: ids_model(kept),
+        primary_track_id: primary.0,
+        primary_clip_id: primary.1,
+    }
+}
+
 /// Press-time rectangles of the selected clips, for the floating copies that
 /// follow the cursor during a group drag.
 pub fn group_floaters(
@@ -578,6 +623,61 @@ mod tests {
 
         let miss = resolve_marquee(&seq, 200, 300, -0.5, 2.0, true);
         assert!(ids_vec(&miss.ids).is_empty());
+    }
+
+    #[test]
+    fn has_link_spots_linked_members_only() {
+        let seq = sample();
+        // A carries link "L"; B is unlinked.
+        assert!(selection_has_link(&seq, &ids(&["A", "B"])));
+        assert!(!selection_has_link(&seq, &ids(&["B"])));
+        assert!(!selection_has_link(&seq, &ids(&[])));
+    }
+
+    // --- prune (projection republish reconciliation) -------------------------
+
+    #[test]
+    fn prune_keeps_selection_when_clips_survive() {
+        let seq = sample();
+        let upd = prune_selection(&seq, &ids(&["A", "D"]), "A");
+        assert_eq!(ids_vec(&upd.ids), vec!["A", "D"]);
+        assert_eq!(upd.primary_clip_id, "A");
+        assert_eq!(upd.primary_track_id, "2");
+    }
+
+    #[test]
+    fn prune_drops_vanished_ids_and_reanchors_primary() {
+        let seq = sample();
+        // "X" was deleted by the history step; it was also the primary, so
+        // the anchor moves to the first surviving member in (row, start)
+        // order — A on row 0.
+        let upd = prune_selection(&seq, &ids(&["X", "D", "A"]), "X");
+        assert_eq!(ids_vec(&upd.ids), vec!["D", "A"]);
+        assert_eq!(upd.primary_clip_id, "A");
+        assert_eq!(upd.primary_track_id, "2");
+    }
+
+    #[test]
+    fn prune_clears_when_nothing_survives() {
+        let seq = sample();
+        let upd = prune_selection(&seq, &ids(&["X", "Y"]), "X");
+        assert!(ids_vec(&upd.ids).is_empty());
+        assert_eq!(upd.primary_clip_id, "");
+        assert_eq!(upd.primary_track_id, "");
+    }
+
+    #[test]
+    fn prune_remaps_primary_track_after_cross_lane_move() {
+        // Undo of a cross-lane move: the clip id survives but now lives on a
+        // different lane than the stored anchor track — follow the clip.
+        let seq = sequence(vec![
+            track("2", TrackKind::Video, vec![]),
+            track("1", TrackKind::Video, vec![clip("A", 0, 50)]),
+        ]);
+        let upd = prune_selection(&seq, &ids(&["A"]), "A");
+        assert_eq!(ids_vec(&upd.ids), vec!["A"]);
+        assert_eq!(upd.primary_clip_id, "A");
+        assert_eq!(upd.primary_track_id, "1");
     }
 
     // --- group drag -----------------------------------------------------------

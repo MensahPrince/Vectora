@@ -50,6 +50,7 @@ pub fn project_to_slint(
     // CapCut/Premiere. UI row r ↔ engine order index (track_count - 1 - r).
     let mut tracks: Vec<Track> = timeline
         .tracks_ordered()
+        .filter(|track| kind_visible(track.kind))
         .map(|track| track_to_slint(project, track, generator_sizes))
         .collect();
     tracks.reverse();
@@ -526,6 +527,18 @@ fn to_even(v: u32) -> u32 {
     if v.is_multiple_of(2) { v } else { v + 1 }
 }
 
+/// Lane kinds the UI surfaces today. Effect / filter / adjustment lanes are
+/// phantom until their engines land (v1 roadmap M0 "hide phantom kinds",
+/// M4/M5): the model keeps them — they round-trip through save/load
+/// untouched and composite nothing — but the projection skips them so users
+/// never see lanes that do nothing.
+fn kind_visible(kind: EngineKind) -> bool {
+    !matches!(
+        kind,
+        EngineKind::Effect | EngineKind::Filter | EngineKind::Adjustment
+    )
+}
+
 fn track_kind(kind: EngineKind) -> TrackKind {
     match kind {
         EngineKind::Video => TrackKind::Video,
@@ -640,6 +653,27 @@ mod tests {
         assert_eq!(speed_label(&clip), "0.75x R");
         clip.speed = EngineRational::new(1, 1);
         assert_eq!(speed_label(&clip), "R");
+    }
+
+    #[test]
+    fn phantom_lanes_are_not_projected() {
+        use slint::Model;
+
+        let mut project = EngineProject::new("test", EngineRational::FPS_24);
+        project.add_track(cutlass_models::TrackKind::Video, "V1");
+        project.add_track(cutlass_models::TrackKind::Effect, "FX1");
+        project.add_track(cutlass_models::TrackKind::Filter, "F1");
+        project.add_track(cutlass_models::TrackKind::Adjustment, "ADJ1");
+        project.add_track(cutlass_models::TrackKind::Sticker, "ST1");
+
+        let projected = project_to_slint(&project, &HashMap::new());
+        let tracks = &projected.sequence.tracks;
+        // Top-first: the sticker lane (real) above the video lane; the
+        // effect / filter / adjustment lanes stay model-only (M0 "hide
+        // phantom kinds").
+        assert_eq!(tracks.row_count(), 2);
+        assert_eq!(tracks.row_data(0).unwrap().kind, TrackKind::Sticker);
+        assert_eq!(tracks.row_data(1).unwrap().kind, TrackKind::Video);
     }
 
     #[test]

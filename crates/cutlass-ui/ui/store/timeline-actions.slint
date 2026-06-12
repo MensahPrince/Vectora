@@ -11,6 +11,7 @@ import { EditorStore } from "editor-store.slint";
 import { TimelineStore } from "timeline-store.slint";
 import { TimelineViewState } from "../panels/timeline/state.slint";
 import { InspectorBackend, SelectedClipInfo } from "../lib/inspector-backend.slint";
+import { SelectionBackend, SelectionUpdate } from "../lib/selection-backend.slint";
 import { TimelineLib } from "../lib/timeline-lib.slint";
 import { TransportBackend } from "../lib/transport-backend.slint";
 
@@ -34,6 +35,31 @@ export global TimelineActions {
             EditorStore.project.sequence,
             TimelineStore.selected-track-id,
             TimelineStore.selected-clip-id);
+    }
+
+    // Scratch slot for prune-selection: the result is read several times and
+    // Slint functions have no local bindings (same trick as pending-tick).
+    private property <SelectionUpdate> pending-prune;
+
+    // Reconcile the selection with a freshly published projection (app.slint
+    // calls this on every projection-revision bump): undo/redo and agent
+    // edits can remove clips the selection still points at — drop those ids
+    // and re-anchor the primary instead of leaving them stale. Selection
+    // only mutates when something actually changed (prune never adds or
+    // reorders, so an equal length ⇔ an identical set).
+    public function prune-selection() {
+        if (TimelineStore.selected-clip-id == "" && TimelineStore.selected-ids.length == 0) {
+            return;
+        }
+        self.pending-prune = SelectionBackend.prune(
+            EditorStore.project.sequence,
+            TimelineStore.selected-ids,
+            TimelineStore.selected-clip-id);
+        if (self.pending-prune.ids.length != TimelineStore.selected-ids.length
+                || self.pending-prune.primary-clip-id != TimelineStore.selected-clip-id
+                || self.pending-prune.primary-track-id != TimelineStore.selected-track-id) {
+            TimelineStore.apply-selection(self.pending-prune);
+        }
     }
 
     // --- edit ops ----------------------------------------------------
@@ -67,9 +93,12 @@ export global TimelineActions {
         EditorStore.on-clip-split(TimelineStore.selected-clip-id, TimelineStore.playhead-tick);
     }
 
+    // Copy/duplicate act on the whole multi-selection (one block, one
+    // history entry), same as delete — linked partners ride along because
+    // selection includes them.
     public function copy-selected() {
         if (self.has-selection()) {
-            EditorStore.on-clip-copied(TimelineStore.selected-clip-id);
+            EditorStore.on-clips-copied(TimelineStore.selected-ids);
         }
     }
 
@@ -79,7 +108,23 @@ export global TimelineActions {
 
     public function duplicate-selected() {
         if (self.has-selection()) {
-            EditorStore.on-clip-duplicated(TimelineStore.selected-clip-id);
+            EditorStore.on-clips-duplicated(TimelineStore.selected-ids);
+        }
+    }
+
+    // Whether the selection touches any link group — gates the toolbar's
+    // Unlink button.
+    public pure function selection-has-link() -> bool {
+        return SelectionBackend.has-link(
+            EditorStore.project.sequence,
+            TimelineStore.selected-ids);
+    }
+
+    // Dissolve the link groups the selection touches (whole groups — the
+    // gesture means "separate this A/V pair", not "detach one member").
+    public function unlink-selected() {
+        if (self.selection-has-link()) {
+            EditorStore.on-clips-unlinked(TimelineStore.selected-ids);
         }
     }
 

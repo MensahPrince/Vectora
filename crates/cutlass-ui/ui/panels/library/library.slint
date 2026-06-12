@@ -187,33 +187,10 @@ export component LibraryPanel inherits PanelBase {
                     label: "Stickers";
                 }
 
-                // The remaining tabs mirror the engine's TrackKind catalog
-                // (effect / filter / adjustment lanes exist in the model;
-                // transitions are clip-to-clip). All placeholder content
-                // until the effect engine lands (v1 roadmap M4/M5).
-                LibraryTab {
-                    tab-id: "effects";
-                    icon: @image-url("../../../../../assets/icon/library/effects.svg");
-                    label: "Effects";
-                }
-
-                LibraryTab {
-                    tab-id: "transitions";
-                    icon: @image-url("../../../../../assets/icon/library/transitions.svg");
-                    label: "Transitions";
-                }
-
-                LibraryTab {
-                    tab-id: "filters";
-                    icon: @image-url("../../../../../assets/icon/library/filters.svg");
-                    label: "Filters";
-                }
-
-                LibraryTab {
-                    tab-id: "adjustment";
-                    icon: @image-url("../../../../../assets/icon/library/adjustment.svg");
-                    label: "Adjustment";
-                }
+                // Effects / Transitions / Filters / Adjustment tabs return
+                // when their engines land (v1 roadmap M4/M5). The model's
+                // TrackKind catalog keeps those lanes; the UI hides dead
+                // features until then (M0 "hide phantom kinds").
             }
         }
 
@@ -264,30 +241,6 @@ export component LibraryPanel inherits PanelBase {
                     width: parent.width;
                     sections: [{ id: "shapes", label: "Shapes" }];
                     active: "shapes";
-                }
-
-                if LibraryState.active-tab == "effects": SectionList {
-                    width: parent.width;
-                    sections: [{ id: "video", label: "Video effects" }];
-                    active: "video";
-                }
-
-                if LibraryState.active-tab == "transitions": SectionList {
-                    width: parent.width;
-                    sections: [{ id: "all", label: "Transitions" }];
-                    active: "all";
-                }
-
-                if LibraryState.active-tab == "filters": SectionList {
-                    width: parent.width;
-                    sections: [{ id: "all", label: "Filters" }];
-                    active: "all";
-                }
-
-                if LibraryState.active-tab == "adjustment": SectionList {
-                    width: parent.width;
-                    sections: [{ id: "all", label: "Adjustment" }];
-                    active: "all";
                 }
             }
 
@@ -501,40 +454,6 @@ export component LibraryPanel inherits PanelBase {
                     }
                 }
 
-                // ---- Effects / Transitions / Filters / Adjustment -----------
-                // Placeholders until the effect engine lands (v1 roadmap M4:
-                // effects + transitions + adjustment layers, M5: filters).
-                if LibraryState.active-tab == "effects": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/effects.svg");
-                    title: "Effects";
-                    message: "Drag-and-drop visual effects with a starter pack. Coming soon.";
-                }
-
-                if LibraryState.active-tab == "transitions": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/transitions.svg");
-                    title: "Transitions";
-                    message: "Crossfades, wipes, and motion transitions between clips. Coming soon.";
-                }
-
-                if LibraryState.active-tab == "filters": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/filters.svg");
-                    title: "Filters";
-                    message: "Preset looks built on the color pipeline. Coming soon.";
-                }
-
-                if LibraryState.active-tab == "adjustment": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/adjustment.svg");
-                    title: "Adjustment";
-                    message: "Adjustment layers that grade every lane below them. Coming soon.";
-                }
             }
         }
     }

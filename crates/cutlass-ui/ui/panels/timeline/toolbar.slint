@@ -169,6 +169,18 @@ export component Toolbar inherits Rectangle {
             }
         }
 
+        // Dissolve the selection's link groups (CapCut's right-click
+        // unlink): the A/V pair separates for good, not just while the
+        // Link toggle is off. Undoable; enabled only when the selection
+        // actually touches a link group.
+        ToolButton {
+            label: "Unlink";
+            enabled: TimelineActions.selection-has-link();
+            clicked => {
+                TimelineActions.unlink-selected();
+            }
+        }
+
         Rectangle {
             width: AppStore.theme.metrics.spacing.sm;
         }

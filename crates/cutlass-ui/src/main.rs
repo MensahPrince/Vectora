@@ -970,6 +970,15 @@ fn main() -> Result<(), slint::PlatformError> {
             selection::resolve_marquee(&sequence, tick0, tick1, row0, row1, link_enabled)
         });
 
+    // Selection survives undo/redo (v1 roadmap M0): every projection
+    // republish reconciles the selection against the new clip set.
+    app.global::<SelectionBackend>().on_prune(|sequence, current, primary_clip_id| {
+        selection::prune_selection(&sequence, &current, primary_clip_id.as_str())
+    });
+
+    app.global::<SelectionBackend>()
+        .on_has_link(|sequence, ids| selection::selection_has_link(&sequence, &ids));
+
     // --- preview roadmap Phase 2: click-to-select in the viewport ---------
 
     app.global::<PreviewBackend>().on_hit_test(|sequence, tick, x, y, view_w, view_h| {
@@ -1164,8 +1173,9 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let copy_handle = preview_worker.handle();
-    editor.on_on_clip_copied(move |clip_id| {
-        copy_handle.copy_clip(clip_id.to_string());
+    editor.on_on_clips_copied(move |clip_ids| {
+        let clips: Vec<String> = clip_ids.iter().map(|id| id.to_string()).collect();
+        copy_handle.copy_clips(clips);
     });
 
     let paste_handle = preview_worker.handle();
@@ -1174,8 +1184,15 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let duplicate_handle = preview_worker.handle();
-    editor.on_on_clip_duplicated(move |clip_id| {
-        duplicate_handle.duplicate_clip(clip_id.to_string());
+    editor.on_on_clips_duplicated(move |clip_ids| {
+        let clips: Vec<String> = clip_ids.iter().map(|id| id.to_string()).collect();
+        duplicate_handle.duplicate_clips(clips);
+    });
+
+    let unlink_handle = preview_worker.handle();
+    editor.on_on_clips_unlinked(move |clip_ids| {
+        let clips: Vec<String> = clip_ids.iter().map(|id| id.to_string()).collect();
+        unlink_handle.unlink_clips(clips);
     });
 
     let track_flag_handle = preview_worker.handle();

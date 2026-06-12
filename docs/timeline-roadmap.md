@@ -317,11 +317,19 @@ same resolver-pattern as drags.
       tails re-linked as a fresh group). Toggle off ⇒ links persist, dormant.
 - [ ] Compound clips (select N clips → one nested clip) — far future.
 
-Deliberate gaps: **group moves are freeform** (no main-track magnet
-ripple-insert for a multi-selection — singles keep it); **no group
-copy/duplicate** (those ops still act on the primary clip); **no unlink
-gesture** in the UI (the engine command exists; the toggle just makes links
-dormant); linked pairs don't render a link badge yet.
+Group copy/duplicate and the unlink gesture landed with v1 M0: copy
+snapshots the whole selection as one clipboard block (lanes + relative
+placement; paste slides the block right as a unit until every member fits,
+copied link groups re-link fresh), duplicate places the block right after
+itself the same way, and the toolbar's Unlink button dissolves the
+selection's link groups undoably (each member gets a fresh singleton group
+via `LinkClips` — behaviorally unlinked everywhere links are read; a
+dedicated `UnlinkClips` command can replace the trick once the command
+surface is open again post-M1).
+
+Deliberate gaps: **group moves and pastes are freeform** (no main-track
+magnet ripple-insert for a multi-selection — single-clip paste/duplicate
+keep it); linked pairs don't render a link badge yet.
 
 ## Phase 11 — Transitions & effects on the timeline
 
@@ -340,8 +348,9 @@ dormant); linked pairs don't render a link badge yet.
 - The multi-selection set is keyed by clip id alone (Phase 10), but the
   primary anchor is still the `(track-id, clip-id)` pair; the track half is
   redundant and could go.
-- Selection can go stale after undo/redo (the projection republish doesn't
-  touch `TimelineStore`); stale ids resolve to "nothing selected"
-  everywhere, but clearing selection on history steps would be cleaner.
+- ~~Selection can go stale after undo/redo~~ — fixed in v1 M0: every
+  projection republish prunes the selection against the new clip set
+  (`SelectionBackend.prune`, called from the app's projection-revision
+  watcher), dropping vanished ids and re-anchoring the primary.
 - The clipboard lives on the worker thread (content snapshot, not a
-  reference) — fine for clips, revisit when multi-select copy lands.
+  reference); since v1 M0 it holds the whole selection as one block.

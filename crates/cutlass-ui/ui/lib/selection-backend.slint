@@ -28,4 +28,12 @@ export global SelectionBackend {
     // (rows in lane units, top-first; fractional ends include partly covered
     // lanes). Locked lanes are skipped; link groups join whole.
     pure callback resolve-marquee(Sequence /* sequence */, int    /* tick0 */, int    /* tick1 */, float  /* row0 */, float  /* row1 */, bool   /* link-enabled */, ) -> SelectionUpdate;
+
+    // Reconcile the selection with a republished projection (undo/redo,
+    // agent edits): drop ids whose clips vanished; the primary follows its
+    // clip's lane or re-anchors on the first surviving member.
+    pure callback prune(Sequence /* sequence */, [string] /* current selection */, string /* primary-clip-id */, ) -> SelectionUpdate;
+
+    // Whether any selected clip carries a link-group id (gates Unlink).
+    pure callback has-link(Sequence /* sequence */, [string] /* selection */, ) -> bool;
 }

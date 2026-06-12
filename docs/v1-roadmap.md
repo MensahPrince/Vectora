@@ -318,14 +318,24 @@ Goal: nothing in the shipped app lies to users or loses their work.
       (`project-lifecycle-roadmap.md` Phase 4 — done).
 - [ ] **Missing-media relink** flow on open (engine `Load` already keeps
       placeholder entries; UI needs the relink dialog).
-- [ ] **Hide phantom kinds**: sticker/effect/filter/adjustment generators
+- [x] **Hide phantom kinds**: sticker/effect/filter/adjustment generators
       and lanes removed from the UI surface until their milestones land
-      (model keeps them; users stop seeing dead features).
-- [ ] **Selection survives undo/redo** (clear or remap on history steps —
-      tracked debt in `timeline-roadmap.md`).
+      (model keeps them; users stop seeing dead features). Library tabs
+      for Effects/Transitions/Filters/Adjustment removed; the projection
+      skips effect/filter/adjustment lanes (they round-trip through
+      save/load untouched). The Stickers tab stays — its shape/solid
+      generators are real.
+- [x] **Selection survives undo/redo** (clear or remap on history steps —
+      tracked debt in `timeline-roadmap.md`). Every projection republish
+      prunes the selection against the new clip set (vanished ids drop,
+      the primary re-anchors), so agent edits are covered too.
 - [ ] **Ripple trim on the magnet track** (`TrimClip` + `ShiftClips`
       composition; the deliberate gap from timeline Phase 7).
-- [ ] **Group copy/duplicate + unlink gesture** (timeline Phase 10 gaps).
+- [x] **Group copy/duplicate + unlink gesture** (timeline Phase 10 gaps).
+      Copy/duplicate act on the whole selection as one block (lanes +
+      relative placement preserved, copied link groups re-link, one
+      history entry); a toolbar Unlink button dissolves the selection's
+      link groups undoably.
 - [ ] **README/CHANGELOG honesty pass**: fix the proxy claim, fix the
       crate-responsibility table, state exactly what ships.
 - [ ] **Format versioning policy**: schema v2 = v1 + tolerated unknown
