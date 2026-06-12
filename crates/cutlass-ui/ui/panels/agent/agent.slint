@@ -13,14 +13,19 @@ import {
 } from "../../components/index.slint";
 import { AgentStore, AgentEntry, AppStore, TimelineActions } from "../../store/index.slint";
 
-// The prompt composer: single-line input styled like the inspector's
-// text fields (focus ring in the accent teal). Enter sends.
+// The prompt composer: multi-line input styled like the inspector's
+// text fields (focus ring in the accent teal). Grows with content up to
+// a cap, then scrolls. Enter inserts a newline; Ctrl+Enter (or Cmd+Enter)
+// sends.
 component PromptInput inherits Rectangle {
     in-out property <string> text;
     in property <bool> enabled: true;
     callback accepted(text: string);
 
-    height: 34px;
+    private property <length> pad-y: AppStore.theme.metrics.spacing.sm;
+    private property <length> pad-x: AppStore.theme.metrics.spacing.md;
+
+    height: clamp(input.preferred-height + 2 * self.pad-y, 34px, 110px);
     horizontal-stretch: 1;
     border-radius: AppStore.theme.metrics.radius.md;
     border-width: input.has-focus ? 1px : 0px;
@@ -47,31 +52,66 @@ component PromptInput inherits Rectangle {
     }
 
     if root.text == "" && !input.has-focus: CutlassText {
-        x: AppStore.theme.metrics.spacing.md;
-        width: parent.width - 2 * AppStore.theme.metrics.spacing.md;
+        x: root.pad-x;
+        width: parent.width - 2 * root.pad-x;
         height: parent.height;
         vertical-alignment: center;
-        text: "Describe an edit…";
+        text: "Describe an edit…  (Ctrl+Enter sends)";
         style: AppStore.theme.typography.body;
         foreground: AppStore.theme.text.muted;
+        overflow: elide;
     }
 
-    input := TextInput {
-        x: AppStore.theme.metrics.spacing.md;
-        width: parent.width - 2 * AppStore.theme.metrics.spacing.md;
-        height: parent.height;
-        vertical-alignment: center;
-        single-line: true;
-        enabled: root.enabled;
-        text <=> root.text;
-        color: AppStore.theme.text.primary;
-        font-size: AppStore.theme.typography.body.size;
-        font-weight: AppStore.theme.typography.body.weight;
-        selection-background-color: #00E5C755;
-        selection-foreground-color: AppStore.theme.text.primary;
-        accessible-role: none;
-        accepted => {
-            root.accepted(self.text);
+    editor-scroll := CutlassScrollView {
+        x: root.pad-x;
+        y: root.pad-y;
+        width: max(0px, root.width - 2 * root.pad-x);
+        height: max(0px, root.height - 2 * root.pad-y);
+        viewport-width: self.width;
+        viewport-height: max(self.height, input.preferred-height);
+        show-horizontal-scrollbar: false;
+        show-vertical-scrollbar: input.preferred-height > self.height;
+
+        input := TextInput {
+            width: editor-scroll.width;
+            height: max(editor-scroll.height, self.preferred-height);
+            single-line: false;
+            wrap: word-wrap;
+            enabled: root.enabled;
+            text <=> root.text;
+            color: AppStore.theme.text.primary;
+            font-size: AppStore.theme.typography.body.size;
+            font-weight: AppStore.theme.typography.body.weight;
+            selection-background-color: #00E5C755;
+            selection-foreground-color: AppStore.theme.text.primary;
+            page-height: editor-scroll.height;
+            accessible-role: none;
+            key-pressed(event) => {
+                if (event.text == Key.Return && (event.modifiers.control || event.modifiers.meta)) {
+                    root.accepted(root.text);
+                    return accept;
+                }
+                // Never let Slint's built-in text undo/redo run here: its
+                // undo stack records byte offsets that our programmatic
+                // clear-on-send invalidates, and replaying one against the
+                // emptied input panics (upstream Slint bug). Routing the
+                // shortcuts to timeline history is also what Cmd+Z means
+                // right after "Applied N edits" — undo the edit, not the
+                // typing.
+                if ((event.text == "z" || event.text == "Z") && (event.modifiers.control || event.modifiers.meta)) {
+                    if (event.modifiers.shift) {
+                        TimelineActions.redo();
+                    } else {
+                        TimelineActions.undo();
+                    }
+                    return accept;
+                }
+                if ((event.text == "y" || event.text == "Y") && (event.modifiers.control || event.modifiers.meta)) {
+                    TimelineActions.redo();
+                    return accept;
+                }
+                reject
+            }
         }
     }
 }
@@ -321,18 +361,23 @@ export component AgentPanel inherits PanelBase {
                     }
                 }
 
-                if !AgentStore.running: AccentButton {
-                    label: "Send";
-                    enabled: prompt-input.text != "";
-                    clicked => {
-                        root.submit(prompt-input.text);
-                    }
-                }
+                // Pin the action at the bottom edge while the input grows.
+                VerticalLayout {
+                    alignment: end;
 
-                if AgentStore.running: SubtleButton {
-                    label: "Stop";
-                    clicked => {
-                        AgentStore.cancel();
+                    if !AgentStore.running: AccentButton {
+                        label: "Send";
+                        enabled: prompt-input.text != "";
+                        clicked => {
+                            root.submit(prompt-input.text);
+                        }
+                    }
+
+                    if AgentStore.running: SubtleButton {
+                        label: "Stop";
+                        clicked => {
+                            AgentStore.cancel();
+                        }
                     }
                 }
             }
