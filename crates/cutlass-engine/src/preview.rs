@@ -2,13 +2,13 @@
 
 use std::time::Instant;
 
-use cutlass_compositor::{Compositor, GpuContext, Yuv420pImage};
+use cutlass_compositor::{Compositor, CompositorConfig, GpuContext, Yuv420pImage};
 use cutlass_cache::FrameCache;
 use cutlass_models::{ClipId, ClipTransform, Generator, ModelError, Project, RationalTime};
 use tracing::debug;
 
 use crate::ColorConvertPath;
-use crate::composite::{composite_canvas_size, resolve_layers};
+use crate::composite::{composite_canvas_config, resolve_layers};
 use crate::decoder_pool::DecoderPool;
 use crate::error::EngineError;
 use crate::frame::RgbaFrame;
@@ -36,8 +36,7 @@ pub fn get_frame(
         .into());
     }
 
-    let (width, height) = composite_canvas_size(project);
-    let config = cutlass_compositor::CompositorConfig::new(width, height);
+    let config = composite_canvas_config(project);
 
     // Stage timings (playback roadmap Phase 2): resolve covers decode or
     // cache read; composite covers GPU submit + RGBA readback.
@@ -57,10 +56,10 @@ pub fn get_frame(
     let resolve_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     // A timeline gap isn't an error: the canvas composites bottom-up from
-    // black, so zero layers is just the bare canvas. Skip the GPU
-    // round-trip and hand back opaque black directly.
+    // the background color, so zero layers is just the bare canvas. Skip
+    // the GPU round-trip and hand back the solid background directly.
     if layers.is_empty() {
-        return black_rgba_frame(width, height);
+        return background_rgba_frame(&config);
     }
 
     let start = Instant::now();
@@ -90,8 +89,7 @@ pub fn prefetch_frame(
     time: RationalTime,
     color_convert: ColorConvertPath,
 ) -> Result<(), EngineError> {
-    let (width, height) = composite_canvas_size(project);
-    let config = cutlass_compositor::CompositorConfig::new(width, height);
+    let config = composite_canvas_config(project);
     resolve_layers(project, Some(cache), pool, raster, time, 0.0, &config, color_convert, None, None)?;
     Ok(())
 }
@@ -120,8 +118,7 @@ pub fn get_export_yuv_frame(
         .into());
     }
 
-    let (width, height) = composite_canvas_size(project);
-    let config = cutlass_compositor::CompositorConfig::new(width, height);
+    let config = composite_canvas_config(project);
     // Export never sees a gesture override: committed project state only.
     let layers = resolve_layers(
         project,
@@ -136,9 +133,10 @@ pub fn get_export_yuv_frame(
         None,
     )?;
 
-    // Same gap policy as preview: a tick no clip covers exports as black.
+    // Same gap policy as preview: a tick no clip covers exports as the
+    // bare canvas background.
     if layers.is_empty() {
-        return Ok(black_yuv420p(width, height));
+        return Ok(background_yuv420p(&config));
     }
 
     match color_convert {
@@ -158,25 +156,32 @@ pub fn get_export_yuv_frame(
     }
 }
 
-/// Opaque black canvas — what compositing zero layers produces, without the
-/// GPU submit + readback.
-fn black_rgba_frame(width: u32, height: u32) -> Result<RgbaFrame, EngineError> {
-    let mut bytes = vec![0u8; width as usize * height as usize * 4];
-    for px in bytes.chunks_exact_mut(4) {
-        px[3] = 255;
+/// Opaque canvas background — what compositing zero layers produces, without
+/// the GPU submit + readback.
+fn background_rgba_frame(config: &CompositorConfig) -> Result<RgbaFrame, EngineError> {
+    let [r, g, b] = config.background;
+    let px = [r, g, b, 255];
+    let count = config.width as usize * config.height as usize;
+    let mut bytes = Vec::with_capacity(count * 4);
+    for _ in 0..count {
+        bytes.extend_from_slice(&px);
     }
-    RgbaFrame::new(width, height, bytes)
+    RgbaFrame::new(config.width, config.height, bytes)
 }
 
-/// Limited-range black (Y=16, U=V=128), matching what the GPU and legacy CPU
-/// RGBA→YUV converters emit for RGB black.
-fn black_yuv420p(width: u32, height: u32) -> Yuv420pImage {
-    let (w, h) = (width as usize, height as usize);
+/// The canvas background as limited-range YUV, matching what the GPU and
+/// legacy CPU RGBA→YUV converters (BT.601) emit for that solid RGB frame.
+fn background_yuv420p(config: &CompositorConfig) -> Yuv420pImage {
+    let [r, g, b] = config.background.map(i32::from);
+    let y = (((66 * r + 129 * g + 25 * b + 128) >> 8) + 16).clamp(16, 235) as u8;
+    let u = (((-38 * r - 74 * g + 112 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+    let v = (((112 * r - 94 * g - 18 * b + 128) >> 8) + 128).clamp(16, 240) as u8;
+    let (w, h) = (config.width as usize, config.height as usize);
     Yuv420pImage {
-        width,
-        height,
-        y: vec![16; w * h],
-        u: vec![128; (w / 2) * (h / 2)],
-        v: vec![128; (w / 2) * (h / 2)],
+        width: config.width,
+        height: config.height,
+        y: vec![y; w * h],
+        u: vec![u; (w / 2) * (h / 2)],
+        v: vec![v; (w / 2) * (h / 2)],
     }
 }

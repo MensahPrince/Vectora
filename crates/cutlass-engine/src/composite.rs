@@ -19,11 +19,21 @@ use crate::generator_raster::GeneratorRaster;
 const DEFAULT_WIDTH: u32 = 1920;
 const DEFAULT_HEIGHT: u32 = 1080;
 
-/// Output canvas size: max *video* media dimensions on the timeline, or
-/// 1920×1080 fallback. Width and height are forced even for downstream H.264
-/// export. Stills don't vote: a 12MP photo must not balloon the canvas (and
-/// the encode) past what the footage calls for — it aspect-fits like any
-/// other layer.
+/// Output canvas size, honoring the project's canvas aspect preset (M1
+/// canvas settings).
+///
+/// The *base* size is the max *video* media dimensions on the timeline, or
+/// 1920×1080 fallback. Stills don't vote: a 12MP photo must not balloon the
+/// canvas (and the encode) past what the footage calls for — it aspect-fits
+/// like any other layer.
+///
+/// - `Auto` (default): the base size as-is — the pre-canvas-settings
+///   behavior.
+/// - A fixed ratio: the canvas short edge keeps the base's short edge (the
+///   footage's quality tier survives a ratio change — 4K stays 4K-class
+///   when flipped to 9:16), the long edge follows the ratio.
+///
+/// Width and height are forced even for downstream H.264 export.
 pub fn composite_canvas_size(project: &Project) -> (u32, u32) {
     let mut max_w = 0u32;
     let mut max_h = 0u32;
@@ -43,11 +53,34 @@ pub fn composite_canvas_size(project: &Project) -> (u32, u32) {
         }
     }
 
-    if max_w == 0 || max_h == 0 {
+    let (base_w, base_h) = if max_w == 0 || max_h == 0 {
         (DEFAULT_WIDTH, DEFAULT_HEIGHT)
     } else {
-        (to_even(max_w), to_even(max_h))
+        (max_w, max_h)
+    };
+
+    match project.timeline().canvas().aspect.ratio() {
+        None => (to_even(base_w), to_even(base_h)),
+        Some((rw, rh)) => {
+            let tier = u64::from(base_w.min(base_h));
+            let (rw, rh) = (u64::from(rw), u64::from(rh));
+            let (w, h) = if rw >= rh {
+                (tier * rw / rh, tier)
+            } else {
+                (tier, tier * rh / rw)
+            };
+            (to_even(w as u32), to_even(h as u32))
+        }
     }
+}
+
+/// The full compositor canvas for a project: derived size plus the
+/// project's background color. Preview and export both build their pass
+/// config here so the two can never disagree on what the canvas looks like.
+pub fn composite_canvas_config(project: &Project) -> CompositorConfig {
+    let (width, height) = composite_canvas_size(project);
+    CompositorConfig::new(width, height)
+        .with_background(project.timeline().canvas().background)
 }
 
 /// Canvas placement for content of `content_w × content_h` under a clip
@@ -376,10 +409,7 @@ mod tests {
 
     // --- layer_placement ---------------------------------------------------
 
-    const CANVAS: CompositorConfig = CompositorConfig {
-        width: 1920,
-        height: 1080,
-    };
+    const CANVAS: CompositorConfig = CompositorConfig::new(1920, 1080);
 
     #[test]
     fn identity_transform_on_canvas_sized_content_is_full_canvas() {
@@ -668,6 +698,74 @@ mod tests {
             )
             .unwrap();
         assert_eq!(composite_canvas_size(&project), (1920, 1080));
+    }
+
+    #[test]
+    fn canvas_size_honors_aspect_presets() {
+        use cutlass_models::{CanvasAspect, CanvasSettings, MediaSource, TimeRange};
+        let rate = cutlass_models::Rational::FPS_24;
+        let mut project = Project::new("t", rate);
+        let media_id = project.add_media(MediaSource::new(
+            "/tmp/clip.mp4",
+            1920,
+            1080,
+            rate,
+            240,
+            false,
+        ));
+        let track = project.add_track(TrackKind::Video, "V1");
+        project
+            .add_clip(
+                track,
+                media_id,
+                TimeRange::at_rate(0, 100, rate),
+                RationalTime::new(0, rate),
+            )
+            .unwrap();
+
+        // The short edge keeps the footage's 1080 tier; the long edge
+        // follows the chosen ratio.
+        let expect = [
+            (CanvasAspect::Auto, (1920, 1080)),
+            (CanvasAspect::Wide16x9, (1920, 1080)),
+            (CanvasAspect::Tall9x16, (1080, 1920)),
+            (CanvasAspect::Square1x1, (1080, 1080)),
+            (CanvasAspect::Portrait4x5, (1080, 1350)),
+            (CanvasAspect::Cinema21x9, (2520, 1080)),
+        ];
+        for (aspect, size) in expect {
+            project.timeline_mut().set_canvas(CanvasSettings {
+                aspect,
+                background: [0, 0, 0],
+            });
+            assert_eq!(composite_canvas_size(&project), size, "{}", aspect.name());
+        }
+    }
+
+    #[test]
+    fn canvas_aspect_applies_to_the_empty_project_fallback() {
+        use cutlass_models::{CanvasAspect, CanvasSettings};
+        let mut project = Project::new("t", cutlass_models::Rational::FPS_24);
+        project.timeline_mut().set_canvas(CanvasSettings {
+            aspect: CanvasAspect::Tall9x16,
+            background: [0, 0, 0],
+        });
+        // No media: the 1080 tier of the 1920×1080 fallback, reshaped.
+        assert_eq!(composite_canvas_size(&project), (1080, 1920));
+    }
+
+    #[test]
+    fn canvas_config_carries_the_project_background() {
+        use cutlass_models::{CanvasAspect, CanvasSettings};
+        let mut project = Project::new("t", cutlass_models::Rational::FPS_24);
+        assert_eq!(composite_canvas_config(&project).background, [0, 0, 0]);
+        project.timeline_mut().set_canvas(CanvasSettings {
+            aspect: CanvasAspect::Auto,
+            background: [30, 60, 90],
+        });
+        let config = composite_canvas_config(&project);
+        assert_eq!(config.background, [30, 60, 90]);
+        assert_eq!((config.width, config.height), (1920, 1080));
     }
 
     #[test]

@@ -336,10 +336,18 @@ impl Compositor {
                     view: &target.view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        // Opaque black canvas: placed layers may leave parts
-                        // of the canvas uncovered (transforms), and preview/
-                        // export both define the background as black.
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        // Opaque canvas background: placed layers may leave
+                        // parts of the canvas uncovered (transforms), and
+                        // preview/export both show the project background
+                        // there. The target is Rgba8Unorm (no sRGB encode),
+                        // so byte/255 lands the exact color, same as the
+                        // solid-layer shader.
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: f64::from(config.background[0]) / 255.0,
+                            g: f64::from(config.background[1]) / 255.0,
+                            b: f64::from(config.background[2]) / 255.0,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],

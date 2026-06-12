@@ -13,7 +13,10 @@ mod import;
 mod preview;
 
 pub use action::ApplyOutcome;
-pub use composite::{content_uv, cropped_layer_placement, layer_placement};
+pub use composite::{
+    composite_canvas_config, composite_canvas_size, content_uv, cropped_layer_placement,
+    layer_placement,
+};
 pub use generator_raster::system_font_families;
 pub use engine::{ColorConvertPath, DEFAULT_CACHE_BUDGET_BYTES, Engine, EngineConfig};
 pub use error::EngineError;

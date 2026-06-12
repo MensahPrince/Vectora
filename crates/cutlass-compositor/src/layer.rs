@@ -1,13 +1,25 @@
-/// Canvas dimensions for a composite pass.
+/// Canvas dimensions + background for a composite pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositorConfig {
     pub width: u32,
     pub height: u32,
+    /// Opaque background color (`[r, g, b]`) the canvas clears to before
+    /// layers composite over it.
+    pub background: [u8; 3],
 }
 
 impl CompositorConfig {
-    pub fn new(width: u32, height: u32) -> Self {
-        Self { width, height }
+    pub const fn new(width: u32, height: u32) -> Self {
+        Self {
+            width,
+            height,
+            background: [0, 0, 0],
+        }
+    }
+
+    pub const fn with_background(mut self, background: [u8; 3]) -> Self {
+        self.background = background;
+        self
     }
 }
 

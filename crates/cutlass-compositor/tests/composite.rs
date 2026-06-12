@@ -39,6 +39,41 @@ fn solid_fills_canvas() {
 }
 
 #[test]
+fn background_color_fills_uncovered_canvas() {
+    let Some(gpu) = try_gpu() else {
+        eprintln!("skipping background_color_fills_uncovered_canvas: no GPU adapter");
+        return;
+    };
+    let mut compositor = Compositor::new(&gpu).expect("compositor");
+    let config = CompositorConfig::new(8, 8).with_background([10, 120, 250]);
+
+    // A half-width layer leaves the right side of the canvas bare: the
+    // bare half clears to the background, the covered half stays content.
+    let image = compositor
+        .composite(
+            &gpu,
+            &config,
+            &[CompositeLayer::solid(
+                [255, 0, 0, 255],
+                LayerPlacement {
+                    center: [2.0, 4.0],
+                    size: [4.0, 8.0],
+                    rotation: 0.0,
+                    opacity: 1.0,
+                },
+            )],
+        )
+        .expect("composite");
+
+    assert_eq!(pixel(&image, 1, 4), [255, 0, 0, 255], "covered: content");
+    assert_eq!(pixel(&image, 6, 4), [10, 120, 250, 255], "bare: background");
+
+    // Zero layers = the bare canvas, all background.
+    let empty = compositor.composite(&gpu, &config, &[]).expect("composite");
+    assert!(empty.bytes.chunks_exact(4).all(|p| p == [10, 120, 250, 255]));
+}
+
+#[test]
 fn rgba_over_solid_alpha_blends() {
     let Some(gpu) = try_gpu() else {
         eprintln!("skipping rgba_over_solid_alpha_blends: no GPU adapter");
