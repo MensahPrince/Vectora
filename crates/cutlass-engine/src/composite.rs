@@ -3,7 +3,7 @@
 use std::time::Instant;
 
 use cutlass_cache::{FrameCache, SourceFingerprint};
-use cutlass_compositor::{CompositeLayer, CompositorConfig, LayerPlacement};
+use cutlass_compositor::{CompositeLayer, CompositorConfig, LayerEffect, LayerPlacement};
 use cutlass_decoder::DecodedFrame;
 use cutlass_models::{
     Clip, ClipId, ClipTransform, CropRect, Generator, ModelError, Project, RationalTime, TrackKind,
@@ -205,17 +205,20 @@ pub fn resolve_layers(
         // Animated params sample at the clip-relative tick (M2): pure binary
         // search + lerp per property, allocation-free. A live gesture
         // override replaces the whole sampled value for this resolve only.
+        let anim_tick = clip.animation_tick_f(time.value as f64 + f64::from(anim_phase));
         let transform = match &override_transform {
             Some((id, t)) if *id == clip.id => *t,
-            _ => clip.transform.sample_at(
-                clip.animation_tick_f(time.value as f64 + f64::from(anim_phase)),
-            ),
+            _ => clip.transform.sample_at(anim_tick),
         };
         let transform = &transform;
         // Framing (M1): the kept region shapes the placement, the UV rect
         // samples it (flips reverse the sampled axis).
         let crop = &clip.crop;
         let uv = content_uv(crop, clip.flip_h, clip.flip_v);
+        // Effects (M4): sample each animated param at the same clip tick and
+        // pack into the compositor's slot order. Empty for clips without
+        // effects (no allocation), keeping the no-effect path untouched.
+        let effects = resolve_effects(clip, anim_tick);
         match &clip.content {
             cutlass_models::ClipSource::Media { .. } => {
                 // Still images bypass the decode/cache pipeline entirely:
@@ -229,7 +232,9 @@ pub fn resolve_layers(
                     let placement =
                         cropped_layer_placement(transform, width, height, crop, canvas);
                     layers.push(
-                        CompositeLayer::rgba(bytes, width, height, placement).with_uv(uv),
+                        CompositeLayer::rgba(bytes, width, height, placement)
+                            .with_uv(uv)
+                            .with_effects(effects),
                     );
                     continue;
                 }
@@ -261,7 +266,7 @@ pub fn resolve_layers(
                         .with_uv(uv)
                     }
                 };
-                layers.push(layer);
+                layers.push(layer.with_effects(effects));
             }
             cutlass_models::ClipSource::Generated(generator) => {
                 // A live inspector edit (e.g. font-size drag) renders this clip
@@ -278,7 +283,7 @@ pub fn resolve_layers(
                     Generator::SolidColor { rgba } => {
                         // Solids have no texture to sample: crop shrinks the
                         // quad, flips are invisible.
-                        layers.push(CompositeLayer::solid(*rgba, placement));
+                        layers.push(CompositeLayer::solid(*rgba, placement).with_effects(effects));
                     }
                     Generator::Text { .. } | Generator::Shape { .. } => {
                         match raster.raster(generator, canvas.width, canvas.height) {
@@ -289,7 +294,8 @@ pub fn resolve_layers(
                                     canvas.height,
                                     placement,
                                 )
-                                .with_uv(uv),
+                                .with_uv(uv)
+                                .with_effects(effects),
                             ),
                             None => {
                                 debug!(?generator, "generator produced no raster");
@@ -308,6 +314,33 @@ pub fn resolve_layers(
     }
 
     Ok(layers)
+}
+
+/// Sample a clip's effect chain at clip-relative `tick` into compositor
+/// [`LayerEffect`]s. Each model parameter is looked up by name in the
+/// compositor's slot table, so the catalog (defaults / ranges) and the WGSL
+/// (slot order) bridge by name and can't silently drift. Unknown effects or
+/// params are skipped here; the model layer validates them on edit.
+fn resolve_effects(clip: &Clip, tick: f64) -> Vec<LayerEffect> {
+    if clip.effects.is_empty() {
+        return Vec::new();
+    }
+    clip.effects
+        .iter()
+        .filter_map(|fx| {
+            let spec = cutlass_models::effect_spec(&fx.effect_id)?;
+            let mut layer_effect = LayerEffect::new(&fx.effect_id);
+            for pspec in spec.params {
+                let value = fx.sample_param(pspec.name, tick).unwrap_or(pspec.default);
+                if let Some(slot) =
+                    cutlass_compositor::effect_param_index(&fx.effect_id, pspec.name)
+                {
+                    layer_effect.params[slot] = value;
+                }
+            }
+            Some(layer_effect)
+        })
+        .collect()
 }
 
 fn decode_media_frame(
@@ -536,6 +569,71 @@ mod tests {
         assert_eq!(layers[0].placement.size, [320.0, 120.0]);
         // UV samples the kept band, mirrored horizontally.
         assert_eq!(layers[0].uv, [1.0, 0.25, 0.0, 0.75]);
+    }
+
+    #[test]
+    fn resolve_attaches_sampled_effects_to_layer() {
+        use cutlass_models::TimeRange;
+        let rate = cutlass_models::Rational::FPS_24;
+        let mut project = Project::new("t", rate);
+        let track = project.add_track(TrackKind::Text, "T1");
+        let clip = project
+            .add_generated(track, Generator::text("Hi"), TimeRange::at_rate(0, 24, rate))
+            .unwrap();
+        project.add_effect(clip, "vignette").unwrap();
+        // amount is slot 0 of vignette.
+        project.set_effect_param(clip, 0, 0, 0.5).unwrap();
+
+        let mut pool = DecoderPool::new();
+        let mut raster = GeneratorRaster::new();
+        let canvas = CompositorConfig::new(64, 64);
+        let layers = resolve_layers(
+            &project,
+            None,
+            &mut pool,
+            &mut raster,
+            RationalTime::new(0, rate),
+            0.0,
+            &canvas,
+            ColorConvertPath::Gpu,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].effects.len(), 1);
+        assert_eq!(layers[0].effects[0].effect_id, "vignette");
+        let slot = cutlass_compositor::effect_param_index("vignette", "amount").unwrap();
+        assert_eq!(layers[0].effects[0].params[slot], 0.5);
+    }
+
+    #[test]
+    fn resolve_without_effects_leaves_empty_chain() {
+        use cutlass_models::TimeRange;
+        let rate = cutlass_models::Rational::FPS_24;
+        let mut project = Project::new("t", rate);
+        let track = project.add_track(TrackKind::Text, "T1");
+        project
+            .add_generated(track, Generator::text("Hi"), TimeRange::at_rate(0, 24, rate))
+            .unwrap();
+
+        let mut pool = DecoderPool::new();
+        let mut raster = GeneratorRaster::new();
+        let canvas = CompositorConfig::new(64, 64);
+        let layers = resolve_layers(
+            &project,
+            None,
+            &mut pool,
+            &mut raster,
+            RationalTime::new(0, rate),
+            0.0,
+            &canvas,
+            ColorConvertPath::Gpu,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(layers[0].effects.is_empty());
     }
 
     #[test]

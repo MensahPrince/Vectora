@@ -137,6 +137,23 @@ fn dispatch_edit(
             let inverse = edit::set_audio::set_audio(ctx, clip, volume, fade_in, fade_out)?;
             Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
         }
+        EditCommand::AddEffect { clip, effect_id } => {
+            let inverse = edit::set_effect::add_effect(ctx, clip, &effect_id)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+        }
+        EditCommand::RemoveEffect { clip, index } => {
+            let inverse = edit::set_effect::remove_effect(ctx, clip, index)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+        }
+        EditCommand::SetEffectParam {
+            clip,
+            index,
+            param,
+            value,
+        } => {
+            let inverse = edit::set_effect::set_effect_param(ctx, clip, index, param, value)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+        }
         EditCommand::SplitClip { clip, at } => {
             let (id, inverse) = edit::split_clip::execute(ctx, clip, at)?;
             Ok((ApplyOutcome::Edited(EditOutcome::Created(id)), Some(inverse)))

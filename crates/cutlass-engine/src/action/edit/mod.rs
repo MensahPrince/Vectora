@@ -13,6 +13,7 @@ pub mod remove_media;
 pub mod set_audio;
 pub mod set_canvas;
 pub mod set_crop;
+pub mod set_effect;
 pub mod set_generator;
 pub mod set_param;
 pub mod set_speed;

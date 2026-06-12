@@ -1487,3 +1487,149 @@ fn failed_move_overlap_does_not_push_undo() {
     assert!(engine.undo());
     assert!(!engine.can_undo());
 }
+
+#[test]
+fn add_effect_undo_redo_roundtrip() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+
+    engine
+        .apply(Command::Edit(EditCommand::AddEffect {
+            clip: clip_id,
+            effect_id: "gaussian_blur".into(),
+        }))
+        .expect("add effect");
+    let effects = |engine: &cutlass_engine::Engine| {
+        engine.project().clip(clip_id).unwrap().effects.clone()
+    };
+    assert_eq!(effects(&engine).len(), 1);
+    assert_eq!(effects(&engine)[0].effect_id, "gaussian_blur");
+
+    assert!(engine.undo());
+    assert!(effects(&engine).is_empty());
+    assert!(engine.redo());
+    assert_eq!(effects(&engine).len(), 1);
+}
+
+#[test]
+fn remove_effect_undo_restores_it() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+
+    engine
+        .apply(Command::Edit(EditCommand::AddEffect {
+            clip: clip_id,
+            effect_id: "vignette".into(),
+        }))
+        .expect("add effect");
+    engine
+        .apply(Command::Edit(EditCommand::RemoveEffect {
+            clip: clip_id,
+            index: 0,
+        }))
+        .expect("remove effect");
+    assert!(engine.project().clip(clip_id).unwrap().effects.is_empty());
+
+    assert!(engine.undo());
+    let effects = engine.project().clip(clip_id).unwrap().effects.clone();
+    assert_eq!(effects.len(), 1);
+    assert_eq!(effects[0].effect_id, "vignette");
+}
+
+#[test]
+fn set_effect_param_undo_redo_roundtrip() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+
+    engine
+        .apply(Command::Edit(EditCommand::AddEffect {
+            clip: clip_id,
+            effect_id: "vignette".into(),
+        }))
+        .expect("add effect");
+    engine
+        .apply(Command::Edit(EditCommand::SetEffectParam {
+            clip: clip_id,
+            index: 0,
+            param: 0,
+            value: 0.75,
+        }))
+        .expect("set param");
+
+    let amount = |engine: &cutlass_engine::Engine| {
+        engine.project().clip(clip_id).unwrap().effects[0].sample_param("amount", 0.0)
+    };
+    assert_eq!(amount(&engine), Some(0.75));
+
+    // Undo restores the default (param absent → catalog default 0.6).
+    assert!(engine.undo());
+    assert_eq!(amount(&engine), Some(0.6));
+    assert!(engine.redo());
+    assert_eq!(amount(&engine), Some(0.75));
+}
+
+#[test]
+fn effect_param_keyframe_through_clip_param() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+    engine
+        .apply(Command::Edit(EditCommand::AddEffect {
+            clip: clip_id,
+            effect_id: "gaussian_blur".into(),
+        }))
+        .expect("add effect");
+
+    let fx_param = ClipParam::Effect { effect: 0, param: 0 };
+    engine
+        .apply(Command::Edit(EditCommand::SetParamKeyframe {
+            clip: clip_id,
+            param: fx_param,
+            at: rt(0),
+            value: ParamValue::Scalar(0.0),
+            easing: Easing::Linear,
+        }))
+        .expect("kf0");
+    engine
+        .apply(Command::Edit(EditCommand::SetParamKeyframe {
+            clip: clip_id,
+            param: fx_param,
+            at: rt(24),
+            value: ParamValue::Scalar(8.0),
+            easing: Easing::Linear,
+        }))
+        .expect("kf24");
+
+    let radius_at = |engine: &cutlass_engine::Engine, tick: f64| {
+        engine.project().clip(clip_id).unwrap().effects[0].sample_param("radius", tick)
+    };
+    assert_eq!(radius_at(&engine, 12.0), Some(4.0));
+
+    // Undo peels keyframes one at a time, like the transform path.
+    assert!(engine.undo());
+    assert!(engine.undo());
+    assert_eq!(radius_at(&engine, 12.0), Some(4.0)); // back to default constant
+}
+
+#[test]
+fn effect_commands_reject_unknown_ids_without_history() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+
+    assert!(engine
+        .apply(Command::Edit(EditCommand::AddEffect {
+            clip: clip_id,
+            effect_id: "no_such_effect".into(),
+        }))
+        .is_err());
+    assert!(engine
+        .apply(Command::Edit(EditCommand::RemoveEffect {
+            clip: clip_id,
+            index: 0,
+        }))
+        .is_err());
+    // Only the add-track + add-generated steps are undoable; failed effect
+    // edits push nothing.
+    assert!(engine.undo());
+    assert!(engine.undo());
+    assert!(!engine.can_undo());
+}
