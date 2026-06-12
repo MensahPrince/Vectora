@@ -14,6 +14,7 @@ import { AppState } from "state.slint";
 import { FullscreenPreview } from "fullscreen-preview.slint";
 import { TitleBar } from "shell/title-bar.slint";
 import { ExportDialog } from "shell/export-dialog.slint";
+import { MessageDialog } from "shell/message-dialog.slint";
 import { ExportBackend } from "lib/export-backend.slint";
 import { PreviewBackend, PreviewDragResolution } from "lib/preview-backend.slint";
 
@@ -93,6 +94,18 @@ export component AppWindow inherits Window {
         EditorStore.on-playhead-changed(self.playhead);
     }
 
+    // The session was replaced wholesale (open / new — lifecycle roadmap
+    // Phase 2): reset UI-side session state. The projection republish
+    // already swapped the project; this clears what rides alongside it.
+    private property <int> session-epoch: EditorStore.session-epoch;
+
+    changed session-epoch => {
+        TimelineActions.pause();
+        TimelineActions.clear-selection();
+        TimelineActions.clear-range();
+        TimelineActions.seek-start();
+    }
+
     // Arrow keys nudge the selected visual clip by whole canvas pixels
     // (preview roadmap Phase 3; CapCut: 1 px, Shift = 10) through the same
     // commit path as a preview drag — one undoable entry per keypress.
@@ -138,6 +151,14 @@ export component AppWindow inherits Window {
 
     shortcuts := FocusScope {
         key-pressed(event) => {
+            // The error dialog is modal: Escape/Enter dismiss, everything
+            // else is swallowed (same policy as the export dialog below).
+            if (EditorStore.session-error != "") {
+                if (event.text == Key.Escape || event.text == Key.Return) {
+                    EditorStore.session-error = "";
+                }
+                return accept;
+            }
             // The export dialog is modal: swallow timeline shortcuts while
             // it's up (Space must not start playback under the scrim).
             // Escape dismisses it unless a job is running — then stopping
@@ -151,6 +172,23 @@ export component AppWindow inherits Window {
             }
             // Accept both Ctrl and Cmd (macOS) as the command modifier.
             if (event.modifiers.control || event.modifiers.meta) {
+                // Save / Save As (lifecycle roadmap Phase 1): Shift forces
+                // the path picker; main.rs owns the async dialog and the
+                // first-save fallback.
+                if (event.text == "s" || event.text == "S") {
+                    EditorStore.on-save-requested(event.modifiers.shift);
+                    return accept;
+                }
+                // Open / New (lifecycle roadmap Phase 2): main.rs runs the
+                // unsaved-changes guard before the session is replaced.
+                if (event.text == "o" || event.text == "O") {
+                    EditorStore.on-open-requested();
+                    return accept;
+                }
+                if (event.text == "n" || event.text == "N") {
+                    EditorStore.on-new-requested();
+                    return accept;
+                }
                 if (event.text == "b" || event.text == "B") {
                     TimelineActions.split-at-playhead();
                     return accept;
@@ -341,6 +379,13 @@ export component AppWindow inherits Window {
     // Export settings dialog — declared last so the modal paints above
     // every panel and the title bar.
     if AppState.export-dialog-open: ExportDialog {
+        width: root.width;
+        height: root.height;
+    }
+
+    // Session-error dialog (save/open failures) — above even the export
+    // dialog: an error must never hide behind another modal.
+    if EditorStore.session-error != "": MessageDialog {
         width: root.width;
         height: root.height;
     }

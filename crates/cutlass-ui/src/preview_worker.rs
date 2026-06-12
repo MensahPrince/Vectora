@@ -149,6 +149,37 @@ enum WorkerMsg {
     Export(ExportRequest),
     /// Flag the running export job to stop after the frame in flight.
     CancelExport,
+    /// Write the session to a `.cutlass` file. `None` reuses the engine's
+    /// current project path (plain Cmd+S on a saved project — the UI gates
+    /// on a path existing); `Some` rebinds it (first save / Save As). Not
+    /// undoable; on success the projection republish clears the dirty dot.
+    /// Either way `save-finished(ok)` fires so a pending guarded transition
+    /// (open/new/close waiting on "Save") can continue or abort.
+    SaveProject { path: Option<PathBuf> },
+    /// Replace the session from a `.cutlass` file (strict: every media path
+    /// must exist). Success re-registers pool media with the thumbnail and
+    /// strip workers, republishes everything, and bumps the session epoch
+    /// so the UI resets its session state (playhead, selection, range).
+    /// Failure publishes `session-error`. The unsaved-changes guard ran
+    /// UI-side before this message was sent.
+    OpenProject { path: PathBuf },
+    /// Replace the session with a fresh, empty, unsaved project (File →
+    /// New). Same epoch bump as `OpenProject`; guard ran UI-side.
+    NewProject,
+    /// Periodic autosave sweep (UI timer, every
+    /// [`autosave::SWEEP_INTERVAL`](crate::autosave::SWEEP_INTERVAL)).
+    /// Dirty session ⇒ snapshot to the sidecar slot; clean ⇒ the slot is
+    /// stale and gets removed. Failures only log — autosave must never
+    /// interrupt editing.
+    Autosave,
+    /// Restore a crash-recovery snapshot (launch offer, accepted). Loads
+    /// `autosave` tolerantly, binds the session to `source` (the user's
+    /// file — `None` for a never-saved session), and leaves it dirty so
+    /// Cmd+S writes the recovered work back to the real file.
+    RestoreAutosave {
+        autosave: PathBuf,
+        source: Option<PathBuf>,
+    },
 }
 
 /// Dialog settings for one export job (see `ui/lib/export-backend.slint`).
@@ -209,6 +240,26 @@ impl WorkerHandle {
 
     pub fn import(&self, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::Import(path));
+    }
+
+    pub fn save_project(&self, path: Option<PathBuf>) {
+        let _ = self.tx.send(WorkerMsg::SaveProject { path });
+    }
+
+    pub fn open_project(&self, path: PathBuf) {
+        let _ = self.tx.send(WorkerMsg::OpenProject { path });
+    }
+
+    pub fn new_project(&self) {
+        let _ = self.tx.send(WorkerMsg::NewProject);
+    }
+
+    pub fn autosave(&self) {
+        let _ = self.tx.send(WorkerMsg::Autosave);
+    }
+
+    pub fn restore_autosave(&self, autosave: PathBuf, source: Option<PathBuf>) {
+        let _ = self.tx.send(WorkerMsg::RestoreAutosave { autosave, source });
     }
 
     pub fn add_clip(
@@ -474,11 +525,16 @@ fn worker_loop(
     // clears it on exit); `cancel` is reset at every job start so a stale
     // cancel can't kill the next run.
     let export_state = ExportJobState::default();
+    // The autosave slot last written, with the engine revision it captured:
+    // a dirty-but-idle session skips the redundant rewrite, and a session
+    // identity change (Save As / Open / New) cleans the orphaned slot up.
+    let mut autosave_slot: Option<(PathBuf, u64)> = None;
 
     let mutate = |engine: &mut Engine,
                   clipboard: &mut Option<ClipboardClip>,
                   main_magnet: &mut bool,
                   linkage: &mut bool,
+                  autosave_slot: &mut Option<(PathBuf, u64)>,
                   msg: WorkerMsg| {
         match msg {
             WorkerMsg::Import(path) => {
@@ -600,6 +656,21 @@ fn worker_loop(
             WorkerMsg::SetTrackFlag { track, flag, value } => {
                 set_track_flag_and_publish(engine, &track, flag, value, &ui)
             }
+            WorkerMsg::SaveProject { path } => save_project_and_publish(engine, path, &ui),
+            WorkerMsg::OpenProject { path } => {
+                open_project_and_publish(engine, path, &ui, &thumbs, &strips)
+            }
+            WorkerMsg::NewProject => new_project_and_publish(engine, &ui),
+            WorkerMsg::Autosave => autosave_sweep(engine, autosave_slot),
+            WorkerMsg::RestoreAutosave { autosave, source } => restore_autosave_and_publish(
+                engine,
+                autosave,
+                source,
+                autosave_slot,
+                &ui,
+                &thumbs,
+                &strips,
+            ),
             WorkerMsg::Export(request) => start_export(engine, &ui, &export_state, request),
             WorkerMsg::CancelExport => {
                 info!("export cancel requested");
@@ -627,7 +698,7 @@ fn worker_loop(
                             tick = at;
                         }
                         other => {
-                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, other)
+                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
                         }
                     }
                 }
@@ -655,14 +726,14 @@ fn worker_loop(
                             tick = at;
                         }
                         other => {
-                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, other)
+                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
                         }
                     }
                 }
                 apply_transform_override(engine, &clip, transform);
                 render_frame(engine, tl_rate, &preview_weak, tick);
             }
-            other => mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, other),
+            other => mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other),
         }
     }
 }
@@ -746,21 +817,192 @@ fn import_and_publish(
             // Kick off tile thumbnail generation off-thread; the tile shows
             // its placeholder until the image lands (see src/thumbnails.rs).
             if let Some(source) = engine.project().media(media) {
-                let kind = if source.is_audio_only() {
-                    ThumbKind::Audio
-                } else {
-                    ThumbKind::Video
-                };
-                thumbs.request(media.raw(), source.path().to_path_buf(), kind);
-                // The strip worker resolves filmstrip/waveform requests by
-                // media id alone; it needs the path on record (src/strips.rs).
-                strips.register_media(media.raw(), source.path().to_path_buf());
+                register_media_with_workers(source, thumbs, strips);
             }
             publish_projection(engine, ui);
         }
         Ok(other) => error!(path = %path.display(), "unexpected import outcome: {other:?}"),
         Err(e) => error!(path = %path.display(), "import failed: {e}"),
     }
+}
+
+/// Write the session to `path` — or the engine's current project path when
+/// `None` (plain save on an already-saved project). Success republishes the
+/// projection, which is what clears the title bar's dirty dot; failure
+/// publishes `session-error` and leaves the dot on (honest: the file on
+/// disk is still stale). Either way `save-finished(ok)` fires so a pending
+/// guarded transition in main.rs can continue or abort. A `None` path with
+/// no current path is a UI gating bug, not a user state.
+fn save_project_and_publish(engine: &mut Engine, path: Option<PathBuf>, ui: &UiSink) {
+    let Some(path) = path.or_else(|| engine.project_path().cloned()) else {
+        error!("save requested with no target path and no current project path");
+        notify_save_finished(ui, false);
+        return;
+    };
+    match engine.apply(Command::Project(ProjectCommand::Save { path: path.clone() })) {
+        Ok(ApplyOutcome::Saved) => {
+            info!(path = %path.display(), "project saved");
+            publish_projection(engine, ui);
+            notify_save_finished(ui, true);
+        }
+        Ok(other) => {
+            error!(path = %path.display(), "unexpected save outcome: {other:?}");
+            notify_save_finished(ui, false);
+        }
+        Err(e) => {
+            error!(path = %path.display(), "save failed: {e}");
+            publish_session_error(ui, format!("Couldn't save the project to {}: {e}", path.display()));
+            notify_save_finished(ui, false);
+        }
+    }
+}
+
+/// Replace the session from a `.cutlass` file (strict open: every media
+/// path must exist). On success every pool media re-registers with the
+/// thumbnail and strip workers — the same bookkeeping an import does — the
+/// projection republish swaps the UI over, and the session epoch bump
+/// resets UI session state (playhead, selection, in/out range). On failure
+/// the current session is untouched (the engine rejects before replacing)
+/// and `session-error` names the offending path.
+fn open_project_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    ui: &UiSink,
+    thumbs: &ThumbnailHandle,
+    strips: &StripHandle,
+) {
+    match engine.apply(Command::Project(ProjectCommand::Open { path: path.clone() })) {
+        Ok(ApplyOutcome::Opened) => {
+            info!(
+                path = %path.display(),
+                pool = engine.project().media_count(),
+                "opened project"
+            );
+            for media in engine.project().media_iter() {
+                register_media_with_workers(media, thumbs, strips);
+            }
+            publish_projection(engine, ui);
+            bump_session_epoch(ui);
+        }
+        Ok(other) => error!(path = %path.display(), "unexpected open outcome: {other:?}"),
+        Err(e) => {
+            error!(path = %path.display(), "open failed: {e}");
+            publish_session_error(ui, format!("Couldn't open {}: {e}", path.display()));
+        }
+    }
+}
+
+/// Replace the session with a fresh, empty, unsaved project (File → New).
+/// The unsaved-changes guard ran UI-side; this is unconditional.
+fn new_project_and_publish(engine: &mut Engine, ui: &UiSink) {
+    engine.new_session();
+    info!("new session");
+    publish_projection(engine, ui);
+    bump_session_epoch(ui);
+}
+
+/// One autosave sweep: snapshot a dirty session to its sidecar slot
+/// (`~/.cutlass/autosave/`), never to the user's file. Clean session ⇒ any
+/// existing slot is stale (just saved, or untouched) and gets removed. A
+/// session whose identity changed since the last write (Save As / Open /
+/// New) cleans its orphaned slot up first. `slot_state` carries the slot
+/// path and the engine revision it captured, so a dirty-but-idle session
+/// doesn't rewrite an identical snapshot every sweep. Failures only log:
+/// autosave is invisible by contract.
+fn autosave_sweep(engine: &Engine, slot_state: &mut Option<(PathBuf, u64)>) {
+    let dir = crate::autosave::default_dir();
+    let source = engine.project_path().map(PathBuf::as_path);
+    let slot = crate::autosave::slot_for(&dir, source);
+
+    if let Some((old, _)) = slot_state.take_if(|(old, _)| *old != slot) {
+        crate::autosave::discard(&old);
+    }
+    if !engine.is_dirty() {
+        crate::autosave::discard(&slot);
+        *slot_state = None;
+        return;
+    }
+    let revision = engine.revision();
+    if slot_state.as_ref().is_some_and(|(_, rev)| *rev == revision) {
+        return; // dirty but idle: the snapshot on disk is already current
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        warn!(dir = %dir.display(), "autosave skipped: couldn't create dir: {e}");
+        return;
+    }
+    match engine.project().save_to_file(&slot) {
+        Ok(()) => {
+            // Meta lands after the snapshot: a crash between the two writes
+            // degrades to "no candidate", never to a mislabeled restore.
+            if let Err(e) = crate::autosave::write_meta(&slot, source) {
+                warn!(slot = %slot.display(), "autosave meta write failed: {e}");
+                return;
+            }
+            *slot_state = Some((slot, revision));
+        }
+        Err(e) => warn!(slot = %slot.display(), "autosave failed: {e}"),
+    }
+}
+
+/// Restore an accepted crash-recovery snapshot: tolerant load (missing
+/// media entries survive, like `Load`), session bound to `source` — the
+/// user's file, not the sidecar — and left dirty so the first Cmd+S writes
+/// the recovered work where it belongs. Media that still exist on disk
+/// re-register with the tile workers; the epoch bump resets UI session
+/// state, same as an open.
+fn restore_autosave_and_publish(
+    engine: &mut Engine,
+    autosave: PathBuf,
+    source: Option<PathBuf>,
+    slot_state: &mut Option<(PathBuf, u64)>,
+    ui: &UiSink,
+    thumbs: &ThumbnailHandle,
+    strips: &StripHandle,
+) {
+    match engine.restore_session(&autosave, source) {
+        Ok(()) => {
+            info!(
+                autosave = %autosave.display(),
+                pool = engine.project().media_count(),
+                "restored autosave"
+            );
+            for media in engine.project().media_iter() {
+                if media.path().exists() {
+                    register_media_with_workers(media, thumbs, strips);
+                }
+            }
+            // The snapshot becomes the session's live slot (it already holds
+            // this exact content); a pid-named orphan gets swept into the
+            // current slot — and deleted — on the next dirty sweep.
+            *slot_state = Some((autosave, engine.revision()));
+            publish_projection(engine, ui);
+            bump_session_epoch(ui);
+        }
+        Err(e) => {
+            error!(autosave = %autosave.display(), "restore failed: {e}");
+            publish_session_error(
+                ui,
+                format!("Couldn't restore the recovered project {}: {e}", autosave.display()),
+            );
+        }
+    }
+}
+
+/// Register one pool media with the off-thread tile workers: a library
+/// thumbnail render and the strip worker's id → path record (filmstrips /
+/// waveforms resolve by media id alone). Shared by import and open.
+fn register_media_with_workers(
+    media: &cutlass_models::MediaSource,
+    thumbs: &ThumbnailHandle,
+    strips: &StripHandle,
+) {
+    let kind = if media.is_audio_only() {
+        ThumbKind::Audio
+    } else {
+        ThumbKind::Video
+    };
+    thumbs.request(media.id.raw(), media.path().to_path_buf(), kind);
+    strips.register_media(media.id.raw(), media.path().to_path_buf());
 }
 
 /// Place the full source range of `media` on a video track (audio-only media
@@ -2149,15 +2391,76 @@ fn publish_projection(engine: &mut Engine, ui: &UiSink) {
     let project = engine.project().clone();
     let can_undo = engine.can_undo();
     let can_redo = engine.can_redo();
+    // Session save state rides the same chokepoint as the project view, so
+    // the title bar's dirty dot can never disagree with the engine.
+    let dirty = engine.is_dirty();
+    let file_name = engine
+        .project_path()
+        .and_then(|p| p.file_stem())
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let has_path = engine.project_path().is_some();
+    // Full path (not just the stem): main.rs needs it to address the
+    // session's autosave slot when a close discards unsaved work.
+    let file_path = engine
+        .project_path()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let editor_weak = ui.editor.clone();
     if let Err(e) = slint::invoke_from_event_loop(move || {
         if let Some(store) = editor_weak.upgrade() {
             store.set_project(crate::projection::project_to_slint(&project, &generator_sizes));
             store.set_can_undo(can_undo);
             store.set_can_redo(can_redo);
+            store.set_project_dirty(dirty);
+            store.set_project_has_path(has_path);
+            store.set_project_file_name(file_name.into());
+            store.set_project_file_path(file_path.into());
         }
     }) {
         error!("failed to publish project projection to UI: {e}");
+    }
+}
+
+/// Bump `EditorStore.session-epoch`: the session was replaced wholesale
+/// (open / new), and UI-side session state — playhead, selection, in/out
+/// range, playback — must reset. The watcher lives in `app.slint`.
+fn bump_session_epoch(ui: &UiSink) {
+    let editor_weak = ui.editor.clone();
+    if let Err(e) = slint::invoke_from_event_loop(move || {
+        if let Some(store) = editor_weak.upgrade() {
+            store.set_session_epoch(store.get_session_epoch() + 1);
+        }
+    }) {
+        error!("failed to bump session epoch: {e}");
+    }
+}
+
+/// Surface a session-level failure (save/open) to the user: sets
+/// `EditorStore.session-error`, which mounts the message dialog until the
+/// user dismisses it (clearing the property).
+fn publish_session_error(ui: &UiSink, message: String) {
+    let editor_weak = ui.editor.clone();
+    if let Err(e) = slint::invoke_from_event_loop(move || {
+        if let Some(store) = editor_weak.upgrade() {
+            store.set_session_error(message.into());
+        }
+    }) {
+        error!("failed to publish session error: {e}");
+    }
+}
+
+/// Fire `EditorStore.save-finished(ok)` — a Rust→Rust completion signal:
+/// main.rs handles it to continue (or abort) a guarded transition waiting
+/// on "Save". Plain saves fire it too; with nothing pending it's a no-op.
+fn notify_save_finished(ui: &UiSink, ok: bool) {
+    let editor_weak = ui.editor.clone();
+    if let Err(e) = slint::invoke_from_event_loop(move || {
+        if let Some(store) = editor_weak.upgrade() {
+            store.invoke_save_finished(ok);
+        }
+    }) {
+        error!("failed to notify save completion: {e}");
     }
 }
 

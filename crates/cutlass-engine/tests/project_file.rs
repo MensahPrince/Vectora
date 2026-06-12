@@ -19,6 +19,96 @@ fn engine_config(cache_dir: PathBuf) -> EngineConfig {
 }
 
 #[test]
+fn dirty_state_tracks_edits_saves_and_history() {
+    let (dir, mut engine) = temp_engine();
+    assert!(!engine.is_dirty(), "fresh session starts clean");
+
+    let track = common::add_track(&mut engine, TrackKind::Video, "V1");
+    assert!(engine.is_dirty(), "edit marks the session dirty");
+
+    let project_file = dir.path().join("dirty.cutlass");
+    common::save_project(&mut engine, &project_file);
+    assert!(!engine.is_dirty(), "save clears the dirty flag");
+    assert!(engine.can_undo(), "save keeps history");
+
+    engine
+        .apply(Command::Edit(EditCommand::RemoveTrack { track }))
+        .expect("remove track");
+    assert!(engine.is_dirty());
+
+    assert!(engine.undo());
+    assert!(
+        engine.is_dirty(),
+        "undo back to saved content stays dirty (revisions only grow)"
+    );
+    assert!(engine.redo());
+    assert!(engine.is_dirty());
+
+    common::open_project(&mut engine, &project_file);
+    assert!(!engine.is_dirty(), "open rebaselines as clean");
+
+    common::add_track(&mut engine, TrackKind::Video, "V2");
+    assert!(engine.is_dirty(), "edits after open dirty the session again");
+}
+
+#[test]
+fn new_session_resets_project_path_history_and_dirty() {
+    let (dir, mut engine) = temp_engine();
+    common::add_track(&mut engine, TrackKind::Video, "V1");
+    let project_file = dir.path().join("before_new.cutlass");
+    common::save_project(&mut engine, &project_file);
+    common::add_track(&mut engine, TrackKind::Video, "V2");
+    assert!(engine.is_dirty());
+    assert!(engine.can_undo());
+
+    engine.new_session();
+    assert!(!engine.is_dirty(), "a fresh session starts clean");
+    assert!(engine.project_path().is_none(), "the file binding is dropped");
+    assert!(!engine.can_undo() && !engine.can_redo(), "history is cleared");
+    assert_eq!(engine.project().timeline().clip_count(), 0);
+    assert_eq!(engine.project().media_count(), 0);
+    assert_eq!(engine.project().timeline().tracks_ordered().count(), 0);
+
+    // The old session's file is untouched and reopenable.
+    common::open_project(&mut engine, &project_file);
+    assert_eq!(engine.project().timeline().tracks_ordered().count(), 1);
+}
+
+#[test]
+fn restore_session_binds_to_source_and_reads_dirty() {
+    let (dir, mut engine) = temp_engine();
+    common::add_track(&mut engine, TrackKind::Video, "V1");
+
+    // The autosave sidecar is an ordinary project file written elsewhere.
+    let autosave = dir.path().join("autosave-slot.cutlass");
+    engine.project().save_to_file(&autosave).expect("write autosave");
+
+    let source = dir.path().join("the-real-project.cutlass");
+    let mut engine2 = Engine::new(engine_config(dir.path().join("cache-restore"))).expect("engine");
+    engine2
+        .restore_session(&autosave, Some(source.clone()))
+        .expect("restore");
+
+    assert_eq!(engine2.project().timeline().tracks_ordered().count(), 1);
+    assert_eq!(
+        engine2.project_path(),
+        Some(&source),
+        "the session binds to the user's file, not the autosave"
+    );
+    assert!(
+        engine2.is_dirty(),
+        "restored content is not on disk at the source path yet"
+    );
+    assert!(!engine2.can_undo(), "restore clears history");
+
+    // An unsaved-session orphan restores with no binding.
+    let mut engine3 = Engine::new(engine_config(dir.path().join("cache-orphan"))).expect("engine");
+    engine3.restore_session(&autosave, None).expect("restore orphan");
+    assert!(engine3.project_path().is_none());
+    assert!(engine3.is_dirty());
+}
+
+#[test]
 fn save_and_open_roundtrip_restores_session() {
     let Some(path) = small_video_asset() else {
         return;

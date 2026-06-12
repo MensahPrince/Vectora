@@ -1,4 +1,5 @@
 mod audio;
+mod autosave;
 mod inspector;
 mod preview;
 mod preview_gesture;
@@ -77,6 +78,154 @@ async fn pick_import_path() -> Option<std::path::PathBuf> {
         .pick_file()
         .await
         .map(|file| file.path().to_path_buf())
+}
+
+/// Save panel for the first save / Save As (lifecycle roadmap Phase 1).
+/// `default_stem` pre-fills the field (the current file stem on Save As,
+/// "Untitled" before the first save); the `.cutlass` extension is enforced
+/// on whatever the user types.
+async fn pick_save_path(default_stem: String) -> Option<std::path::PathBuf> {
+    let stem = if default_stem.is_empty() { "Untitled".to_owned() } else { default_stem };
+    let mut path = rfd::AsyncFileDialog::new()
+        .add_filter("Cutlass project", &["cutlass"])
+        .set_file_name(format!("{stem}.cutlass"))
+        .save_file()
+        .await
+        .map(|file| file.path().to_path_buf())?;
+    if path.extension().is_none_or(|ext| ext != "cutlass") {
+        // Append rather than `set_extension`: a typed "v1.2" must become
+        // "v1.2.cutlass", not "v1.cutlass".
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled".into());
+        path.set_file_name(format!("{name}.cutlass"));
+    }
+    Some(path)
+}
+
+async fn pick_open_path() -> Option<std::path::PathBuf> {
+    rfd::AsyncFileDialog::new()
+        .add_filter("Cutlass project", &["cutlass"])
+        .pick_file()
+        .await
+        .map(|file| file.path().to_path_buf())
+}
+
+// --- session transitions & the unsaved-changes guard (Phase 2) -----------
+//
+// Open, New, and window close all destroy the current session, so they all
+// funnel through `request_transition`: clean sessions proceed immediately,
+// dirty ones get one native Save / Don't Save / Cancel dialog. Choosing
+// "Save" parks the transition in `pending` and triggers the ordinary save
+// path (including the first-save picker); the worker's `save-finished`
+// signal then continues or aborts it. A cancelled save picker aborts too
+// (the save handler clears `pending`).
+
+#[derive(Clone, Copy, PartialEq)]
+enum Transition {
+    NewProject,
+    OpenProject,
+    CloseWindow,
+}
+
+type PendingTransition = std::rc::Rc<std::cell::RefCell<Option<Transition>>>;
+type GuardOpen = std::rc::Rc<std::cell::Cell<bool>>;
+
+fn perform_transition(handle: &preview_worker::WorkerHandle, transition: Transition) {
+    match transition {
+        Transition::NewProject => handle.new_project(),
+        Transition::OpenProject => {
+            let handle = handle.clone();
+            let task = slint::spawn_local(async move {
+                if let Some(path) = pick_open_path().await {
+                    handle.open_project(path);
+                }
+            });
+            if let Err(e) = task {
+                tracing::error!("failed to open project dialog: {e}");
+            }
+        }
+        Transition::CloseWindow => {
+            let _ = slint::quit_event_loop();
+        }
+    }
+}
+
+fn request_transition(
+    app_weak: &slint::Weak<AppWindow>,
+    handle: &preview_worker::WorkerHandle,
+    pending: &PendingTransition,
+    guard_open: &GuardOpen,
+    transition: Transition,
+) {
+    let Some(app) = app_weak.upgrade() else {
+        return;
+    };
+    // One lifecycle transition at a time: ignore requests while the guard
+    // dialog is up or a save-then-continue is in flight.
+    if guard_open.get() || pending.borrow().is_some() {
+        return;
+    }
+    if !app.global::<EditorStore>().get_project_dirty() {
+        perform_transition(handle, transition);
+        return;
+    }
+    guard_open.set(true);
+    let app_weak = app_weak.clone();
+    let handle = handle.clone();
+    let pending = pending.clone();
+    let guard = guard_open.clone();
+    let task = slint::spawn_local(async move {
+        let choice = rfd::AsyncMessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title("Unsaved changes")
+            .set_description("This project has unsaved changes. Save them before continuing?")
+            .set_buttons(rfd::MessageButtons::YesNoCancelCustom(
+                "Save".to_owned(),
+                "Don't Save".to_owned(),
+                "Cancel".to_owned(),
+            ))
+            .show()
+            .await;
+        guard.set(false);
+        match choice {
+            rfd::MessageDialogResult::Custom(label) if label == "Save" => {
+                *pending.borrow_mut() = Some(transition);
+                if let Some(app) = app_weak.upgrade() {
+                    app.global::<EditorStore>().invoke_on_save_requested(false);
+                }
+            }
+            rfd::MessageDialogResult::Custom(label) if label == "Don't Save" => {
+                // Closing discards for good: drop the autosave slot too, or
+                // the next launch would offer back work the user just threw
+                // away. Open/New don't need this — the worker's next sweep
+                // sees the replaced session and cleans the slot itself.
+                if transition == Transition::CloseWindow
+                    && let Some(app) = app_weak.upgrade()
+                {
+                    discard_session_autosave(&app);
+                }
+                perform_transition(&handle, transition);
+            }
+            _ => {} // Cancel / dismissed: stay in the session.
+        }
+    });
+    if let Err(e) = task {
+        guard_open.set(false);
+        tracing::error!("failed to open unsaved-changes dialog: {e}");
+    }
+}
+
+/// Remove the session's autosave slot (best effort, benign if absent).
+/// Addressed the same way the worker writes it: by the project's file
+/// path, or the process-keyed unsaved slot before the first save.
+fn discard_session_autosave(app: &AppWindow) {
+    let editor = app.global::<EditorStore>();
+    let source = editor
+        .get_project_has_path()
+        .then(|| std::path::PathBuf::from(editor.get_project_file_path().to_string()));
+    autosave::discard(&autosave::slot_for(&autosave::default_dir(), source.as_deref()));
 }
 
 async fn pick_export_path(current: std::path::PathBuf) -> Option<std::path::PathBuf> {
@@ -188,9 +337,9 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    window_backend.on_close(|| {
-        let _ = slint::quit_event_loop();
-    });
+    // `WindowBackend.close` is wired after the engine worker spawns: the
+    // unsaved-changes guard needs the worker handle (see Phase 2 wiring
+    // below).
 
     // Native window move: only valid while a pointer button is down (the
     // title bar's drag TouchArea guarantees that); the OS owns the rest of
@@ -296,6 +445,178 @@ fn main() -> Result<(), slint::PlatformError> {
         });
         if let Err(e) = task {
             tracing::error!("failed to open import dialog: {e}");
+        }
+    });
+
+    // --- project lifecycle (Phase 1 + 2) ----------------------------------
+
+    // A guarded transition (open/new/close) waiting on a "Save" choice, and
+    // the lock that keeps a second guard dialog from stacking on the first.
+    let pending_transition: PendingTransition = std::rc::Rc::new(std::cell::RefCell::new(None));
+    let guard_open: GuardOpen = std::rc::Rc::new(std::cell::Cell::new(false));
+
+    // Save / Save As (Cmd/Ctrl+S / +Shift+S, title bar button). A plain
+    // save on a session that already has a file goes straight to the
+    // worker; Save As — and the first save — pick a path first. The
+    // worker republishes the projection on success, which clears the
+    // title bar's dirty dot. A cancelled picker aborts any transition
+    // waiting on this save (Save-before-open/new/close).
+    let save_handle = preview_worker.handle();
+    let app_weak = app.as_weak();
+    let save_pending = pending_transition.clone();
+    editor.on_on_save_requested(move |save_as| {
+        let Some(app) = app_weak.upgrade() else {
+            return;
+        };
+        let editor = app.global::<EditorStore>();
+        if !save_as && editor.get_project_has_path() {
+            save_handle.save_project(None);
+            return;
+        }
+        let save_handle = save_handle.clone();
+        let pending = save_pending.clone();
+        let default_stem = editor.get_project_file_name().to_string();
+        let task = slint::spawn_local(async move {
+            if let Some(path) = pick_save_path(default_stem).await {
+                save_handle.save_project(Some(path));
+            } else {
+                pending.borrow_mut().take();
+            }
+        });
+        if let Err(e) = task {
+            tracing::error!("failed to open save dialog: {e}");
+        }
+    });
+
+    // The worker reports every save attempt; a parked transition continues
+    // on success and aborts on failure (the worker already surfaced the
+    // error dialog).
+    let finish_handle = preview_worker.handle();
+    let finish_pending = pending_transition.clone();
+    editor.on_save_finished(move |ok| {
+        let Some(transition) = finish_pending.borrow_mut().take() else {
+            return;
+        };
+        if ok {
+            perform_transition(&finish_handle, transition);
+        }
+    });
+
+    // Open / New (Cmd/Ctrl+O / +N) — guarded session replacements.
+    let open_handle = preview_worker.handle();
+    let app_weak = app.as_weak();
+    let open_pending = pending_transition.clone();
+    let open_guard = guard_open.clone();
+    editor.on_on_open_requested(move || {
+        request_transition(
+            &app_weak,
+            &open_handle,
+            &open_pending,
+            &open_guard,
+            Transition::OpenProject,
+        );
+    });
+
+    let new_handle = preview_worker.handle();
+    let app_weak = app.as_weak();
+    let new_pending = pending_transition.clone();
+    let new_guard = guard_open.clone();
+    editor.on_on_new_requested(move || {
+        request_transition(
+            &app_weak,
+            &new_handle,
+            &new_pending,
+            &new_guard,
+            Transition::NewProject,
+        );
+    });
+
+    // Window close — the title-bar ✕ and the OS close request both consult
+    // the same guard before the event loop quits.
+    let close_handle = preview_worker.handle();
+    let app_weak = app.as_weak();
+    let close_pending = pending_transition.clone();
+    let close_guard = guard_open.clone();
+    app.global::<WindowBackend>().on_close(move || {
+        request_transition(
+            &app_weak,
+            &close_handle,
+            &close_pending,
+            &close_guard,
+            Transition::CloseWindow,
+        );
+    });
+
+    let close_handle = preview_worker.handle();
+    let app_weak = app.as_weak();
+    let close_pending = pending_transition.clone();
+    let close_guard = guard_open.clone();
+    app.window().on_close_requested(move || {
+        request_transition(
+            &app_weak,
+            &close_handle,
+            &close_pending,
+            &close_guard,
+            Transition::CloseWindow,
+        );
+        slint::CloseRequestResponse::KeepWindowShown
+    });
+
+    // --- autosave & crash recovery (Phase 4) ------------------------------
+
+    // Periodic sweep: the worker snapshots dirty sessions to the sidecar
+    // slot (never the user's file) and cleans stale slots up. The timer
+    // lives until `run()` returns.
+    let autosave_timer = slint::Timer::default();
+    let autosave_handle = preview_worker.handle();
+    autosave_timer.start(
+        slint::TimerMode::Repeated,
+        autosave::SWEEP_INTERVAL,
+        move || autosave_handle.autosave(),
+    );
+
+    // Launch offer: a leftover slot means the previous session never got to
+    // clean up (a crash — clean exits remove their slots or date them older
+    // than the saved file). Delayed a beat so the window is up before the
+    // dialog sheets over it; "Restore" loads the snapshot bound to the real
+    // file, "Discard" deletes it, dismissing keeps it for next launch.
+    let restore_handle = preview_worker.handle();
+    slint::Timer::single_shot(std::time::Duration::from_millis(300), move || {
+        let Some(candidate) = autosave::newest_candidate(&autosave::default_dir()) else {
+            return;
+        };
+        let task = slint::spawn_local(async move {
+            let name = candidate
+                .source
+                .as_deref()
+                .and_then(|p| p.file_stem())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "an unsaved project".to_owned());
+            let choice = rfd::AsyncMessageDialog::new()
+                .set_level(rfd::MessageLevel::Warning)
+                .set_title("Restore unsaved work?")
+                .set_description(format!(
+                    "Cutlass didn't shut down cleanly, and unsaved work for \
+                     \u{201c}{name}\u{201d} was recovered. Restore it?"
+                ))
+                .set_buttons(rfd::MessageButtons::OkCancelCustom(
+                    "Restore".to_owned(),
+                    "Discard".to_owned(),
+                ))
+                .show()
+                .await;
+            match choice {
+                rfd::MessageDialogResult::Custom(label) if label == "Restore" => {
+                    restore_handle.restore_autosave(candidate.autosave, candidate.source);
+                }
+                rfd::MessageDialogResult::Custom(label) if label == "Discard" => {
+                    autosave::discard(&candidate.autosave);
+                }
+                _ => {} // dismissed: leave the slot; offer again next launch
+            }
+        });
+        if let Err(e) = task {
+            tracing::error!("failed to offer autosave recovery: {e}");
         }
     });
 

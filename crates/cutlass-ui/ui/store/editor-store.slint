@@ -93,6 +93,38 @@ export global EditorStore {
     // SetClipTransform; the worker clears any override in the same step.
     callback on-clip-transform-committed(clip-id: string, position-x: float, position-y: float, scale: float, rotation: float, opacity: float, tick: int);
 
+    // --- project lifecycle (lifecycle roadmap Phases 1–2) ------------------
+    // Save the session to its .cutlass file. `save-as` forces a path picker
+    // (Cmd/Ctrl+Shift+S); a plain save reuses the current file, or asks for
+    // one on the first save (main.rs decides — it owns the async dialog).
+    callback on-save-requested(save-as: bool);
+    // Open a .cutlass project / start a fresh session (Cmd/Ctrl+O / +N).
+    // main.rs runs the unsaved-changes guard first, then the open picker.
+    callback on-open-requested();
+    callback on-new-requested();
+    // Rust→Rust completion signal: the worker invokes it after every save
+    // attempt; main.rs handles it to continue (or abort) a guarded
+    // transition (open/new/close) that chose "Save" first.
+    callback save-finished(ok: bool);
+
+    // Session save state, republished by the worker with every projection
+    // (engine facts, not UI bookkeeping): whether unsaved edits exist (the
+    // title bar dot), whether the session has a file yet, and that file's
+    // stem for the title (empty before the first save).
+    in-out property <bool> project-dirty: false;
+    in-out property <bool> project-has-path: false;
+    in-out property <string> project-file-name: "";
+    // Full path of the session's file (empty before the first save) — main.rs
+    // reads it to address the autosave slot on a "Don't Save" close.
+    in-out property <string> project-file-path: "";
+    // Bumped by the worker when the session is replaced wholesale (open /
+    // new) — the app.slint watcher resets UI session state (playback,
+    // playhead, selection, in/out range).
+    in-out property <int> session-epoch: 0;
+    // Non-empty mounts the error dialog (save/open failures); dismissing
+    // clears it. Worker-set, UI-cleared.
+    in-out property <string> session-error: "";
+
     // Engine history state, republished by the worker after every
     // mutation — drives the toolbar's undo/redo enabled states.
     in-out property <bool> can-undo: false;

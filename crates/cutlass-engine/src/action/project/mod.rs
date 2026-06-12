@@ -26,7 +26,7 @@ pub(crate) fn load_session(
     Ok(())
 }
 
-fn relink_media_cache(
+pub(crate) fn relink_media_cache(
     cache: &FrameCache,
     project: &Project,
     strict: bool,

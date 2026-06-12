@@ -2,7 +2,7 @@
 
 mod dispatch;
 mod edit;
-mod project;
+pub(crate) mod project;
 
 pub use dispatch::{ApplyOutcome, dispatch};
 

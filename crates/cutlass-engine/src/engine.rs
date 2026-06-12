@@ -72,6 +72,12 @@ pub struct Engine {
     /// with this transform instead of its committed one. Session state —
     /// never serialized, never in history, never seen by export.
     transform_override: Option<(ClipId, ClipTransform)>,
+    /// Session revision: bumped on every successful project mutation
+    /// (edits, imports, open/load, undo, redo). Never serialized.
+    revision: u64,
+    /// The revision last written to (or read from) disk; together with
+    /// `revision` this is the dirty flag (see [`is_dirty`](Self::is_dirty)).
+    saved_revision: u64,
 }
 
 impl Engine {
@@ -91,6 +97,8 @@ impl Engine {
             compositor,
             config,
             transform_override: None,
+            revision: 0,
+            saved_revision: 0,
         })
     }
 
@@ -110,6 +118,8 @@ impl Engine {
             compositor,
             config,
             transform_override: None,
+            revision: 0,
+            saved_revision: 0,
         })
     }
 
@@ -132,6 +142,22 @@ impl Engine {
     /// [`Load`](cutlass_commands::ProjectCommand::Load).
     pub fn project_path(&self) -> Option<&PathBuf> {
         self.project_path.as_ref()
+    }
+
+    /// Monotonic session revision: bumped by every successful project
+    /// mutation (edit commands, imports, open/load, undo, redo). Session
+    /// state — never serialized; restarts from 0 with each engine.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// True when the session has mutations not yet written with
+    /// [`Save`](cutlass_commands::ProjectCommand::Save). Conservative by
+    /// design: a rolled-back gesture or an undo back to the saved content
+    /// still reads dirty (revisions only grow) — false-positives only,
+    /// never a false "saved".
+    pub fn is_dirty(&self) -> bool {
+        self.revision != self.saved_revision
     }
 
     pub fn can_undo(&self) -> bool {
@@ -170,6 +196,44 @@ impl Engine {
         }
     }
 
+    /// Replace the session with a fresh, empty, unsaved project (File →
+    /// New). Clears history, decoders, any gesture override, and the
+    /// project path; the session rebaselines as clean. Mirrors what
+    /// [`new`](Self::new) builds, without tearing down the GPU context or
+    /// caches.
+    pub fn new_session(&mut self) {
+        self.project = Project::new("untitled", cutlass_models::Rational::FPS_24);
+        self.history.clear();
+        self.decoder_pool.clear();
+        self.transform_override = None;
+        self.project_path = None;
+        self.revision += 1;
+        self.saved_revision = self.revision;
+    }
+
+    /// Replace the session from an autosave snapshot, binding it to the
+    /// file it stands in for (crash recovery). Loads tolerantly (missing
+    /// media entries are kept, like `Load`), points `project_path` at
+    /// `bind_to` — the user's file, **not** the autosave — and marks the
+    /// session dirty: the restored content is by definition not what's on
+    /// disk at `bind_to`, so the first Cmd+S writes it back there.
+    pub fn restore_session(
+        &mut self,
+        autosave: &std::path::Path,
+        bind_to: Option<PathBuf>,
+    ) -> Result<(), EngineError> {
+        let loaded = Project::load_from_file(autosave)?;
+        crate::action::project::relink_media_cache(&self.cache, &loaded, false)?;
+        self.project = loaded;
+        self.history.clear();
+        self.decoder_pool.clear();
+        self.transform_override = None;
+        self.project_path = bind_to;
+        self.saved_revision = self.revision;
+        self.revision += 1;
+        Ok(())
+    }
+
     /// Apply a wire command. On success, pushes the inverse action onto the undo stack.
     pub fn apply(&mut self, command: Command) -> Result<ApplyOutcome, EngineError> {
         if let Command::Project(ProjectCommand::Export { path }) = command {
@@ -191,8 +255,18 @@ impl Engine {
             history: &mut self.history,
         };
         let (outcome, inverse) = dispatch(command, &mut ctx)?;
-        if matches!(outcome, ApplyOutcome::Opened | ApplyOutcome::Loaded) {
-            self.decoder_pool.clear();
+        match outcome {
+            ApplyOutcome::Opened | ApplyOutcome::Loaded => {
+                self.decoder_pool.clear();
+                // The session now mirrors the file it came from: rebaseline
+                // as clean (revision still bumps so observers see a change).
+                self.revision += 1;
+                self.saved_revision = self.revision;
+            }
+            ApplyOutcome::Saved => self.saved_revision = self.revision,
+            ApplyOutcome::Imported { .. } | ApplyOutcome::Edited(_) => self.revision += 1,
+            // Export is handled by the early return above.
+            ApplyOutcome::Exported { .. } => {}
         }
         if let Some(inverse) = inverse {
             self.history.record_do(inverse);
@@ -258,6 +332,7 @@ impl Engine {
         match self.run_action(action) {
             Ok(inverse) => {
                 self.history.push_redo(inverse);
+                self.revision += 1;
                 true
             }
             Err(_) => {
@@ -276,6 +351,7 @@ impl Engine {
         match self.run_action(action) {
             Ok(inverse) => {
                 self.history.push_undo(inverse);
+                self.revision += 1;
                 true
             }
             Err(_) => false,

@@ -17,6 +17,7 @@ cutlass-models = { path = "../cutlass-models" }
 cutlass-commands = { path = "../cutlass-commands" }
 crossbeam-channel = "0.5.15"
 serde = { workspace = true }
+serde_json = { workspace = true }
 slint = { version = "1.16", features = [
     "unstable-winit-030",
     "unstable-wgpu-28",
@@ -29,7 +30,7 @@ rfd = "0.17.2"
 cpal = "0.18.1"
 
 [dev-dependencies]
-serde_json = { workspace = true }
+tempfile = "3"
 
 [build-dependencies]
 slint-build = "1.16"
