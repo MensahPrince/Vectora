@@ -38,7 +38,9 @@ pub struct ExportSettings {
     pub target_height: Option<u32>,
     /// Output frame rate. `None` ⇒ the timeline rate. Other rates resample
     /// by nearest-tick: output frame `n` composites the timeline frame under
-    /// `n / fps` seconds.
+    /// `n / fps` seconds. Animated clip transforms sample at the exact
+    /// output frame time (sub-frame), so rates above the timeline rate
+    /// genuinely smooth keyframed motion.
     pub fps: Option<Rational>,
     /// Constant-quality level (libx264 CRF, 0–51, lower = better).
     /// `None` ⇒ the encoder default (18, visually near-transparent).
@@ -118,6 +120,17 @@ fn source_tick_for(n: i64, tl: Rational, out: Rational) -> i64 {
     (num / den) as i64
 }
 
+/// Fraction of a timeline tick by which output frame `n`'s exact time sits
+/// past `tick` — the sub-frame phase animated clip transforms sample at.
+/// Zero whenever the rates line up; can exceed 1.0 only for trailing frames
+/// whose tick was clamped to the timeline end (per-clip clamping holds the
+/// last value there).
+fn source_phase_for(n: i64, tl: Rational, out: Rational, tick: i64) -> f32 {
+    let num = n as i128 * out.den as i128 * tl.num as i128;
+    let den = out.num as i128 * tl.den as i128;
+    ((num - tick as i128 * den) as f64 / den as f64) as f32
+}
+
 /// Composite every timeline frame `0..duration` and mux to `output`.
 pub fn export_timeline(
     project: &Project,
@@ -185,10 +198,18 @@ pub fn export_timeline_with(
         return Err(EngineError::ExportCancelled);
     }
 
+    // Sub-frame animation phases only matter when something is keyframed;
+    // a fully static timeline keeps phase at zero so repeated ticks reuse
+    // the composite below.
+    let animated = project
+        .timeline()
+        .tracks_ordered()
+        .any(|t| t.clips().any(|c| c.transform.is_animated()));
+
     // When the output rate exceeds the timeline rate, consecutive output
-    // frames repeat a tick; keep the last composite so a repeat costs a
-    // plane copy instead of a decode + GPU round-trip.
-    let mut last: Option<(i64, cutlass_compositor::Yuv420pImage)> = None;
+    // frames repeat a (tick, phase) pair; keep the last composite so a
+    // repeat costs a plane copy instead of a decode + GPU round-trip.
+    let mut last: Option<(i64, f32, cutlass_compositor::Yuv420pImage)> = None;
     // Generator rasters (text, shapes) are cached per export; a static title
     // composites once, not once per frame.
     let mut raster = GeneratorRaster::new();
@@ -199,7 +220,12 @@ pub fn export_timeline_with(
     let mut audio_buf: Vec<f32> = Vec::new();
     for n in 0..out_frames {
         let tick = source_tick_for(n, tl_rate, out_rate).min(tl_frames - 1);
-        if last.as_ref().map(|(t, _)| *t) != Some(tick) {
+        let phase = if animated {
+            source_phase_for(n, tl_rate, out_rate, tick)
+        } else {
+            0.0
+        };
+        if last.as_ref().map(|(t, p, _)| (*t, *p)) != Some((tick, phase)) {
             let yuv = preview::get_export_yuv_frame(
                 project,
                 pool,
@@ -207,11 +233,12 @@ pub fn export_timeline_with(
                 gpu,
                 compositor,
                 RationalTime::new(tick, tl_rate),
+                phase,
                 color_convert,
             )?;
-            last = Some((tick, yuv));
+            last = Some((tick, phase, yuv));
         }
-        let (_, yuv) = last.as_ref().expect("composite for tick was just stored");
+        let (_, _, yuv) = last.as_ref().expect("composite for tick was just stored");
         sink.push_yuv420p(yuv.width, yuv.height, &yuv.y, &yuv.u, &yuv.v)?;
 
         if let Some(mixer) = &mut mixer {
@@ -347,6 +374,32 @@ mod tests {
         let out = Rational::FPS_60;
         let ticks: Vec<i64> = (0..6).map(|n| source_tick_for(n, tl, out)).collect();
         assert_eq!(ticks, vec![0, 0, 0, 1, 1, 2]);
+    }
+
+    #[test]
+    fn source_phase_tracks_exact_output_time() {
+        let tl = Rational::FPS_24;
+        // Same rate: every output frame sits exactly on its tick.
+        for n in 0..5 {
+            assert_eq!(source_phase_for(n, tl, tl, source_tick_for(n, tl, tl)), 0.0);
+        }
+        // 24 → 60: output frames land 0.4 ticks apart, so the repeated
+        // ticks carry distinct sub-frame phases (smooth motion at 60 Hz).
+        let out = Rational::FPS_60;
+        let phases: Vec<f32> = (0..6)
+            .map(|n| {
+                let tick = source_tick_for(n, tl, out);
+                source_phase_for(n, tl, out, tick)
+            })
+            .collect();
+        let expect = [0.0, 0.4, 0.8, 0.2, 0.6, 0.0];
+        for (got, want) in phases.iter().zip(expect) {
+            assert!((got - want).abs() < 1e-6, "{phases:?}");
+        }
+        // A tail frame whose tick was clamped samples past the tick; the
+        // per-clip clamp holds the last value.
+        let clamped = source_phase_for(5, tl, out, 1);
+        assert!((clamped - 1.0).abs() < 1e-6);
     }
 
     #[test]

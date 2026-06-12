@@ -48,6 +48,7 @@ pub fn get_frame(
         pool,
         raster,
         time,
+        0.0,
         &config,
         color_convert,
         override_transform,
@@ -91,11 +92,14 @@ pub fn prefetch_frame(
 ) -> Result<(), EngineError> {
     let (width, height) = composite_canvas_size(project);
     let config = cutlass_compositor::CompositorConfig::new(width, height);
-    resolve_layers(project, Some(cache), pool, raster, time, &config, color_convert, None, None)?;
+    resolve_layers(project, Some(cache), pool, raster, time, 0.0, &config, color_convert, None, None)?;
     Ok(())
 }
 
 /// Export frame path: no disk cache; returns GPU-composited YUV420P for encode.
+///
+/// `anim_phase` is the sub-frame animation sampling offset in timeline
+/// ticks (see [`resolve_layers`]).
 #[allow(clippy::too_many_arguments)]
 pub fn get_export_yuv_frame(
     project: &Project,
@@ -104,6 +108,7 @@ pub fn get_export_yuv_frame(
     gpu: &GpuContext,
     compositor: &mut Compositor,
     time: RationalTime,
+    anim_phase: f32,
     color_convert: ColorConvertPath,
 ) -> Result<Yuv420pImage, EngineError> {
     let tl_rate = project.timeline().frame_rate;
@@ -118,7 +123,18 @@ pub fn get_export_yuv_frame(
     let (width, height) = composite_canvas_size(project);
     let config = cutlass_compositor::CompositorConfig::new(width, height);
     // Export never sees a gesture override: committed project state only.
-    let layers = resolve_layers(project, None, pool, raster, time, &config, color_convert, None, None)?;
+    let layers = resolve_layers(
+        project,
+        None,
+        pool,
+        raster,
+        time,
+        anim_phase,
+        &config,
+        color_convert,
+        None,
+        None,
+    )?;
 
     // Same gap policy as preview: a tick no clip covers exports as black.
     if layers.is_empty() {

@@ -86,12 +86,28 @@ pub fn cropped_layer_placement(
         1.0
     };
     let scale = fit * transform.scale;
+    let size = [w * scale, h * scale];
+    let mut center = [
+        cw * 0.5 + transform.position[0] * cw,
+        ch * 0.5 + transform.position[1] * ch,
+    ];
+    // Unrotated layers snap their top-left corner to whole canvas pixels.
+    // The bilinear sampler then sees the same sub-texel phase every frame,
+    // so an animated position translates the layer as an exact pixel-shifted
+    // copy of itself instead of pulsing between sharp and blurred as the
+    // fractional offset drifts — the "shaking text" artifact. At 1:1 (text
+    // and other full-canvas rasters) sampling lands exactly on texel
+    // centers, keeping glyphs bit-crisp while they move. Rotated layers are
+    // resampled off-grid by nature, so they keep continuous placement.
+    if transform.rotation == 0.0 {
+        for axis in 0..2 {
+            let half = size[axis] * 0.5;
+            center[axis] = (center[axis] - half).round() + half;
+        }
+    }
     LayerPlacement {
-        center: [
-            cw * 0.5 + transform.position[0] * cw,
-            ch * 0.5 + transform.position[1] * ch,
-        ],
-        size: [w * scale, h * scale],
+        center,
+        size,
         rotation: transform.rotation.to_radians(),
         opacity: transform.opacity.clamp(0.0, 1.0),
     }
@@ -117,6 +133,12 @@ pub fn content_uv(crop: &CropRect, flip_h: bool, flip_v: bool) -> [f32; 4] {
 /// `None` for export so every media frame is decoded from the original source
 /// file — never from cached YUV blobs (and never from future proxy paths).
 ///
+/// `anim_phase` is the fraction of a timeline tick past `time` at which
+/// animated clip transforms sample (media frames stay on the whole tick).
+/// Preview passes `0.0`; export passes the exact output-frame phase so a
+/// 60 fps export of a 24 fps timeline animates at 60 Hz instead of
+/// repeating 24 Hz positions in an uneven 3-2 cadence.
+///
 /// `override_transform` substitutes one clip's transform for this resolve
 /// only — the live preview of an uncommitted drag gesture (preview roadmap
 /// Phase 3). Session state, never project state: export passes `None`.
@@ -131,6 +153,7 @@ pub fn resolve_layers(
     pool: &mut DecoderPool,
     raster: &mut GeneratorRaster,
     time: RationalTime,
+    anim_phase: f32,
     canvas: &CompositorConfig,
     color_convert: ColorConvertPath,
     override_transform: Option<(ClipId, ClipTransform)>,
@@ -151,7 +174,9 @@ pub fn resolve_layers(
         // override replaces the whole sampled value for this resolve only.
         let transform = match &override_transform {
             Some((id, t)) if *id == clip.id => *t,
-            _ => clip.transform.sample(clip.animation_tick(time.value)),
+            _ => clip.transform.sample_at(
+                clip.animation_tick_f(time.value as f64 + f64::from(anim_phase)),
+            ),
         };
         let transform = &transform;
         // Framing (M1): the kept region shapes the placement, the UV rect
@@ -366,10 +391,39 @@ mod tests {
     fn mismatched_aspect_fits_inside_canvas() {
         // Portrait 1080×1920 into a 1920×1080 canvas: height-limited.
         let p = layer_placement(&ClipTransform::IDENTITY, 1080, 1920, &CANVAS);
-        assert_eq!(p.center, [960.0, 540.0]);
         let fit = 1080.0 / 1920.0; // canvas_h / content_h
         assert_eq!(p.size, [1080.0 * fit, 1920.0 * fit]);
         assert!(p.size[1] <= 1080.0 + 1e-3);
+        // Unrotated: the corner pixel-snaps, so the center sits within half
+        // a pixel of true center with an integral left edge.
+        assert_eq!(p.center[1], 540.0);
+        assert!((p.center[0] - 960.0).abs() <= 0.5);
+        let left = p.center[0] - p.size[0] / 2.0;
+        assert_eq!(left, left.round());
+    }
+
+    #[test]
+    fn unrotated_placement_snaps_corner_to_whole_pixels() {
+        // A fractional position offset must not leave the layer sampling
+        // between texels (per-frame sub-pixel phase = moving-text shimmer).
+        let t = ClipTransform {
+            position: [0.1234, -0.0567],
+            ..ClipTransform::IDENTITY
+        };
+        let p = layer_placement(&t, 1920, 1080, &CANVAS);
+        for axis in 0..2 {
+            let corner = p.center[axis] - p.size[axis] / 2.0;
+            assert_eq!(corner, corner.round(), "axis {axis} corner {corner}");
+        }
+        // Snapping moves the layer by less than half a pixel.
+        assert!((p.center[0] - (960.0 + 0.1234 * 1920.0)).abs() <= 0.5);
+        assert!((p.center[1] - (540.0 - 0.0567 * 1080.0)).abs() <= 0.5);
+
+        // Rotated layers resample off-grid regardless; they keep the
+        // continuous (unsnapped) placement.
+        let rotated = ClipTransform { rotation: 30.0, ..t };
+        let p = layer_placement(&rotated, 1920, 1080, &CANVAS);
+        assert_eq!(p.center, [960.0 + 0.1234 * 1920.0, 540.0 - 0.0567 * 1080.0]);
     }
 
     #[test]
@@ -439,6 +493,7 @@ mod tests {
             &mut pool,
             &mut raster,
             RationalTime::new(0, rate),
+            0.0,
             &canvas,
             ColorConvertPath::Gpu,
             None,
@@ -475,6 +530,7 @@ mod tests {
             &mut pool,
             &mut raster,
             RationalTime::new(0, cutlass_models::Rational::FPS_24),
+            0.0,
             &canvas,
             ColorConvertPath::Gpu,
             None,
@@ -513,27 +569,32 @@ mod tests {
         let mut pool = DecoderPool::new();
         let mut raster = GeneratorRaster::new();
         let canvas = CompositorConfig::new(64, 64);
-        let opacity_at = |pool: &mut DecoderPool, raster: &mut GeneratorRaster, tick: i64| {
-            let layers = resolve_layers(
-                &project,
-                None,
-                pool,
-                raster,
-                RationalTime::new(tick, rate),
-                &canvas,
-                ColorConvertPath::Gpu,
-                None,
-                None,
-            )
-            .unwrap();
-            layers[0].placement.opacity
-        };
+        let opacity_at =
+            |pool: &mut DecoderPool, raster: &mut GeneratorRaster, tick: i64, phase: f32| {
+                let layers = resolve_layers(
+                    &project,
+                    None,
+                    pool,
+                    raster,
+                    RationalTime::new(tick, rate),
+                    phase,
+                    &canvas,
+                    ColorConvertPath::Gpu,
+                    None,
+                    None,
+                )
+                .unwrap();
+                layers[0].placement.opacity
+            };
 
-        assert_eq!(opacity_at(&mut pool, &mut raster, 12), 0.0);
-        assert_eq!(opacity_at(&mut pool, &mut raster, 24), 0.5);
-        assert_eq!(opacity_at(&mut pool, &mut raster, 36), 1.0);
+        assert_eq!(opacity_at(&mut pool, &mut raster, 12, 0.0), 0.0);
+        assert_eq!(opacity_at(&mut pool, &mut raster, 24, 0.0), 0.5);
+        assert_eq!(opacity_at(&mut pool, &mut raster, 36, 0.0), 1.0);
         // Past the last keyframe the value holds.
-        assert_eq!(opacity_at(&mut pool, &mut raster, 50), 1.0);
+        assert_eq!(opacity_at(&mut pool, &mut raster, 50, 0.0), 1.0);
+        // Sub-frame phases sample between ticks (export above the timeline
+        // rate): half a tick past 24 is 12.5/24 of the fade.
+        assert_eq!(opacity_at(&mut pool, &mut raster, 24, 0.5), 12.5 / 24.0);
     }
 
     fn png_asset() -> Option<std::path::PathBuf> {
@@ -567,6 +628,7 @@ mod tests {
                 pool,
                 raster,
                 RationalTime::new(tick, rate),
+                0.0,
                 &canvas,
                 ColorConvertPath::Gpu,
                 None,
@@ -634,6 +696,7 @@ mod tests {
                 pool,
                 raster,
                 RationalTime::new(tick, cutlass_models::Rational::FPS_24),
+                0.0,
                 &canvas,
                 ColorConvertPath::Gpu,
                 None,
