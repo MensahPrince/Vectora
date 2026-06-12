@@ -99,28 +99,37 @@ section so we stop re-discovering it.
    color, no masks, no keying.** The entire "look and motion" layer of a
    CapCut-class editor is absent — and several of them require a model
    change (parameter/keyframe system) that gets more expensive the longer
-   we wait.
+   we wait. *(Since landed: keyframes (M2), speed + volume/fades (M1).
+   Transitions/crop/color/masks/keying remain open.)*
 5. **Proxy pipeline unwired.** `cutlass-encoder::build_proxy` exists and
    is tested, but preview decode never uses it; the README claims a
    "proxy/transcode cache" that is actually a decoded-YUV frame cache.
    Fix the wiring or fix the README — currently it's misleading.
+   *(README side fixed in the M0 honesty pass — it now says
+   decoded-frame cache and flags the unwired proxy; the wiring-or-delete
+   decision stays M10.)*
 6. **Text is a string.** No font, size, color, stroke, shadow, alignment,
    spacing — `cosmic-text` rasterizes a default style only.
 7. **Audio model has no volume/fade/speed fields**; mute is the only
-   audio control. MP3 mid-stream seek is approximate.
+   audio control. MP3 mid-stream seek is approximate. *(Since fixed:
+   volume + fade in/out landed in M1; retimed-clip audio mutes until M8
+   varispeed.)*
 8. **Known timeline debt** (from `timeline-roadmap.md`): no ripple trim on
    the magnet track, no group copy/duplicate, no unlink gesture, selection
    goes stale after undo, Slint tick model is `i32` vs engine `i64`.
+   *(All since fixed in M0 except the `i32` tick audit, which M2 tracks.)*
 9. **Readback-bound preview**: composite → RGBA readback → Slint copy is
    ~half the 4K frame budget; the shared-wgpu-texture path is designed but
    unbuilt.
 10. **Packaging**: macOS arm64 unsigned/un-notarized (right-click-to-open
     alpha), Linux tarball needs system FFmpeg, **no Windows build at all**.
 11. **No images.** The library imports video and audio only — stills
-    (PNG/JPEG) are table stakes for a CapCut-class editor.
+    (PNG/JPEG) are table stakes for a CapCut-class editor. *(Since
+    fixed: PNG/JPEG/WebP import landed in M1, with free-stretch trim.)*
 12. **Schema rigidity**: project format is strict v1-only with no
     forward-compat policy; shipping updates will break saved projects
-    unless we define one now.
+    unless we define one now. *(Since fixed: M0 versioning policy +
+    migration scaffold — see `PROJECT_SCHEMA_VERSION`.)*
 13. **Test gaps**: engine/model coverage is excellent, but there are no UI
     integration tests, no golden-frame render tests, and `cutlass-commands`
     and `cutlass-encoder` have no dedicated test crates.
@@ -153,16 +162,16 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 
 | CapCut feature | Cutlass today | v1 plan |
 | --- | --- | --- |
-| Cut / split / trim / ripple | ✅ except ripple-trim | M0 finishes ripple trim |
+| Cut / split / trim / ripple | ✅ (incl. magnet-lane ripple trim) | — |
 | Multi-track, linked A/V, magnet | ✅ | — |
 | Keyframes (position/scale/rotation/opacity/volume/effects) | ✅ transform + opacity (volume/effects ride M1/M4 fields) | **M2** — the keystone |
 | Speed: constant, reverse | ✅ (audio mutes until M8 varispeed) | M1 |
 | Speed: curves / velocity ramps | ❌ | M2 (rides keyframes) |
 | Crop / flip / non-uniform scale | ❌ | M1 |
-| Image (stills) import | ❌ | M1 |
+| Image (stills) import | ✅ (PNG/JPEG/WebP) | — |
 | Compound clips / nested timelines | ❌ | post-v1 |
 | Multi-cam | ❌ | non-goal for v1 |
-| Markers | ❌ | M1 (cheap, agent-useful) |
+| Markers | ✅ (ruler flags, agent tools) | — |
 | Canvas/aspect presets (9:16, 1:1, …) + background | partial (fixed canvas) | M1 |
 
 ### Look
@@ -197,7 +206,7 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 
 | CapCut feature | Cutlass today | v1 plan |
 | --- | --- | --- |
-| Clip volume + fades | ❌ | **M8** (model fields land in M1) |
+| Clip volume + fades | ✅ constant volume + edge fades (M1) | M8 adds envelopes |
 | Volume keyframes / envelopes | ❌ | M8 (rides M2) |
 | Audio ducking (auto-lower music under speech) | ❌ | M8 |
 | Noise reduction | ❌ | M8 (rnnoise-class, local) |

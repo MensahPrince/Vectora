@@ -8,21 +8,33 @@ Cutlass is still in early development. The sections below describe what runs **t
 
 ## Status
 
-This is an early-stage project. The headless editing core is real and tested, and a basic desktop UI now drives it; the natural-language agent is not built yet.
+This is an early-stage project. The headless editing core is real and tested, a desktop UI drives it, and the first cut of the natural-language agent now ships — a chat panel that turns prompts into validated, undoable timeline edits through the same command layer the UI uses.
 
 **Works today**
 
-- A Rust workspace with a tested project/timeline model and a headless editing engine.
-- Media decode via FFmpeg, with hardware-accelerated decode where available.
-- A closed set of deterministic, undo/redo-able edit commands: add clip, add generated clip, split, trim, move, remove, and ripple-delete.
-- Frame resolution through the engine: timeline frame → ordered layers → composited image.
-- A WGPU compositor and an on-disk proxy/transcode cache to keep cold seeks fast.
-- A desktop editor shell (`cutlass-ui`, built on [Slint](https://slint.dev/)): import media, multi-lane timeline editing (snap, magnet, linkage, trim, split, undo/redo), live GPU preview with real-time playback and audio sync, and export to H.264/AAC MP4.
+- A Rust workspace with a tested project/timeline model and a headless editing engine: a closed set of deterministic, undo/redo-able edit commands (add/split/trim/move/remove clips, ripple ops, linking, track flags, transforms, keyframes, speed, audio). Every UI gesture and every agent edit goes through it.
+- **AI agent panel**: describe an edit ("cut the first 3 seconds, add a title that says INTRO") and the agent emits commands that are validated, applied as one undoable history entry per prompt, and listed in the transcript; dry-run preview and read-only Q&A included. Works against any OpenAI-compatible endpoint — local (Ollama, llama.cpp-server) or cloud — configured in `~/.cutlass/config.toml`.
+- **Project lifecycle**: New / Open / Save / Save As / Recent, dirty-state tracking, autosave with crash recovery, and a relink dialog when a project opens with missing media files.
+- **Media**: video + audio import via FFmpeg (hardware-accelerated decode where available) and PNG/JPEG/WebP stills, in a library panel with thumbnails.
+- **Multi-lane timeline editing**: snap, main-track magnet, linked A/V, trim (ripple trim on the magnet lane included), split, ripple-delete, multi-select, group drag/copy/duplicate, link/unlink, undo/redo — with filmstrips, waveforms, ruler markers, and speed/volume badges on clips.
+- **Clip speed**: any constant rate (0.05×–100×) plus reverse, honored by preview, export, trim, and split. Audio on retimed clips is muted until varispeed lands.
+- **Clip audio**: volume + fade in/out per clip, with sample-accurate ramps in both playback and export.
+- **Keyframes** on clip transforms (position / scale / rotation / opacity) with easing curves; CapCut-style diamond UI in the inspector and draggable keyframe markers on timeline clips. Preview and export sample the same curves.
+- **Styled titles**: text clips with font, size, color, stroke, shadow, background, spacing, case, and alignment controls.
+- **Live GPU preview** (WGPU compositor) with real-time playback, audio sync, JKL transport, fullscreen mode, and on-canvas move/scale/rotate gestures.
+- **Export** to H.264/AAC MP4 with resolution, frame-rate, and quality presets.
+- An on-disk **decoded-frame cache** keeps scrubbing and cold seeks fast. (A proxy transcoder exists in `cutlass-encoder` but is **not yet wired into preview** — see the roadmap.)
 - A small end-to-end CLI (`cutlass-app`) that imports a clip, saves a `.cutlass` project, and exports an MP4 — a smoke test for the whole pipeline.
 
-**Not built yet (the goal)**
+**Not shipped yet**
 
-- The natural-language agent that turns a prompt into edit commands. The command layer it will drive already exists.
+- Crop / flip, canvas and aspect presets, speed curves.
+- The look stack: effects, transitions, filters, color correction / LUTs, masks, chroma key, blend modes.
+- The audio suite: volume envelopes, ducking, noise reduction, varispeed.
+- AI media tools: auto captions, transcript-based editing, silence removal, TTS, background removal.
+- Windows builds; signed/notarized macOS builds.
+
+Several of these are in progress — [docs/v1-roadmap.md](docs/v1-roadmap.md) tracks the milestone plan and the current tick state.
 
 ## Architecture
 
@@ -30,12 +42,17 @@ The codebase is a Cargo workspace split into focused crates:
 
 | Crate | Responsibility |
 | --- | --- |
-| `cutlass-models` | Project, timeline, track, and clip data model with edit invariants. |
-| `cutlass-decoder` | FFmpeg demux + decode, hardware acceleration, keyframe indexing, proxy encode. |
-| `cutlass-compositor` | WGPU frame compositor (multi-layer alpha-over, RGBA readback). |
-| `cutlass-engine` | Headless editing engine: edit commands + undo/redo, WGPU preview, timeline export, frame cache. |
-| `cutlass-ui` | Slint desktop shell: preview, scrub/playback, timeline editing, undo/redo, proxy progress. |
-| `cutlass-app` | End-to-end session CLI: import → save project → export MP4 under `.cutlass/`. |
+| `cutlass-models` | Project, media pool, timeline, track, and clip data model with edit invariants; `Param<T>` keyframe curves; project file schema. |
+| `cutlass-commands` | The closed, serializable edit-command vocabulary — the layer both the UI and the AI agent drive. |
+| `cutlass-engine` | Headless editing engine: executes commands with inverse-based undo/redo, resolves timeline frames to composited images, exports, owns the frame cache. |
+| `cutlass-compositor` | WGPU frame compositor (multi-layer alpha-over, GPU YUV conversion, RGBA readback). |
+| `cutlass-decoder` | FFmpeg demux + decode (hardware-accelerated where available), keyframe indexing, image stills, audio peaks + clocked playback streaming. |
+| `cutlass-encoder` | H.264/AAC MP4 export encode + mux; all-intra proxy transcoder (built and tested, not yet consumed by preview). |
+| `cutlass-probe` | Media probing: container / codec / stream metadata at import time. |
+| `cutlass-cache` | On-disk decoded-frame cache. |
+| `cutlass-ai` | AI agent: LLM-facing wire vocabulary + generated tool schemas, validation against the project, provider abstraction (OpenAI-compatible), agent loop. |
+| `cutlass-ui` | Slint desktop shell: timeline, preview, inspector, library, agent panel, transport, export dialog. |
+| `cutlass-app` | End-to-end session CLI: import → edit → save project → export MP4 under `.cutlass/`. |
 
 ## Benchmarks
 
@@ -94,14 +111,24 @@ cargo test --workspace
 
 ### Desktop editor
 
-The `cutlass-ui` shell opens a window where you can import a video, scrub and play a live preview, drag clips on the timeline, split/delete/ripple-delete, and undo/redo:
+The `cutlass-ui` shell opens the full editor: library, multi-lane timeline, live preview, inspector, agent panel, and export dialog:
 
 ```bash
-# Open the editor (use the Import button to add a video)
+# Open the editor (use the Import button to add media)
 cargo run -p cutlass-ui
 
 # …or open with a video already loaded
 cargo run -p cutlass-ui -- path/to/video.mp4
+```
+
+To enable the AI panel, point it at any OpenAI-compatible endpoint in `~/.cutlass/config.toml` (keys never live in project files):
+
+```toml
+[ai]
+base_url = "http://localhost:11434/v1"   # e.g. Ollama
+model = "qwen3:14b"
+# api_key = "sk-..."                # literal key, or:
+# api_key_env = "OPENAI_API_KEY"    # read from the environment
 ```
 
 ### Session CLI (`cutlass-app`)

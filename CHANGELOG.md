@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### AI agent: prompt-to-edit (M3 foundation)
+
+- New `cutlass-ai` crate: an LLM-facing wire vocabulary generated from the
+  edit-command layer (tool schemas versioned and snapshot-tested), with
+  validation that lowers model output to real commands against the live
+  project — phantom generators and project/file commands are rejected by
+  construction.
+- Agent chat panel in the editor: prompts stream plan/status, each applied
+  edit renders as a human-readable action list, and every prompt is exactly
+  **one undo entry** — rehearsed in a sandbox first, then replayed
+  atomically, with rollback on failure.
+- Dry-run mode previews the action list without touching the timeline;
+  read-only Q&A ("how long is the timeline?") answers from a compact
+  project description without mutating anything.
+- Provider-abstracted: any OpenAI-compatible endpoint works — local
+  (Ollama, llama.cpp-server) or cloud — configured in
+  `~/.cutlass/config.toml` (`[ai]` table; keys never live in project
+  files).
+- Eval harness: scripted prompt → expected-timeline tests against a stub
+  provider catch agent regressions in CI without a live model.
+
 ### Keyframes & animatable parameters (M2 foundation)
 
 - New `Param<T>` system in the model: any animatable property is a
@@ -44,6 +65,71 @@
   (schema v3) — e.g. "play the middle clip backwards at double speed".
 - Audio of retimed clips is muted (playback and export) until varispeed
   lands in M8, so what you hear is what you ship.
+
+### Clip audio: volume & fades (M1)
+
+- Media clips carry `volume` (0–10×, 1.0 = as recorded) and fade in/out
+  lengths; both mixers (playback and export) apply sample-accurate linear
+  ramps from the same shared gain curve.
+- Inspector "Audio" section on audio-lane clips: volume slider (0–200%)
+  plus fade-in/fade-out sliders bounded by the clip length.
+- Splitting a clip keeps its volume on both halves and partitions the
+  fades CapCut-style.
+- Timeline audio badge: clips with non-default audio wear a compact chip
+  next to the retime badge — a struck-out speaker when muted, a "57%"
+  label on a non-default volume, a fade ramp when only fades are set.
+- The AI agent can mix: `set_clip_audio` joined the tool vocabulary
+  (schema v4) — video-lane targets steer to the linked audio companion.
+- Constant volume for now; envelopes/keyframes ride M8.
+
+### Image import (M1)
+
+- PNG / JPEG / WebP stills import as media: probed, decoded, and placed
+  as 5-second default clips that transform and composite like video.
+  Library tiles show the rendered thumbnail and badge the kind. A
+  still's duration is a placement default, not a bound — image clips
+  trim out past it freely.
+
+### Timeline markers (M1)
+
+- Named, colored markers on the timeline ruler: the toolbar flag (or
+  `M`) drops one at the playhead, right-click removes it — all undoable.
+- The AI agent can anchor: `add_marker` / `remove_marker` / `set_marker`
+  joined the tool vocabulary (schema v5) — moving and renaming markers
+  is agent-reachable even though the UI gesture for it comes later.
+
+### Project lifecycle & M0 stabilization
+
+- Project lifecycle in the editor: New / Open / Save / Save As / Recent,
+  dirty-state dot in the title bar, save prompt on close.
+- Autosave + crash recovery: periodic snapshots under
+  `~/.cutlass/autosave/`, restore offered on next launch.
+- Missing-media relink: opening a project whose source files moved now
+  surfaces a relink dialog (re-pick per file or point at a folder);
+  library tiles badge missing media until it's repaired.
+- Ripple trim on the magnet track: trimming a main-lane clip with the
+  magnet on shifts everything downstream to follow — one undo entry,
+  linked A/V kept in sync.
+- Format versioning policy: project schema v2 tolerates unknown optional
+  fields, so older builds' projects keep opening as fields are added;
+  migration scaffold + tests in place.
+- Styled titles: text clips grew a full `TextStyle` (font, size, color,
+  stroke, shadow, background, spacing, case, alignment) with matching
+  inspector controls.
+- Library panel with media thumbnails; interactive preview transforms
+  (move / scale / rotate on the canvas) round-trip with the inspector.
+- Selection now survives undo/redo and agent edits: every projection
+  republish prunes vanished clip ids and re-anchors the primary.
+- Phantom features hidden: Effects / Transitions / Filters / Adjustment
+  library tabs removed and effect/filter/adjustment lanes skipped by the
+  projection until their milestones land (the Stickers tab stays — shape/
+  solid generators are real; model enums round-trip untouched).
+- Group copy/duplicate paste the whole selection as one block (lanes and
+  relative placement preserved, link groups re-linked, one undo); a
+  toolbar Unlink button dissolves the selection's link groups undoably.
+- README/CHANGELOG honesty pass: feature claims now state exactly what
+  ships (the unwired proxy claim is gone, the crate table covers all
+  eleven crates).
 
 ## [alpha-0.1.0] — 2026-06-11
 

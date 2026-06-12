@@ -77,6 +77,16 @@ export component ClipView inherits Rectangle {
     private property <bool> show-labels: root.width > 40px;
     private property <length> label-row-h: 14px;
 
+    // Audio badge state (M1 volume/fades): non-default audio earns a chip
+    // in the badge cluster. Exactly one of the three fires: muted wins,
+    // then a changed gain, then fades-only. The fields are engine defaults
+    // on non-audio clips, so in practice this shows on audio-lane clips.
+    private property <bool> audio-muted: model.volume == 0.0;
+    private property <bool> audio-gain-changed:
+        model.volume != 1.0 && model.volume != 0.0;
+    private property <bool> audio-faded-only: model.volume == 1.0
+        && (model.fade-in-s > 0 || model.fade-out-s > 0);
+
     x: TimelineLib.rational-to-length(model.timeline-start, zoom);
 
     width: TimelineLib.clip-timeline-width(model, zoom);
@@ -271,34 +281,107 @@ export component ClipView inherits Rectangle {
             opacity: dimmed ? 0.35 : 1.0;
         }
 
-        // Duration badge (volume markers join it once they exist in the
-        // model).
-        if root.width > 90px: Text {
-            x: parent.width - self.preferred-width - 4px;
+        // Right-aligned badge cluster — the reserved slot from timeline
+        // Phase 8: [audio chip][retime chip][duration]. Chips only appear
+        // on clips wide enough to read them.
+        badges := HorizontalLayout {
+            x: parent.width - self.width - 4px;
+            width: self.preferred-width;
             height: parent.height;
-            vertical-alignment: center;
-            text: model.duration-label;
-            font-size: 9px;
-            color: AppStore.theme.text.primary.with-alpha(0.75);
-            opacity: dimmed ? 0.35 : 1.0;
-        }
+            spacing: 4px;
+            padding-top: 2px;
+            padding-bottom: 2px;
 
-        // Retime badge ("2x", "0.5x R", …), CapCut-style accent chip next
-        // to the duration. Only present on retimed clips.
-        if model.speed-label != "" && root.width > 50px: Rectangle {
-            x: parent.width - self.width - (root.width > 90px ? 40px : 4px);
-            y: (parent.height - self.height) / 2;
-            width: badge-text.preferred-width + 6px;
-            height: parent.height - 4px;
-            border-radius: 2px;
-            background: dimmed ? #00E5C733 : #00E5C755;
+            // Audio badge (M1 volume/fades), same chip language as the
+            // retime badge: struck-out speaker when muted, "57%" on a
+            // non-default gain, a fade ramp when only fades are set.
+            if root.audio-muted && root.width > 50px: Rectangle {
+                width: 14px;
+                border-radius: 2px;
+                background: dimmed ? #00E5C733 : #00E5C755;
 
-            badge-text := Text {
-                text: model.speed-label;
-                font-size: 8px;
-                font-weight: 700;
-                color: AppStore.theme.text.primary;
-                opacity: dimmed ? 0.35 : 1.0;
+                // Speaker pointing right, small X struck beside the cone
+                // (the open subpaths carry no fill; the stroke draws them).
+                Path {
+                    width: 9px;
+                    height: 9px;
+                    viewbox-width: 10;
+                    viewbox-height: 10;
+                    fill: AppStore.theme.text.primary;
+                    stroke: AppStore.theme.text.primary;
+                    stroke-width: 1px;
+                    opacity: root.dimmed ? 0.35 : 1.0;
+
+                    MoveTo { x: 0.8; y: 3.4; }
+                    LineTo { x: 3.0; y: 3.4; }
+                    LineTo { x: 5.8; y: 1.0; }
+                    LineTo { x: 5.8; y: 9.0; }
+                    LineTo { x: 3.0; y: 6.6; }
+                    LineTo { x: 0.8; y: 6.6; }
+                    Close { }
+                    MoveTo { x: 7.0; y: 3.6; }
+                    LineTo { x: 9.4; y: 6.4; }
+                    MoveTo { x: 9.4; y: 3.6; }
+                    LineTo { x: 7.0; y: 6.4; }
+                }
+            }
+            if root.audio-gain-changed && root.width > 50px: Rectangle {
+                width: vol-text.preferred-width + 6px;
+                border-radius: 2px;
+                background: dimmed ? #00E5C733 : #00E5C755;
+
+                vol-text := Text {
+                    text: (root.model.volume * 100).to-fixed(0) + "%";
+                    font-size: 8px;
+                    font-weight: 700;
+                    color: AppStore.theme.text.primary;
+                    opacity: root.dimmed ? 0.35 : 1.0;
+                }
+            }
+            if root.audio-faded-only && root.width > 50px: Rectangle {
+                width: 14px;
+                border-radius: 2px;
+                background: dimmed ? #00E5C733 : #00E5C755;
+
+                // Fade ramp: a right triangle rising left-to-right.
+                Path {
+                    width: 9px;
+                    height: 9px;
+                    viewbox-width: 10;
+                    viewbox-height: 10;
+                    fill: AppStore.theme.text.primary;
+                    opacity: root.dimmed ? 0.35 : 1.0;
+
+                    MoveTo { x: 1.0; y: 9.0; }
+                    LineTo { x: 9.0; y: 9.0; }
+                    LineTo { x: 9.0; y: 1.0; }
+                    Close { }
+                }
+            }
+
+            // Retime badge ("2x", "0.5x R", …), CapCut-style accent chip
+            // next to the duration. Only present on retimed clips.
+            if model.speed-label != "" && root.width > 50px: Rectangle {
+                width: badge-text.preferred-width + 6px;
+                border-radius: 2px;
+                background: dimmed ? #00E5C733 : #00E5C755;
+
+                badge-text := Text {
+                    text: model.speed-label;
+                    font-size: 8px;
+                    font-weight: 700;
+                    color: AppStore.theme.text.primary;
+                    opacity: root.dimmed ? 0.35 : 1.0;
+                }
+            }
+
+            // Duration badge.
+            if root.width > 90px: Text {
+                vertical-alignment: center;
+                text: model.duration-label;
+                font-size: 9px;
+                color: AppStore.theme.text.primary.with-alpha(0.75);
+                opacity: root.dimmed ? 0.35 : 1.0;
             }
         }
     }
