@@ -27,6 +27,29 @@
   carry a corrective example — adding a text clip via gemma-class models
   no longer dead-ends.
 
+### Canvas settings (M1)
+
+- Projects now own their **canvas shape and background**: aspect presets
+  (16:9, 9:16, 1:1, 4:5, 21:9 — or auto, which follows the footage like
+  before) and a per-project background color shown wherever no clip
+  covers the canvas. Switching presets keeps the footage's quality tier
+  (shortest edge) and reshapes the long edge, so a 1080p landscape
+  project becomes a true 1080×1920 vertical, not a crop.
+- File ▸ Canvas Settings… dialog: ratio dropdown + background color
+  swatch with a live canvas-size readout; every change is one undoable
+  edit (`SetCanvas`).
+- Inspector grows **Fit / Fill** buttons: one click letterboxes a clip
+  inside the canvas or cover-fills it (centered, crop-aware) — the
+  CapCut reframe moves for "make this landscape clip fill my vertical
+  canvas".
+- The AI agent can do it too: `set_canvas` tool (tool schema v8) —
+  "make this a vertical short with a dark grey background" works, with
+  omitted fields keeping their current values; `describe_project` now
+  reports non-default canvas state.
+- Preview, export, and empty timelines all render the background color —
+  it's the compositor's clear color, not an extra layer.
+- This closes **M1 (editing core parity)** on the v1 roadmap.
+
 ### Crop & flip (M1)
 
 - Clips can be **cropped** (trim a fraction off each edge; the kept region
