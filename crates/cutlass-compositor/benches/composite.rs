@@ -3,7 +3,7 @@
 //! Run: `cargo bench -p cutlass-compositor --bench composite`
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement,
+    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerEffect, LayerPlacement,
 };
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -103,5 +103,50 @@ fn bench_two_layers(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_solid, bench_rgba_layer, bench_two_layers);
+fn bench_effect(c: &mut Criterion, name: &str, effects: Vec<LayerEffect>) {
+    let Some(mut ctx) = GpuBench::try_new() else {
+        return;
+    };
+    let config = CompositorConfig::new(W, H);
+    let bytes = std::sync::Arc::new(solid_bytes([10, 120, 200, 255]));
+    let layers = [
+        CompositeLayer::rgba(bytes, W, H, LayerPlacement::full_canvas(&config)).with_effects(effects),
+    ];
+
+    let mut group = c.benchmark_group("compositor/effect");
+    group.throughput(Throughput::Bytes((W * H * 4) as u64));
+    group.bench_function(format!("{name}_1080p"), |b| {
+        b.iter(|| {
+            ctx.compositor
+                .composite(&ctx.gpu, &config, &layers)
+                .expect("composite")
+        });
+    });
+    group.finish();
+}
+
+fn bench_gaussian_blur(c: &mut Criterion) {
+    bench_effect(
+        c,
+        "gaussian_blur",
+        vec![LayerEffect::new("gaussian_blur").with_param(0, 4.0)],
+    );
+}
+
+fn bench_vignette(c: &mut Criterion) {
+    bench_effect(
+        c,
+        "vignette",
+        vec![LayerEffect::new("vignette").with_param(0, 0.8)],
+    );
+}
+
+criterion_group!(
+    benches,
+    bench_solid,
+    bench_rgba_layer,
+    bench_two_layers,
+    bench_gaussian_blur,
+    bench_vignette
+);
 criterion_main!(benches);
