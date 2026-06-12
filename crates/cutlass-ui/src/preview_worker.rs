@@ -767,7 +767,10 @@ fn set_transform_and_publish(
             info!(%clip_id, ?transform, "set clip transform");
             publish_projection(engine, ui);
         }
-        Err(e) => error!(%clip_id, "set transform failed: {e}"),
+        Err(e) => {
+            error!(%clip_id, "set transform failed: {e}");
+            publish_projection(engine, ui);
+        }
     }
 }
 
@@ -2414,6 +2417,7 @@ fn publish_projection(engine: &mut Engine, ui: &UiSink) {
             store.set_project(crate::projection::project_to_slint(&project, &generator_sizes));
             store.set_can_undo(can_undo);
             store.set_can_redo(can_redo);
+            store.set_projection_revision(store.get_projection_revision().saturating_add(1));
             store.set_project_dirty(dirty);
             store.set_project_has_path(has_path);
             store.set_project_file_name(file_name.into());

@@ -128,11 +128,13 @@ export component TransformInspector inherits VerticalLayout {
                 if (PreviewStore.gesture-active && PreviewStore.gesture-clip == model.id) {
                     EditorStore.on-preview-override-cleared(TimelineStore.playhead-tick);
                 }
+                PreviewStore.gesture-active = false;
+                PreviewStore.gesture-commit-pending = false;
             } else {
                 EditorStore.on-clip-transform-committed(
                     model.id, px, py, s, r, o, TimelineStore.playhead-tick);
+                PreviewStore.gesture-commit-pending = true;
             }
-            PreviewStore.gesture-active = false;
         } else {
             PreviewStore.gesture-clip = model.id;
             PreviewStore.gesture = {
@@ -148,6 +150,7 @@ export component TransformInspector inherits VerticalLayout {
                 guide-x: 0,
                 guide-y: 0,
             };
+            PreviewStore.gesture-commit-pending = false;
             PreviewStore.gesture-active = true;
             EditorStore.on-preview-transform-overridden(
                 model.id, px, py, s, r, o, TimelineStore.playhead-tick);

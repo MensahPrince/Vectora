@@ -125,14 +125,16 @@ export component PreviewPanel inherits PanelBase {
                                 self.drag-res.rotation,
                                 self.drag-res.opacity,
                                 TimelineStore.playhead-tick);
+                            PreviewStore.gesture-commit-pending = true;
                         } else if (self.dragging) {
                             // Snap the frame back to committed state.
                             EditorStore.on-preview-override-cleared(TimelineStore.playhead-tick);
+                            PreviewStore.gesture-active = false;
+                            PreviewStore.gesture-commit-pending = false;
                         }
                         self.drag-mode = 0;
                         self.drag-zone = 0;
                         self.dragging = false;
-                        PreviewStore.gesture-active = false;
                     }
 
                     Image {
@@ -238,6 +240,7 @@ export component PreviewPanel inherits PanelBase {
                                 // inspector's numbers follow mid-gesture.
                                 PreviewStore.gesture-clip = viewport.drag-clip;
                                 PreviewStore.gesture = viewport.drag-res;
+                                PreviewStore.gesture-commit-pending = false;
                                 PreviewStore.gesture-active = true;
                                 EditorStore.on-preview-transform-overridden(
                                     viewport.drag-clip,

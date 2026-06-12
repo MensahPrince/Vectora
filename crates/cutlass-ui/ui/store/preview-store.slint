@@ -10,6 +10,10 @@ export global PreviewStore {
     // value is a worker-side render override), so the selection box and the
     // inspector's numbers read this instead to follow mid-gesture.
     in-out property <bool> gesture-active: false;
+    // A transform commit was sent while the projection still contains the
+    // press-time values. Keep the live gesture visible until the next
+    // projection publish swaps in the committed transform.
+    in-out property <bool> gesture-commit-pending: false;
     in-out property <string> gesture-clip;
     in-out property <PreviewDragResolution> gesture;
 }

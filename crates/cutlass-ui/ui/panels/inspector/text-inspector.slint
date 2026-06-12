@@ -1,6 +1,6 @@
-import { Slider } from "std-widgets.slint";
 import {
     CutlassScrollView,
+    CutlassSlider,
     CutlassText,
     PanelHeader,
 } from "../../components/index.slint";
@@ -12,6 +12,7 @@ import {
 } from "../../store/index.slint";
 import { InspectorBackend } from "../../lib/inspector-backend.slint";
 import { Clip } from "../../models/index.slint";
+import { AppState } from "../../state.slint";
 
 component InspectorDivider inherits Rectangle {
     height: 1px;
@@ -41,6 +42,9 @@ component PillTab inherits Rectangle {
 
     ta := TouchArea {
         enabled: root.enabled;
+        clicked => {
+            AppState.refocus-shortcuts();
+        }
     }
 }
 
@@ -67,6 +71,9 @@ component CategoryTab inherits Rectangle {
 
     ta := TouchArea {
         enabled: root.enabled;
+        clicked => {
+            AppState.refocus-shortcuts();
+        }
     }
 }
 
@@ -157,6 +164,15 @@ component MultilineTextInput inherits Rectangle {
     animate border-width {
         duration: 120ms;
         easing: ease-out;
+    }
+
+    // Clicking the padding ring around the editor focuses it instead of
+    // falling through to the panel's blur catcher.
+    TouchArea {
+        mouse-cursor: MouseCursor.text;
+        clicked => {
+            input.focus();
+        }
     }
 
     editor-scroll := CutlassScrollView {
@@ -254,6 +270,16 @@ component LineTextInput inherits Rectangle {
         easing: ease-out;
     }
 
+    // Clicking the field's padding (e.g. the prefix gutter in NumberBox)
+    // focuses the input instead of falling through to the blur catcher.
+    TouchArea {
+        enabled: root.enabled && !root.read-only;
+        mouse-cursor: MouseCursor.text;
+        clicked => {
+            input.focus();
+        }
+    }
+
     input := TextInput {
         x: root.text-padding-left;
         width: max(0px, root.width - root.text-padding-left - root.text-padding-right);
@@ -270,6 +296,14 @@ component LineTextInput inherits Rectangle {
         selection-background-color: #00E5C755;
         selection-foreground-color: AppStore.theme.text.primary;
         accessible-role: none;
+
+        // Blur commits like Enter does, so a value typed and then clicked
+        // away from isn't silently left uncommitted in the box.
+        changed has-focus => {
+            if (!self.has-focus) {
+                root.accepted(self.text);
+            }
+        }
 
         accepted => {
             root.accepted(self.text);
@@ -436,6 +470,9 @@ component SliderRow inherits HorizontalLayout {
         height: 28px;
         vertical-stretch: 0;
         mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            AppState.refocus-shortcuts();
+        }
         double-clicked => {
             root.commit(root.reset-value);
         }
@@ -451,7 +488,7 @@ component SliderRow inherits HorizontalLayout {
         }
     }
 
-    sl := Slider {
+    sl := CutlassSlider {
         horizontal-stretch: 1;
         height: 28px;
         vertical-stretch: 0;
@@ -652,11 +689,13 @@ export component TextInspector inherits VerticalLayout {
                 if (PreviewStore.gesture-active && PreviewStore.gesture-clip == model.id) {
                     EditorStore.on-preview-override-cleared(TimelineStore.playhead-tick);
                 }
+                PreviewStore.gesture-active = false;
+                PreviewStore.gesture-commit-pending = false;
             } else {
                 EditorStore.on-clip-transform-committed(
                     model.id, px, py, s, r, o, TimelineStore.playhead-tick);
+                PreviewStore.gesture-commit-pending = true;
             }
-            PreviewStore.gesture-active = false;
         } else {
             PreviewStore.gesture-clip = model.id;
             PreviewStore.gesture = {
@@ -672,6 +711,7 @@ export component TextInspector inherits VerticalLayout {
                 guide-x: 0,
                 guide-y: 0,
             };
+            PreviewStore.gesture-commit-pending = false;
             PreviewStore.gesture-active = true;
             EditorStore.on-preview-transform-overridden(
                 model.id, px, py, s, r, o, TimelineStore.playhead-tick);
@@ -679,13 +719,27 @@ export component TextInspector inherits VerticalLayout {
     }
 
     PanelHeader {
-        CutlassScrollView {
+        tab-scroll := CutlassScrollView {
             width: 100%;
             height: 100%;
             viewport-width: category-tabs.preferred-width;
             viewport-height: self.height;
             show-vertical-scrollbar: false;
             show-horizontal-scrollbar: false;
+
+            // Clicks on dead space in the tab strip blur the focused text
+            // box by pulling keyboard focus back to the shortcut scope.
+            // Lives inside the scroll view because its Flickable swallows
+            // presses that no child handles.
+            TouchArea {
+                x: 0;
+                y: 0;
+                width: max(tab-scroll.width, category-tabs.preferred-width);
+                height: tab-scroll.height;
+                clicked => {
+                    AppState.refocus-shortcuts();
+                }
+            }
 
             category-tabs := HorizontalLayout {
                 height: 100%;
@@ -718,11 +772,24 @@ export component TextInspector inherits VerticalLayout {
         }
     }
 
-    CutlassScrollView {
+    body-scroll := CutlassScrollView {
         vertical-stretch: 1;
         viewport-width: root.width;
         viewport-height: content.preferred-height;
         show-horizontal-scrollbar: false;
+
+        // Same blur catcher for the property sheet: any click that no
+        // control claims (labels, dividers, padding) unfocuses the active
+        // text input, which commits its pending edit.
+        TouchArea {
+            x: 0;
+            y: 0;
+            width: body-scroll.width;
+            height: max(body-scroll.height, content.preferred-height);
+            clicked => {
+                AppState.refocus-shortcuts();
+            }
+        }
 
         content := VerticalLayout {
             width: max(0px, root.width - AppStore.theme.scrollbar.size);

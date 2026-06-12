@@ -9,7 +9,7 @@ import {
     PreviewPanel,
     TimelinePanel,
 } from "panels/index.slint";
-import { AppStore, EditorStore, TimelineStore, TimelineActions } from "store/index.slint";
+import { AppStore, EditorStore, PreviewStore, TimelineStore, TimelineActions } from "store/index.slint";
 import { AppState } from "state.slint";
 import { FullscreenPreview } from "fullscreen-preview.slint";
 import { TitleBar } from "shell/title-bar.slint";
@@ -104,6 +104,18 @@ export component AppWindow inherits Window {
         TimelineActions.clear-selection();
         TimelineActions.clear-range();
         TimelineActions.seek-start();
+    }
+
+    // Transform commits are optimistic for a moment: keep the live gesture
+    // values visible until the worker publishes the projection containing the
+    // committed transform, then let the UI read from the model again.
+    private property <int> projection-revision: EditorStore.projection-revision;
+
+    changed projection-revision => {
+        if (PreviewStore.gesture-commit-pending) {
+            PreviewStore.gesture-active = false;
+            PreviewStore.gesture-commit-pending = false;
+        }
     }
 
     // Arrow keys nudge the selected visual clip by whole canvas pixels
