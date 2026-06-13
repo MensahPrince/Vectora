@@ -27,6 +27,50 @@
   carry a corrective example — adding a text clip via gemma-class models
   no longer dead-ends.
 
+### Effects & transitions (M4)
+
+- **GPU effect engine.** Clips carry an ordered **effect chain**; the
+  compositor renders an affected layer placed-but-opaque into a canvas-sized
+  scratch texture, ping-pongs it through each effect's passes (two scratch
+  textures reused across the whole frame), then blends the result back with
+  the layer's opacity. Layers without effects keep the original single-pass
+  path untouched — no regression on the common case (guarded by the
+  `composite` benches).
+- **Starter pack of 10 effects**: gaussian blur, vignette, sharpen, pixelate,
+  glitch, chromatic aberration, grain, glow, zoom-blur, mirror. Each ships a
+  golden-frame test and a criterion bench. Effects are **data** — an effect
+  catalog (id, label, param specs with default/min/max) lives in
+  `cutlass-models`; the compositor owns the WGSL.
+- **Effect parameters are keyframable**: they ride the same `Param` system as
+  transforms (`ClipParam::Effect`), so the constant-value quick edit and the
+  animated path share one engine.
+- **Adjustment layers are real.** An adjustment clip applies its effect chain
+  to the **accumulated canvas below it** (CapCut semantics) — the compositor
+  closes the current pass, ping-pongs the canvas itself, then keeps stacking
+  layers above. Adjustment lanes are no longer hidden.
+- **Transitions at clip junctions.** A transition stored on the track blends
+  the outgoing and incoming clips across a window centered on the cut; the
+  engine resolves **both** clips' frames (source times clamped at media
+  bounds, no repositioning) and emits a dual-input layer that a transition
+  registry blends with a progress uniform. Starter set: crossfade,
+  dip-to-black, dip-to-white, wipe left/right/up/down, slide, zoom, blur.
+- **Structural edits prune dead junctions.** Trim / move / split / remove /
+  ripple drop a transition whose clips no longer abut, inside the edit's own
+  history group — so a single undo restores both the structural change and
+  the junction.
+- **Effects & Transitions are back in the Library** as browsable catalog
+  tabs; clicking a tile applies the effect to the selected clip or the
+  transition at its right junction. The inspector grows an **Effects**
+  section (per-effect param sliders + remove), and the timeline shows a
+  **transition pill** at each junction with edge-drag resize and a remove
+  control.
+- **The AI agent can do all of it**: `add_effect` / `remove_effect` /
+  `set_effect_param` and `add_transition` / `remove_transition` /
+  `set_transition` tools (tool schema **v10**), with catalog validation,
+  action-log lines, and `describe_project` listing each clip's effects and
+  transitions.
+- This advances **M4 (effect engine & transitions)** on the v1 roadmap.
+
 ### Canvas settings (M1)
 
 - Projects now own their **canvas shape and background**: aspect presets

@@ -178,10 +178,10 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 
 | CapCut feature | Cutlass today | v1 plan |
 | --- | --- | --- |
-| Effects library (drag-drop visual effects) | model placeholder only | **M4** effect engine + starter pack |
+| Effects library (visual effects) | ✅ 10-effect engine + catalog (M4) | **M4** ✅ effect engine + starter pack |
 | Filters (preset looks) | placeholder | M5 (presets over the color stack) |
-| Adjustment layers | placeholder | M4 |
-| Transitions (crossfade, wipes, motion) | ❌ | M4 |
+| Adjustment layers | ✅ chain applies to canvas-below (M4) | M4 ✅ |
+| Transitions (crossfade, wipes, motion) | ✅ junction model + 9 transitions (M4) | M4 ✅ |
 | Color: basic correction (exposure/contrast/temp/tint/sat) | ❌ | **M5** |
 | Color: curves (Luma/R/G/B), HSL, color wheels | ❌ | M5 |
 | LUT import (.cube) | ❌ | M5 |
@@ -519,35 +519,41 @@ the speed field.)*
 Goal: the rendering substrate for everything visual that isn't a plain
 clip; the placeholder kinds finally become real.
 
-- [ ] **Compositor effect graph**: per-layer post-pass chain
+- [x] **Compositor effect graph**: per-layer post-pass chain
       (`texture → effect pass(es) → blend`). Effect registry: id →
-      WGSL pass + parameter layout. Ping-pong intermediate targets;
-      passes batched per frame.
-- [ ] **Model**: `EffectInstance { effect_id, params: Map<String, Param> }`
-      attached to clips; `Effect`/`Adjustment` generators become real —
+      WGSL pass + parameter layout. Ping-pong intermediate targets
+      (two scratch textures reused across the frame); the no-effects
+      path stays single-pass.
+- [x] **Model**: `EffectInstance { effect_id, params: Map<String, Param> }`
+      attached to clips; `Adjustment` generators became real —
       an adjustment clip applies its chain to everything composited below
       it (CapCut semantics).
-- [ ] **Commands**: `AddEffect` / `RemoveEffect` / `SetEffectParam` —
-      undoable, in the agent vocabulary ("add a blur to the background
-      clip").
-- [ ] **Starter effect pack** (~10, all parametric, all keyframable via
+- [x] **Commands**: `AddEffect` / `RemoveEffect` / `SetEffectParam` —
+      undoable (clip-snapshot inverses), in the agent vocabulary ("add a
+      blur to the background clip").
+- [x] **Starter effect pack** (10, all parametric, all keyframable via
       M2): gaussian blur, sharpen, pixelate/mosaic, glitch (RGB split +
       displacement), chromatic aberration, vignette, grain, glow/bloom,
       zoom-blur, mirror.
-- [ ] **Transitions**: model = junction object between abutting clips on
-      one lane (duration + transition_id + params). Compositor renders
-      the overlap window with both frames. Starter set: crossfade, dip to
-      black/white, wipe L/R/U/D, slide, zoom/whip, blur-through.
-      Timeline UI: drop targets at junctions (timeline Phase 11), drag
-      duration handles.
-- [ ] **Effects panel** in the UI: browsable/searchable grid with hover
-      preview, drag onto clips or lanes; transitions tab.
-- [ ] **Golden-frame tests**: every effect + transition renders a fixture
+- [x] **Transitions**: model = junction object stored on the track
+      (duration + transition_id), abutment-detected; compositor renders
+      the window with both frames (dual-input layer + progress uniform).
+      Starter set: crossfade, dip to black/white, wipe L/R/U/D, slide,
+      zoom, blur. Structural edits prune dead junctions (undo restores).
+      Timeline UI: transition pill at the junction with edge-drag resize
+      and remove.
+- [x] **Effects panel** in the UI: browsable catalog grid for effects and
+      transitions; click-to-apply to the selection, inspector Effects
+      section, timeline pills. *(Drag-onto-clip and hover-preview deferred
+      — see `docs/effects-roadmap.md` § deliberate gaps.)*
+- [x] **Golden-frame tests**: every effect + transition renders a fixture
       frame compared against a stored reference (the render-correctness
       backstop for all later look work).
 
-Exit: drag a glitch onto a clip, crossfade between two clips, drop an
-adjustment layer over a stack — preview and export agree.
+Exit: add a glitch to a clip, crossfade between two clips, drop an
+adjustment layer over a stack — preview and export agree. *(Effect-param
+keyframe diamonds in the inspector and library drag-drop are tracked as
+follow-ups in `docs/effects-roadmap.md`.)*
 
 ### M5 — Color: correction, grading, LUTs, filters
 

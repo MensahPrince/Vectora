@@ -338,9 +338,16 @@ keep it); linked pairs don't render a link badge yet.
 
 ## Phase 11 — Transitions & effects on the timeline
 
-- [ ] Transition drop targets at clip junctions (only when clips abut).
-- [ ] Effect/filter/adjustment lanes already exist as kinds; drag-drop from a
-      future effects panel follows the Phase 1/2 resolver pattern.
+- [x] Transition pills at clip junctions (M4): rendered in content space
+      centered on the cut, with an edge-drag resize (symmetric — the cut is
+      the anchor, commits one `SetTransition`) and a remove control. Added
+      from the Library Transitions tab onto the selected clip's right
+      junction; the engine rejects junctions whose clips don't abut.
+- [ ] Transition *drop targets* via drag-from-library (deferred — see
+      `docs/effects-roadmap.md` § deliberate gaps; current flow is
+      click-to-apply against the selection).
+- [ ] Effect/filter/adjustment lane drag-drop from the library follows the
+      Phase 1/2 resolver pattern (deferred with the above).
 
 ---
 
