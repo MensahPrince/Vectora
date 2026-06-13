@@ -117,7 +117,9 @@ section so we stop re-discovering it.
 8. **Known timeline debt** (from `timeline-roadmap.md`): no ripple trim on
    the magnet track, no group copy/duplicate, no unlink gesture, selection
    goes stale after undo, Slint tick model is `i32` vs engine `i64`.
-   *(All since fixed in M0 except the `i32` tick audit, which M2 tracks.)*
+   *(All since fixed in M0; the `i32` tick audit closed in M2 — every
+   i64→i32 crossing saturates through `clamp_i32`, bound documented + tested.
+   Promoting the Slint model to `i64` remains the long-term fix.)*
 9. **Readback-bound preview**: composite → RGBA readback → Slint copy is
    ~half the 4K frame budget; the shared-wgpu-texture path is designed but
    unbuilt.
@@ -166,7 +168,7 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 | Multi-track, linked A/V, magnet | ✅ | — |
 | Keyframes (position/scale/rotation/opacity/volume/effects) | ✅ transform + opacity (volume/effects ride M1/M4 fields) | **M2** — the keystone |
 | Speed: constant, reverse | ✅ (audio mutes until M8 varispeed) | M1 |
-| Speed: curves / velocity ramps | ❌ | M2 (rides keyframes) |
+| Speed: curves / velocity ramps | ✅ (presets + velocity-graph editor; audio mutes until M8) | M2 |
 | Crop / flip / non-uniform scale | ✅ crop + flip H/V (non-uniform scale open) | M1 |
 | Image (stills) import | ✅ (PNG/JPEG/WebP) | — |
 | Compound clips / nested timelines | ❌ | post-v1 |
@@ -463,14 +465,24 @@ Detailed plan: `keyframes-roadmap.md`.
 - [x] **Timeline keyframe markers** on selected clips (diamonds on the
       clip body, all properties merged; drag to retime, right-click to
       delete — each one undoable history group, CapCut behavior).
-- [ ] **Speed curves**: retime `speed` as a keyframable param →
-      velocity-edit ramps; presets (montage, hero moment) as data.
+- [x] **Speed curves**: an additive `speed_curve: Param<f32>` multiplies the
+      M1 constant `speed` over the clip's normalized span (rate → source via
+      `Easing::integral_to`); the engine re-derives timeline duration from
+      the curve average (CapCut model), linked clips ramp together, audio
+      stays muted until M8. Presets (ramp up/down, montage, hero, bullet) as
+      data, in the agent vocabulary (`set_speed_curve`, wire v11) and an
+      inspector velocity-graph editor with draggable handles; the timeline
+      badge marks ramps with their effective average (`~1.4x`).
       *Unblocked: M1's constant speed + reverse landed.*
-- [ ] **Tick model audit**: keyframes make long/dense timelines likelier —
-      resolve the Slint `i32` vs engine `i64` clamp now.
+- [x] **Tick model audit**: every i64→i32 tick crossing saturates through
+      the single `clamp_i32` choke point (never wraps); the timeline-length
+      bound is documented there and covered by guard tests. Promoting the
+      Slint model to `i64` remains the long-term fix (`timeline-roadmap.md`).
 
-Exit: position/scale/rotation/opacity/volume/speed animate with eased
-keyframes in preview and export, with CapCut's diamond UX.
+Exit: position/scale/rotation/opacity animate with eased keyframes in
+preview and export, with CapCut's diamond UX; speed animates as a velocity
+ramp. *(Volume envelopes ride M8 — `volume` stays an M1 constant until the
+audio suite lands; the `Param` plumbing it will reuse is proven here.)*
 
 ### M3 — The AI agent (prompt-to-edit foundation)
 

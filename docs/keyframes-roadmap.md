@@ -123,20 +123,37 @@ the feature-area plan for `v1-roadmap.md` § M2.
 - [x] **Right-click delete** on a diamond: removes every property's
       keyframe at that tick, also one history group.
 
-## Phase 3 — Speed curves (unblocked: M1 constant speed landed)
+## Phase 3 — Speed curves ✅ (unblocked: M1 constant speed landed)
 
-- [ ] `speed` landed in M1 as a constant (`Rational` + `reversed` on
-      `Clip`); retiming it as a `Param<f32>` gives velocity ramps. Needs
-      source-time integration
-      (speed is a *rate*: source position is the integral of the curve),
-      so it is deliberately after the basic system proves out.
-- [ ] Presets (montage, hero moment) as data over the same curves.
+- [x] **Speed as a curve**: an additive `speed_curve: Param<f32>` on `Clip`
+      multiplies the M1 constant `speed`, animating the instantaneous rate
+      over the clip's NORMALIZED span (`tick` ∈ `0..=SPEED_CURVE_SCALE`, so
+      the shape survives trims/moves). Source-time integration lands as
+      `Easing::integral_to` + `Clip::speed_curve_integral` (speed is a
+      *rate*; source position is the integral of the curve); the exact
+      rational path is preserved untouched when no curve is present.
+- [x] **Duration re-derive** (CapCut model): source window fixed, timeline
+      duration recomputes from `source ÷ (base_speed × curve_average)` via
+      `set_clip_speed_curve`. Linked clips ramp together in one history
+      group; audio of a ramped clip stays muted until M8 varispeed.
+- [x] **Presets as data** (`speed_preset`): ramp up/down, montage, hero,
+      bullet — shared by the inspector buttons and the agent's
+      `set_speed_curve` tool (wire schema v11).
+- [x] **Velocity-graph editor** in the inspector: preset dropdown + filled
+      eased-curve graph (dense samples projected from the engine) with a
+      draggable handle per control point (`set-speed-curve-point`). The
+      timeline badge marks a ramp with its effective average (`~1.4x`).
 
-## Phase 4 — Tick model audit
+## Phase 4 — Tick model audit ✅
 
-- [ ] Slint's tick properties are `i32` against the engine's `i64`
-      (documented debt in `timeline-roadmap.md`). Keyframes make dense,
-      long timelines likelier; audit the clamps before they bite.
+- [x] Slint's tick properties are `i32` against the engine's `i64`
+      (documented debt in `timeline-roadmap.md`). Every i64→i32 tick
+      crossing routes through the single `clamp_i32` choke point (plus the
+      pre-existing `clamp`/`min`-then-`as` sites in `timeline.rs`,
+      `transport.rs`, `main.rs`), so an out-of-range tick **saturates**
+      instead of wrapping. The timeline-length bound is documented on
+      `clamp_i32` (≈20.7 h at 30 fps; `i32::MAX / fps` s) and guarded by
+      `clamp_i32_saturates_at_the_bounds` + `rational_time_saturates_huge_ticks`.
 
 ## Later milestones that reuse `Param`
 
