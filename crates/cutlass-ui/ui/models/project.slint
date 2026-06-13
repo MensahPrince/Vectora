@@ -177,6 +177,10 @@ export struct Clip {
     // Retime badge: "2x", "0.5x", "2x R", "R", … — "" when the clip plays
     // forward at 1× (no badge). Built in src/projection.rs.
     speed-label: string,
+    // Preserve pitch while retimed (CapCut "pitch" switch, M8 Phase 3): true
+    // time-stretches so the audio keeps its original pitch, false lets pitch
+    // ride the speed ("chipmunk"). Only meaningful on retimed media clips.
+    preserve-pitch: bool,
     // Audio mix (CapCut volume + fades, M1). Gain multiplier 1.0 ⇔ as
     // recorded, 0.0 ⇔ muted; fades as seconds of linear ramp anchored at
     // the clip edges. Meaningful on audio-lane clips; defaults elsewhere.

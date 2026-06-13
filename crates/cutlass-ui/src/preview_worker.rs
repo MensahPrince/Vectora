@@ -106,6 +106,14 @@ enum WorkerMsg {
         den: i32,
         reversed: bool,
     },
+    /// Toggle pitch preservation on a retimed media clip (CapCut "pitch"
+    /// switch, M8 Phase 3): `true` keeps the original pitch (time-stretch),
+    /// `false` lets pitch ride the speed. With linkage on the clip's
+    /// audio-lane link partners follow; one undoable history entry.
+    SetClipPitch {
+        clip: String,
+        preserve: bool,
+    },
     /// Set (or clear) a media clip's speed ramp (CapCut speed curves, M2):
     /// `curve` is the normalized rate curve, `None` clears it. The engine
     /// re-derives the timeline duration from the ramp's average; one undoable
@@ -549,6 +557,10 @@ impl WorkerHandle {
             den,
             reversed,
         });
+    }
+
+    pub fn set_clip_pitch(&self, clip: String, preserve: bool) {
+        let _ = self.tx.send(WorkerMsg::SetClipPitch { clip, preserve });
     }
 
     /// Resolve a speed-ramp preset name (CapCut speed curves, M2) and dispatch
@@ -1004,6 +1016,9 @@ fn worker_loop(
                 den,
                 reversed,
             } => set_clip_speed_and_publish(engine, &clip, num, den, reversed, *linkage, &ui),
+            WorkerMsg::SetClipPitch { clip, preserve } => {
+                set_clip_pitch_and_publish(engine, &clip, preserve, *linkage, &ui)
+            }
             WorkerMsg::SetSpeedCurve { clip, curve } => {
                 set_speed_curve_and_publish(engine, &clip, &curve, *linkage, &ui)
             }
@@ -1337,6 +1352,7 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::RemoveClips { .. }
             | WorkerMsg::SetGenerator { .. }
             | WorkerMsg::SetClipSpeed { .. }
+            | WorkerMsg::SetClipPitch { .. }
             | WorkerMsg::SetSpeedCurve { .. }
             | WorkerMsg::SetSpeedCurvePoint { .. }
             | WorkerMsg::SetClipCrop { .. }
@@ -2285,6 +2301,44 @@ fn set_clip_speed_and_publish(
     }
     engine.commit_group();
     info!(%clip_id, num, den, reversed, clips = targets.len(), "retimed clip");
+    publish_projection(engine, ui);
+}
+
+/// Toggle pitch preservation on a retimed media clip (CapCut "pitch" switch,
+/// M8 Phase 3). With linkage on the whole link group flips together so an A/V
+/// pair stays consistent — one undoable history entry. The republish
+/// re-snapshots the mixer so the new stretch mode is audible immediately.
+fn set_clip_pitch_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    preserve: bool,
+    linkage: bool,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-pitch ignored: unparsable clip id");
+        return;
+    };
+    let targets = if linkage {
+        link_group_ids(engine, clip_id)
+    } else {
+        vec![clip_id]
+    };
+
+    engine.begin_group();
+    for target in &targets {
+        if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipPitch {
+            clip: *target,
+            preserve_pitch: preserve,
+        })) {
+            error!(clip_id = %target, "set clip pitch failed: {e}");
+            engine.rollback_group();
+            publish_projection(engine, ui);
+            return;
+        }
+    }
+    engine.commit_group();
+    info!(%clip_id, preserve, clips = targets.len(), "set clip pitch");
     publish_projection(engine, ui);
 }
 

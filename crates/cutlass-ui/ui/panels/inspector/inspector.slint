@@ -117,7 +117,8 @@ component MissingSelectionInspector inherits VerticalLayout {
 // Preset rates keep the engine's rational math exact; the engine re-derives
 // the clip's timeline footprint on commit and the projection republish
 // updates everything (duration label, retime badge, filmstrip density).
-// Audio of retimed clips is muted until varispeed lands (M8).
+// Retimed clips play time-stretched audio (M8 Phase 3); the "Keep pitch"
+// toggle chooses pitch-preserving stretch vs. pitch-follows-speed.
 component SpeedInspector inherits VerticalLayout {
     in property <Clip> model;
 
@@ -126,6 +127,10 @@ component SpeedInspector inherits VerticalLayout {
 
     function commit(num: int, den: int, reversed: bool) {
         InspectorBackend.set-clip-speed(root.model.id, num, den, reversed);
+    }
+
+    function commit-pitch(preserve: bool) {
+        InspectorBackend.set-clip-pitch(root.model.id, preserve);
     }
 
     // Current rational rate, recovered from the projected float. Presets
@@ -220,10 +225,34 @@ component SpeedInspector inherits VerticalLayout {
         Rectangle { horizontal-stretch: 1; }
     }
 
-    if root.model.speed-label != "": CutlassText {
-        text: "Audio is muted while a clip is retimed.";
-        style: AppStore.theme.typography.caption;
-        foreground: AppStore.theme.text.muted;
+    if root.model.speed-label != "": HorizontalLayout {
+        spacing: AppStore.theme.metrics.spacing.md;
+        height: 28px;
+        vertical-stretch: 0;
+
+        LabelCell {
+            label: "Keep pitch";
+        }
+
+        Rectangle {
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 3px;
+            border-width: 1px;
+            border-color: root.model.preserve-pitch ? AppStore.theme.accent.primary : #ffffff2f;
+            background: root.model.preserve-pitch ? AppStore.theme.accent.primary : #ffffff14;
+
+            TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    root.commit-pitch(!root.model.preserve-pitch);
+                    AppState.refocus-shortcuts();
+                }
+            }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
     }
 }
 

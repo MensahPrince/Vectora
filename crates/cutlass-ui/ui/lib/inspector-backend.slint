@@ -99,6 +99,12 @@ export global InspectorBackend {
         reversed: bool,
     );
 
+    // Toggle pitch preservation on a retimed media clip (CapCut "pitch"
+    // switch, M8 Phase 3): true keeps the original pitch (time-stretch),
+    // false lets pitch follow the speed ("chipmunk"). With linkage on the
+    // clip's audio-lane link partners follow. One undoable edit.
+    callback set-clip-pitch(clip-id: string, preserve: bool);
+
     // Apply a named speed-ramp preset to a media clip (CapCut speed curves,
     // M2): "ramp_up" | "ramp_down" | "montage" | "hero" | "bullet", or ""
     // (also "none"/"normal") to clear it back to a constant speed. The engine

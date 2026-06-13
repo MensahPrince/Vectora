@@ -1358,6 +1358,11 @@ fn main() -> Result<(), slint::PlatformError> {
         .on_set_clip_speed(move |clip_id, num, den, reversed| {
             set_speed_handle.set_clip_speed(clip_id.to_string(), num, den, reversed);
         });
+    let set_pitch_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_clip_pitch(move |clip_id, preserve| {
+            set_pitch_handle.set_clip_pitch(clip_id.to_string(), preserve);
+        });
     let set_curve_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
         .on_set_speed_curve(move |clip_id, preset| {

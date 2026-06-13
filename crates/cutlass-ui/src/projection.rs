@@ -225,6 +225,7 @@ fn clip_to_slint(
         speed: speed_factor(clip.speed),
         reversed: clip.reversed,
         speed_label: speed_label(clip).into(),
+        preserve_pitch: clip.preserve_pitch,
         // The clip-start sample: the constant gain for a flat clip; the
         // envelope start for an animated one (the inspector samples the
         // published curve UI-side for playhead accuracy).
