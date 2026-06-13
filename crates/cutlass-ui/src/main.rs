@@ -1428,6 +1428,63 @@ fn main() -> Result<(), slint::PlatformError> {
             ModelRc::new(VecModel::from(filtered))
         });
 
+    // Effects & transitions (M4): fill the Library catalogs once, then route
+    // the inspector/timeline edits through the engine's undoable commands.
+    {
+        let effects = app.global::<EffectsBackend>();
+        let effect_rows: Vec<CatalogEntry> = cutlass_models::effect_catalog()
+            .iter()
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        effects.set_effect_catalog(ModelRc::new(VecModel::from(effect_rows)));
+        let transition_rows: Vec<CatalogEntry> = cutlass_models::transition_catalog()
+            .iter()
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        effects.set_transition_catalog(ModelRc::new(VecModel::from(transition_rows)));
+    }
+    let add_effect_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_add_effect(move |clip_id, effect_id| {
+            add_effect_handle.add_effect(clip_id.to_string(), effect_id.to_string());
+        });
+    let remove_effect_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_remove_effect(move |clip_id, index| {
+            remove_effect_handle.remove_effect(clip_id.to_string(), index.max(0) as u32);
+        });
+    let set_effect_param_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_set_effect_param(move |clip_id, index, param, value| {
+            set_effect_param_handle.set_effect_param(
+                clip_id.to_string(),
+                index.max(0) as u32,
+                param.to_string(),
+                value,
+            );
+        });
+    let add_transition_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_add_transition(move |clip_id, transition_id| {
+            add_transition_handle.add_transition(clip_id.to_string(), transition_id.to_string());
+        });
+    let remove_transition_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_remove_transition(move |clip_id| {
+            remove_transition_handle.remove_transition(clip_id.to_string());
+        });
+    let set_transition_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_set_transition(move |clip_id, duration| {
+            set_transition_handle.set_transition(clip_id.to_string(), i64::from(duration));
+        });
+
     // Enumerate system fonts off the UI thread (the scan is slow) and feed the
     // Font picker once ready.
     let font_app = app.as_weak();
