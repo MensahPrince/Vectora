@@ -1578,6 +1578,7 @@ fn fit_clip_transform(
         .sample_at(clip.animation_tick_f(tick as f64));
     Some(ClipTransform {
         position: [0.0, 0.0],
+        anchor_point: sampled.anchor_point,
         scale,
         rotation: sampled.rotation,
         opacity: sampled.opacity,

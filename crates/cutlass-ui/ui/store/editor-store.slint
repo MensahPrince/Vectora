@@ -98,13 +98,13 @@ export global EditorStore {
     // Live drag motion: render with an uncommitted override — session state
     // on the engine, no history entry, no projection republish. Fires at
     // pointer-move rate; the worker coalesces to the newest value.
-    callback on-preview-transform-overridden(clip-id: string, position-x: float, position-y: float, scale: float, rotation: float, opacity: float, tick: int);
+    callback on-preview-transform-overridden(clip-id: string, position-x: float, position-y: float, anchor-x: float, anchor-y: float, scale: float, rotation: float, opacity: float, tick: int);
     // Gesture ended without a commit (no-op click / cancelled drag): drop
     // the override and re-render from committed state.
     callback on-preview-override-cleared(tick: int);
     // Gesture commit (drag release / arrow nudge): one undoable
     // SetClipTransform; the worker clears any override in the same step.
-    callback on-clip-transform-committed(clip-id: string, position-x: float, position-y: float, scale: float, rotation: float, opacity: float, tick: int);
+    callback on-clip-transform-committed(clip-id: string, position-x: float, position-y: float, anchor-x: float, anchor-y: float, scale: float, rotation: float, opacity: float, tick: int);
 
     // --- project lifecycle (lifecycle roadmap Phases 1–2) ------------------
     // Save the session to its .cutlass file. `save-as` forces a path picker

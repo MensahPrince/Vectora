@@ -30,6 +30,8 @@ export struct PreviewSelectionBox {
     x2: float, y2: float,
     x3: float, y3: float,
     hx: float, hy: float,
+    // Anchor pivot in viewport coordinates (CapCut crosshair handle).
+    ax: float, ay: float,
 }
 
 // Resolution of a move gesture (resolve-drag) or an arrow-key nudge. One
@@ -48,6 +50,8 @@ export struct PreviewDragResolution {
     moved: bool,
     position-x: float,
     position-y: float,
+    anchor-x: float,
+    anchor-y: float,
     scale: float,
     rotation: float,
     opacity: float,
@@ -89,9 +93,13 @@ export global PreviewBackend {
     // the center, clamped at a minimum so the box stays grabbable.
     pure callback resolve-scale(Sequence /* sequence */, string /* clip-id */, int    /* playhead-tick */, float  /* press-x */, float  /* press-y */, float  /* cursor-x */, float  /* cursor-y */, float  /* view-w */, float  /* view-h */, ) -> PreviewDragResolution;
 
-    // Rotate-affordance gesture: cursor angle about the content center
-    // relative to the press, added to the committed rotation; magnets to
-    // the cardinal angles within `snap-tolerance-deg`. The resolution's
-    // `rotation` also feeds the live degree tooltip.
+    // Rotate-affordance gesture: cursor angle about the anchor relative to
+    // the press, added to the committed rotation; magnets to the cardinal
+    // angles within `snap-tolerance-deg`. The resolution's `rotation` also
+    // feeds the live degree tooltip.
     pure callback resolve-rotate(Sequence /* sequence */, string /* clip-id */, int    /* playhead-tick */, float  /* press-x */, float  /* press-y */, float  /* cursor-x */, float  /* cursor-y */, float  /* view-w */, float  /* view-h */, float  /* snap-tolerance-deg */, ) -> PreviewDragResolution;
+
+    // Anchor-handle drag: move the pivot within the content while keeping
+    // the rendered frame fixed — updates both anchor and position.
+    pure callback resolve-anchor(Sequence /* sequence */, string /* clip-id */, int    /* playhead-tick */, float  /* press-x */, float  /* press-y */, float  /* cursor-x */, float  /* cursor-y */, float  /* view-w */, float  /* view-h */, ) -> PreviewDragResolution;
 }

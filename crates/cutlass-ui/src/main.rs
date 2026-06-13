@@ -69,6 +69,7 @@ fn clip_param_value(
     use cutlass_models::{ClipParam, ParamValue};
     Some(match param {
         "position" => (ClipParam::Position, ParamValue::Vec2([value_x, value_y])),
+        "anchor" => (ClipParam::AnchorPoint, ParamValue::Vec2([value_x, value_y])),
         "scale" => (ClipParam::Scale, ParamValue::Scalar(value_x)),
         "rotation" => (ClipParam::Rotation, ParamValue::Scalar(value_x)),
         "opacity" => (ClipParam::Opacity, ParamValue::Scalar(value_x)),
@@ -1127,13 +1128,30 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
+    app.global::<PreviewBackend>().on_resolve_anchor(
+        |sequence, clip_id, tick, press_x, press_y, cursor_x, cursor_y, view_w, view_h| {
+            preview_gesture::resolve_anchor(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                press_x,
+                press_y,
+                cursor_x,
+                cursor_y,
+                view_w,
+                view_h,
+            )
+        },
+    );
+
     let override_handle = preview_worker.handle();
     editor.on_on_preview_transform_overridden(
-        move |clip_id, pos_x, pos_y, scale, rotation, opacity, tick| {
+        move |clip_id, pos_x, pos_y, anchor_x, anchor_y, scale, rotation, opacity, tick| {
             override_handle.transform_override(
                 clip_id.to_string(),
                 cutlass_models::ClipTransform {
                     position: [pos_x, pos_y],
+                    anchor_point: [anchor_x, anchor_y],
                     scale,
                     rotation,
                     opacity,
@@ -1150,11 +1168,12 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let transform_commit_handle = preview_worker.handle();
     editor.on_on_clip_transform_committed(
-        move |clip_id, pos_x, pos_y, scale, rotation, opacity, tick| {
+        move |clip_id, pos_x, pos_y, anchor_x, anchor_y, scale, rotation, opacity, tick| {
             transform_commit_handle.set_transform(
                 clip_id.to_string(),
                 cutlass_models::ClipTransform {
                     position: [pos_x, pos_y],
+                    anchor_point: [anchor_x, anchor_y],
                     scale,
                     rotation,
                     opacity,

@@ -44,9 +44,9 @@ export component PreviewPanel inherits PanelBase {
                     // undoable SetClipTransform. A gesture without effective
                     // displacement commits nothing.
                     //
-                    // drag-mode: 0 = idle, 1 = move, 2 = scale, 3 = rotate.
+                    // drag-mode: 0 = idle, 1 = move, 2 = scale, 3 = rotate, 4 = anchor.
                     // drag-zone: pressed handle (1–4 = corners clockwise
-                    // from the content's top-left, 5 = rotate), for cursor
+                    // from the content's top-left, 5 = rotate, 6 = anchor), for cursor
                     // feedback while the gesture runs.
                     private property <int> drag-mode: 0;
                     private property <int> drag-zone: 0;
@@ -88,6 +88,9 @@ export component PreviewPanel inherits PanelBase {
                         if (self.near(px, py, self.sel-box.hx, self.sel-box.hy)) {
                             return 5;
                         }
+                        if (self.near(px, py, self.sel-box.ax, self.sel-box.ay)) {
+                            return 6;
+                        }
                         if (self.near(px, py, self.sel-box.x0, self.sel-box.y0)) {
                             return 1;
                         }
@@ -112,6 +115,9 @@ export component PreviewPanel inherits PanelBase {
                         if (zone == 5) {
                             return active ? MouseCursor.grabbing : MouseCursor.grab;
                         }
+                        if (zone == 6) {
+                            return active ? MouseCursor.grabbing : MouseCursor.crosshair;
+                        }
                         return active ? MouseCursor.grabbing : MouseCursor.default;
                     }
 
@@ -121,6 +127,8 @@ export component PreviewPanel inherits PanelBase {
                                 self.drag-clip,
                                 self.drag-res.position-x,
                                 self.drag-res.position-y,
+                                self.drag-res.anchor-x,
+                                self.drag-res.anchor-y,
                                 self.drag-res.scale,
                                 self.drag-res.rotation,
                                 self.drag-res.opacity,
@@ -157,9 +165,9 @@ export component PreviewPanel inherits PanelBase {
                                 viewport.press-y = self.mouse-y / 1px;
                                 viewport.drag-zone = viewport.zone-at(viewport.press-x, viewport.press-y);
                                 if (viewport.drag-zone != 0) {
-                                    // Handle press: scale or rotate the
-                                    // already-selected clip; no re-selection.
-                                    viewport.drag-mode = viewport.drag-zone == 5 ? 3 : 2;
+                                    // Handle press: scale, rotate, or reposition anchor.
+                                    viewport.drag-mode = viewport.drag-zone == 5 ? 3
+                                        : viewport.drag-zone == 6 ? 4 : 2;
                                     viewport.drag-clip = TimelineStore.selected-clip-id;
                                 } else {
                                     viewport.hit = PreviewBackend.hit-test(
@@ -224,7 +232,7 @@ export component PreviewPanel inherits PanelBase {
                                     self.mouse-y / 1px,
                                     viewport.width / 1px,
                                     viewport.height / 1px);
-                            } else {
+                            } else if (viewport.drag-mode == 3) {
                                 viewport.drag-res = PreviewBackend.resolve-rotate(
                                     EditorStore.project.sequence,
                                     viewport.drag-clip,
@@ -236,6 +244,17 @@ export component PreviewPanel inherits PanelBase {
                                     viewport.width / 1px,
                                     viewport.height / 1px,
                                     3.0);
+                            } else {
+                                viewport.drag-res = PreviewBackend.resolve-anchor(
+                                    EditorStore.project.sequence,
+                                    viewport.drag-clip,
+                                    TimelineStore.playhead-tick,
+                                    viewport.press-x,
+                                    viewport.press-y,
+                                    self.mouse-x / 1px,
+                                    self.mouse-y / 1px,
+                                    viewport.width / 1px,
+                                    viewport.height / 1px);
                             }
                             if (viewport.drag-res.valid) {
                                 viewport.dragging = true;
@@ -249,6 +268,8 @@ export component PreviewPanel inherits PanelBase {
                                     viewport.drag-clip,
                                     viewport.drag-res.position-x,
                                     viewport.drag-res.position-y,
+                                    viewport.drag-res.anchor-x,
+                                    viewport.drag-res.anchor-y,
                                     viewport.drag-res.scale,
                                     viewport.drag-res.rotation,
                                     viewport.drag-res.opacity,
@@ -333,6 +354,32 @@ export component PreviewPanel inherits PanelBase {
                         background: #FFFFFF;
                         border-width: 1px;
                         border-color: #00000066;
+                    }
+
+                    // Anchor pivot: crosshair riding the anchor point.
+                    if viewport.sel-box.visible: Path {
+                        width: 100%;
+                        height: 100%;
+                        viewbox-width: viewport.width / 1px;
+                        viewbox-height: viewport.height / 1px;
+                        stroke: #00E5C7;
+                        stroke-width: 1.5px;
+                        fill: transparent;
+
+                        MoveTo { x: viewport.sel-box.ax - 8; y: viewport.sel-box.ay; }
+                        LineTo { x: viewport.sel-box.ax + 8; y: viewport.sel-box.ay; }
+                        MoveTo { x: viewport.sel-box.ax; y: viewport.sel-box.ay - 8; }
+                        LineTo { x: viewport.sel-box.ax; y: viewport.sel-box.ay + 8; }
+                    }
+                    if viewport.sel-box.visible: Rectangle {
+                        x: viewport.sel-box.ax * 1px - 4px;
+                        y: viewport.sel-box.ay * 1px - 4px;
+                        width: 8px;
+                        height: 8px;
+                        border-radius: 4px;
+                        background: transparent;
+                        border-width: 1.5px;
+                        border-color: #00E5C7;
                     }
 
                     // Rotate affordance: a hollow ring floating below the

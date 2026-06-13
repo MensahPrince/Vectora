@@ -11,6 +11,7 @@
 
 use cutlass_compositor::{CompositorConfig, LayerPlacement};
 use cutlass_engine::cropped_layer_placement;
+use cutlass_engine::anchor_canvas_position;
 use cutlass_models::{ClipTransform, CropRect};
 use slint::Model;
 
@@ -53,6 +54,17 @@ pub(crate) fn is_composited(clip: &Clip) -> bool {
         )
 }
 
+/// Build the clip's current `ClipTransform` from projected fields.
+pub(crate) fn clip_transform(clip: &Clip) -> ClipTransform {
+    ClipTransform {
+        position: [clip.transform_position_x, clip.transform_position_y],
+        anchor_point: [clip.transform_anchor_x, clip.transform_anchor_y],
+        scale: clip.transform_scale,
+        rotation: clip.transform_rotation,
+        opacity: clip.transform_opacity,
+    }
+}
+
 /// The clip's canvas placement, sized to its visible content.
 ///
 /// Media clips use the shared engine helper (native size aspect-fit into the
@@ -63,12 +75,7 @@ pub(crate) fn is_composited(clip: &Clip) -> bool {
 /// selection box and hit-test hug the shape/text, not the transparent raster
 /// (CapCut). Unknown bounds (0×0, e.g. empty text) keep the canvas-sized box.
 pub(crate) fn clip_placement(clip: &Clip, canvas: &CompositorConfig) -> LayerPlacement {
-    let transform = ClipTransform {
-        position: [clip.transform_position_x, clip.transform_position_y],
-        scale: clip.transform_scale,
-        rotation: clip.transform_rotation,
-        opacity: clip.transform_opacity,
-    };
+    let transform = clip_transform(clip);
     let crop = clip_crop(clip);
     let has_size = clip.media_width > 0 && clip.media_height > 0;
     if !clip.media_id.is_empty() {
@@ -243,11 +250,17 @@ pub fn selection_box(
             if let Some(res) = gesture {
                 clip.transform_position_x = res.position_x;
                 clip.transform_position_y = res.position_y;
+                clip.transform_anchor_x = res.anchor_x;
+                clip.transform_anchor_y = res.anchor_y;
                 clip.transform_scale = res.scale;
                 clip.transform_rotation = res.rotation;
             }
             let p = clip_placement(&clip, &canvas);
             let [c0, c1, c2, c3] = placement_corners(&p, scale, ox, oy);
+            let transform = clip_transform(&clip);
+            let anchor = anchor_canvas_position(&transform, &p);
+            let ax = ox + anchor[0] * scale;
+            let ay = oy + anchor[1] * scale;
             // Rotate affordance: floats a constant viewport distance below
             // the content's bottom edge (between c3 and c2), riding the
             // box's rotation. Outward = the edge direction rotated +90°
@@ -268,6 +281,8 @@ pub fn selection_box(
                 y3: c3[1],
                 hx: mid[0] + out[0] * ROTATE_HANDLE_OFFSET_PX,
                 hy: mid[1] + out[1] * ROTATE_HANDLE_OFFSET_PX,
+                ax,
+                ay,
             };
         }
     }
@@ -304,6 +319,8 @@ mod tests {
             media_height: h,
             transform_scale: 1.0,
             transform_opacity: 1.0,
+            transform_anchor_x: 0.5,
+            transform_anchor_y: 0.5,
             ..Default::default()
         }
     }

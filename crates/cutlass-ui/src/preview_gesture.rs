@@ -14,7 +14,9 @@
 
 use slint::Model;
 
-use crate::preview_select::{canvas_config, clip_placement, contain_mapping, is_composited};
+use cutlass_engine::{anchor_canvas_position, reposition_anchor};
+
+use crate::preview_select::{canvas_config, clip_placement, clip_transform, contain_mapping, is_composited};
 use crate::{Clip, PreviewDragResolution, Sequence, TrackKind};
 
 /// Find a draggable clip by id: on a visual, enabled, unlocked lane, and
@@ -88,26 +90,25 @@ pub fn resolve_drag(
         return invalid();
     }
 
-    // Viewport displacement → canvas px → the content's new center.
-    let start = clip_placement(&clip, &canvas);
-    let mut center_x = start.center[0] + (cursor_x - press_x) / scale;
-    let mut center_y = start.center[1] + (cursor_y - press_y) / scale;
+    // Viewport displacement → canvas px → the anchor's new canvas position.
+    let placement = clip_placement(&clip, &canvas);
+    let start = anchor_canvas_position(&clip_transform(&clip), &placement);
+    let mut anchor_x = start[0] + (cursor_x - press_x) / scale;
+    let mut anchor_y = start[1] + (cursor_y - press_y) / scale;
 
-    // Center guides: magnet each axis independently (CapCut shows one or
-    // both lines). Tolerance is felt in viewport px, applied in canvas px.
+    // Center guides: magnet the anchor onto the canvas center lines.
     let tolerance = snap_tolerance_px / scale;
-    let snap_v = (center_x - cw / 2.0).abs() <= tolerance;
-    let snap_h = (center_y - ch / 2.0).abs() <= tolerance;
+    let snap_v = (anchor_x - cw / 2.0).abs() <= tolerance;
+    let snap_h = (anchor_y - ch / 2.0).abs() <= tolerance;
     if snap_v {
-        center_x = cw / 2.0;
+        anchor_x = cw / 2.0;
     }
     if snap_h {
-        center_y = ch / 2.0;
+        anchor_y = ch / 2.0;
     }
 
-    // Canvas center → normalized model position (the `ClipTransform` space).
-    let position_x = (center_x - cw / 2.0) / cw;
-    let position_y = (center_y - ch / 2.0) / ch;
+    let position_x = (anchor_x - cw / 2.0) / cw;
+    let position_y = (anchor_y - ch / 2.0) / ch;
 
     PreviewDragResolution {
         valid: true,
@@ -115,6 +116,8 @@ pub fn resolve_drag(
             || position_y != clip.transform_position_y,
         position_x,
         position_y,
+        anchor_x: clip.transform_anchor_x,
+        anchor_y: clip.transform_anchor_y,
         scale: clip.transform_scale,
         rotation: clip.transform_rotation,
         opacity: clip.transform_opacity,
@@ -130,10 +133,9 @@ pub fn resolve_drag(
 /// gesture collapse the box to nothing.
 const MIN_SCALE: f32 = 0.05;
 
-/// The clip's content center in viewport-element coordinates — the fixed
-/// point scale and rotate gestures pivot about (position is untouched, so
-/// it can't move mid-gesture). `None` when the mapping is degenerate.
-fn center_in_view(
+/// The clip's anchor pivot in viewport-element coordinates — the fixed point
+/// scale and rotate gestures pivot about. `None` when the mapping is degenerate.
+fn pivot_in_view(
     sequence: &Sequence,
     clip: &Clip,
     view_w: f32,
@@ -146,16 +148,14 @@ fn center_in_view(
         return None;
     }
     let placement = clip_placement(clip, &canvas);
-    Some((
-        ox + placement.center[0] * scale,
-        oy + placement.center[1] * scale,
-    ))
+    let anchor = anchor_canvas_position(&clip_transform(clip), &placement);
+    Some((ox + anchor[0] * scale, oy + anchor[1] * scale))
 }
 
-/// Resolve a corner-handle scale gesture: uniform about the content center,
-/// factor = cursor distance from center ÷ press distance from center (the
-/// grabbed corner stays under the cursor along its center ray), clamped at
-/// [`MIN_SCALE`]. Position, rotation, and opacity pass through.
+/// Resolve a corner-handle scale gesture: uniform about the anchor, factor =
+/// cursor distance from anchor ÷ press distance from anchor (the grabbed
+/// corner stays under the cursor along its anchor ray), clamped at
+/// [`MIN_SCALE`]. Position, anchor, rotation, and opacity pass through.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_scale(
     sequence: &Sequence,
@@ -171,7 +171,7 @@ pub fn resolve_scale(
     let Some(clip) = draggable_clip(sequence, clip_id, tick) else {
         return invalid();
     };
-    let Some((center_x, center_y)) = center_in_view(sequence, &clip, view_w, view_h) else {
+    let Some((center_x, center_y)) = pivot_in_view(sequence, &clip, view_w, view_h) else {
         return invalid();
     };
 
@@ -189,6 +189,8 @@ pub fn resolve_scale(
         moved: scale != clip.transform_scale,
         position_x: clip.transform_position_x,
         position_y: clip.transform_position_y,
+        anchor_x: clip.transform_anchor_x,
+        anchor_y: clip.transform_anchor_y,
         scale,
         rotation: clip.transform_rotation,
         opacity: clip.transform_opacity,
@@ -206,10 +208,10 @@ fn normalize_degrees(angle: f32) -> f32 {
     if wrapped == -180.0 { 180.0 } else { wrapped }
 }
 
-/// Resolve a rotate-affordance gesture: the cursor's angle around the
-/// content center, relative to where the press grabbed the handle, added to
-/// the clip's committed rotation — so the handle tracks the cursor. Magnets
-/// to the nearest cardinal angle (0/90/180/270) within `snap_tolerance_deg`.
+/// Resolve a rotate-affordance gesture: the cursor's angle around the anchor,
+/// relative to where the press grabbed the handle, added to the clip's
+/// committed rotation — so the handle tracks the cursor. Magnets to the
+/// nearest cardinal angle (0/90/180/270) within `snap_tolerance_deg`.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_rotate(
     sequence: &Sequence,
@@ -226,7 +228,7 @@ pub fn resolve_rotate(
     let Some(clip) = draggable_clip(sequence, clip_id, tick) else {
         return invalid();
     };
-    let Some((center_x, center_y)) = center_in_view(sequence, &clip, view_w, view_h) else {
+    let Some((center_x, center_y)) = pivot_in_view(sequence, &clip, view_w, view_h) else {
         return invalid();
     };
 
@@ -247,6 +249,8 @@ pub fn resolve_rotate(
         moved: rotation != clip.transform_rotation,
         position_x: clip.transform_position_x,
         position_y: clip.transform_position_y,
+        anchor_x: clip.transform_anchor_x,
+        anchor_y: clip.transform_anchor_y,
         scale: clip.transform_scale,
         rotation,
         opacity: clip.transform_opacity,
@@ -279,6 +283,62 @@ pub fn nudge(
         moved: dx_canvas_px != 0.0 || dy_canvas_px != 0.0,
         position_x: clip.transform_position_x + dx_canvas_px / cw,
         position_y: clip.transform_position_y + dy_canvas_px / ch,
+        anchor_x: clip.transform_anchor_x,
+        anchor_y: clip.transform_anchor_y,
+        scale: clip.transform_scale,
+        rotation: clip.transform_rotation,
+        opacity: clip.transform_opacity,
+        snap_h: false,
+        snap_v: false,
+        guide_x: 0.0,
+        guide_y: 0.0,
+    }
+}
+
+/// Resolve an anchor-handle drag: the pivot follows the cursor while the
+/// rendered frame stays fixed — both `anchor_point` and `position` update.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_anchor(
+    sequence: &Sequence,
+    clip_id: &str,
+    tick: i32,
+    _press_x: f32,
+    _press_y: f32,
+    cursor_x: f32,
+    cursor_y: f32,
+    view_w: f32,
+    view_h: f32,
+) -> PreviewDragResolution {
+    let Some(clip) = draggable_clip(sequence, clip_id, tick) else {
+        return invalid();
+    };
+    let canvas = canvas_config(sequence);
+    let (cw, ch) = (canvas.width as f32, canvas.height as f32);
+    let (scale, ox, oy) = contain_mapping(cw, ch, view_w, view_h);
+    if scale <= 0.0 {
+        return invalid();
+    }
+
+    let placement = clip_placement(&clip, &canvas);
+    let anchor_canvas = [(cursor_x - ox) / scale, (cursor_y - oy) / scale];
+    let (anchor_point, position) = reposition_anchor(
+        anchor_canvas,
+        placement.center,
+        placement.size,
+        clip.transform_rotation,
+        &canvas,
+    );
+
+    PreviewDragResolution {
+        valid: true,
+        moved: anchor_point[0] != clip.transform_anchor_x
+            || anchor_point[1] != clip.transform_anchor_y
+            || position[0] != clip.transform_position_x
+            || position[1] != clip.transform_position_y,
+        position_x: position[0],
+        position_y: position[1],
+        anchor_x: anchor_point[0],
+        anchor_y: anchor_point[1],
         scale: clip.transform_scale,
         rotation: clip.transform_rotation,
         opacity: clip.transform_opacity,
@@ -317,6 +377,8 @@ mod tests {
             media_height: h,
             transform_scale: 1.0,
             transform_opacity: 1.0,
+            transform_anchor_x: 0.5,
+            transform_anchor_y: 0.5,
             ..Default::default()
         }
     }
