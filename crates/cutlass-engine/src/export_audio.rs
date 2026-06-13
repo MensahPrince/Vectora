@@ -33,14 +33,18 @@ struct Span {
     /// Source window length in output sample frames (the clip's in/out range).
     /// Drives the varispeed stretch ratio when `retimed`.
     source_frames: i64,
-    /// Retimed (constant speed ≠ 1× and/or reversed, M8 Phase 3): the span is
-    /// time-stretched to its timeline length and served 1:1, not read at
-    /// native rate. Speed-curve clips are excluded by [`ExportAudioMixer::for_project`].
+    /// Retimed (constant speed ≠ 1×, reversed, and/or a speed ramp, M8 Phase
+    /// 3): the span is time-stretched to its timeline length and served 1:1,
+    /// not read at native rate.
     retimed: bool,
     /// Play the source window back-to-front (CapCut reverse).
     reversed: bool,
     /// Varispeed pitch factor (`1.0` keeps pitch, `> 1.0` is chipmunk mode).
     pitch_factor: f32,
+    /// Speed ramp (CapCut speed curves, M2): `Some` ⇒ the retime rate varies,
+    /// and the stretch follows the curve's normalized integral. `None` ⇒ a
+    /// constant-rate retime.
+    speed_curve: Option<Param<f32>>,
     /// Clip gain envelope (volume, M1 → M8): `1.0` ⇔ unchanged. Keyframe
     /// ticks are rebased into clip-relative output sample frames.
     volume: Param<f32>,
@@ -77,11 +81,11 @@ impl ExportAudioMixer {
                 continue;
             }
             for clip in track.clips_ordered() {
-                // Constant-zero clips contribute nothing. Speed-curve clips
-                // (M2 ramps) still mute until the varispeed curve slice lands;
-                // a constant speed change or reverse is now time-stretched
-                // (M8 Phase 3) so export matches the preview mixer.
-                if clip.is_silent() || clip.has_speed_curve() {
+                // Constant-zero clips contribute nothing. Every retimed clip —
+                // constant speed, reverse, and now speed ramps (M2) —
+                // time-stretches (M8 Phase 3) so export matches the preview
+                // mixer.
+                if clip.is_silent() {
                     continue;
                 }
                 let Some(media_id) = clip.media() else {
@@ -113,6 +117,7 @@ impl ExportAudioMixer {
                     retimed: clip.is_retimed(),
                     reversed: clip.reversed,
                     pitch_factor: clip.audio_pitch_factor(),
+                    speed_curve: clip.has_speed_curve().then(|| clip.speed_curve.clone()),
                     // Rebase the envelope's clip-relative ticks into
                     // clip-relative output sample frames.
                     volume: clip
@@ -241,15 +246,30 @@ fn mix_retimed_span(
     out: &mut [f32],
 ) -> Result<(), EngineError> {
     if span.rendered.is_none() {
-        let buf = cutlass_decoder::render_stretched(
-            &span.path,
-            EXPORT_AUDIO_RATE,
-            span.source_start,
-            span.source_frames,
-            span.end - span.start,
-            span.reversed,
-            span.pitch_factor,
-        )
+        // A ramp (M2) renders variable-rate, following the curve's normalized
+        // integral; a constant-rate retime takes the uniform path. Identical
+        // inputs to the preview mixer, so what you hear is what you ship.
+        let buf = match &span.speed_curve {
+            Some(curve) => cutlass_decoder::render_stretched_curve(
+                &span.path,
+                EXPORT_AUDIO_RATE,
+                span.source_start,
+                span.source_frames,
+                span.end - span.start,
+                span.reversed,
+                span.pitch_factor,
+                |p| cutlass_models::speed_curve_source_fraction(curve, p),
+            ),
+            None => cutlass_decoder::render_stretched(
+                &span.path,
+                EXPORT_AUDIO_RATE,
+                span.source_start,
+                span.source_frames,
+                span.end - span.start,
+                span.reversed,
+                span.pitch_factor,
+            ),
+        }
         .map_err(|err| audio_err("render varispeed audio", &span.path, err))?;
         span.rendered = Some(buf);
     }
@@ -375,7 +395,9 @@ mod tests {
     }
 
     #[test]
-    fn speed_curve_clips_stay_muted_until_the_variable_ratio_slice() {
+    fn speed_curve_clips_are_audible_and_carry_the_ramp() {
+        // A ramp used to mute on export; now it time-stretches variable-rate
+        // (M8 Phase 3) so export matches the preview mixer.
         let (mut project, clip) = audio_clip_project(Rational::new(1, 1), false);
         let curve = Param::Keyframed {
             keyframes: vec![
@@ -392,9 +414,13 @@ mod tests {
             ],
         };
         project.set_clip_speed_curve(clip, Some(curve)).unwrap();
+        let mixer = ExportAudioMixer::for_project(&project).expect("a ramp is now audible");
+        assert_eq!(mixer.spans.len(), 1);
+        let span = &mixer.spans[0];
+        assert!(span.retimed, "a ramp flags a retime");
         assert!(
-            ExportAudioMixer::for_project(&project).is_none(),
-            "speed-curve ramps contribute no audio for now"
+            span.speed_curve.is_some(),
+            "the ramp rides along to drive the variable-rate render"
         );
     }
 
