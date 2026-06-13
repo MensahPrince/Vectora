@@ -729,6 +729,21 @@ fn time_range(range: EngineRange) -> TimeRange {
     }
 }
 
+/// The single choke point projecting engine `i64` ticks into Slint's `i32`
+/// time model (keyframes roadmap Phase 4 — tick audit). Every tick that
+/// crosses the boundary (`rational_time`, markers, keyframe + speed-ramp
+/// rows) routes through here so an out-of-range value **saturates** instead
+/// of wrapping — a clip parked past the bound clamps to the edge of the
+/// addressable timeline rather than teleporting to a negative tick.
+///
+/// ## Timeline-length bound
+///
+/// `i32::MAX` ticks is the hard ceiling. In wall-clock time that is
+/// `i32::MAX / fps` seconds: ≈ 20.7 hours at 30 fps, ≈ 8.3 hours at 72 fps,
+/// ≈ 24.8 days at 1000 fps. Real projects stay orders of magnitude inside
+/// it; the clamp only exists so a pathological/corrupt tick can never alias
+/// to a bogus on-screen position. Promoting the Slint model to `i64` is the
+/// long-term fix (tracked in `timeline-roadmap.md`).
 fn clamp_i32(value: i64) -> i32 {
     value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
@@ -867,6 +882,31 @@ mod tests {
             [second.bez_x1, second.bez_y1, second.bez_x2, second.bez_y2],
             [0.42, 0.0, 0.58, 1.0]
         );
+    }
+
+    // --- Phase 4 tick audit: i64 → i32 projection saturates, never wraps. ---
+
+    #[test]
+    fn clamp_i32_saturates_at_the_bounds() {
+        assert_eq!(clamp_i32(0), 0);
+        assert_eq!(clamp_i32(1_000), 1_000);
+        // Above/below i32 range pin to the edge instead of wrapping (a naive
+        // `as i32` would alias these to small / negative ticks).
+        assert_eq!(clamp_i32(i64::from(i32::MAX) + 1), i32::MAX);
+        assert_eq!(clamp_i32(i64::MAX), i32::MAX);
+        assert_eq!(clamp_i32(i64::from(i32::MIN) - 1), i32::MIN);
+        assert_eq!(clamp_i32(i64::MIN), i32::MIN);
+    }
+
+    #[test]
+    fn rational_time_saturates_huge_ticks() {
+        // A tick parked past the i32 ceiling clamps to the edge of the
+        // addressable timeline rather than teleporting to a negative frame.
+        let huge = rational_time(t(i64::from(i32::MAX) + 5_000, 30, 1));
+        assert_eq!(huge.value, i32::MAX);
+        assert_eq!((huge.rate.num, huge.rate.den), (30, 1));
+        // In-range ticks pass through untouched.
+        assert_eq!(rational_time(t(123, 30, 1)).value, 123);
     }
 
     #[test]
