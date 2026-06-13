@@ -46,8 +46,9 @@ beat markers all mirror CapCut desktop's audio panel.
   Values are validated in `0..=MAX_CLIP_VOLUME` per keyframe, finite.
 - **A keyframed envelope is never "silent."** `Clip::is_silent` is true
   only for a constant gain of `0`; an envelope is kept by both mixers (it
-  may be non-zero elsewhere) and sampled. Retimed clips still mute until
-  varispeed (Phase 3).
+  may be non-zero elsewhere) and sampled. Constant-speed and reversed clips
+  now play time-stretched audio (Phase 3); only speed-curve (M2) clips still
+  mute, pending the variable-ratio render.
 
 ---
 
@@ -102,13 +103,28 @@ beat markers all mirror CapCut desktop's audio panel.
 
 ## Phase 3 — Varispeed audio
 
-- [ ] Time-stretch with pitch preservation so M1/M2 speed clips finally
-      play sound (today retimed clips mute in both mixers). Pitch-shift
-      toggle (chipmunk mode optional, as CapCut offers).
-- [ ] **Open decision**: stretch backend (signalsmith-stretch vs
-      rubberband vs a vendored phase-vocoder) — weigh quality, license, and
-      bundling against the FFmpeg posture noted in the v1 roadmap. Drop the
-      `is_retimed()` mixer mute once a backend lands.
+- [x] **Backend (decided)**: `signalsmith-stretch` — MIT, header-only C++
+      via a maintained Rust wrapper, chosen over rubberband (GPL) and a
+      vendored phase-vocoder for license fit and quality. Lives in
+      `cutlass-decoder` as an *offline per-span render* (`render_stretched`):
+      the whole retimed span is stretched into a buffer once (lazily, then
+      cached on a `RenderKey`) and served 1:1, so preview and export use
+      identical samples and reverse is a buffered flip rather than a streamed
+      special case.
+- [x] **Constant-speed + reverse audio (M1)**: both mixers drop the
+      `is_retimed()` mute for constant-rate and reversed clips, render the
+      span through `render_stretched`, and play it. `Clip.preserve_pitch`
+      (serde-default true, back-compat) drives the transpose: pitch-locked
+      time-stretch by default, pitch-follows-speed ("chipmunk") when off.
+- [x] **Pitch toggle**: `set_clip_pitch` model setter + `SetClipPitch`
+      command + engine action (clip-snapshot inverse) + a "Keep pitch" switch
+      in the Speed inspector (flips the whole link group when linkage is on,
+      so an A/V pair stays consistent). Replaces the old "audio is muted while
+      retimed" caption.
+- [ ] **Speed-curve audio (M2)**: variable-ratio ramps still mute — the
+      offline render takes one ratio per call, so a ramp needs a
+      variable-rate pass. Follow-up before the velocity graph can claim
+      audible ramps.
 
 ## Phase 4 — Audio ducking
 
