@@ -53,6 +53,18 @@ pub struct AudioSpan {
     /// Source-in value at `source_rate` (the media's native rate).
     pub source_start: i64,
     pub source_rate: (i32, i32),
+    /// Source window length at `source_rate` (the clip's in/out range). Drives
+    /// the varispeed stretch ratio for retimed clips; ignored at 1×.
+    pub source_duration: i64,
+    /// Retimed (constant speed ≠ 1× and/or reversed, M8 Phase 3): the mixer
+    /// time-stretches the source window to the span length instead of reading
+    /// it 1:1. Speed-curve clips are excluded by the snapshot builder for now.
+    pub retimed: bool,
+    /// Play the source window back-to-front (CapCut reverse).
+    pub reversed: bool,
+    /// Varispeed pitch factor (`1.0` keeps pitch; `> 1.0` is chipmunk mode).
+    /// Only consulted when `retimed`.
+    pub pitch_factor: f32,
     /// Clip gain envelope (volume, M1 → M8): `1.0` ⇔ unchanged. Keyframe
     /// ticks are clip-relative sequence ticks at the snapshot's fps; the
     /// mixer rebases them into sample frames once per span.
@@ -351,6 +363,24 @@ struct ResolvedSpan {
     volume: Param<f32>,
     fade_in_frames: i64,
     fade_out_frames: i64,
+    /// Varispeed render identity for a retimed span; `None` ⇒ read 1:1.
+    render: Option<RenderKey>,
+}
+
+/// Identifies a retimed span's time-stretch render (M8 Phase 3). Doubles as
+/// the cache key so a span keeps its rendered buffer across snapshots while
+/// nothing it depends on changes, and re-renders the moment any does.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RenderKey {
+    path: PathBuf,
+    source_start_frame: i64,
+    /// Source window length in device sample frames.
+    source_frames: i64,
+    /// Stretched output length in device sample frames (the span length).
+    out_frames: i64,
+    reversed: bool,
+    /// Pitch factor bit pattern (f32 isn't `Hash`/`Eq`).
+    pitch_bits: u32,
 }
 
 fn mixer_loop(
@@ -367,6 +397,9 @@ fn mixer_loop(
     // shared demuxer position.
     let mut readers: HashMap<(PathBuf, i64), AudioReader> = HashMap::new();
     let mut failed_opens: HashMap<PathBuf, ()> = HashMap::new();
+    // Time-stretched buffers for retimed spans (M8 Phase 3), rendered once
+    // and served 1:1; kept across snapshots while the render identity holds.
+    let mut rendered: HashMap<RenderKey, Arc<Vec<f32>>> = HashMap::new();
     let mut epoch = 0u64;
     let mut playing = false;
     // Timeline device-frame position the next block mixes from.
@@ -410,6 +443,9 @@ fn mixer_loop(
                 .map(|s| (s.path.clone(), s.start_frame))
                 .collect();
             readers.retain(|key, _| live.contains(key));
+            let live_renders: std::collections::HashSet<RenderKey> =
+                spans.iter().filter_map(|s| s.render.clone()).collect();
+            rendered.retain(|key, _| live_renders.contains(key));
             failed_opens.clear();
         }
 
@@ -425,6 +461,7 @@ fn mixer_loop(
                 &spans,
                 &mut readers,
                 &mut failed_opens,
+                &mut rendered,
                 write_frame,
                 sample_rate,
                 &mut samples,
@@ -451,6 +488,7 @@ fn mix_block(
     spans: &[ResolvedSpan],
     readers: &mut HashMap<(PathBuf, i64), AudioReader>,
     failed_opens: &mut HashMap<PathBuf, ()>,
+    rendered: &mut HashMap<RenderKey, Arc<Vec<f32>>>,
     pos: i64,
     sample_rate: u32,
     out: &mut [f32],
@@ -465,6 +503,13 @@ fn mix_block(
         }
         let s = span.start_frame.max(pos);
         let e = span.end_frame.min(block_end);
+
+        // Retimed clips (M8 Phase 3) play their time-stretched buffer 1:1
+        // instead of reading the source at native rate.
+        if let Some(key) = &span.render {
+            mix_retimed_span(span, key, rendered, failed_opens, sample_rate, pos, s, e, out);
+            continue;
+        }
         let want = (e - s) as usize;
 
         let key = (span.path.clone(), span.start_frame);
@@ -539,22 +584,109 @@ fn mix_block(
     }
 }
 
+/// Mix the overlap `[s, e)` of a retimed span (M8 Phase 3) by serving its
+/// time-stretched buffer 1:1. The buffer is rendered + cached on first touch;
+/// the volume envelope and fades ride on top exactly like the 1× path.
+#[allow(clippy::too_many_arguments)]
+fn mix_retimed_span(
+    span: &ResolvedSpan,
+    key: &RenderKey,
+    rendered: &mut HashMap<RenderKey, Arc<Vec<f32>>>,
+    failed_opens: &mut HashMap<PathBuf, ()>,
+    sample_rate: u32,
+    pos: i64,
+    s: i64,
+    e: i64,
+    out: &mut [f32],
+) {
+    let buf = match rendered.get(key) {
+        Some(buf) => buf.clone(),
+        None => {
+            if failed_opens.contains_key(&span.path) {
+                return;
+            }
+            match cutlass_decoder::render_stretched(
+                &span.path,
+                sample_rate,
+                key.source_start_frame,
+                key.source_frames,
+                key.out_frames,
+                key.reversed,
+                f32::from_bits(key.pitch_bits),
+            ) {
+                Ok(buf) => {
+                    let buf = Arc::new(buf);
+                    rendered.insert(key.clone(), Arc::clone(&buf));
+                    buf
+                }
+                Err(err) => {
+                    warn!(path = %span.path.display(), "varispeed render failed: {err}");
+                    failed_opens.insert(span.path.clone(), ());
+                    return;
+                }
+            }
+        }
+    };
+
+    let span_len = span.end_frame - span.start_frame;
+    let total_frames = buf.len() / AUDIO_CHANNELS;
+    let unity = span.volume.constant() == Some(1.0)
+        && span.fade_in_frames == 0
+        && span.fade_out_frames == 0;
+    for f in s..e {
+        let bi = (f - span.start_frame) as usize;
+        if bi >= total_frames {
+            break;
+        }
+        let dst = ((f - pos) as usize) * AUDIO_CHANNELS;
+        let gain = if unity {
+            1.0
+        } else {
+            cutlass_models::audio_gain_at(
+                f - span.start_frame,
+                span_len,
+                &span.volume,
+                span.fade_in_frames,
+                span.fade_out_frames,
+            )
+        };
+        for ch in 0..AUDIO_CHANNELS {
+            out[dst + ch] += buf[bi * AUDIO_CHANNELS + ch] * gain;
+        }
+    }
+}
+
 fn resolve_spans(snapshot: &AudioSnapshot, sample_rate: u32) -> Vec<ResolvedSpan> {
     snapshot
         .spans
         .iter()
-        .map(|span| ResolvedSpan {
-            path: span.path.clone(),
-            start_frame: ticks_to_frames(span.start_tick, snapshot.fps, sample_rate),
-            end_frame: ticks_to_frames(span.end_tick, snapshot.fps, sample_rate),
-            source_start_frame: ticks_to_frames(span.source_start, span.source_rate, sample_rate),
-            // Rebase the envelope's clip-relative ticks into clip-relative
-            // sample frames, matching the per-frame `pos` the mixer feeds it.
-            volume: span
-                .volume
-                .map_ticks(|tick| ticks_to_frames(tick, snapshot.fps, sample_rate)),
-            fade_in_frames: ticks_to_frames(span.fade_in_ticks, snapshot.fps, sample_rate),
-            fade_out_frames: ticks_to_frames(span.fade_out_ticks, snapshot.fps, sample_rate),
+        .map(|span| {
+            let start_frame = ticks_to_frames(span.start_tick, snapshot.fps, sample_rate);
+            let end_frame = ticks_to_frames(span.end_tick, snapshot.fps, sample_rate);
+            let source_start_frame =
+                ticks_to_frames(span.source_start, span.source_rate, sample_rate);
+            let render = span.retimed.then(|| RenderKey {
+                path: span.path.clone(),
+                source_start_frame,
+                source_frames: ticks_to_frames(span.source_duration, span.source_rate, sample_rate),
+                out_frames: end_frame - start_frame,
+                reversed: span.reversed,
+                pitch_bits: span.pitch_factor.to_bits(),
+            });
+            ResolvedSpan {
+                path: span.path.clone(),
+                start_frame,
+                end_frame,
+                source_start_frame,
+                // Rebase the envelope's clip-relative ticks into clip-relative
+                // sample frames, matching the per-frame `pos` the mixer feeds it.
+                volume: span
+                    .volume
+                    .map_ticks(|tick| ticks_to_frames(tick, snapshot.fps, sample_rate)),
+                fade_in_frames: ticks_to_frames(span.fade_in_ticks, snapshot.fps, sample_rate),
+                fade_out_frames: ticks_to_frames(span.fade_out_ticks, snapshot.fps, sample_rate),
+                render,
+            }
         })
         .collect()
 }
@@ -607,6 +739,10 @@ mod tests {
                 end_tick: 24,
                 source_start: 0,
                 source_rate: (24, 1),
+                source_duration: 0,
+                retimed: false,
+                reversed: false,
+                pitch_factor: 1.0,
                 volume: Param::Keyframed {
                     keyframes: vec![
                         Keyframe { tick: 0, value: 0.0, easing: Easing::Linear },
@@ -667,8 +803,9 @@ mod tests {
         // No spans: block stays silent.
         let mut readers = HashMap::new();
         let mut failed = HashMap::new();
+        let mut rendered = HashMap::new();
         let mut out = vec![0.5f32; BLOCK_FRAMES * AUDIO_CHANNELS];
-        mix_block(&[], &mut readers, &mut failed, 0, 48_000, &mut out);
+        mix_block(&[], &mut readers, &mut failed, &mut rendered, 0, 48_000, &mut out);
         assert!(out.iter().all(|&s| s == 0.5), "no spans leave input alone");
     }
 
@@ -701,6 +838,10 @@ mod tests {
                 end_tick: 48,
                 source_start: 0,
                 source_rate: (24, 1),
+                source_duration: 0,
+                retimed: false,
+                reversed: false,
+                pitch_factor: 1.0,
                 volume: Param::Constant(1.0),
                 fade_in_ticks: 0,
                 fade_out_ticks: 0,
@@ -712,10 +853,11 @@ mod tests {
 
         let mut readers = HashMap::new();
         let mut failed = HashMap::new();
+        let mut rendered = HashMap::new();
 
         // Block fully before the clip: silence.
         let mut before = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
-        mix_block(&spans, &mut readers, &mut failed, 0, RATE, &mut before);
+        mix_block(&spans, &mut readers, &mut failed, &mut rendered, 0, RATE, &mut before);
         assert!(before.iter().all(|&s| s == 0.0), "silence before the clip");
 
         // Block inside the clip: real audio.
@@ -724,6 +866,7 @@ mod tests {
             &spans,
             &mut readers,
             &mut failed,
+            &mut rendered,
             i64::from(RATE) + 4 * BLOCK_FRAMES as i64,
             RATE,
             &mut inside,
@@ -740,7 +883,7 @@ mod tests {
         // Block straddling the clip start: leading samples stay silent.
         let straddle_pos = i64::from(RATE) - (BLOCK_FRAMES / 2) as i64;
         let mut straddle = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
-        mix_block(&spans, &mut readers, &mut failed, straddle_pos, RATE, &mut straddle);
+        mix_block(&spans, &mut readers, &mut failed, &mut rendered, straddle_pos, RATE, &mut straddle);
         let lead = (BLOCK_FRAMES / 2) * AUDIO_CHANNELS;
         assert!(
             straddle[..lead].iter().all(|&s| s == 0.0),
@@ -762,6 +905,10 @@ mod tests {
                 end_tick: 48,
                 source_start: 0,
                 source_rate: (24, 1),
+                source_duration: 0,
+                retimed: false,
+                reversed: false,
+                pitch_factor: 1.0,
                 volume: Param::Constant(volume),
                 fade_in_ticks,
                 fade_out_ticks: 0,
@@ -770,15 +917,16 @@ mod tests {
         // Mix the same block at full and half volume: every sample halves.
         let mut readers = HashMap::new();
         let mut failed = HashMap::new();
+        let mut rendered = HashMap::new();
         let pos = 8 * BLOCK_FRAMES as i64;
         let mut full = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
         let spans = resolve_spans(&span_at(1.0, 0), RATE);
-        mix_block(&spans, &mut readers, &mut failed, pos, RATE, &mut full);
+        mix_block(&spans, &mut readers, &mut failed, &mut rendered, pos, RATE, &mut full);
         assert!(full.iter().any(|&s| s != 0.0), "fixture block is audible");
 
         let mut half = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
         let spans = resolve_spans(&span_at(0.5, 0), RATE);
-        mix_block(&spans, &mut readers, &mut failed, pos, RATE, &mut half);
+        mix_block(&spans, &mut readers, &mut failed, &mut rendered, pos, RATE, &mut half);
         for (f, h) in full.iter().zip(&half) {
             assert!((f * 0.5 - h).abs() < 1e-4, "half volume halves samples");
         }
@@ -787,15 +935,65 @@ mod tests {
         // and leaves the block quieter than the flat mix.
         let mut faded = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
         let spans = resolve_spans(&span_at(1.0, 48), RATE);
-        mix_block(&spans, &mut readers, &mut failed, 0, RATE, &mut faded);
+        mix_block(&spans, &mut readers, &mut failed, &mut rendered, 0, RATE, &mut faded);
         assert_eq!(faded[0], 0.0, "fade-in starts from silence");
         let mut flat = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
         let spans = resolve_spans(&span_at(1.0, 0), RATE);
-        mix_block(&spans, &mut readers, &mut failed, 0, RATE, &mut flat);
+        mix_block(&spans, &mut readers, &mut failed, &mut rendered, 0, RATE, &mut flat);
         let energy = |b: &[f32]| b.iter().map(|s| f64::from(s * s)).sum::<f64>();
         if energy(&flat) > 0.0 {
             assert!(energy(&faded) < energy(&flat), "ramp lowers block energy");
         }
+    }
+
+    #[test]
+    fn mixer_time_stretches_a_retimed_span() {
+        let Some(path) = audio_asset() else {
+            return;
+        };
+        const RATE: u32 = 48_000;
+        // A 2× clip: 2s of source (ticks [0, 48) at 24fps) plays over a 1s
+        // timeline span (ticks [0, 24)). The mixer time-stretches it instead
+        // of muting (M8 Phase 3).
+        let snapshot = AudioSnapshot {
+            fps: (24, 1),
+            spans: vec![AudioSpan {
+                path,
+                start_tick: 0,
+                end_tick: 24,
+                source_start: 0,
+                source_rate: (24, 1),
+                source_duration: 48,
+                retimed: true,
+                reversed: false,
+                pitch_factor: 1.0,
+                volume: Param::Constant(1.0),
+                fade_in_ticks: 0,
+                fade_out_ticks: 0,
+            }],
+        };
+        let spans = resolve_spans(&snapshot, RATE);
+        assert!(spans[0].render.is_some(), "a retimed span carries a render key");
+
+        let mut readers = HashMap::new();
+        let mut failed = HashMap::new();
+        let mut rendered = HashMap::new();
+        let mut inside = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            4 * BLOCK_FRAMES as i64,
+            RATE,
+            &mut inside,
+        );
+        assert_eq!(rendered.len(), 1, "the stretched buffer is rendered + cached");
+        assert!(inside.iter().any(|&s| s != 0.0), "retimed audio plays");
+        assert!(
+            inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),
+            "clamped to [-1, 1]"
+        );
     }
 
     /// End-to-end mixer thread, no device: snapshot + play produce blocks
@@ -824,6 +1022,10 @@ mod tests {
                     end_tick: 48,
                     source_start: 0,
                     source_rate: (24, 1),
+                    source_duration: 0,
+                    retimed: false,
+                    reversed: false,
+                    pitch_factor: 1.0,
                     volume: Param::Constant(1.0),
                     fade_in_ticks: 0,
                     fade_out_ticks: 0,

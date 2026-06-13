@@ -4393,11 +4393,11 @@ fn audio_snapshot(engine: &Engine) -> AudioSnapshot {
             continue;
         }
         for clip in track.clips_ordered() {
-            // Retimed clips (speed ≠ 1× or reversed) play silent until
-            // varispeed lands (M8) — the export mixer mutes them the same
-            // way, so what you hear is what you ship. Constant-zero clips
-            // contribute nothing either way.
-            if clip.is_retimed() || clip.is_silent() {
+            // Constant-zero clips are silent either way. Speed-curve clips
+            // (M2 ramps) still mute until the varispeed curve slice lands; a
+            // constant speed change or reverse now time-stretches (M8 Phase 3)
+            // — the export mixer matches, so what you hear is what you ship.
+            if clip.is_silent() || clip.has_speed_curve() {
                 continue;
             }
             let Some(media_id) = clip.media() else {
@@ -4418,6 +4418,10 @@ fn audio_snapshot(engine: &Engine) -> AudioSnapshot {
                 end_tick: clip.timeline.end_tick(),
                 source_start: source.start.value,
                 source_rate: (source.start.rate.num, source.start.rate.den),
+                source_duration: source.duration.value,
+                retimed: clip.is_retimed(),
+                reversed: clip.reversed,
+                pitch_factor: clip.audio_pitch_factor(),
                 volume: clip.volume.clone(),
                 fade_in_ticks: clip.fade_in,
                 fade_out_ticks: clip.fade_out,
