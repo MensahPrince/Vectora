@@ -465,6 +465,15 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
         WireCommand::SetEffectParam(a) => {
             format!("set clip {} effect {} {} = {}", a.clip, a.index, a.param, a.value)
         }
+        WireCommand::AddTransition(a) => {
+            format!("added {} transition after clip {}", a.transition, a.clip)
+        }
+        WireCommand::RemoveTransition(a) => {
+            format!("removed transition after clip {}", a.clip)
+        }
+        WireCommand::SetTransition(a) => {
+            format!("set transition after clip {} to {}s", a.clip, a.seconds)
+        }
         WireCommand::SplitClip(a) => format!("split clip {} at {}", a.clip, secs(a.at)),
         WireCommand::TrimClip(a) => format!(
             "trimmed clip {} to {}–{}",

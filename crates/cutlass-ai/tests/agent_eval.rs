@@ -945,6 +945,63 @@ fn add_a_blur_to_the_clip() {
 }
 
 #[test]
+fn crossfade_between_two_clips() {
+    let mut project = Project::new("eval", R24);
+    let media = project.add_media(MediaSource::new("/tmp/eval.mp4", 1920, 1080, R24, 60 * 24, true));
+    let track = project.add_track(TrackKind::Video, "V1");
+    let first = project
+        .add_clip(track, media, TimeRange::at_rate(0, 120, R24), RationalTime::new(0, R24))
+        .unwrap()
+        .raw();
+    let _second = project
+        .add_clip(track, media, TimeRange::at_rate(0, 120, R24), RationalTime::new(120, R24))
+        .unwrap();
+    let mut host = EngineHost::new(project);
+
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![
+            (
+                "call_1",
+                "add_transition",
+                serde_json::json!({ "clip": first, "transition": "crossfade" }),
+            ),
+            (
+                "call_2",
+                "set_transition",
+                serde_json::json!({ "clip": first, "seconds": 0.5 }),
+            ),
+        ]),
+        text_turn("Added a half-second crossfade between the two clips."),
+    ]);
+
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "crossfade between the two clips",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 2);
+    assert_eq!(
+        outcome.actions[0].description,
+        format!("added crossfade transition after clip {first}")
+    );
+
+    // The junction landed and surfaces on the left clip in the next summary.
+    let summary = summarize(host.engine.project());
+    let described = &summary.tracks[0].clips[0];
+    assert_eq!(described.transition.as_deref(), Some("crossfade"));
+
+    // One prompt = one undo: the whole transition disappears as a unit.
+    assert!(host.engine.undo());
+    let summary = summarize(host.engine.project());
+    assert_eq!(summary.tracks[0].clips[0].transition, None);
+    assert!(!host.engine.undo());
+}
+
+#[test]
 fn add_marker_at_playhead() {
     let (mut host, _, _, _) = fixture();
     let provider = ScriptedProvider::new(vec![

@@ -541,6 +541,77 @@
       }
     },
     {
+      "description": "Add a transition at the cut where a clip meets the next clip on its track. Available transitions: crossfade, dip_to_black, dip_to_white, wipe_left, wipe_right, wipe_up, wipe_down, slide. The clip must butt directly against a following clip. Not valid on audio tracks.",
+      "name": "add_transition",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Add a transition at the junction where `clip` abuts the next clip on its\ntrack. `clip` must butt directly against a following clip (same track, the\nnext clip starts exactly where this one ends). Rejected for clips on audio\ntracks and clips with no abutting neighbor.",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "transition": {
+            "description": "Transition id from the catalog, e.g. `crossfade` or `dip_to_black`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "clip",
+          "transition"
+        ],
+        "title": "AddTransition",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Remove the transition at a clip's right cut. See describe_project for which clips carry one.",
+      "name": "remove_transition",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Remove the transition at `clip`'s right junction. See `describe_project`\nfor which clips currently carry one.",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clip"
+        ],
+        "title": "RemoveTransition",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Set the duration in seconds of the transition at a clip's right cut (centered on the cut).",
+      "name": "set_transition",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Set the duration (in seconds) of the transition at `clip`'s right junction.\nThe window is centered on the cut.",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "seconds": {
+            "description": "New window length in seconds (must be positive).",
+            "format": "double",
+            "type": "number"
+          }
+        },
+        "required": [
+          "clip",
+          "seconds"
+        ],
+        "title": "SetTransition",
+        "type": "object"
+      }
+    },
+    {
       "description": "Add or replace a keyframe on a clip property (position, scale, rotation, opacity) at a timeline position in seconds, animating it over time. Use 'value' for scalar params, 'position' for position.",
       "name": "set_param_keyframe",
       "parameters": {
@@ -1336,5 +1407,5 @@
       }
     }
   ],
-  "version": 9
+  "version": 10
 }

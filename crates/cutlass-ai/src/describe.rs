@@ -127,6 +127,10 @@ pub struct ClipSummary {
     /// is what remove_effect / set_effect_param address. Absent when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<EffectSummary>,
+    /// Transition at this clip's right cut (add_transition), if any. The
+    /// catalog id of the blend into the next clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -301,6 +305,9 @@ pub fn summarize(project: &Project) -> ProjectSummary {
                                 .unwrap_or_default(),
                         })
                         .collect(),
+                    transition: track
+                        .transition_at(clip.id)
+                        .map(|t| t.transition_id.clone()),
                 })
                 .collect(),
         })

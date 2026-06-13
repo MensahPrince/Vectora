@@ -27,7 +27,8 @@ use serde::{Deserialize, Serialize};
 ///    so small local models stop guessing nested argument shapes.
 /// 8: M1 canvas settings (`set_canvas`).
 /// 9: M4 effects (`add_effect`, `remove_effect`, `set_effect_param`).
-pub const TOOL_SCHEMA_VERSION: u32 = 9;
+/// 10: M4 transitions (`add_transition`, `remove_transition`, `set_transition`).
+pub const TOOL_SCHEMA_VERSION: u32 = 10;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -221,6 +222,33 @@ pub struct SetEffectParam {
     pub param: String,
     /// New value (clamped to the parameter's catalog range).
     pub value: f64,
+}
+
+/// Add a transition at the junction where `clip` abuts the next clip on its
+/// track. `clip` must butt directly against a following clip (same track, the
+/// next clip starts exactly where this one ends). Rejected for clips on audio
+/// tracks and clips with no abutting neighbor.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct AddTransition {
+    pub clip: u64,
+    /// Transition id from the catalog, e.g. `crossfade` or `dip_to_black`.
+    pub transition: String,
+}
+
+/// Remove the transition at `clip`'s right junction. See `describe_project`
+/// for which clips currently carry one.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct RemoveTransition {
+    pub clip: u64,
+}
+
+/// Set the duration (in seconds) of the transition at `clip`'s right junction.
+/// The window is centered on the cut.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetTransition {
+    pub clip: u64,
+    /// New window length in seconds (must be positive).
+    pub seconds: f64,
 }
 
 /// An animatable clip property the keyframe commands can address.
@@ -563,6 +591,9 @@ pub enum WireCommand {
     AddEffect(AddEffect),
     RemoveEffect(RemoveEffect),
     SetEffectParam(SetEffectParam),
+    AddTransition(AddTransition),
+    RemoveTransition(RemoveTransition),
+    SetTransition(SetTransition),
     SetParamKeyframe(SetParamKeyframe),
     RemoveParamKeyframe(RemoveParamKeyframe),
     SetParamConstant(SetParamConstant),
@@ -626,6 +657,9 @@ impl WireCommand {
             WireCommand::AddEffect(a) => clip(&mut a.clip),
             WireCommand::RemoveEffect(a) => clip(&mut a.clip),
             WireCommand::SetEffectParam(a) => clip(&mut a.clip),
+            WireCommand::AddTransition(a) => clip(&mut a.clip),
+            WireCommand::RemoveTransition(a) => clip(&mut a.clip),
+            WireCommand::SetTransition(a) => clip(&mut a.clip),
             WireCommand::SetParamKeyframe(a) => clip(&mut a.clip),
             WireCommand::RemoveParamKeyframe(a) => clip(&mut a.clip),
             WireCommand::SetParamConstant(a) => clip(&mut a.clip),
@@ -772,6 +806,12 @@ tools! {
         "Remove an effect from a clip's chain by its index (0 = first). See describe_project for a clip's current effects.";
     "set_effect_param" => SetEffectParam(SetEffectParam),
         "Set a parameter of an effect on a clip to a value (e.g. gaussian_blur 'radius', vignette 'amount'). Use describe_project to see effect indices and current params.";
+    "add_transition" => AddTransition(AddTransition),
+        "Add a transition at the cut where a clip meets the next clip on its track. Available transitions: crossfade, dip_to_black, dip_to_white, wipe_left, wipe_right, wipe_up, wipe_down, slide. The clip must butt directly against a following clip. Not valid on audio tracks.";
+    "remove_transition" => RemoveTransition(RemoveTransition),
+        "Remove the transition at a clip's right cut. See describe_project for which clips carry one.";
+    "set_transition" => SetTransition(SetTransition),
+        "Set the duration in seconds of the transition at a clip's right cut (centered on the cut).";
     "set_param_keyframe" => SetParamKeyframe(SetParamKeyframe),
         "Add or replace a keyframe on a clip property (position, scale, rotation, opacity) at a timeline position in seconds, animating it over time. Use 'value' for scalar params, 'position' for position.";
     "remove_param_keyframe" => RemoveParamKeyframe(RemoveParamKeyframe),
@@ -969,7 +1009,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 30);
+        assert_eq!(specs.len(), 33);
         for spec in &specs {
             assert!(!spec.description.is_empty(), "{} missing description", spec.name);
             assert_eq!(

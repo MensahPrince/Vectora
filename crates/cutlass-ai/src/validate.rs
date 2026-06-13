@@ -230,6 +230,47 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 value: v as f32,
             }
         }
+        WireCommand::AddTransition(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            reject_audio_lane(project, clip, "transitions need a visual frame", args.clip)?;
+            if cutlass_models::transition_spec(&args.transition).is_none() {
+                return Err(Rejection::new(format!(
+                    "unknown transition '{}'; available transitions: {}",
+                    args.transition,
+                    transition_ids()
+                )));
+            }
+            if !has_right_neighbor(project, clip) {
+                return Err(Rejection::new(format!(
+                    "clip {} has no clip butting against its right edge to transition into",
+                    args.clip
+                )));
+            }
+            EditCommand::AddTransition {
+                clip: clip.id,
+                transition_id: args.transition.clone(),
+            }
+        }
+        WireCommand::RemoveTransition(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            require_transition(project, clip, args.clip)?;
+            EditCommand::RemoveTransition { clip: clip.id }
+        }
+        WireCommand::SetTransition(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            require_transition(project, clip, args.clip)?;
+            if !(args.seconds.is_finite()) || args.seconds <= 0.0 {
+                return Err(Rejection::new(format!(
+                    "transition duration must be positive (got {}s)",
+                    args.seconds
+                )));
+            }
+            let duration = seconds_to_ticks(args.seconds, timeline_rate(project), "duration")?.max(1);
+            EditCommand::SetTransition {
+                clip: clip.id,
+                duration,
+            }
+        }
         WireCommand::SetParamKeyframe(args) => {
             let clip = clip_ref(project, args.clip)?;
             let at = keyframe_position(project, clip, args.at)?;
@@ -554,6 +595,43 @@ fn effect_ids() -> String {
         .map(|s| s.id)
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn transition_ids() -> String {
+    cutlass_models::transition_catalog()
+        .iter()
+        .map(|s| s.id)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether a clip butts directly against a following clip on its track (the
+/// next clip starts exactly where this one ends) — the precondition for a
+/// transition at its right junction.
+fn has_right_neighbor(project: &Project, clip: &Clip) -> bool {
+    let timeline = project.timeline();
+    let Some(track) = timeline.track_of(clip.id).and_then(|id| timeline.track(id)) else {
+        return false;
+    };
+    let end = clip.timeline.end_tick();
+    track
+        .clips()
+        .any(|c| c.id != clip.id && c.timeline.start.value == end)
+}
+
+/// Reject when the clip carries no transition at its right junction.
+fn require_transition(project: &Project, clip: &Clip, raw_clip: u64) -> Result<(), Rejection> {
+    let timeline = project.timeline();
+    let has = timeline
+        .track_of(clip.id)
+        .and_then(|id| timeline.track(id))
+        .is_some_and(|t| t.transition_at(clip.id).is_some());
+    if !has {
+        return Err(Rejection::new(format!(
+            "clip {raw_clip} has no transition at its right cut"
+        )));
+    }
+    Ok(())
 }
 
 /// Resolve a wire effect-chain index against a clip, rejecting out-of-range
