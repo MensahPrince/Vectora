@@ -766,7 +766,7 @@ fn set_clip_audio_undo_redo_roundtrip() {
     engine
         .apply(Command::Edit(EditCommand::SetClipAudio {
             clip: clip_id,
-            volume: 0.5,
+            volume: Some(0.5),
             fade_in: rt(12),
             fade_out: rt(24),
         }))
@@ -797,7 +797,7 @@ fn set_clip_audio_rejects_generated_clips_and_long_fades() {
         engine
             .apply(Command::Edit(EditCommand::SetClipAudio {
                 clip: clip_id,
-                volume: 0.5,
+                volume: Some(0.5),
                 fade_in: rt(0),
                 fade_out: rt(0),
             }))

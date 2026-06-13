@@ -927,19 +927,24 @@ impl Project {
         Ok(())
     }
 
-    /// Set a media clip's audio mix (CapCut volume + fades, M1): constant
-    /// gain `volume` (`0` mutes, `1` unchanged, up to
-    /// [`crate::MAX_CLIP_VOLUME`]× boost) plus linear fade-in/out durations
-    /// at the timeline rate. Rejected on generated clips (nothing to hear),
-    /// out-of-range volume, negative fades, and fades longer than the clip.
+    /// Set a media clip's audio mix (CapCut volume + fades): `volume` is
+    /// `Some` to set a flat gain (`0` mutes, `1` unchanged, up to
+    /// [`crate::MAX_CLIP_VOLUME`]× boost), overwriting any M8 envelope
+    /// (CapCut's basic slider), or `None` to keep the current gain and only
+    /// update the fades — so a fade edit never flattens an envelope. Fades
+    /// are linear in/out durations at the timeline rate. Rejected on
+    /// generated clips (nothing to hear), out-of-range volume, negative
+    /// fades, and fades longer than the clip.
     pub fn set_clip_audio(
         &mut self,
         clip_id: ClipId,
-        volume: f32,
+        volume: Option<f32>,
         fade_in: RationalTime,
         fade_out: RationalTime,
     ) -> Result<(), ModelError> {
-        crate::clip::validate_volume(volume)?;
+        if let Some(volume) = volume {
+            crate::clip::validate_volume(volume)?;
+        }
         let tl_rate = self.timeline.frame_rate;
         check_same_rate(fade_in.rate, tl_rate)?;
         check_same_rate(fade_out.rate, tl_rate)?;
@@ -969,10 +974,14 @@ impl Project {
             .timeline
             .clip_mut(clip_id)
             .expect("clip existence checked above");
-        // The basic volume control sets a flat level, flattening any envelope
-        // (CapCut's slider behaviour); envelopes are drawn through the volume
-        // keyframe commands (`ClipParam::Volume`).
-        clip.volume = Param::Constant(volume);
+        // `Some` is the basic volume slider: a flat level that flattens any
+        // envelope (CapCut). `None` keeps the gain (constant or envelope) and
+        // touches only the fades, so a fade edit never destroys automation;
+        // envelopes are otherwise drawn through the volume keyframe commands
+        // (`ClipParam::Volume`).
+        if let Some(volume) = volume {
+            clip.volume = Param::Constant(volume);
+        }
         clip.fade_in = fade_in.value;
         clip.fade_out = fade_out.value;
         Ok(())
@@ -1820,15 +1829,42 @@ mod tests {
         let (mut project, media_id, track) = project_with_media(500);
         let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
 
-        project.set_clip_audio(clip, 0.5, rt(10), rt(20)).unwrap();
+        project.set_clip_audio(clip, Some(0.5), rt(10), rt(20)).unwrap();
         let c = project.clip(clip).unwrap();
         assert_eq!(c.volume.constant(), Some(0.5));
         assert_eq!((c.fade_in, c.fade_out), (10, 20));
         assert!(c.has_custom_audio());
 
+        // A `None` volume keeps the gain and only moves the fades.
+        project.set_clip_audio(clip, None, rt(5), rt(0)).unwrap();
+        let c = project.clip(clip).unwrap();
+        assert_eq!(c.volume.constant(), Some(0.5));
+        assert_eq!((c.fade_in, c.fade_out), (5, 0));
+
         // Back to defaults clears the custom-audio state.
-        project.set_clip_audio(clip, 1.0, rt(0), rt(0)).unwrap();
+        project.set_clip_audio(clip, Some(1.0), rt(0), rt(0)).unwrap();
         assert!(!project.clip(clip).unwrap().has_custom_audio());
+    }
+
+    #[test]
+    fn set_clip_audio_none_volume_preserves_envelope() {
+        let (mut project, media_id, track) = project_with_media(500);
+        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        // A keyframed gain envelope (dips to 0.2 mid-clip).
+        project
+            .set_param_keyframe(clip, ClipParam::Volume, rt(0), ParamValue::Scalar(1.0), Easing::Linear)
+            .unwrap();
+        project
+            .set_param_keyframe(clip, ClipParam::Volume, rt(50), ParamValue::Scalar(0.2), Easing::Linear)
+            .unwrap();
+        assert!(project.clip(clip).unwrap().has_volume_envelope());
+
+        // Setting only fades (None volume) must not flatten the envelope.
+        project.set_clip_audio(clip, None, rt(10), rt(20)).unwrap();
+        let c = project.clip(clip).unwrap();
+        assert!(c.has_volume_envelope());
+        assert_eq!(c.volume.sample(50), 0.2);
+        assert_eq!((c.fade_in, c.fade_out), (10, 20));
     }
 
     #[test]
@@ -1838,17 +1874,17 @@ mod tests {
 
         for volume in [-0.1, 11.0, f32::NAN, f32::INFINITY] {
             assert!(matches!(
-                project.set_clip_audio(clip, volume, rt(0), rt(0)),
+                project.set_clip_audio(clip, Some(volume), rt(0), rt(0)),
                 Err(ModelError::InvalidParam(_))
             ));
         }
         // Negative or longer-than-the-clip fades.
         assert!(matches!(
-            project.set_clip_audio(clip, 1.0, rt(-1), rt(0)),
+            project.set_clip_audio(clip, Some(1.0), rt(-1), rt(0)),
             Err(ModelError::InvalidParam(_))
         ));
         assert!(matches!(
-            project.set_clip_audio(clip, 1.0, rt(0), rt(101)),
+            project.set_clip_audio(clip, Some(1.0), rt(0), rt(101)),
             Err(ModelError::InvalidParam(_))
         ));
 
@@ -1857,12 +1893,12 @@ mod tests {
             .add_generated(fx, Generator::Adjustment, tr(0, 100))
             .unwrap();
         assert!(matches!(
-            project.set_clip_audio(generated, 0.5, rt(0), rt(0)),
+            project.set_clip_audio(generated, Some(0.5), rt(0), rt(0)),
             Err(ModelError::InvalidParam(_))
         ));
 
         assert_eq!(
-            project.set_clip_audio(ClipId::from_raw(404), 0.5, rt(0), rt(0)),
+            project.set_clip_audio(ClipId::from_raw(404), Some(0.5), rt(0), rt(0)),
             Err(ModelError::UnknownClip(ClipId::from_raw(404)))
         );
     }
@@ -1871,7 +1907,7 @@ mod tests {
     fn split_keeps_volume_and_partitions_fades() {
         let (mut project, media_id, track) = project_with_media(500);
         let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
-        project.set_clip_audio(clip, 0.5, rt(10), rt(20)).unwrap();
+        project.set_clip_audio(clip, Some(0.5), rt(10), rt(20)).unwrap();
 
         let right = project.split_clip(clip, rt(60)).unwrap();
         let left = project.clip(clip).unwrap();

@@ -373,7 +373,10 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                     ),
                 }));
             }
-            // Omitted fields keep the clip's current mix.
+            // Omitted volume keeps the clip's gain untouched — a flat level
+            // stays flat and, crucially, an envelope is preserved (so "fade
+            // the music out" past a keyframed clip doesn't wipe the
+            // automation). A present volume sets a flat level (basic slider).
             let volume = match args.volume {
                 Some(volume) => {
                     if !volume.is_finite() || !(0.0..=10.0).contains(&volume) {
@@ -381,11 +384,9 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                             "volume must be between 0 (mute) and 10 (got {volume})"
                         )));
                     }
-                    volume as f32
+                    Some(volume as f32)
                 }
-                // Omitting volume keeps the clip's level; an envelope
-                // collapses to its base (set_clip_audio sets a flat level).
-                None => clip.volume.constant().unwrap_or_else(|| clip.volume.sample(0)),
+                None => None,
             };
             let rate = timeline_rate(project);
             let clip_ticks = clip.timeline.duration.value;
@@ -1586,7 +1587,7 @@ mod tests {
             edit,
             EditCommand::SetClipAudio {
                 clip: audio_clip,
-                volume: 0.5,
+                volume: Some(0.5),
                 fade_in: RationalTime::new(24, R24),
                 fade_out: RationalTime::new(12, R24),
             }
@@ -1606,8 +1607,29 @@ mod tests {
             edit,
             EditCommand::SetClipAudio {
                 clip: audio_clip,
-                volume: 0.0,
+                volume: Some(0.0),
                 fade_in: RationalTime::new(0, R24),
+                fade_out: RationalTime::new(0, R24),
+            }
+        );
+
+        // Omitting volume lowers to `None`, so the clip's gain (a flat level
+        // or an M8 envelope) is preserved — only the fades change.
+        let edit = lower(
+            &project,
+            WireCommand::SetClipAudio(wire::SetClipAudio {
+                clip: audio_clip.raw(),
+                volume: None,
+                fade_in: Some(0.5),
+                fade_out: None,
+            }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::SetClipAudio {
+                clip: audio_clip,
+                volume: None,
+                fade_in: RationalTime::new(12, R24),
                 fade_out: RationalTime::new(0, R24),
             }
         );

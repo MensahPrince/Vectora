@@ -2398,7 +2398,7 @@ fn set_clip_audio_and_publish(
     for target in &targets {
         if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipAudio {
             clip: *target,
-            volume,
+            volume: Some(volume),
             fade_in,
             fade_out,
         })) {

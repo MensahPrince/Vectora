@@ -133,14 +133,17 @@ pub enum EditCommand {
         flip_h: bool,
         flip_v: bool,
     },
-    /// Set a media clip's audio mix (CapCut volume + fades, M1): constant
-    /// gain `volume` (`0` mutes, `1` = unchanged, up to 10× boost) plus
-    /// linear fade-in/out durations at the timeline rate. Audible for clips
-    /// on audio lanes; rejected on generated clips and on fades longer than
-    /// the clip. The inverse restores the previous clip state.
+    /// Set a media clip's audio mix (CapCut volume + fades): `volume` is the
+    /// flat gain (`0` mutes, `1` = unchanged, up to 10× boost) — `Some`
+    /// overwrites the clip's gain with that constant (the basic slider,
+    /// flattening any M8 envelope), `None` leaves the gain (constant or
+    /// envelope) untouched and only updates the fades. Fades are linear
+    /// in/out durations at the timeline rate. Audible for clips on audio
+    /// lanes; rejected on generated clips and on fades longer than the clip.
+    /// The inverse restores the previous clip state.
     SetClipAudio {
         clip: ClipId,
-        volume: f32,
+        volume: Option<f32>,
         fade_in: RationalTime,
         fade_out: RationalTime,
     },

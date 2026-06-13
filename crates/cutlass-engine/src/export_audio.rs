@@ -310,7 +310,7 @@ mod tests {
         project
             .set_clip_audio(
                 clip,
-                0.0,
+                Some(0.0),
                 RationalTime::new(0, Rational::FPS_24),
                 RationalTime::new(0, Rational::FPS_24),
             )
@@ -325,7 +325,7 @@ mod tests {
         project
             .set_clip_audio(
                 clip,
-                0.5,
+                Some(0.5),
                 RationalTime::new(24, Rational::FPS_24),
                 RationalTime::new(12, Rational::FPS_24),
             )
