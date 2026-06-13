@@ -32,7 +32,8 @@ use serde::{Deserialize, Serialize};
 /// 12: M8 volume envelopes (`volume` joins the keyframe param enum).
 /// 13: M8 varispeed pitch lock (`set_clip_pitch`); retimed-audio descriptions
 ///     drop the "muted" language now that speed/reverse/ramp clips sound.
-pub const TOOL_SCHEMA_VERSION: u32 = 13;
+/// 14: M8 sidechain ducking (`duck`).
+pub const TOOL_SCHEMA_VERSION: u32 = 14;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -407,6 +408,34 @@ pub struct SetClipAudio {
     pub fade_out: Option<f64>,
 }
 
+/// Duck the music clips under the voice clips (CapCut sidechain ducking). The
+/// editor measures how loud the voice clips are in the speech band and writes
+/// volume keyframes that dip the music while the voice talks, recovering in
+/// the gaps. The result is ordinary, editable volume automation on each music
+/// clip. Target audio-lane clips by id (for a video clip with sound, its
+/// linked audio companion).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Duck {
+    /// Ids of the voice / narration clips that drive the ducking (at least
+    /// one).
+    pub voice: Vec<u64>,
+    /// Ids of the music / background clips to duck (at least one).
+    pub music: Vec<u64>,
+    /// How far to dip the music while the voice plays: 0.0 leaves it alone,
+    /// 1.0 ducks to silence. Defaults to 0.66 (about a third of the level
+    /// stays).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<f64>,
+    /// Seconds for the music to dip once the voice starts (the "grab").
+    /// Defaults to 0.08.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attack: Option<f64>,
+    /// Seconds for the music to recover once the voice stops. Defaults to
+    /// 0.32.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release: Option<f64>,
+}
+
 /// Split a clip at a timeline position into two abutting clips.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SplitClip {
@@ -642,6 +671,7 @@ pub enum WireCommand {
     SetSpeedCurve(SetSpeedCurve),
     SetClipPitch(SetClipPitch),
     SetClipAudio(SetClipAudio),
+    Duck(Duck),
     SplitClip(SplitClip),
     TrimClip(TrimClip),
     MoveClip(MoveClip),
@@ -710,6 +740,10 @@ impl WireCommand {
             WireCommand::SetSpeedCurve(a) => clip(&mut a.clip),
             WireCommand::SetClipPitch(a) => clip(&mut a.clip),
             WireCommand::SetClipAudio(a) => clip(&mut a.clip),
+            WireCommand::Duck(a) => {
+                a.voice.iter_mut().for_each(&clip);
+                a.music.iter_mut().for_each(clip);
+            }
             WireCommand::SplitClip(a) => clip(&mut a.clip),
             WireCommand::TrimClip(a) => clip(&mut a.clip),
             WireCommand::MoveClip(a) => {
@@ -871,6 +905,8 @@ tools! {
         "Lock or unlock a retimed media clip's pitch. preserve_pitch true (default) keeps the original pitch while time-stretching; false lets pitch follow speed (the chipmunk effect when sped up). Only affects a clip that is retimed (speed change, reverse, or ramp). Not valid for generated clips.";
     "set_clip_audio" => SetClipAudio(SetClipAudio),
         "Set an audio-lane clip's volume (0.0 mutes, 1.0 unchanged, 2.0 doubles) and/or fade-in/fade-out durations in seconds. Omitted fields keep their current value. For a video clip, target its linked audio companion clip.";
+    "duck" => Duck(Duck),
+        "Duck music clips under voice/narration clips (sidechain): measures speech-band loudness on the voice clips and writes volume keyframes that dip the music while the voice talks, recovering in the gaps. amount 0..1 sets how far it dips (default ~0.66). Pass audio-lane clip ids for both lists. The result is ordinary, editable volume automation.";
     "split_clip" => SplitClip(SplitClip),
         "Split a clip at a timeline position (seconds) into two abutting clips.";
     "trim_clip" => TrimClip(TrimClip),
@@ -1058,7 +1094,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 35);
+        assert_eq!(specs.len(), 36);
         for spec in &specs {
             assert!(!spec.description.is_empty(), "{} missing description", spec.name);
             assert_eq!(

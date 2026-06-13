@@ -552,6 +552,49 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
             }
             EditCommand::LinkClips { clips }
         }
+        WireCommand::Duck(args) => {
+            if args.voice.is_empty() {
+                return Err(Rejection::new(
+                    "duck needs at least one voice clip id".to_string(),
+                ));
+            }
+            if args.music.is_empty() {
+                return Err(Rejection::new(
+                    "duck needs at least one music clip id".to_string(),
+                ));
+            }
+            let mut voice = Vec::with_capacity(args.voice.len());
+            for &raw in &args.voice {
+                voice.push(clip_ref(project, raw)?.id);
+            }
+            let mut music = Vec::with_capacity(args.music.len());
+            for &raw in &args.music {
+                music.push(clip_ref(project, raw)?.id);
+            }
+            // Defaults mirror the decoder's broadcast-typical ducker; the
+            // linear speech-band threshold stays an internal detail.
+            let amount = args.amount.unwrap_or(0.66);
+            if !(0.0..=1.0).contains(&amount) {
+                return Err(Rejection::new(
+                    "duck amount must be between 0 (no change) and 1 (silence)".to_string(),
+                ));
+            }
+            let attack = args.attack.unwrap_or(0.08);
+            let release = args.release.unwrap_or(0.32);
+            if !attack.is_finite() || attack < 0.0 || !release.is_finite() || release < 0.0 {
+                return Err(Rejection::new(
+                    "duck attack/release must be non-negative seconds".to_string(),
+                ));
+            }
+            EditCommand::DuckLanes {
+                voice,
+                music,
+                threshold: 0.025,
+                amount: amount as f32,
+                attack: attack as f32,
+                release: release as f32,
+            }
+        }
         WireCommand::AddMarker(args) => {
             require_non_negative(args.at, "at")?;
             let at = timeline_time(project, args.at, "at")?;
@@ -1597,6 +1640,79 @@ mod tests {
             }),
         );
         assert!(msg.contains("generated clip"), "{msg}");
+    }
+
+    #[test]
+    fn duck_lowers_voice_and_music_with_defaults_and_overrides() {
+        let (mut project, media, _, _, _, _) = fixture();
+        // Two audio-lane clips: one voice, one music.
+        let v_lane = project.add_track(TrackKind::Audio, "A1");
+        let voice = project
+            .add_clip(
+                v_lane,
+                cutlass_models::MediaId::from_raw(media),
+                TimeRange::at_rate(0, 24, R24),
+                RationalTime::new(0, R24),
+            )
+            .unwrap();
+        let m_lane = project.add_track(TrackKind::Audio, "A2");
+        let music = project
+            .add_clip(
+                m_lane,
+                cutlass_models::MediaId::from_raw(media),
+                TimeRange::at_rate(0, 24, R24),
+                RationalTime::new(0, R24),
+            )
+            .unwrap();
+
+        // Defaults fill amount/attack/release; threshold is internal.
+        let edit = lower(
+            &project,
+            WireCommand::Duck(wire::Duck {
+                voice: vec![voice.raw()],
+                music: vec![music.raw()],
+                amount: None,
+                attack: None,
+                release: None,
+            }),
+        );
+        match edit {
+            EditCommand::DuckLanes {
+                voice: v,
+                music: m,
+                amount,
+                ..
+            } => {
+                assert_eq!(v, vec![voice]);
+                assert_eq!(m, vec![music]);
+                assert!((amount - 0.66).abs() < 1e-6, "default amount");
+            }
+            other => panic!("expected DuckLanes, got {other:?}"),
+        }
+
+        // Empty lists and out-of-range amounts are rejected with names.
+        let msg = reject(
+            &project,
+            WireCommand::Duck(wire::Duck {
+                voice: vec![],
+                music: vec![music.raw()],
+                amount: None,
+                attack: None,
+                release: None,
+            }),
+        );
+        assert!(msg.contains("voice clip"), "{msg}");
+        let msg = reject(
+            &project,
+            WireCommand::Duck(wire::Duck {
+                voice: vec![voice.raw()],
+                music: vec![music.raw()],
+                amount: Some(1.5),
+                attack: None,
+                release: None,
+            }),
+        );
+        assert!(msg.contains("between 0"), "{msg}");
     }
 
     #[test]

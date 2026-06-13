@@ -454,6 +454,11 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
                 "follow speed"
             }
         ),
+        WireCommand::Duck(a) => format!(
+            "ducked {} music clip(s) under {} voice clip(s)",
+            a.music.len(),
+            a.voice.len()
+        ),
         WireCommand::SetClipAudio(a) => {
             let mut parts = Vec::new();
             if let Some(v) = a.volume {
