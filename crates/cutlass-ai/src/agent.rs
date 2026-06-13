@@ -119,18 +119,28 @@ pub fn system_prompt(summary: &ProjectSummary, context: &EditorContext) -> Strin
          track; solids and shapes need a sticker track.\n\
          - If a tool call is rejected, read the error and correct course; \
          do not repeat the identical call.\n\
-         - The state below is a fresh snapshot from the moment the user \
-         sent this prompt. When the user asks a question, answer in text \
-         directly from it — make no edits, and do not call \
-         describe_project first (it would return the same state). Name \
-         clips and tracks by id and content so the answer is checkable. \
-         If the state cannot answer the question, say what is missing \
-         instead of guessing.\n\
-         - Earlier messages in this conversation may describe an older \
-         version of the project (clips since split, trimmed, or removed). \
-         The state below always reflects the project as it is now, so \
-         trust it over anything said earlier; use the conversation only to \
-         understand what the user is referring to.\n\
+         - The state below is a fresh snapshot of the project as it is \
+         now: it already reflects every edit applied so far, including \
+         ones made earlier in this conversation. Trust it over anything \
+         said earlier; use the conversation only to understand what the \
+         user is referring to.\n\
+         - describe_project returns this same state, kept current as you \
+         edit. When the user only asks a question, answer directly from \
+         the state below — do not call describe_project first. But once \
+         you have applied edits that move, resize, split, add, or remove \
+         clips this turn, call describe_project to read the new positions \
+         and ids before any further edit that depends on them: recompute, \
+         do not assume, and do not give up. Name clips and tracks by id \
+         and content so answers stay checkable; if the state cannot \
+         answer a question, say what is missing instead of guessing.\n\
+         - Clips on one track can never overlap, and a clip can only grow \
+         into free space. To lengthen a clip or insert into a packed \
+         track, first make room: move or shift the later clips on that \
+         track to the right (shift_clips, move_clip, or ripple_insert), \
+         then resize. If a tool call is rejected for an overlap or for \
+         exceeding the source media, read the error, re-inspect the \
+         current state, and adjust the plan — never abandon the task for \
+         lack of state you can fetch.\n\
          \n\
          Current state (the user's selection and playhead are in \
          'editor'):\n{state}"
@@ -719,6 +729,10 @@ mod tests {
         assert!(prompt.contains("INCREASE start"));
         assert!(prompt.contains("\"name\":\"demo\""));
         // The Q&A rule: answer from the pushed state, no tool calls.
-        assert!(prompt.contains("answer in text directly from it"));
+        assert!(prompt.contains("answer directly from"));
+        // The re-inspect rule: after edits, read the new state, don't give up.
+        assert!(prompt.contains("call describe_project to read the new"));
+        // The overlap rule: make room before growing into a packed track.
+        assert!(prompt.contains("Clips on one track can never overlap"));
     }
 }
