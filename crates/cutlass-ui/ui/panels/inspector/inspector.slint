@@ -226,6 +226,145 @@ component SpeedInspector inherits VerticalLayout {
     }
 }
 
+// Speed ramp / velocity graph for media-backed clips (CapCut speed curves,
+// M2). Presets drop a ready-made multiplier curve over the clip's normalized
+// span; the engine re-derives the clip's timeline footprint from the ramp's
+// average, the projection republish updates the graph, duration label and
+// timeline badge. Each handle drags vertically to retune one control point.
+// The base "Rate" above multiplies this curve; audio stays muted until
+// varispeed (M8).
+component SpeedRampInspector inherits VerticalLayout {
+    in property <Clip> model;
+
+    // Vertical display window of the velocity graph: 0× at the floor, 4× at
+    // the ceiling (presets top out at 3×). Values outside clamp to the edge.
+    private property <float> disp-max: 4.0;
+    // Drag floor: the engine clamps harder, this just keeps a handle on-graph.
+    private property <float> drag-min: 0.1;
+
+    spacing: AppStore.theme.metrics.spacing.md;
+    alignment: LayoutAlignment.start;
+
+    function key-of(label: string) -> string {
+        if (label == "Ramp up") { return "ramp_up"; }
+        if (label == "Ramp down") { return "ramp_down"; }
+        if (label == "Montage") { return "montage"; }
+        if (label == "Hero") { return "hero"; }
+        if (label == "Bullet") { return "bullet"; }
+        return "";
+    }
+
+    SectionHeader {
+        title: "Speed ramp";
+    }
+
+    HorizontalLayout {
+        spacing: AppStore.theme.metrics.spacing.md;
+        height: 28px;
+        vertical-stretch: 0;
+
+        LabelCell {
+            label: "Preset";
+        }
+
+        CutlassDropdown {
+            items: ["Normal", "Ramp up", "Ramp down", "Montage", "Hero", "Bullet"];
+            current: root.model.has-speed-curve ? "" : "Normal";
+            placeholder: "Custom";
+            selected(value) => {
+                InspectorBackend.set-speed-curve(root.model.id, root.key-of(value));
+                AppState.refocus-shortcuts();
+            }
+        }
+    }
+
+    // Velocity graph: filled silhouette of the eased curve (dense samples)
+    // with a 1× reference line and a draggable handle per control point.
+    graph := Rectangle {
+        height: 104px;
+        vertical-stretch: 0;
+        border-radius: AppStore.theme.metrics.radius.sm;
+        background: #ffffff0a;
+        border-width: 1px;
+        border-color: #ffffff14;
+        clip: true;
+
+        // 1× baseline.
+        Rectangle {
+            x: 0;
+            width: parent.width;
+            height: 1px;
+            y: parent.height * (1 - 1 / root.disp-max);
+            background: #ffffff24;
+        }
+
+        // Eased ramp fill (dense samples projected from the engine). Spacing
+        // matches SPEED_GRAPH_SAMPLES (49 ⇒ 48 gaps) in src/projection.rs.
+        for s[i] in root.model.speed-curve-samples: Rectangle {
+            x: graph.width * i / 48;
+            width: graph.width / 48 + 1px;
+            height: graph.height * min(s, root.disp-max) / root.disp-max;
+            y: graph.height - self.height;
+            background: AppStore.theme.accent.primary.with-alpha(0.22);
+        }
+
+        // Draggable control-point handles. `tick` is 0..=1000 across the span;
+        // dragging vertically retunes that point's multiplier on release.
+        for kf[i] in root.model.kf-speed-curve: Rectangle {
+            property <bool> dragging: false;
+            // Multiplier captured off the pointer while dragging.
+            property <float> drag-value;
+            // Shown multiplier: the pointer's while dragging, else the model's
+            // — the latter binding stays live so a republish moves the dot.
+            property <float> shown: self.dragging ? self.drag-value : kf.value-x;
+
+            width: 12px;
+            height: 12px;
+            border-radius: 6px;
+            x: graph.width * kf.tick / 1000 - self.width / 2;
+            y: graph.height * (1 - min(self.shown, root.disp-max) / root.disp-max) - self.height / 2;
+            background: self.dragging ? AppStore.theme.accent.primary : #ffffff;
+            border-width: 2px;
+            border-color: AppStore.theme.accent.primary;
+
+            ta := TouchArea {
+                mouse-cursor: MouseCursor.ns-resize;
+                moved => {
+                    if (self.pressed) {
+                        parent.dragging = true;
+                        // Pointer y in graph space → multiplier (top = disp-max).
+                        parent.drag-value = clamp(
+                            root.disp-max * (1 - (parent.y + self.mouse-y) / graph.height),
+                            root.drag-min,
+                            root.disp-max);
+                    }
+                }
+                pointer-event(ev) => {
+                    if (ev.kind == PointerEventKind.up && parent.dragging) {
+                        parent.dragging = false;
+                        InspectorBackend.set-speed-curve-point(root.model.id, i, parent.drag-value);
+                        AppState.refocus-shortcuts();
+                    }
+                }
+            }
+        }
+
+        if !root.model.has-speed-curve: CutlassText {
+            x: AppStore.theme.metrics.spacing.sm;
+            y: AppStore.theme.metrics.spacing.sm;
+            text: "Pick a preset to add a speed ramp.";
+            style: AppStore.theme.typography.caption;
+            foreground: AppStore.theme.text.muted;
+        }
+    }
+
+    if root.model.has-speed-curve: CutlassText {
+        text: "Effective speed " + Math.round(root.model.speed-curve-avg * 100) / 100 + "× · audio muted while ramped.";
+        style: AppStore.theme.typography.caption;
+        foreground: AppStore.theme.text.muted;
+    }
+}
+
 // Volume + fades for audio-lane clips (CapCut audio mix, M1). Constant
 // gain for now — envelopes ride M8. Each commit is one undoable edit; the
 // projection republish re-snapshots the playback mixer, so the change is
@@ -349,6 +488,10 @@ component VisualClipInspector inherits VerticalLayout {
                 model: root.model;
             }
 
+            if root.model.media-id != "": SpeedRampInspector {
+                model: root.model;
+            }
+
             InspectorDivider { }
 
             // Effect chain (M4): every visual clip can carry effects.
@@ -402,6 +545,10 @@ component AudioClipInspector inherits VerticalLayout {
             // Same retime control as visual clips — the engine retimes the
             // waveform window; playback stays muted until varispeed (M8).
             if root.model.media-id != "": SpeedInspector {
+                model: root.model;
+            }
+
+            if root.model.media-id != "": SpeedRampInspector {
                 model: root.model;
             }
         }
