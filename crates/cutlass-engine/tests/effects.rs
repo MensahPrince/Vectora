@@ -35,3 +35,26 @@ fn model_catalog_matches_compositor_descriptors() {
         );
     }
 }
+
+#[test]
+fn model_transition_catalog_matches_compositor_set() {
+    let renderable = cutlass_compositor::transition_ids();
+
+    // Every catalog transition must be renderable.
+    for spec in cutlass_models::transition_catalog() {
+        assert!(
+            renderable.contains(&spec.id),
+            "compositor cannot render catalog transition '{}'",
+            spec.id
+        );
+    }
+
+    // Every renderable transition must have a catalog entry (UI + validation).
+    for id in &renderable {
+        assert!(
+            cutlass_models::transition_spec(id).is_some(),
+            "no catalog entry for renderable transition '{}'",
+            id
+        );
+    }
+}

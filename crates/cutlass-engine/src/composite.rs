@@ -202,125 +202,255 @@ pub fn resolve_layers(
             continue;
         };
 
-        // Animated params sample at the clip-relative tick (M2): pure binary
-        // search + lerp per property, allocation-free. A live gesture
-        // override replaces the whole sampled value for this resolve only.
-        let anim_tick = clip.animation_tick_f(time.value as f64 + f64::from(anim_phase));
-        let transform = match &override_transform {
-            Some((id, t)) if *id == clip.id => *t,
-            _ => clip.transform.sample_at(anim_tick),
-        };
-        let transform = &transform;
-        // Framing (M1): the kept region shapes the placement, the UV rect
-        // samples it (flips reverse the sampled axis).
-        let crop = &clip.crop;
-        let uv = content_uv(crop, clip.flip_h, clip.flip_v);
-        // Effects (M4): sample each animated param at the same clip tick and
-        // pack into the compositor's slot order. Empty for clips without
-        // effects (no allocation), keeping the no-effect path untouched.
-        let effects = resolve_effects(clip, anim_tick);
-        match &clip.content {
-            cutlass_models::ClipSource::Media { .. } => {
-                // Still images bypass the decode/cache pipeline entirely:
-                // one cached RGBA upload, identical for every tick the clip
-                // covers (and for both color-convert paths).
-                if let Some(media_id) = clip.media()
-                    && let Some(media) = project.media(media_id)
-                    && media.is_image
-                {
-                    let (bytes, width, height) = pool.still(media_id, media.path())?;
-                    let placement =
-                        cropped_layer_placement(transform, width, height, crop, canvas);
-                    layers.push(
-                        CompositeLayer::rgba(bytes, width, height, placement)
-                            .with_uv(uv)
-                            .with_effects(effects),
-                    );
-                    continue;
-                }
-                let layer = match color_convert {
-                    ColorConvertPath::Gpu => {
-                        let decoded = decode_media_frame(project, cache, pool, clip, time)?;
-                        let yuv = decoded_to_yuv_layer(&decoded)?;
-                        let placement =
-                            cropped_layer_placement(transform, yuv.width, yuv.height, crop, canvas);
-                        CompositeLayer::yuv420p(yuv, placement).with_uv(uv)
-                    }
-                    ColorConvertPath::LegacyCpu => {
-                        // Native-size upload; the GPU scales it into place
-                        // (the old CPU bilinear resize-to-canvas is gone).
-                        let frame = decode_media_rgba_legacy(project, cache, pool, clip, time)?;
-                        let placement = cropped_layer_placement(
-                            transform,
-                            frame.width,
-                            frame.height,
-                            crop,
-                            canvas,
-                        );
-                        CompositeLayer::rgba(
-                            std::sync::Arc::new(frame.bytes),
-                            frame.width,
-                            frame.height,
-                            placement,
-                        )
-                        .with_uv(uv)
-                    }
-                };
-                layers.push(layer.with_effects(effects));
+        // Transitions (M4): if `time` falls inside a junction's window on this
+        // track, blend the outgoing and incoming clips instead of drawing the
+        // single active one. Each side samples its own frame, holding the edge
+        // frame where the window spills past that clip's range.
+        if let Some(window) = transition_window(track, clip, time) {
+            let from = resolve_clip_layer(
+                project,
+                cache,
+                pool,
+                raster,
+                window.from,
+                window.from_sample,
+                anim_phase,
+                canvas,
+                color_convert,
+                override_transform,
+                override_generator,
+            )?;
+            let to = resolve_clip_layer(
+                project,
+                cache,
+                pool,
+                raster,
+                window.to,
+                window.to_sample,
+                anim_phase,
+                canvas,
+                color_convert,
+                override_transform,
+                override_generator,
+            )?;
+            if let (Some(from), Some(to)) = (from, to) {
+                layers.push(CompositeLayer::transition(
+                    from,
+                    to,
+                    window.transition_id,
+                    window.progress,
+                ));
+                continue;
             }
-            cutlass_models::ClipSource::Generated(generator) => {
-                // A live inspector edit (e.g. font-size drag) renders this clip
-                // from the override generator instead of its committed one.
-                let generator = match override_generator {
-                    Some((id, g)) if id == clip.id => g,
-                    _ => generator,
-                };
-                // Generators raster at canvas size, so their fit is 1:1 and
-                // the clip transform applies on top of the full canvas.
-                let placement =
-                    cropped_layer_placement(transform, canvas.width, canvas.height, crop, canvas);
-                match generator {
-                    Generator::SolidColor { rgba } => {
-                        // Solids have no texture to sample: crop shrinks the
-                        // quad, flips are invisible.
-                        layers.push(CompositeLayer::solid(*rgba, placement).with_effects(effects));
-                    }
-                    Generator::Text { .. } | Generator::Shape { .. } => {
-                        match raster.raster(generator, canvas.width, canvas.height) {
-                            Some(bytes) => layers.push(
-                                CompositeLayer::rgba(
-                                    bytes,
-                                    canvas.width,
-                                    canvas.height,
-                                    placement,
-                                )
-                                .with_uv(uv)
-                                .with_effects(effects),
-                            ),
-                            None => {
-                                debug!(?generator, "generator produced no raster");
-                            }
-                        }
-                    }
-                    Generator::Adjustment => {
-                        // Adjustment layers (M4) carry no content of their
-                        // own; the compositor applies their effect chain to
-                        // the accumulated canvas below. An empty chain is a
-                        // harmless no-op there, so emit unconditionally.
-                        layers.push(CompositeLayer::adjustment(
-                            effects,
-                            transform.opacity.clamp(0.0, 1.0),
-                        ));
-                    }
-                    Generator::Sticker | Generator::Effect | Generator::Filter => {
-                        debug!(?generator, "skipping unsupported generator for composite");
-                    }
-                }
-            }
+            // A side failed to resolve (e.g. missing media): fall back to the
+            // plain active clip below.
+        }
+
+        if let Some(layer) = resolve_clip_layer(
+            project,
+            cache,
+            pool,
+            raster,
+            clip,
+            time,
+            anim_phase,
+            canvas,
+            color_convert,
+            override_transform,
+            override_generator,
+        )? {
+            layers.push(layer);
         }
     }
 
     Ok(layers)
+}
+
+/// A resolved transition window at `time`: which clips blend, the frame time
+/// each side samples (clamped into its own range), and the blend progress.
+struct ResolvedTransition<'a> {
+    from: &'a Clip,
+    to: &'a Clip,
+    from_sample: RationalTime,
+    to_sample: RationalTime,
+    transition_id: &'a str,
+    progress: f32,
+}
+
+/// If `time` falls inside the window of a transition on `track` whose junction
+/// touches `active` (the clip `clip_at(time)` returned), resolve it. The
+/// window is centered on the cut (`left.end == right.start`) and spans the
+/// transition's `duration` in ticks.
+fn transition_window<'a>(
+    track: &'a cutlass_models::Track,
+    active: &Clip,
+    time: RationalTime,
+) -> Option<ResolvedTransition<'a>> {
+    for transition in track.transitions() {
+        if active.id != transition.left && active.id != transition.right {
+            continue;
+        }
+        let left = track.clip(transition.left)?;
+        let right = track.clip(transition.right)?;
+        // The cut sits where the two clips abut; bail if they no longer do
+        // (a stale junction the prune pass hasn't swept yet).
+        let center = left.timeline.end_tick();
+        if center != right.timeline.start.value {
+            continue;
+        }
+        let half = transition.duration / 2;
+        let start = center - half;
+        let end = start + transition.duration;
+        if time.value < start || time.value >= end {
+            continue;
+        }
+        let rate = time.rate;
+        let progress = ((time.value - start) as f32 / transition.duration as f32).clamp(0.0, 1.0);
+        // Hold each side's edge frame where the window spills past its range.
+        let from_sample = RationalTime::new(
+            time.value.clamp(left.timeline.start.value, left.timeline.end_tick() - 1),
+            rate,
+        );
+        let to_sample = RationalTime::new(
+            time.value.clamp(right.timeline.start.value, right.timeline.end_tick() - 1),
+            rate,
+        );
+        return Some(ResolvedTransition {
+            from: left,
+            to: right,
+            from_sample,
+            to_sample,
+            transition_id: &transition.transition_id,
+            progress,
+        });
+    }
+    None
+}
+
+/// Resolve a single clip into a [`CompositeLayer`] at sample time `time`.
+/// `None` when the content contributes nothing (e.g. a generator with no
+/// raster). The active-clip path and both transition sides share this so they
+/// can never disagree on placement, framing, or effects.
+#[allow(clippy::too_many_arguments)]
+fn resolve_clip_layer(
+    project: &Project,
+    cache: Option<&FrameCache>,
+    pool: &mut DecoderPool,
+    raster: &mut GeneratorRaster,
+    clip: &Clip,
+    time: RationalTime,
+    anim_phase: f32,
+    canvas: &CompositorConfig,
+    color_convert: ColorConvertPath,
+    override_transform: Option<(ClipId, ClipTransform)>,
+    override_generator: Option<(ClipId, &Generator)>,
+) -> Result<Option<CompositeLayer>, EngineError> {
+    // Animated params sample at the clip-relative tick (M2): pure binary
+    // search + lerp per property, allocation-free. A live gesture
+    // override replaces the whole sampled value for this resolve only.
+    let anim_tick = clip.animation_tick_f(time.value as f64 + f64::from(anim_phase));
+    let transform = match &override_transform {
+        Some((id, t)) if *id == clip.id => *t,
+        _ => clip.transform.sample_at(anim_tick),
+    };
+    let transform = &transform;
+    // Framing (M1): the kept region shapes the placement, the UV rect
+    // samples it (flips reverse the sampled axis).
+    let crop = &clip.crop;
+    let uv = content_uv(crop, clip.flip_h, clip.flip_v);
+    // Effects (M4): sample each animated param at the same clip tick and
+    // pack into the compositor's slot order. Empty for clips without
+    // effects (no allocation), keeping the no-effect path untouched.
+    let effects = resolve_effects(clip, anim_tick);
+    match &clip.content {
+        cutlass_models::ClipSource::Media { .. } => {
+            // Still images bypass the decode/cache pipeline entirely:
+            // one cached RGBA upload, identical for every tick the clip
+            // covers (and for both color-convert paths).
+            if let Some(media_id) = clip.media()
+                && let Some(media) = project.media(media_id)
+                && media.is_image
+            {
+                let (bytes, width, height) = pool.still(media_id, media.path())?;
+                let placement = cropped_layer_placement(transform, width, height, crop, canvas);
+                return Ok(Some(
+                    CompositeLayer::rgba(bytes, width, height, placement)
+                        .with_uv(uv)
+                        .with_effects(effects),
+                ));
+            }
+            let layer = match color_convert {
+                ColorConvertPath::Gpu => {
+                    let decoded = decode_media_frame(project, cache, pool, clip, time)?;
+                    let yuv = decoded_to_yuv_layer(&decoded)?;
+                    let placement =
+                        cropped_layer_placement(transform, yuv.width, yuv.height, crop, canvas);
+                    CompositeLayer::yuv420p(yuv, placement).with_uv(uv)
+                }
+                ColorConvertPath::LegacyCpu => {
+                    // Native-size upload; the GPU scales it into place
+                    // (the old CPU bilinear resize-to-canvas is gone).
+                    let frame = decode_media_rgba_legacy(project, cache, pool, clip, time)?;
+                    let placement =
+                        cropped_layer_placement(transform, frame.width, frame.height, crop, canvas);
+                    CompositeLayer::rgba(
+                        std::sync::Arc::new(frame.bytes),
+                        frame.width,
+                        frame.height,
+                        placement,
+                    )
+                    .with_uv(uv)
+                }
+            };
+            Ok(Some(layer.with_effects(effects)))
+        }
+        cutlass_models::ClipSource::Generated(generator) => {
+            // A live inspector edit (e.g. font-size drag) renders this clip
+            // from the override generator instead of its committed one.
+            let generator = match override_generator {
+                Some((id, g)) if id == clip.id => g,
+                _ => generator,
+            };
+            // Generators raster at canvas size, so their fit is 1:1 and
+            // the clip transform applies on top of the full canvas.
+            let placement =
+                cropped_layer_placement(transform, canvas.width, canvas.height, crop, canvas);
+            match generator {
+                Generator::SolidColor { rgba } => {
+                    // Solids have no texture to sample: crop shrinks the
+                    // quad, flips are invisible.
+                    Ok(Some(CompositeLayer::solid(*rgba, placement).with_effects(effects)))
+                }
+                Generator::Text { .. } | Generator::Shape { .. } => {
+                    match raster.raster(generator, canvas.width, canvas.height) {
+                        Some(bytes) => Ok(Some(
+                            CompositeLayer::rgba(bytes, canvas.width, canvas.height, placement)
+                                .with_uv(uv)
+                                .with_effects(effects),
+                        )),
+                        None => {
+                            debug!(?generator, "generator produced no raster");
+                            Ok(None)
+                        }
+                    }
+                }
+                Generator::Adjustment => {
+                    // Adjustment layers (M4) carry no content of their
+                    // own; the compositor applies their effect chain to
+                    // the accumulated canvas below. An empty chain is a
+                    // harmless no-op there, so emit unconditionally.
+                    Ok(Some(CompositeLayer::adjustment(
+                        effects,
+                        transform.opacity.clamp(0.0, 1.0),
+                    )))
+                }
+                Generator::Sticker | Generator::Effect | Generator::Filter => {
+                    debug!(?generator, "skipping unsupported generator for composite");
+                    Ok(None)
+                }
+            }
+        }
+    }
 }
 
 /// Sample a clip's effect chain at clip-relative `tick` into compositor
@@ -648,6 +778,65 @@ mod tests {
         assert!(matches!(layers[0].content, LayerContent::Adjustment));
         assert_eq!(layers[0].effects.len(), 1);
         assert_eq!(layers[0].effects[0].effect_id, "vignette");
+    }
+
+    #[test]
+    fn resolve_emits_transition_layer_inside_the_window() {
+        use cutlass_compositor::LayerContent;
+        use cutlass_models::TimeRange;
+        let rate = cutlass_models::Rational::FPS_24;
+        let mut project = Project::new("t", rate);
+        let track = project.add_track(TrackKind::Sticker, "S");
+        let left = project
+            .add_generated(
+                track,
+                Generator::SolidColor { rgba: [255, 0, 0, 255] },
+                TimeRange::at_rate(0, 24, rate),
+            )
+            .unwrap();
+        let _right = project
+            .add_generated(
+                track,
+                Generator::SolidColor { rgba: [0, 0, 255, 255] },
+                TimeRange::at_rate(24, 24, rate),
+            )
+            .unwrap();
+        project.add_transition(left, "crossfade").unwrap();
+
+        let mut pool = DecoderPool::new();
+        let mut raster = GeneratorRaster::new();
+        let canvas = CompositorConfig::new(64, 64);
+        let resolve = |t: i64, pool: &mut DecoderPool, raster: &mut GeneratorRaster| {
+            resolve_layers(
+                &project,
+                None,
+                pool,
+                raster,
+                RationalTime::new(t, rate),
+                0.0,
+                &canvas,
+                ColorConvertPath::Gpu,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+
+        // Centered on the cut at tick 24 with a 24-tick window → [12, 36). At
+        // the cut the blend is half-way.
+        let mid = resolve(24, &mut pool, &mut raster);
+        assert_eq!(mid.len(), 1);
+        match &mid[0].content {
+            LayerContent::Transition { transition_id, progress, .. } => {
+                assert_eq!(transition_id, "crossfade");
+                assert!((*progress - 0.5).abs() < 1e-4, "progress {progress}");
+            }
+            other => panic!("expected a transition layer, got {other:?}"),
+        }
+
+        // Outside the window it is a plain solid layer again.
+        let before = resolve(4, &mut pool, &mut raster);
+        assert!(matches!(before[0].content, LayerContent::Solid { .. }));
     }
 
     #[test]
