@@ -132,10 +132,31 @@ beat markers all mirror CapCut desktop's audio panel.
 
 ## Phase 4 — Audio ducking
 
-- [ ] Sidechain: detect speech-band energy on chosen "voice" lanes,
-      auto-keyframe music lanes down (attack / release / threshold / amount).
-      Writes **ordinary volume keyframes** (Phase 1 envelope) so ducking is
-      inspectable and editable after the fact. One undoable history group.
+- [x] **Sidechain analysis (decoder)**: `speech_band_energy` band-passes the
+      voice (300–3400 Hz) and follows its RMS at a 100 Hz control rate;
+      `duck_gain` turns that into a threshold + attack/release gain-reduction
+      curve; `reduce_curve` (Douglas–Peucker) thins the curve to the few points
+      a volume envelope needs. Pure, model-free DSP — the engine owns decode
+      and timeline mapping — so the tricky parts unit-test on synthetic input,
+      the same seam the varispeed render uses.
+- [x] **`DuckLanes` command + action (engine)**: decodes the voice clips
+      (`AudioReader` at a 16 kHz analysis rate), composites their energy onto a
+      shared timeline track (loudest-wins), runs the ducker, and writes the
+      result as **ordinary M8 volume keyframes** on each music clip — scaled
+      onto the clip's own level (a set volume or a prior envelope is dipped, not
+      overwritten) and skipped where the voice never crosses the threshold. The
+      timeline math is a pure, tested planner. One undo entry: a `CompoundAction`
+      of per-clip restores. Both mixers already sample the envelope, so preview
+      and export duck identically with no extra plumbing.
+- [x] **Agent vocabulary**: a `duck` tool (voice ids + music ids, optional
+      `amount`/`attack`/`release`; the linear speech-band threshold stays
+      internal) lowers to `DuckLanes` — "duck the music under the narration"
+      from a prompt. Wire DTO + validation + action-log phrasing + schema
+      snapshot bump (v14) + eval.
+- [ ] **Inspector trigger (later slice)**: a one-click "Duck under…" control in
+      the audio inspector. Deferred on a UX fork (how the user designates voice
+      vs music) — the capability ships agent-driven today, and the written
+      keyframes are editable through the existing envelope UI.
 
 ## Phase 5 — Noise reduction
 
