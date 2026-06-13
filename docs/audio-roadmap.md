@@ -86,14 +86,19 @@ beat markers all mirror CapCut desktop's audio panel.
 
 ## Phase 2 — Fades as corner handles
 
-- [ ] Fade-in/out handles on the clip's top corners (sugar over the M1
-      `fade_in`/`fade_out` fields, which already feed `audio_gain_at`);
-      drag to set duration, with the existing badge.
-- [ ] **Envelope-preserving fades**: `set_clip_audio` flattens the envelope
-      (it sets a constant gain), so the basic fade rows currently *hide*
-      while a clip is keyframed (a keyframed ramp expresses the same thing).
-      Make fades orthogonal — preserve the envelope when only the fades
-      change — so the corner handles and an automation curve coexist.
+- [x] **Envelope-preserving fades**: `SetClipAudio.volume` is now
+      `Option<f32>` — `Some` sets a flat level (the basic slider, flattening
+      an envelope), `None` keeps the gain (constant or keyframed) and only
+      moves the fades. The inspector fade rows route through a `set-clip-fades`
+      worker path (volume `None`), so they're visible again on enveloped
+      clips and never wipe automation; the agent's omitted volume lowers to
+      `None` too, so "fade the music out" past a keyframed clip is safe.
+- [x] **Corner handles**: drag the top corners of a selected audio clip to set
+      fade-in (left) / fade-out (right) durations — a darkening triangle with
+      a bright edge line per ramp and a grab dot riding the corner. Maps px to
+      seconds against the card width, committing one envelope-preserving
+      `set-clip-fades` on release; declared after the trim handles so a corner
+      grab fades rather than trims.
 
 ## Phase 3 — Varispeed audio
 
