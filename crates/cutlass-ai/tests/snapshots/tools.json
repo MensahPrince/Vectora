@@ -854,6 +854,34 @@
       }
     },
     {
+      "description": "Apply a CapCut-style speed ramp to a media clip so its speed varies across its length: preset 'ramp_up' (slow to fast), 'ramp_down' (fast to slow), 'montage' (fast/slow/fast), 'hero' (slow-mo on the action), or 'bullet' (fast/hard-slow/fast). Omit preset to clear the ramp. The clip's length re-derives from the ramp's average speed; its audio is muted while ramped. Not valid for generated clips.",
+      "name": "set_speed_curve",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Apply (or clear) a CapCut-style speed ramp on a media clip: its playback\nspeed varies across its length following a named preset, instead of a\nsingle constant speed. The clip keeps its source footage; its timeline\nlength re-derives from the ramp's average speed. Audio of retimed clips is\nmuted. Not valid for generated clips.",
+        "properties": {
+          "clip": {
+            "description": "The media clip to ramp.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "preset": {
+            "description": "Named ramp preset: \"ramp_up\" (slow→fast), \"ramp_down\" (fast→slow),\n\"montage\" (fast/slow/fast), \"hero\" (dip to slow-mo on the action),\n\"bullet\" (fast / hard slow / fast). Omit or set null to clear the ramp\nback to a constant speed.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "clip"
+        ],
+        "title": "SetSpeedCurve",
+        "type": "object"
+      }
+    },
+    {
       "description": "Set an audio-lane clip's volume (0.0 mutes, 1.0 unchanged, 2.0 doubles) and/or fade-in/fade-out durations in seconds. Omitted fields keep their current value. For a video clip, target its linked audio companion clip.",
       "name": "set_clip_audio",
       "parameters": {
@@ -1407,5 +1435,5 @@
       }
     }
   ],
-  "version": 10
+  "version": 11
 }

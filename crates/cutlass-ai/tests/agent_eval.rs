@@ -828,6 +828,56 @@ fn speed_up_and_reverse_clip() {
 }
 
 #[test]
+fn apply_and_clear_speed_ramp_on_clip() {
+    let (mut host, _, _, clip) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "set_speed_curve",
+            serde_json::json!({ "clip": clip, "preset": "montage" }),
+        )]),
+        text_turn("Added a montage speed ramp."),
+    ]);
+
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "give the clip a montage speed ramp",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 1);
+    assert_eq!(
+        outcome.actions[0].description,
+        format!("applied montage speed ramp to clip {clip}")
+    );
+
+    // The ramp lands, retimes the clip (montage averages faster than 1×, so
+    // shorter than the 240-tick original), and surfaces in the next describe.
+    let placed = host
+        .engine
+        .project()
+        .clip(cutlass_models::ClipId::from_raw(clip))
+        .unwrap();
+    assert!(placed.has_speed_curve() && placed.is_retimed());
+    assert!(placed.timeline.duration.value < 240);
+    let summary = summarize(host.engine.project());
+    assert_eq!(summary.tracks[0].clips[0].speed_ramp, Some(true));
+
+    // One undo restores the original constant-speed placement.
+    assert!(host.engine.undo());
+    let restored = host
+        .engine
+        .project()
+        .clip(cutlass_models::ClipId::from_raw(clip))
+        .unwrap();
+    assert_eq!(restored.timeline.duration.value, 240);
+    assert!(!restored.is_retimed());
+}
+
+#[test]
 fn crop_to_center_and_mirror_clip() {
     let (mut host, _, _, clip) = fixture();
     let provider = ScriptedProvider::new(vec![

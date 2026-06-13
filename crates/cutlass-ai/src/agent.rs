@@ -438,6 +438,10 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             }
             format!("set clip {} {}", a.clip, parts.join(", "))
         }
+        WireCommand::SetSpeedCurve(a) => match &a.preset {
+            Some(preset) => format!("applied {preset} speed ramp to clip {}", a.clip),
+            None => format!("cleared speed ramp on clip {}", a.clip),
+        },
         WireCommand::SetClipAudio(a) => {
             let mut parts = Vec::new();
             if let Some(v) = a.volume {

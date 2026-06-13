@@ -312,6 +312,29 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 reversed: args.reversed.unwrap_or(clip.reversed),
             }
         }
+        WireCommand::SetSpeedCurve(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            if clip.is_generated() {
+                return Err(Rejection::new(format!(
+                    "clip {} is a generated clip; set_speed_curve only works on media \
+                     clips (footage with a source file)",
+                    args.clip
+                )));
+            }
+            let curve = match &args.preset {
+                Some(name) => Some(cutlass_models::speed_preset(name).ok_or_else(|| {
+                    Rejection::new(format!(
+                        "unknown speed ramp preset '{name}'; choose one of: \
+                         ramp_up, ramp_down, montage, hero, bullet"
+                    ))
+                })?),
+                None => None,
+            };
+            EditCommand::SetSpeedCurve {
+                clip: clip.id,
+                curve,
+            }
+        }
         WireCommand::SetClipAudio(args) => {
             let clip = clip_ref(project, args.clip)?;
             if clip.is_generated() {

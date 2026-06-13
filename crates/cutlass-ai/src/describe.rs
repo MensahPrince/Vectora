@@ -104,6 +104,10 @@ pub struct ClipSummary {
     /// Playing backwards (set_clip_speed); absent when forward.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reversed: Option<bool>,
+    /// Carries a varying-speed ramp (set_speed_curve); absent when the clip
+    /// plays at a single constant speed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_ramp: Option<bool>,
     /// Audio gain multiplier (set_clip_audio); absent when 1.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub volume: Option<f64>,
@@ -272,6 +276,7 @@ pub fn summarize(project: &Project) -> ProjectSummary {
                         f64::from(clip.speed.num) / f64::from(clip.speed.den)
                     }),
                     reversed: clip.reversed.then_some(true),
+                    speed_ramp: clip.has_speed_curve().then_some(true),
                     volume: (clip.volume != 1.0).then(|| f64::from(clip.volume)),
                     fade_in: (clip.fade_in > 0).then(|| seconds(clip.fade_in, rate)),
                     fade_out: (clip.fade_out > 0).then(|| seconds(clip.fade_out, rate)),

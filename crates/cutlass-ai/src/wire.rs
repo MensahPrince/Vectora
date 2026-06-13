@@ -28,7 +28,8 @@ use serde::{Deserialize, Serialize};
 /// 8: M1 canvas settings (`set_canvas`).
 /// 9: M4 effects (`add_effect`, `remove_effect`, `set_effect_param`).
 /// 10: M4 transitions (`add_transition`, `remove_transition`, `set_transition`).
-pub const TOOL_SCHEMA_VERSION: u32 = 10;
+/// 11: M2 speed ramps (`set_speed_curve`).
+pub const TOOL_SCHEMA_VERSION: u32 = 11;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -344,6 +345,23 @@ pub struct SetClipSpeed {
     pub reversed: Option<bool>,
 }
 
+/// Apply (or clear) a CapCut-style speed ramp on a media clip: its playback
+/// speed varies across its length following a named preset, instead of a
+/// single constant speed. The clip keeps its source footage; its timeline
+/// length re-derives from the ramp's average speed. Audio of retimed clips is
+/// muted. Not valid for generated clips.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetSpeedCurve {
+    /// The media clip to ramp.
+    pub clip: u64,
+    /// Named ramp preset: "ramp_up" (slow→fast), "ramp_down" (fast→slow),
+    /// "montage" (fast/slow/fast), "hero" (dip to slow-mo on the action),
+    /// "bullet" (fast / hard slow / fast). Omit or set null to clear the ramp
+    /// back to a constant speed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+}
+
 /// Set a clip's audio mix: a constant volume gain plus linear fade-in/out
 /// ramps. Volume 1.0 is unchanged, 0.0 mutes, 2.0 doubles (max 10). Fades
 /// are seconds of ramp at the clip's head/tail. Audio lives on audio-lane
@@ -598,6 +616,7 @@ pub enum WireCommand {
     RemoveParamKeyframe(RemoveParamKeyframe),
     SetParamConstant(SetParamConstant),
     SetClipSpeed(SetClipSpeed),
+    SetSpeedCurve(SetSpeedCurve),
     SetClipAudio(SetClipAudio),
     SplitClip(SplitClip),
     TrimClip(TrimClip),
@@ -664,6 +683,7 @@ impl WireCommand {
             WireCommand::RemoveParamKeyframe(a) => clip(&mut a.clip),
             WireCommand::SetParamConstant(a) => clip(&mut a.clip),
             WireCommand::SetClipSpeed(a) => clip(&mut a.clip),
+            WireCommand::SetSpeedCurve(a) => clip(&mut a.clip),
             WireCommand::SetClipAudio(a) => clip(&mut a.clip),
             WireCommand::SplitClip(a) => clip(&mut a.clip),
             WireCommand::TrimClip(a) => clip(&mut a.clip),
@@ -820,6 +840,8 @@ tools! {
         "Set a clip property to a fixed value and remove all its keyframes (stops its animation).";
     "set_clip_speed" => SetClipSpeed(SetClipSpeed),
         "Change a media clip's playback speed (2.0 = double speed, 0.5 = slow motion) and/or play it in reverse. The clip's timeline length re-derives from the speed; its audio is muted while retimed. Not valid for generated clips.";
+    "set_speed_curve" => SetSpeedCurve(SetSpeedCurve),
+        "Apply a CapCut-style speed ramp to a media clip so its speed varies across its length: preset 'ramp_up' (slow to fast), 'ramp_down' (fast to slow), 'montage' (fast/slow/fast), 'hero' (slow-mo on the action), or 'bullet' (fast/hard-slow/fast). Omit preset to clear the ramp. The clip's length re-derives from the ramp's average speed; its audio is muted while ramped. Not valid for generated clips.";
     "set_clip_audio" => SetClipAudio(SetClipAudio),
         "Set an audio-lane clip's volume (0.0 mutes, 1.0 unchanged, 2.0 doubles) and/or fade-in/fade-out durations in seconds. Omitted fields keep their current value. For a video clip, target its linked audio companion clip.";
     "split_clip" => SplitClip(SplitClip),
@@ -1009,7 +1031,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 33);
+        assert_eq!(specs.len(), 34);
         for spec in &specs {
             assert!(!spec.description.is_empty(), "{} missing description", spec.name);
             assert_eq!(
