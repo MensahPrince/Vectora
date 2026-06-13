@@ -4,6 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::effects::EffectRegistry;
+use crate::transitions::TransitionRegistry;
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
 use crate::image::RgbaImage;
@@ -109,6 +110,7 @@ pub struct Compositor {
     rgba_to_yuv_bind_layout: wgpu::BindGroupLayout,
     effect_bind_layout: wgpu::BindGroupLayout,
     effects: EffectRegistry,
+    transitions: TransitionRegistry,
     sampler: wgpu::Sampler,
     rgba_to_yuv_params: wgpu::Buffer,
     /// Reused each composite when canvas size matches.
@@ -252,6 +254,15 @@ impl Compositor {
             EFFECT_HEADER,
         );
 
+        // Transitions share the effect bind layout and header (orig_tex =
+        // outgoing frame, src_tex = incoming, progress in fx.p0.x).
+        let transitions = TransitionRegistry::build(
+            &gpu.device,
+            &pipeline_layout(gpu, "transition_layout", &effect_bind_layout),
+            FORMAT,
+            EFFECT_HEADER,
+        );
+
         let composite_shader = shader(gpu, "composite", include_str!("../shaders/composite.wgsl"));
         let composite_pipeline = render_pipeline(
             gpu,
@@ -309,6 +320,7 @@ impl Compositor {
             rgba_to_yuv_bind_layout,
             effect_bind_layout,
             effects,
+            transitions,
             sampler,
             rgba_to_yuv_params,
             target: None,
@@ -400,9 +412,12 @@ impl Compositor {
         config: &CompositorConfig,
         layers: &[CompositeLayer],
     ) -> Result<(), CompositorError> {
-        // Effect layers need offscreen ping-pong targets; allocate them only
-        // when something actually carries an effect.
-        if layers.iter().any(|l| !l.effects.is_empty()) {
+        // Effect and transition layers need offscreen ping-pong targets;
+        // allocate them only when something actually needs them.
+        if layers
+            .iter()
+            .any(|l| !l.effects.is_empty() || matches!(l.content, LayerContent::Transition { .. }))
+        {
             self.ensure_scratch(gpu, config)?;
         }
 
@@ -425,11 +440,18 @@ impl Compositor {
                     self.apply_adjustment(encoder, gpu, config, layer);
                 }
                 i += 1;
+            } else if matches!(layer.content, LayerContent::Transition { .. }) {
+                self.draw_transition_layer(encoder, gpu, config, layer, first);
+                first = false;
+                i += 1;
             } else if layer.effects.is_empty() {
                 let start = i;
                 while i < layers.len()
                     && layers[i].effects.is_empty()
-                    && !matches!(layers[i].content, LayerContent::Adjustment)
+                    && !matches!(
+                        layers[i].content,
+                        LayerContent::Adjustment | LayerContent::Transition { .. }
+                    )
                 {
                     i += 1;
                 }
@@ -634,9 +656,10 @@ impl Compositor {
                 pass.set_bind_group(0, &bind, &[]);
                 pass.draw(0..6, 0..1);
             }
-            // Adjustment layers carry no pixels; they are handled out of band
-            // in render_layers_into and never reach a plain run.
-            LayerContent::Adjustment => {}
+            // Adjustment and transition layers carry no directly-encodable
+            // pixels of their own; they are handled out of band in
+            // render_layers_into and never reach a plain run.
+            LayerContent::Adjustment | LayerContent::Transition { .. } => {}
         }
     }
 
@@ -744,6 +767,115 @@ impl Compositor {
         // 2. Run the chain, then 3. composite the result back over the canvas.
         let input = self.run_effect_chain(encoder, gpu, config, &layer.effects, scratch);
         self.composite_view_to_target(encoder, gpu, config, input, layer.placement.opacity, false);
+    }
+
+    /// Draw a transition layer: render the outgoing sub-layer into `scratch.orig`
+    /// and the incoming one into `scratch.a`, blend them by progress through the
+    /// transition shader into `scratch.b`, then composite the blend over the
+    /// canvas. An unknown transition id falls back to a hard cut to the
+    /// incoming clip.
+    fn draw_transition_layer(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+        layer: &CompositeLayer,
+        first: bool,
+    ) {
+        let LayerContent::Transition {
+            from,
+            to,
+            transition_id,
+            progress,
+        } = &layer.content
+        else {
+            return;
+        };
+        let scratch = self.scratch.as_ref().expect("scratch initialized");
+
+        // 1. Outgoing → orig, incoming → a (each over a transparent clear, so
+        // the scratch holds premultiplied content).
+        for (target_view, sub) in [(&scratch.orig, from.as_ref()), (&scratch.a, to.as_ref())] {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("transition_side"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            self.encode_layer(&mut pass, gpu, config, sub, 1.0);
+        }
+
+        let Some(pipeline_idx) = self.transitions.pipeline(transition_id) else {
+            self.composite_view_to_target(encoder, gpu, config, &scratch.a, 1.0, first);
+            return;
+        };
+
+        // 2. Blend orig (from) and a (to) by progress into b.
+        let resolution = [
+            config.width as f32,
+            config.height as f32,
+            1.0 / config.width as f32,
+            1.0 / config.height as f32,
+        ];
+        let uniforms = EffectUniforms {
+            resolution,
+            p0: [*progress, 0.0, 0.0, 0.0],
+            p1: [0.0; 4],
+            pass_info: [0.0, 1.0, 0.0, 0.0],
+        };
+        let buffer = uniform_buffer(gpu, "transition_uniform", &uniforms);
+        let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("transition_bind"),
+            layout: &self.effect_bind_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&scratch.a),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&scratch.orig),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: buffer.as_entire_binding(),
+                },
+            ],
+        });
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("transition_blend"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &scratch.b,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(&self.transitions.pipelines[pipeline_idx]);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // 3. Composite the blend over the canvas below.
+        self.composite_view_to_target(encoder, gpu, config, &scratch.b, 1.0, first);
     }
 
     /// Run an effect chain starting from `scratch.orig`, ping-ponging through
@@ -1109,6 +1241,10 @@ fn validate_layers(
                 }
             }
             LayerContent::Yuv420p(yuv) => validate_yuv_layer(yuv)?,
+            LayerContent::Transition { from, to, .. } => {
+                validate_layers(config, std::slice::from_ref(from.as_ref()))?;
+                validate_layers(config, std::slice::from_ref(to.as_ref()))?;
+            }
             LayerContent::Solid { .. } | LayerContent::Adjustment => {}
         }
     }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use cutlass_compositor::{
     CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerEffect, LayerPlacement,
-    RgbaImage,
+    RgbaImage, transition_ids,
 };
 
 const W: u32 = 64;
@@ -411,5 +411,101 @@ fn unknown_effect_is_skipped() {
     // Same content (the unknown effect contributes no pass), within tolerance.
     for (a, b) in plain.bytes.iter().zip(with_unknown.bytes.iter()) {
         assert!((i32::from(*a) - i32::from(*b)).abs() <= TOL);
+    }
+}
+
+// --- transitions (M4) -----------------------------------------------------
+
+/// Compose a transition between a full-canvas `from` and `to` solid at a given
+/// progress.
+fn render_transition(
+    compositor: &mut Compositor,
+    gpu: &GpuContext,
+    id: &str,
+    from: [u8; 4],
+    to: [u8; 4],
+    progress: f32,
+) -> RgbaImage {
+    let config = CompositorConfig::new(W, H);
+    let from_layer = CompositeLayer::solid(from, LayerPlacement::full_canvas(&config));
+    let to_layer = CompositeLayer::solid(to, LayerPlacement::full_canvas(&config));
+    let layer = CompositeLayer::transition(from_layer, to_layer, id, progress);
+    compositor
+        .composite(gpu, &config, &[layer])
+        .expect("composite")
+}
+
+const RED: [u8; 4] = [220, 20, 20, 255];
+const BLUE: [u8; 4] = [20, 20, 220, 255];
+
+#[test]
+fn crossfade_interpolates_from_to_to() {
+    let Some(gpu) = try_gpu() else {
+        eprintln!("skipping crossfade_interpolates_from_to_to: no GPU adapter");
+        return;
+    };
+    let mut compositor = Compositor::new(&gpu).expect("compositor");
+
+    let start = render_transition(&mut compositor, &gpu, "crossfade", RED, BLUE, 0.0);
+    assert_eq!(pixel(&start, W / 2, H / 2), RED, "progress 0 is the outgoing clip");
+
+    let end = render_transition(&mut compositor, &gpu, "crossfade", RED, BLUE, 1.0);
+    assert_eq!(pixel(&end, W / 2, H / 2), BLUE, "progress 1 is the incoming clip");
+
+    let mid = render_transition(&mut compositor, &gpu, "crossfade", RED, BLUE, 0.5);
+    let p = pixel(&mid, W / 2, H / 2);
+    assert!(
+        (i32::from(p[0]) - 120).abs() <= 4 && (i32::from(p[2]) - 120).abs() <= 4,
+        "halfway is a blend of both (got {p:?})"
+    );
+    assert_golden("transition_crossfade_mid", &mid);
+}
+
+#[test]
+fn wipe_right_reveals_incoming_from_the_left() {
+    let Some(gpu) = try_gpu() else {
+        eprintln!("skipping wipe_right_reveals_incoming_from_the_left: no GPU adapter");
+        return;
+    };
+    let mut compositor = Compositor::new(&gpu).expect("compositor");
+    let mid = render_transition(&mut compositor, &gpu, "wipe_right", RED, BLUE, 0.5);
+    assert_eq!(pixel(&mid, 1, H / 2), BLUE, "left edge has been wiped to incoming");
+    assert_eq!(pixel(&mid, W - 2, H / 2), RED, "right edge still shows outgoing");
+    assert_golden("transition_wipe_right_mid", &mid);
+}
+
+#[test]
+fn dip_to_black_passes_through_black_at_the_midpoint() {
+    let Some(gpu) = try_gpu() else {
+        eprintln!("skipping dip_to_black_passes_through_black_at_the_midpoint: no GPU adapter");
+        return;
+    };
+    let mut compositor = Compositor::new(&gpu).expect("compositor");
+    let mid = render_transition(&mut compositor, &gpu, "dip_to_black", RED, BLUE, 0.5);
+    let p = pixel(&mid, W / 2, H / 2);
+    assert!(
+        p[0] < 8 && p[1] < 8 && p[2] < 8,
+        "the midpoint dips fully to black (got {p:?})"
+    );
+}
+
+#[test]
+fn every_transition_changes_the_frame_at_the_midpoint() {
+    // Guard against a no-op transition shader: at progress 0.5 each transition
+    // must differ from the outgoing clip somewhere on the canvas.
+    let Some(gpu) = try_gpu() else {
+        eprintln!("skipping every_transition_changes_the_frame_at_the_midpoint: no GPU adapter");
+        return;
+    };
+    let mut compositor = Compositor::new(&gpu).expect("compositor");
+    for id in transition_ids() {
+        let mid = render_transition(&mut compositor, &gpu, id, RED, BLUE, 0.5);
+        let from_only = render_transition(&mut compositor, &gpu, id, RED, BLUE, 0.0);
+        let changed = mid
+            .bytes
+            .iter()
+            .zip(from_only.bytes.iter())
+            .any(|(a, b)| (i32::from(*a) - i32::from(*b)).abs() > TOL);
+        assert!(changed, "transition '{id}' is a no-op at progress 0.5");
     }
 }

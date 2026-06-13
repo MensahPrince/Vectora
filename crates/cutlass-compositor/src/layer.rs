@@ -167,10 +167,36 @@ impl CompositeLayer {
         self.effects = effects;
         self
     }
+
+    /// A transition between two sub-layers blended by `progress` (0..1). Drawn
+    /// full-canvas; the sub-layers carry their own placement and content.
+    pub fn transition(
+        from: CompositeLayer,
+        to: CompositeLayer,
+        transition_id: impl Into<String>,
+        progress: f32,
+    ) -> Self {
+        Self {
+            content: LayerContent::Transition {
+                from: Box::new(from),
+                to: Box::new(to),
+                transition_id: transition_id.into(),
+                progress: progress.clamp(0.0, 1.0),
+            },
+            placement: LayerPlacement {
+                center: [0.0, 0.0],
+                size: [0.0, 0.0],
+                rotation: 0.0,
+                opacity: 1.0,
+            },
+            uv: FULL_UV,
+            effects: Vec::new(),
+        }
+    }
 }
 
 /// Pixel source for a [`CompositeLayer`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum LayerContent {
     /// Decoder-native YUV420P; converted and scaled on GPU.
     Yuv420p(Yuv420pLayer),
@@ -187,4 +213,13 @@ pub enum LayerContent {
     /// An adjustment marker: no pixels of its own. The compositor applies the
     /// layer's effect chain to the accumulated canvas below it.
     Adjustment,
+    /// A transition (M4): two full-canvas sub-layers blended by `progress`
+    /// (0 = fully `from`, 1 = fully `to`) via the named transition shader. The
+    /// engine builds this for the window where two abutting clips overlap.
+    Transition {
+        from: Box<CompositeLayer>,
+        to: Box<CompositeLayer>,
+        transition_id: String,
+        progress: f32,
+    },
 }

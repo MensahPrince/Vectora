@@ -14,6 +14,7 @@ mod error;
 mod gpu;
 mod image;
 mod layer;
+pub mod transitions;
 mod yuv;
 
 pub use compositor::Compositor;
@@ -24,6 +25,7 @@ pub use image::RgbaImage;
 pub use layer::{
     CompositeLayer, CompositorConfig, FULL_UV, LayerContent, LayerEffect, LayerPlacement,
 };
+pub use transitions::transition_ids;
 pub use yuv::{Yuv420pImage, Yuv420pLayer, legacy_rgba_to_yuv420p};
 
 use tracing::info;
