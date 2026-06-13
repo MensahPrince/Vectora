@@ -1,122 +1,3 @@
-import { Slider, LineEdit } from "std-widgets.slint";
-import { CutlassText, SubtleButton } from "../../components/index.slint";
-import { AppStore, EditorStore, TimelineStore, PreviewStore } from "../../store/index.slint";
-import { Clip } from "../../models/index.slint";
-import {
-    InspectorBackend,
-    ParamRowState,
-    TransformSample,
-} from "../../lib/inspector-backend.slint";
-import { KeyframeControl } from "keyframe-control.slint";
-
-// One transform property row: slider for coarse motion, numeric entry for
-// precision, double-click the label to reset (CapCut), and the keyframe
-// cluster (◀ ◆ ▶ + easing) on the right. Works in display units (px / % /
-// °); the parent converts to and from the normalized model space. Slider
-// motion previews (uncommitted worker override), slider release / Enter /
-// reset commit one undoable SetClipTransform.
-component TransformRow inherits HorizontalLayout {
-    in property <string> label;
-    in property <float> value;
-    in property <float> minimum;
-    in property <float> maximum;
-    in property <string> suffix;
-    in property <float> reset-value: 0;
-    // Keyframe state for the row's property at the playhead, and whether
-    // the diamond may toggle (playhead inside the clip).
-    in property <ParamRowState> kf;
-    in property <bool> kf-can-toggle;
-
-    callback preview(value: float);
-    callback commit(value: float);
-    // Diamond / arrows / easing flyout, routed to the parent (it owns the
-    // param identity and the current sampled values).
-    callback kf-toggle();
-    callback kf-set-easing(easing: int);
-
-    spacing: AppStore.theme.metrics.spacing.md;
-
-    // The slider assigns `value` internally on drag and the box assigns
-    // `text` on typing — both would permanently drop a plain binding, so
-    // external updates (projection republish, live gestures, selection
-    // changes, playhead moves over an animated property) re-sync through
-    // this watcher instead.
-    changed value => {
-        sl.value = clamp(root.value, root.minimum, root.maximum);
-        num.text = Math.round(root.value) + "";
-    }
-
-    TouchArea {
-        width: 80px;
-        mouse-cursor: MouseCursor.pointer;
-        double-clicked => {
-            root.commit(root.reset-value);
-        }
-
-        CutlassText {
-            width: 100%;
-            height: 100%;
-            text: root.label;
-            style: AppStore.theme.typography.label;
-            foreground: AppStore.theme.text.secondary;
-            vertical-alignment: TextVerticalAlignment.center;
-            overflow: TextOverflow.elide;
-        }
-    }
-
-    sl := Slider {
-        horizontal-stretch: 1;
-        minimum: root.minimum;
-        maximum: root.maximum;
-        value: clamp(root.value, root.minimum, root.maximum);
-
-        changed(v) => {
-            root.preview(v);
-        }
-        released(v) => {
-            root.commit(v);
-        }
-    }
-
-    num := LineEdit {
-        width: 56px;
-        horizontal-alignment: TextHorizontalAlignment.right;
-        text: Math.round(root.value) + "";
-
-        accepted(entered) => {
-            if (entered.is-float()) {
-                root.commit(entered.to-float());
-            }
-            // Re-sync the display whether or not the entry committed
-            // (rejected parse, clamped value, or no-op).
-            self.text = Math.round(root.value) + "";
-        }
-    }
-
-    CutlassText {
-        width: 18px;
-        height: 100%;
-        text: root.suffix;
-        style: AppStore.theme.typography.label;
-        foreground: AppStore.theme.text.muted;
-        vertical-alignment: TextVerticalAlignment.center;
-    }
-
-    KeyframeControl {
-        state: root.kf;
-        can-toggle: root.kf-can-toggle;
-        toggle => {
-            root.kf-toggle();
-        }
-        jump(tick) => {
-            TimelineStore.playhead-tick = tick;
-        }
-        set-easing(easing) => {
-            root.kf-set-easing(easing);
-        }
-    }
-}
-
 // CapCut's "Basic" transform block (preview roadmap Phase 5): numeric truth
 // for what the mouse does in the preview. Value rows show the playhead
 // sample of each (possibly animated) property — `sample-transform` re-runs
@@ -125,6 +6,16 @@ component TransformRow inherits HorizontalLayout {
 // is frozen during one), and its own slider drags ride the same
 // override-then-commit pipeline as preview gestures — so the preview frame
 // and selection box follow the sliders.
+
+import { CutlassText, SubtleButton } from "../../components/index.slint";
+import { AppStore, EditorStore, TimelineStore, PreviewStore } from "../../store/index.slint";
+import { Clip } from "../../models/index.slint";
+import {
+    InspectorBackend,
+    TransformSample,
+} from "../../lib/inspector-backend.slint";
+import { SliderRow } from "inspector-widgets.slint";
+
 export component TransformInspector inherits VerticalLayout {
     // Named `model` — `clip` is a built-in boolean on Slint elements.
     in property <Clip> model;
@@ -239,9 +130,11 @@ export component TransformInspector inherits VerticalLayout {
 
     HorizontalLayout {
         spacing: AppStore.theme.metrics.spacing.sm;
+        height: 26px;
+        vertical-stretch: 0;
 
         CutlassText {
-            text: "Transform";
+            text: "Transform ^";
             style: AppStore.theme.typography.heading-sm;
             vertical-alignment: TextVerticalAlignment.center;
         }
@@ -301,13 +194,14 @@ export component TransformInspector inherits VerticalLayout {
         }
     }
 
-    TransformRow {
+    SliderRow {
         label: "Position X";
         suffix: "px";
         value: root.pos-x * root.canvas-w;
         minimum: -root.canvas-w;
         maximum: root.canvas-w;
         reset-value: 0;
+        kf-visible: true;
         kf: root.sample.position-row;
         kf-can-toggle: root.playhead-inside;
         preview(v) => {
@@ -325,13 +219,14 @@ export component TransformInspector inherits VerticalLayout {
         }
     }
 
-    TransformRow {
+    SliderRow {
         label: "Position Y";
         suffix: "px";
         value: root.pos-y * root.canvas-h;
         minimum: -root.canvas-h;
         maximum: root.canvas-h;
         reset-value: 0;
+        kf-visible: true;
         kf: root.sample.position-row;
         kf-can-toggle: root.playhead-inside;
         preview(v) => {
@@ -348,7 +243,7 @@ export component TransformInspector inherits VerticalLayout {
         }
     }
 
-    TransformRow {
+    SliderRow {
         label: "Scale";
         suffix: "%";
         value: root.scale-v * 100;
@@ -357,6 +252,7 @@ export component TransformInspector inherits VerticalLayout {
         minimum: 1;
         maximum: 400;
         reset-value: 100;
+        kf-visible: true;
         kf: root.sample.scale-row;
         kf-can-toggle: root.playhead-inside;
         preview(v) => {
@@ -373,13 +269,14 @@ export component TransformInspector inherits VerticalLayout {
         }
     }
 
-    TransformRow {
+    SliderRow {
         label: "Rotation";
         suffix: "°";
         value: root.rot-v;
         minimum: -180;
         maximum: 180;
         reset-value: 0;
+        kf-visible: true;
         kf: root.sample.rotation-row;
         kf-can-toggle: root.playhead-inside;
         preview(v) => {
@@ -396,13 +293,14 @@ export component TransformInspector inherits VerticalLayout {
         }
     }
 
-    TransformRow {
+    SliderRow {
         label: "Opacity";
         suffix: "%";
         value: root.opacity-v * 100;
         minimum: 0;
         maximum: 100;
         reset-value: 100;
+        kf-visible: true;
         kf: root.sample.opacity-row;
         kf-can-toggle: root.playhead-inside;
         preview(v) => {

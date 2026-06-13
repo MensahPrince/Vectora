@@ -1,86 +1,18 @@
-import { Slider, LineEdit } from "std-widgets.slint";
+// CapCut's crop block (M1): trim a percentage off each content edge and
+// mirror the result. Shown for visual clips; commits ride
+// `InspectorBackend.set-clip-crop` → one undoable `SetClipCrop` on the
+// worker. The compositor re-renders from the projection republish, and the
+// preview selection box hugs the cropped quad (`src/preview_select.rs`).
+//
+// Crop is constant per clip (not animatable), so the rows carry no keyframe
+// cluster and no live-preview override — sliders commit on release and the
+// projection republish refreshes the frame.
+
 import { CutlassText } from "../../components/index.slint";
 import { AppStore } from "../../store/index.slint";
 import { Clip } from "../../models/index.slint";
 import { InspectorBackend } from "../../lib/inspector-backend.slint";
-
-// One crop inset row: slider for coarse motion, numeric entry for precision,
-// double-click the label to reset the inset to 0. Values are percentages of
-// the content edge trimmed away. Crop is constant per clip (not animatable),
-// so there is no keyframe cluster and no live-preview override — the slider
-// commits on release and the projection republish refreshes the frame.
-component CropRow inherits HorizontalLayout {
-    in property <string> label;
-    in property <float> value;
-
-    callback commit(value: float);
-
-    spacing: AppStore.theme.metrics.spacing.md;
-
-    // The slider assigns `value` internally on drag and the box assigns
-    // `text` on typing — both would permanently drop a plain binding, so
-    // external updates (projection republish, selection changes) re-sync
-    // through this watcher instead.
-    changed value => {
-        sl.value = clamp(root.value, 0, 49);
-        num.text = Math.round(root.value) + "";
-    }
-
-    TouchArea {
-        width: 80px;
-        mouse-cursor: MouseCursor.pointer;
-        double-clicked => {
-            root.commit(0);
-        }
-
-        CutlassText {
-            width: 100%;
-            height: 100%;
-            text: root.label;
-            style: AppStore.theme.typography.label;
-            foreground: AppStore.theme.text.secondary;
-            vertical-alignment: TextVerticalAlignment.center;
-            overflow: TextOverflow.elide;
-        }
-    }
-
-    sl := Slider {
-        horizontal-stretch: 1;
-        minimum: 0;
-        // Opposite insets cap at 49% each so the kept window never collapses
-        // (engine floor is 1%).
-        maximum: 49;
-        value: clamp(root.value, 0, 49);
-
-        released(v) => {
-            root.commit(v);
-        }
-    }
-
-    num := LineEdit {
-        width: 56px;
-        horizontal-alignment: TextHorizontalAlignment.right;
-        text: Math.round(root.value) + "";
-
-        accepted(entered) => {
-            if (entered.is-float()) {
-                root.commit(clamp(entered.to-float(), 0, 49));
-            }
-            // Re-sync the display whether or not the entry committed
-            // (rejected parse, clamped value, or no-op).
-            self.text = Math.round(root.value) + "";
-        }
-    }
-
-    CutlassText {
-        width: 18px;
-        height: 100%;
-        text: "%";
-        style: AppStore.theme.typography.label;
-        foreground: AppStore.theme.text.muted;
-        vertical-alignment: TextVerticalAlignment.center;
-    }
-}
+import { SectionHeader, SliderRow } from "inspector-widgets.slint";
 
 // Mirror toggle: quiet bordered chip that fills with the accent when active.
 component FlipToggle inherits Rectangle {
@@ -112,11 +44,6 @@ component FlipToggle inherits Rectangle {
     }
 }
 
-// CapCut's crop block (M1): trim a percentage off each content edge and
-// mirror the result. Shown for visual clips; commits ride
-// `InspectorBackend.set-clip-crop` → one undoable `SetClipCrop` on the
-// worker. The compositor re-renders from the projection republish, and the
-// preview selection box hugs the cropped quad (`src/preview_select.rs`).
 export component CropInspector inherits VerticalLayout {
     // Named `model` — `clip` is a built-in boolean on Slint elements.
     in property <Clip> model;
@@ -135,7 +62,9 @@ export component CropInspector inherits VerticalLayout {
 
     // One funnel for every control, in inset fractions. Skips the engine
     // round-trip when nothing changed (slider released without motion,
-    // Enter on the same value, reset of an uncropped edge).
+    // Enter on the same value, reset of an uncropped edge). Opposite insets
+    // cap at 49% each so the kept window never collapses (engine floor is
+    // 1%) — the rows clamp typed entries to the same range.
     function apply(l: float, t: float, r: float, b: float, fh: bool, fv: bool) {
         if (l == root.left-v
             && t == root.top-v
@@ -148,43 +77,54 @@ export component CropInspector inherits VerticalLayout {
         InspectorBackend.set-clip-crop(root.model.id, l, t, r, b, fh, fv);
     }
 
-    CutlassText {
-        text: "Crop";
-        style: AppStore.theme.typography.heading-sm;
+    SectionHeader {
+        title: "Crop";
     }
 
-    CropRow {
+    SliderRow {
         label: "Left";
+        suffix: "%";
         value: root.left-v * 100;
+        minimum: 0;
+        maximum: 49;
         commit(v) => {
-            root.apply(v / 100, root.top-v, root.right-v, root.bottom-v,
+            root.apply(clamp(v, 0, 49) / 100, root.top-v, root.right-v, root.bottom-v,
                 root.model.flip-h, root.model.flip-v);
         }
     }
 
-    CropRow {
+    SliderRow {
         label: "Top";
+        suffix: "%";
         value: root.top-v * 100;
+        minimum: 0;
+        maximum: 49;
         commit(v) => {
-            root.apply(root.left-v, v / 100, root.right-v, root.bottom-v,
+            root.apply(root.left-v, clamp(v, 0, 49) / 100, root.right-v, root.bottom-v,
                 root.model.flip-h, root.model.flip-v);
         }
     }
 
-    CropRow {
+    SliderRow {
         label: "Right";
+        suffix: "%";
         value: root.right-v * 100;
+        minimum: 0;
+        maximum: 49;
         commit(v) => {
-            root.apply(root.left-v, root.top-v, v / 100, root.bottom-v,
+            root.apply(root.left-v, root.top-v, clamp(v, 0, 49) / 100, root.bottom-v,
                 root.model.flip-h, root.model.flip-v);
         }
     }
 
-    CropRow {
+    SliderRow {
         label: "Bottom";
+        suffix: "%";
         value: root.bottom-v * 100;
+        minimum: 0;
+        maximum: 49;
         commit(v) => {
-            root.apply(root.left-v, root.top-v, root.right-v, v / 100,
+            root.apply(root.left-v, root.top-v, root.right-v, clamp(v, 0, 49) / 100,
                 root.model.flip-h, root.model.flip-v);
         }
     }
