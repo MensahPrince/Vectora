@@ -12,8 +12,8 @@ use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, EngineError, ExportSettings};
 use cutlass_models::{
     AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, CropRect, Easing, Generator,
-    LinkId, MarkerColor, MarkerId, MediaId, ParamValue, Project, Rational, RationalTime, TimeRange,
-    Track, TrackId, TrackKind, resample,
+    LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param, ParamValue, Project,
+    Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
 };
 use tracing::{error, info, warn};
 
@@ -105,6 +105,22 @@ enum WorkerMsg {
         num: i32,
         den: i32,
         reversed: bool,
+    },
+    /// Set (or clear) a media clip's speed ramp (CapCut speed curves, M2):
+    /// `curve` is the normalized rate curve, `None` clears it. The engine
+    /// re-derives the timeline duration from the ramp's average; one undoable
+    /// history entry (the whole link group when linkage is on).
+    SetSpeedCurve {
+        clip: String,
+        curve: Option<Param<f32>>,
+    },
+    /// Adjust one existing ramp point's multiplier (velocity-graph drag): the
+    /// worker reads the clip's current curve, replaces point `index`, and
+    /// re-commits as a `SetSpeedCurve`. One undoable history entry.
+    SetSpeedCurvePoint {
+        clip: String,
+        index: usize,
+        value: f32,
     },
     /// Set a clip's audio mix (CapCut volume + fades, M1): gain multiplier
     /// plus fade durations in seconds (converted to ticks at the timeline
@@ -533,6 +549,33 @@ impl WorkerHandle {
         });
     }
 
+    /// Resolve a speed-ramp preset name (CapCut speed curves, M2) and dispatch
+    /// the edit. `""` / `"none"` / `"normal"` clears the ramp; an unknown name
+    /// is dropped with a warning so a stray UI string can't apply garbage.
+    pub fn set_speed_curve(&self, clip: String, preset: String) {
+        let curve = match preset.trim() {
+            "" | "none" | "normal" => None,
+            name => match cutlass_models::speed_preset(name) {
+                Some(curve) => Some(curve),
+                None => {
+                    warn!(preset = name, "set-speed-curve ignored: unknown preset");
+                    return;
+                }
+            },
+        };
+        let _ = self.tx.send(WorkerMsg::SetSpeedCurve { clip, curve });
+    }
+
+    pub fn set_speed_curve_point(&self, clip: String, index: i32, value: f32) {
+        let Ok(index) = usize::try_from(index) else {
+            warn!(index, "set-speed-curve-point ignored: negative index");
+            return;
+        };
+        let _ = self
+            .tx
+            .send(WorkerMsg::SetSpeedCurvePoint { clip, index, value });
+    }
+
     pub fn set_clip_audio(&self, clip: String, volume: f32, fade_in_s: f32, fade_out_s: f32) {
         let _ = self.tx.send(WorkerMsg::SetClipAudio {
             clip,
@@ -946,6 +989,12 @@ fn worker_loop(
                 den,
                 reversed,
             } => set_clip_speed_and_publish(engine, &clip, num, den, reversed, *linkage, &ui),
+            WorkerMsg::SetSpeedCurve { clip, curve } => {
+                set_speed_curve_and_publish(engine, &clip, &curve, *linkage, &ui)
+            }
+            WorkerMsg::SetSpeedCurvePoint { clip, index, value } => {
+                set_speed_curve_point_and_publish(engine, &clip, index, value, *linkage, &ui)
+            }
             WorkerMsg::SetClipAudio {
                 clip,
                 volume,
@@ -1273,6 +1322,8 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::RemoveClips { .. }
             | WorkerMsg::SetGenerator { .. }
             | WorkerMsg::SetClipSpeed { .. }
+            | WorkerMsg::SetSpeedCurve { .. }
+            | WorkerMsg::SetSpeedCurvePoint { .. }
             | WorkerMsg::SetClipCrop { .. }
             // Effects and transitions repaint the canvas at the playhead.
             | WorkerMsg::AddEffect { .. }
@@ -2220,6 +2271,80 @@ fn set_clip_speed_and_publish(
     engine.commit_group();
     info!(%clip_id, num, den, reversed, clips = targets.len(), "retimed clip");
     publish_projection(engine, ui);
+}
+
+/// Set (or clear) a media clip's speed ramp (CapCut speed curves, M2). Like
+/// constant-speed retiming the engine re-derives each clip's timeline
+/// duration from the ramp average, so with linkage on every link partner
+/// ramps in lockstep to keep A/V in sync — one undoable history group. The
+/// republish re-snapshots the mixer, which keeps a ramped clip muted until
+/// M8 varispeed audio lands.
+fn set_speed_curve_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    curve: &Option<Param<f32>>,
+    linkage: bool,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-speed-curve ignored: unparsable clip id");
+        return;
+    };
+    let targets = if linkage {
+        link_group_ids(engine, clip_id)
+    } else {
+        vec![clip_id]
+    };
+
+    engine.begin_group();
+    for target in &targets {
+        if let Err(e) = engine.apply(Command::Edit(EditCommand::SetSpeedCurve {
+            clip: *target,
+            curve: curve.clone(),
+        })) {
+            error!(clip_id = %target, "set speed curve failed: {e}");
+            engine.rollback_group();
+            publish_projection(engine, ui);
+            return;
+        }
+    }
+    engine.commit_group();
+    info!(%clip_id, points = curve.as_ref().map_or(0, |c| c.keyframes().len()), clips = targets.len(), "set speed ramp");
+    publish_projection(engine, ui);
+}
+
+/// Adjust one existing ramp point's multiplier (velocity-graph drag). Reads
+/// the addressed clip's current curve, replaces point `index`'s value, and
+/// re-commits through [`set_speed_curve_and_publish`] so duration re-derive,
+/// linkage, and undo all flow through the one path.
+fn set_speed_curve_point_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    index: usize,
+    value: f32,
+    linkage: bool,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-speed-curve-point ignored: unparsable clip id");
+        return;
+    };
+    let Some(mut curve) = engine
+        .project()
+        .clip(clip_id)
+        .map(|c| c.speed_curve.clone())
+    else {
+        error!(%clip_id, "set-speed-curve-point ignored: unknown clip");
+        return;
+    };
+    // Address the point by index, but edit it through the keyframe API at its
+    // own tick so the curve keeps its shape (tick + easing) and stays sorted.
+    let Some(&point) = curve.keyframes().get(index) else {
+        warn!(%clip_id, index, "set-speed-curve-point ignored: index out of range");
+        return;
+    };
+    curve.set_keyframe(point.tick, value.clamp(MIN_SPEED, MAX_SPEED), point.easing);
+    set_speed_curve_and_publish(engine, clip, &Some(curve), linkage, ui);
 }
 
 /// Set a clip's audio mix (CapCut volume + fades, M1). Audio rides

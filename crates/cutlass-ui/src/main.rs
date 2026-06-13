@@ -1354,6 +1354,16 @@ fn main() -> Result<(), slint::PlatformError> {
         .on_set_clip_speed(move |clip_id, num, den, reversed| {
             set_speed_handle.set_clip_speed(clip_id.to_string(), num, den, reversed);
         });
+    let set_curve_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_speed_curve(move |clip_id, preset| {
+            set_curve_handle.set_speed_curve(clip_id.to_string(), preset.to_string());
+        });
+    let set_curve_point_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_speed_curve_point(move |clip_id, index, value| {
+            set_curve_point_handle.set_speed_curve_point(clip_id.to_string(), index, value);
+        });
     let set_audio_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
         .on_set_clip_audio(move |clip_id, volume, fade_in_s, fade_out_s| {

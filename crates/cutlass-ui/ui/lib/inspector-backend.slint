@@ -84,6 +84,18 @@ export global InspectorBackend {
         reversed: bool,
     );
 
+    // Apply a named speed-ramp preset to a media clip (CapCut speed curves,
+    // M2): "ramp_up" | "ramp_down" | "montage" | "hero" | "bullet", or ""
+    // (also "none"/"normal") to clear it back to a constant speed. The engine
+    // re-derives the clip's timeline duration from the ramp's average; with
+    // linkage on, link partners ramp too. One undoable edit.
+    callback set-speed-curve(clip-id: string, preset: string);
+
+    // Adjust one existing ramp point's speed multiplier (velocity-graph
+    // drag). The worker reads the clip's current curve, replaces point
+    // `index`'s value, and re-commits. One undoable edit.
+    callback set-speed-curve-point(clip-id: string, index: int, value: float);
+
     // Set a clip's audio mix (CapCut volume + fades, M1): gain multiplier
     // (0 mutes, 1 unchanged) plus fade in/out durations in seconds. The
     // worker routes a video clip to its audio-lane link partners, so the
