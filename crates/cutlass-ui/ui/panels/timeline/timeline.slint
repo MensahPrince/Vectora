@@ -11,6 +11,7 @@ import { TrackLane } from "track-lane.slint";
 import { TrackHead } from "track-head.slint";
 import { Ruler } from "ruler.slint";
 import { ClipView } from "clip.slint";
+import { TransitionPill } from "transition-pill.slint";
 import { TimelineViewState } from "state.slint";
 import { Sequence } from "../../models/index.slint";
 import { TimelineLib } from "../../lib/timeline-lib.slint";
@@ -549,6 +550,21 @@ export component TimelinePanel inherits PanelBase {
                             height: parent.height - 5px;
                             zoom: TimelineStore.zoom;
                         }
+                    }
+                }
+
+                // --- transition junction pills (M4, above the clips) ---------
+                // One overlay band per lane; each transition pill is centered
+                // on its cut tick in content space and resizes / removes the
+                // junction in place.
+                for t[lane-idx] in sequence.tracks: Rectangle {
+                    x: 0;
+                    y: (lane-idx + 1) * row-pitch;
+                    width: max(parent.width, content-width);
+                    height: track-height - 5px;
+                    for tr in t.transitions: TransitionPill {
+                        model: tr;
+                        lane-height: parent.height;
                     }
                 }
 
