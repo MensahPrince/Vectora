@@ -10,6 +10,7 @@ pub mod video;
 
 pub use audio::{
     AUDIO_CHANNELS, AudioPeaks, AudioReader, audio_peaks, audio_peaks_per_second, render_stretched,
+    render_stretched_curve,
 };
 pub use error::DecodeError;
 pub use image::{STILL_MAX_DIM, decode_image};

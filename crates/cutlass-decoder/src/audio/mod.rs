@@ -9,7 +9,7 @@ mod playback;
 mod stretch;
 
 pub use playback::{AudioReader, CHANNELS as AUDIO_CHANNELS};
-pub use stretch::render_stretched;
+pub use stretch::{render_stretched, render_stretched_curve};
 
 use std::path::Path;
 
