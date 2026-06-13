@@ -260,8 +260,61 @@ fn clip_to_slint(
         kf_scale: keyframes_to_slint(&clip.transform.scale, clip_start, |v| (*v, 0.0)),
         kf_rotation: keyframes_to_slint(&clip.transform.rotation, clip_start, |v| (*v, 0.0)),
         kf_opacity: keyframes_to_slint(&clip.transform.opacity, clip_start, |v| (*v, 0.0)),
+        kf_speed_curve: speed_curve_to_slint(&clip.speed_curve),
+        has_speed_curve: clip.has_speed_curve(),
+        speed_curve_avg: clip.speed_curve_average() as f32,
+        speed_curve_samples: speed_curve_samples(clip),
         effects: project_effects(clip),
     }
+}
+
+/// Project a clip's speed ramp keyframes (M2 speed curves) as the inspector's
+/// draggable graph handles. Unlike transform keyframes, ramp ticks stay in
+/// their NORMALIZED domain (`0..=SPEED_CURVE_SCALE`) — no `clip_start` offset
+/// — because the curve is defined over the clip's span, not the sequence.
+/// Empty ⇔ a flat constant-speed clip.
+fn speed_curve_to_slint(curve: &Param<f32>) -> ModelRc<ParamKeyframe> {
+    let rows: Vec<ParamKeyframe> = curve
+        .keyframes()
+        .iter()
+        .map(|kf: &Keyframe<f32>| {
+            let (easing, [bez_x1, bez_y1, bez_x2, bez_y2]) = easing_to_ui(kf.easing);
+            ParamKeyframe {
+                tick: clamp_i32(kf.tick),
+                value_x: kf.value,
+                value_y: 0.0,
+                easing,
+                bez_x1,
+                bez_y1,
+                bez_x2,
+                bez_y2,
+            }
+        })
+        .collect();
+    model(rows)
+}
+
+/// Number of polyline samples the inspector velocity graph plots across a
+/// ramp. Odd so the midpoint lands on a sample; cheap enough to recompute on
+/// every projection republish (only clips that actually carry a ramp pay).
+const SPEED_GRAPH_SAMPLES: usize = 49;
+
+/// Dense, evenly-spaced multiplier samples of a clip's speed ramp across its
+/// normalized span (engine `Param` math, so easing curvature shows). Empty
+/// for a flat clip — the graph then just draws the 1.0× baseline.
+fn speed_curve_samples(clip: &EngineClip) -> ModelRc<f32> {
+    if !clip.has_speed_curve() {
+        return model(Vec::new());
+    }
+    let last = (SPEED_GRAPH_SAMPLES - 1) as f64;
+    let scale = cutlass_models::SPEED_CURVE_SCALE as f64;
+    let rows: Vec<f32> = (0..SPEED_GRAPH_SAMPLES)
+        .map(|i| {
+            let tick = (i as f64 / last) * scale;
+            clip.speed_curve.sample_at(tick)
+        })
+        .collect();
+    model(rows)
 }
 
 /// Project a clip's effect chain (M4) for the inspector Effects section, each
@@ -361,14 +414,19 @@ fn speed_factor(speed: EngineRational) -> f32 {
 
 /// Retime badge for the timeline card: `2x` / `0.5x` (trailing zeros
 /// trimmed), with ` R` appended when reversed — a reversed 1× clip shows
-/// just `R`. Empty ⇔ forward 1× (no badge).
+/// just `R`. A speed ramp (M2 curve) shows its *effective* average rate with
+/// a `~` prefix (`~1.4x`) so it reads as varying, not constant. Empty ⇔
+/// forward 1× with no ramp (no badge).
 fn speed_label(clip: &EngineClip) -> String {
     if !clip.is_retimed() {
         return String::new();
     }
     let mut parts: Vec<String> = Vec::new();
-    let factor = speed_factor(clip.speed);
-    if (factor - 1.0).abs() > f32::EPSILON {
+    // A ramp's effective rate is the base speed times the curve's average;
+    // the `~` marks that the instantaneous rate varies across the clip.
+    let ramped = clip.has_speed_curve();
+    let factor = speed_factor(clip.speed) * if ramped { clip.speed_curve_average() as f32 } else { 1.0 };
+    if ramped || (factor - 1.0).abs() > f32::EPSILON {
         let mut s = format!("{factor:.2}");
         while s.ends_with('0') {
             s.pop();
@@ -376,7 +434,7 @@ fn speed_label(clip: &EngineClip) -> String {
         if s.ends_with('.') {
             s.pop();
         }
-        parts.push(format!("{s}x"));
+        parts.push(format!("{}{s}x", if ramped { "~" } else { "" }));
     }
     if clip.reversed {
         parts.push("R".into());
@@ -809,5 +867,60 @@ mod tests {
             [second.bez_x1, second.bez_y1, second.bez_x2, second.bez_y2],
             [0.42, 0.0, 0.58, 1.0]
         );
+    }
+
+    #[test]
+    fn speed_label_marks_ramps_with_a_tilde() {
+        use cutlass_models::{Clip as MClip, MediaId, TimeRange, speed_preset};
+        let mut clip = MClip::from_media(
+            MediaId::from_raw(1),
+            TimeRange::at_rate(0, 48, EngineRational::FPS_24),
+            TimeRange::at_rate(0, 48, EngineRational::FPS_24),
+        );
+        clip.speed_curve = speed_preset("montage").unwrap();
+        let label = speed_label(&clip);
+        assert!(label.starts_with('~'), "ramp badge is tilde-prefixed: {label}");
+        assert!(label.ends_with('x'), "ramp badge reports an effective rate: {label}");
+    }
+
+    #[test]
+    fn speed_curve_projects_dense_samples_and_handles() {
+        use cutlass_models::{MediaId, MediaSource, TimeRange, speed_preset};
+        use slint::Model;
+
+        let mut project = EngineProject::new("test", EngineRational::FPS_24);
+        let media = project.add_media(MediaSource::new(
+            "/tmp/a.mp4",
+            1920,
+            1080,
+            EngineRational::FPS_24,
+            480,
+            true,
+        ));
+        let _ = media;
+        let mut clip = cutlass_models::Clip::from_media(
+            MediaId::from_raw(media.raw()),
+            TimeRange::at_rate(0, 240, EngineRational::FPS_24),
+            TimeRange::at_rate(0, 240, EngineRational::FPS_24),
+        );
+        // Flat clip: no ramp data projected.
+        let flat = clip_to_slint(&project, &clip, &HashMap::new());
+        assert!(!flat.has_speed_curve);
+        assert_eq!(flat.kf_speed_curve.row_count(), 0);
+        assert_eq!(flat.speed_curve_samples.row_count(), 0);
+
+        // Montage ramp: handles mirror the curve's control points (normalized
+        // ticks, no clip-start offset), and the dense sample strip fills in.
+        clip.speed_curve = speed_preset("montage").unwrap();
+        let ramped = clip_to_slint(&project, &clip, &HashMap::new());
+        assert!(ramped.has_speed_curve);
+        assert_eq!(ramped.kf_speed_curve.row_count(), 3);
+        assert_eq!(ramped.kf_speed_curve.row_data(0).unwrap().tick, 0);
+        assert_eq!(
+            ramped.kf_speed_curve.row_data(2).unwrap().tick,
+            cutlass_models::SPEED_CURVE_SCALE as i32
+        );
+        assert_eq!(ramped.speed_curve_samples.row_count(), SPEED_GRAPH_SAMPLES);
+        assert!(ramped.speed_curve_avg > 0.0);
     }
 }

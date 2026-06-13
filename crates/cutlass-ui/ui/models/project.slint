@@ -250,6 +250,21 @@ export struct Clip {
     kf-scale: [ParamKeyframe],
     kf-rotation: [ParamKeyframe],
     kf-opacity: [ParamKeyframe],
+    // Playback-rate ramp (M2 speed curves): the speed-multiplier curve over
+    // the clip's NORMALIZED span — `tick` is 0..=1000 (0 = clip start, 1000 =
+    // clip end), `value-x` the multiplier. Empty ⇔ a flat constant-speed
+    // clip. Edits go through `InspectorBackend.set-speed-curve*`.
+    kf-speed-curve: [ParamKeyframe],
+    // True ⇔ the clip carries a non-flat speed ramp (drives the inspector's
+    // ramp state and the timeline badge).
+    has-speed-curve: bool,
+    // Average multiplier of the ramp over the clip (1.0 when flat) — the
+    // inspector shows it as the effective speed.
+    speed-curve-avg: float,
+    // Dense, evenly-spaced samples of the ramp's multiplier across the
+    // clip's normalized span (engine `Param` math, easing included), for the
+    // inspector velocity graph. Empty ⇔ flat — the graph draws a 1.0× line.
+    speed-curve-samples: [float],
     // Visual effect chain (M4), in order. The index of each entry is what
     // remove-effect / set-effect-param address. Empty ⇔ no effects.
     effects: [EffectView],
