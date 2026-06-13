@@ -77,14 +77,16 @@ export component ClipView inherits Rectangle {
     private property <bool> show-labels: root.width > 40px;
     private property <length> label-row-h: 14px;
 
-    // Audio badge state (M1 volume/fades): non-default audio earns a chip
-    // in the badge cluster. Exactly one of the three fires: muted wins,
-    // then a changed gain, then fades-only. The fields are engine defaults
-    // on non-audio clips, so in practice this shows on audio-lane clips.
-    private property <bool> audio-muted: model.volume == 0.0;
-    private property <bool> audio-gain-changed:
-        model.volume != 1.0 && model.volume != 0.0;
-    private property <bool> audio-faded-only: model.volume == 1.0
+    // Audio badge state (volume/fades): non-default audio earns a chip in
+    // the badge cluster. A keyframed gain (M8) takes precedence and shows its
+    // own envelope chip + on-clip line; otherwise exactly one M1 chip fires:
+    // muted wins, then a changed gain, then fades-only. The fields are engine
+    // defaults on non-audio clips, so in practice this shows on audio lanes.
+    private property <bool> audio-enveloped: model.has-volume-envelope;
+    private property <bool> audio-muted: !audio-enveloped && model.volume == 0.0;
+    private property <bool> audio-gain-changed: !audio-enveloped
+        && model.volume != 1.0 && model.volume != 0.0;
+    private property <bool> audio-faded-only: !audio-enveloped && model.volume == 1.0
         && (model.fade-in-s > 0 || model.fade-out-s > 0);
 
     x: TimelineLib.rational-to-length(model.timeline-start, zoom);
@@ -150,6 +152,39 @@ export component ClipView inherits Rectangle {
             source: tile.image;
             image-fit: fill;
             opacity: root.dimmed ? 0.35 : 1.0;
+        }
+    }
+
+    // Volume automation line (M8 volume envelopes): the gain curve drawn over
+    // the waveform with a dot at each keyframe, CapCut-style. Only on audio
+    // clips that actually carry an envelope and are wide enough to read. The
+    // path's normalized viewbox stretches across the card; x runs clip
+    // start→end, y maps the gain 0..200% top-down (so the dot math matches).
+    if root.show-waveform && root.model.has-volume-envelope && root.width > 40px: Rectangle {
+        width: 100%;
+        height: 100%;
+        opacity: root.dimmed ? 0.4 : 0.9;
+
+        Path {
+            width: 100%;
+            height: 100%;
+            viewbox-width: 1000;
+            viewbox-height: 1000;
+            commands: root.model.volume-path;
+            stroke: #ffffff;
+            stroke-width: 1.5px;
+            fill: transparent;
+        }
+
+        for kf in root.model.kf-volume: Rectangle {
+            x: (kf.tick - root.model.timeline-start.value) * root.zoom * 1px - self.width / 2;
+            y: (1 - clamp(kf.value-x / 2, 0, 1)) * parent.height - self.height / 2;
+            width: 6px;
+            height: 6px;
+            border-radius: 3px;
+            background: AppStore.theme.accent.primary;
+            border-width: 1px;
+            border-color: #ffffff;
         }
     }
 
@@ -356,6 +391,30 @@ export component ClipView inherits Rectangle {
                     LineTo { x: 9.0; y: 9.0; }
                     LineTo { x: 9.0; y: 1.0; }
                     Close { }
+                }
+            }
+
+            // Envelope chip (M8): a small automation curve, marking a clip
+            // whose gain is keyframed (it also draws the on-clip line above).
+            if root.audio-enveloped && root.width > 50px: Rectangle {
+                width: 14px;
+                border-radius: 2px;
+                background: dimmed ? AppStore.theme.accent.primary.with-alpha(0.2) : AppStore.theme.accent.primary.with-alpha(0.33);
+
+                Path {
+                    width: 10px;
+                    height: 9px;
+                    viewbox-width: 10;
+                    viewbox-height: 10;
+                    stroke: AppStore.theme.text.primary;
+                    stroke-width: 1px;
+                    fill: transparent;
+                    opacity: root.dimmed ? 0.35 : 1.0;
+
+                    MoveTo { x: 0.6; y: 3.0; }
+                    LineTo { x: 3.4; y: 3.0; }
+                    LineTo { x: 6.6; y: 7.5; }
+                    LineTo { x: 9.4; y: 7.5; }
                 }
             }
 

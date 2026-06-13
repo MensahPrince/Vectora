@@ -268,10 +268,11 @@ fn clip_to_slint(
         speed_curve_avg: clip.speed_curve_average() as f32,
         speed_curve_samples: speed_curve_samples(clip),
         // Volume automation (M8): the envelope as absolute-tick keyframes
-        // (transform pattern), plus a dense sample curve for the on-clip line.
+        // (transform pattern), plus a normalized path string for the on-clip
+        // automation line.
         kf_volume: keyframes_to_slint(&clip.volume, clip_start, |v| (*v, 0.0)),
         has_volume_envelope: clip.has_volume_envelope(),
-        volume_samples: volume_samples(clip),
+        volume_path: volume_path(clip).into(),
         effects: project_effects(clip),
     }
 }
@@ -325,24 +326,35 @@ fn speed_curve_samples(clip: &EngineClip) -> ModelRc<f32> {
     model(rows)
 }
 
-/// Dense, evenly-spaced gain samples of a clip's volume envelope across its
-/// span, in the envelope's own clip-relative tick domain (engine `Param`
-/// math, so easing curvature shows). Empty for a constant-gain clip — the
-/// on-clip automation line then draws nothing. Mirrors `speed_curve_samples`
-/// but in absolute clip ticks rather than the normalized speed domain.
-fn volume_samples(clip: &EngineClip) -> ModelRc<f32> {
+/// The full gain a slider/automation line maps to (200%, the inspector's
+/// volume max), so 100% sits mid-band and a boost still has headroom.
+const VOLUME_GRAPH_MAX: f64 = 2.0;
+
+/// A clip's volume envelope as an SVG path-commands string for the on-clip
+/// automation line: dense, evenly-spaced samples (engine `Param` math, so
+/// easing shows) in a normalized 1000×1000 viewbox — x runs clip start→end,
+/// y is the gain top-down (0 at the top of the band, `VOLUME_GRAPH_MAX` at
+/// the bottom), clamped into the band. Empty for a constant-gain clip — the
+/// card then draws no line.
+fn volume_path(clip: &EngineClip) -> String {
     if !clip.has_volume_envelope() {
-        return model(Vec::new());
+        return String::new();
     }
     let span = (clip.timeline.duration.value - 1).max(0) as f64;
     let last = (SPEED_GRAPH_SAMPLES - 1) as f64;
-    let rows: Vec<f32> = (0..SPEED_GRAPH_SAMPLES)
-        .map(|i| {
-            let tick = ((i as f64 / last) * span).round() as i64;
-            clip.volume.sample(tick)
-        })
-        .collect();
-    model(rows)
+    let mut path = String::with_capacity(SPEED_GRAPH_SAMPLES * 14);
+    for i in 0..SPEED_GRAPH_SAMPLES {
+        let tick = ((i as f64 / last) * span).round() as i64;
+        let gain = f64::from(clip.volume.sample(tick));
+        let x = (i as f64 / last) * 1000.0;
+        let y = (1.0 - (gain / VOLUME_GRAPH_MAX).clamp(0.0, 1.0)) * 1000.0;
+        if i == 0 {
+            path.push_str(&format!("M {x:.1} {y:.1}"));
+        } else {
+            path.push_str(&format!(" L {x:.1} {y:.1}"));
+        }
+    }
+    path
 }
 
 /// Project a clip's effect chain (M4) for the inspector Effects section, each

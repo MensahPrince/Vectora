@@ -274,10 +274,11 @@ export struct Clip {
     // True ⇔ the clip's gain is a non-constant envelope — drives the
     // inspector's diamond state and the on-clip automation line + badge.
     has-volume-envelope: bool,
-    // Dense, evenly-spaced gain samples across the clip's span (engine
-    // `Param` math, easing included), for the on-clip volume line. Empty ⇔
-    // a flat clip, so no automation line is drawn.
-    volume-samples: [float],
+    // The volume envelope as an SVG path-commands string in a normalized
+    // 1000×1000 viewbox (x = clip start→end, y = gain 0..200% top-down,
+    // densely sampled so easing curvature shows). "" ⇔ a flat clip, so no
+    // automation line is drawn. Built in src/projection.rs.
+    volume-path: string,
     // Visual effect chain (M4), in order. The index of each entry is what
     // remove-effect / set-effect-param address. Empty ⇔ no effects.
     effects: [EffectView],
