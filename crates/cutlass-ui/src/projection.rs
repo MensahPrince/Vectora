@@ -24,8 +24,8 @@ use slint::{Color, ModelRc, VecModel};
 
 use crate::params::easing_to_ui;
 use crate::{
-    Clip, Media, ParamKeyframe, Project, Rational, RationalTime, Sequence, TextClipStyle,
-    TimeRange, TimelineMarker, Track, TrackKind,
+    Clip, EffectParamView, EffectView, Media, ParamKeyframe, Project, Rational, RationalTime,
+    Sequence, TextClipStyle, TimeRange, TimelineMarker, Track, TrackKind, TransitionView,
 };
 
 
@@ -173,6 +173,7 @@ fn track_to_slint(
         enabled: track.enabled,
         muted: track.muted,
         locked: track.locked,
+        transitions: project_transitions(track),
     }
 }
 
@@ -259,7 +260,64 @@ fn clip_to_slint(
         kf_scale: keyframes_to_slint(&clip.transform.scale, clip_start, |v| (*v, 0.0)),
         kf_rotation: keyframes_to_slint(&clip.transform.rotation, clip_start, |v| (*v, 0.0)),
         kf_opacity: keyframes_to_slint(&clip.transform.opacity, clip_start, |v| (*v, 0.0)),
+        effects: project_effects(clip),
     }
+}
+
+/// Project a clip's effect chain (M4) for the inspector Effects section, each
+/// parameter sampled at the clip start with its catalog label and range.
+fn project_effects(clip: &EngineClip) -> ModelRc<EffectView> {
+    let rows: Vec<EffectView> = clip
+        .effects
+        .iter()
+        .map(|fx| {
+            let spec = cutlass_models::effect_spec(&fx.effect_id);
+            let label = spec.map(|s| s.label).unwrap_or(fx.effect_id.as_str());
+            let params: Vec<EffectParamView> = spec
+                .map(|spec| {
+                    spec.params
+                        .iter()
+                        .map(|p| EffectParamView {
+                            name: p.name.into(),
+                            label: p.label.into(),
+                            value: fx.sample_param(p.name, 0.0).unwrap_or(p.default),
+                            min: p.min,
+                            max: p.max,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            EffectView {
+                effect_id: fx.effect_id.clone().into(),
+                label: label.into(),
+                params: model(params),
+            }
+        })
+        .collect();
+    model(rows)
+}
+
+/// Project a track's transitions (M4) for the timeline junction pills, with
+/// the absolute cut tick (the left clip's end) and the catalog label.
+fn project_transitions(track: &EngineTrack) -> ModelRc<TransitionView> {
+    let rows: Vec<TransitionView> = track
+        .transitions()
+        .iter()
+        .filter_map(|t| {
+            let cut = track.clip(t.left)?.timeline.end_tick();
+            let label = cutlass_models::transition_spec(&t.transition_id)
+                .map(|s| s.label)
+                .unwrap_or(t.transition_id.as_str());
+            Some(TransitionView {
+                left_clip_id: t.left.raw().to_string().into(),
+                transition_id: t.transition_id.clone().into(),
+                label: label.into(),
+                duration_ticks: clamp_i32(t.duration),
+                cut_tick: clamp_i32(cut),
+            })
+        })
+        .collect();
+    model(rows)
 }
 
 /// Project one animatable property's keyframes for the UI: clip-relative

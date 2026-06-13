@@ -318,6 +318,7 @@ mod tests {
             enabled: true,
             muted: false,
             locked: false,
+            transitions: ModelRc::default(),
         }
     }
 
