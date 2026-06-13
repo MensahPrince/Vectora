@@ -56,15 +56,19 @@ pub struct AudioSpan {
     /// Source window length at `source_rate` (the clip's in/out range). Drives
     /// the varispeed stretch ratio for retimed clips; ignored at 1×.
     pub source_duration: i64,
-    /// Retimed (constant speed ≠ 1× and/or reversed, M8 Phase 3): the mixer
-    /// time-stretches the source window to the span length instead of reading
-    /// it 1:1. Speed-curve clips are excluded by the snapshot builder for now.
+    /// Retimed (constant speed ≠ 1× and/or reversed and/or a speed ramp, M8
+    /// Phase 3): the mixer time-stretches the source window to the span length
+    /// instead of reading it 1:1.
     pub retimed: bool,
     /// Play the source window back-to-front (CapCut reverse).
     pub reversed: bool,
     /// Varispeed pitch factor (`1.0` keeps pitch; `> 1.0` is chipmunk mode).
     /// Only consulted when `retimed`.
     pub pitch_factor: f32,
+    /// Speed ramp (CapCut speed curves, M2): `Some` ⇒ the retime rate varies
+    /// over the clip, and the stretch follows the curve's normalized integral
+    /// (`Param` over `0..=SPEED_CURVE_SCALE`). `None` ⇒ a constant-rate retime.
+    pub speed_curve: Option<Param<f32>>,
     /// Clip gain envelope (volume, M1 → M8): `1.0` ⇔ unchanged. Keyframe
     /// ticks are clip-relative sequence ticks at the snapshot's fps; the
     /// mixer rebases them into sample frames once per span.
@@ -363,6 +367,8 @@ struct ResolvedSpan {
     volume: Param<f32>,
     fade_in_frames: i64,
     fade_out_frames: i64,
+    /// Speed ramp (M2): drives the variable-rate render when present.
+    speed_curve: Option<Param<f32>>,
     /// Varispeed render identity for a retimed span; `None` ⇒ read 1:1.
     render: Option<RenderKey>,
 }
@@ -381,6 +387,36 @@ struct RenderKey {
     reversed: bool,
     /// Pitch factor bit pattern (f32 isn't `Hash`/`Eq`).
     pitch_bits: u32,
+    /// Speed-ramp identity (M2): the curve's keyframes flattened to a hashable
+    /// form so editing the ramp re-renders. Empty for a constant-rate retime.
+    curve: Vec<CurveKeyframe>,
+}
+
+/// One speed-ramp keyframe as a hashable tuple — `(tick, value bits, easing
+/// tag, bezier control-point bits)` — for the [`RenderKey`] cache identity
+/// (`f32` and [`cutlass_models::Easing`] are neither `Hash` nor `Eq`).
+type CurveKeyframe = (i64, u32, u8, [u32; 4]);
+
+/// Flatten a speed ramp to a hashable cache identity. The empty vec stands for
+/// a constant-rate retime (no ramp).
+fn curve_key(curve: Option<&Param<f32>>) -> Vec<CurveKeyframe> {
+    let Some(curve) = curve else {
+        return Vec::new();
+    };
+    curve
+        .keyframes()
+        .iter()
+        .map(|kf| {
+            let (tag, pts) = match kf.easing {
+                cutlass_models::Easing::Linear => (0u8, [0u32; 4]),
+                cutlass_models::Easing::EaseIn => (1, [0; 4]),
+                cutlass_models::Easing::EaseOut => (2, [0; 4]),
+                cutlass_models::Easing::EaseInOut => (3, [0; 4]),
+                cutlass_models::Easing::Bezier { points } => (4, points.map(f32::to_bits)),
+            };
+            (kf.tick, kf.value.to_bits(), tag, pts)
+        })
+        .collect()
 }
 
 fn mixer_loop(
@@ -605,15 +641,31 @@ fn mix_retimed_span(
             if failed_opens.contains_key(&span.path) {
                 return;
             }
-            match cutlass_decoder::render_stretched(
-                &span.path,
-                sample_rate,
-                key.source_start_frame,
-                key.source_frames,
-                key.out_frames,
-                key.reversed,
-                f32::from_bits(key.pitch_bits),
-            ) {
+            // A ramp (M2) renders with a variable rate that follows the curve's
+            // normalized integral; a constant-rate retime takes the uniform
+            // path. Both resolve to one cached buffer served 1:1.
+            let result = match &span.speed_curve {
+                Some(curve) => cutlass_decoder::render_stretched_curve(
+                    &span.path,
+                    sample_rate,
+                    key.source_start_frame,
+                    key.source_frames,
+                    key.out_frames,
+                    key.reversed,
+                    f32::from_bits(key.pitch_bits),
+                    |p| cutlass_models::speed_curve_source_fraction(curve, p),
+                ),
+                None => cutlass_decoder::render_stretched(
+                    &span.path,
+                    sample_rate,
+                    key.source_start_frame,
+                    key.source_frames,
+                    key.out_frames,
+                    key.reversed,
+                    f32::from_bits(key.pitch_bits),
+                ),
+            };
+            match result {
                 Ok(buf) => {
                     let buf = Arc::new(buf);
                     rendered.insert(key.clone(), Arc::clone(&buf));
@@ -672,6 +724,7 @@ fn resolve_spans(snapshot: &AudioSnapshot, sample_rate: u32) -> Vec<ResolvedSpan
                 out_frames: end_frame - start_frame,
                 reversed: span.reversed,
                 pitch_bits: span.pitch_factor.to_bits(),
+                curve: curve_key(span.speed_curve.as_ref()),
             });
             ResolvedSpan {
                 path: span.path.clone(),
@@ -685,6 +738,9 @@ fn resolve_spans(snapshot: &AudioSnapshot, sample_rate: u32) -> Vec<ResolvedSpan
                     .map_ticks(|tick| ticks_to_frames(tick, snapshot.fps, sample_rate)),
                 fade_in_frames: ticks_to_frames(span.fade_in_ticks, snapshot.fps, sample_rate),
                 fade_out_frames: ticks_to_frames(span.fade_out_ticks, snapshot.fps, sample_rate),
+                // The ramp's keyframe ticks are normalized (0..=SPEED_CURVE_SCALE),
+                // independent of fps, so it rides through unmapped.
+                speed_curve: span.speed_curve.clone(),
                 render,
             }
         })
@@ -743,6 +799,7 @@ mod tests {
                 retimed: false,
                 reversed: false,
                 pitch_factor: 1.0,
+                speed_curve: None,
                 volume: Param::Keyframed {
                     keyframes: vec![
                         Keyframe { tick: 0, value: 0.0, easing: Easing::Linear },
@@ -842,6 +899,7 @@ mod tests {
                 retimed: false,
                 reversed: false,
                 pitch_factor: 1.0,
+                speed_curve: None,
                 volume: Param::Constant(1.0),
                 fade_in_ticks: 0,
                 fade_out_ticks: 0,
@@ -909,6 +967,7 @@ mod tests {
                 retimed: false,
                 reversed: false,
                 pitch_factor: 1.0,
+                speed_curve: None,
                 volume: Param::Constant(volume),
                 fade_in_ticks,
                 fade_out_ticks: 0,
@@ -967,6 +1026,7 @@ mod tests {
                 retimed: true,
                 reversed: false,
                 pitch_factor: 1.0,
+                speed_curve: None,
                 volume: Param::Constant(1.0),
                 fade_in_ticks: 0,
                 fade_out_ticks: 0,
@@ -990,6 +1050,64 @@ mod tests {
         );
         assert_eq!(rendered.len(), 1, "the stretched buffer is rendered + cached");
         assert!(inside.iter().any(|&s| s != 0.0), "retimed audio plays");
+        assert!(
+            inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),
+            "clamped to [-1, 1]"
+        );
+    }
+
+    #[test]
+    fn mixer_time_stretches_a_speed_ramp_span() {
+        use cutlass_models::{Easing, Keyframe, SPEED_CURVE_SCALE};
+        let Some(path) = audio_asset() else {
+            return;
+        };
+        const RATE: u32 = 48_000;
+        // A ramped clip (M2): 2s of source (ticks [0, 48)) over a 1s span
+        // (ticks [0, 24)), rate ramping 1→3 (average 2×). The mixer renders it
+        // variable-rate instead of muting (M8 Phase 3).
+        let snapshot = AudioSnapshot {
+            fps: (24, 1),
+            spans: vec![AudioSpan {
+                path,
+                start_tick: 0,
+                end_tick: 24,
+                source_start: 0,
+                source_rate: (24, 1),
+                source_duration: 48,
+                retimed: true,
+                reversed: false,
+                pitch_factor: 1.0,
+                speed_curve: Some(Param::Keyframed {
+                    keyframes: vec![
+                        Keyframe { tick: 0, value: 1.0, easing: Easing::Linear },
+                        Keyframe { tick: SPEED_CURVE_SCALE, value: 3.0, easing: Easing::Linear },
+                    ],
+                }),
+                volume: Param::Constant(1.0),
+                fade_in_ticks: 0,
+                fade_out_ticks: 0,
+            }],
+        };
+        let spans = resolve_spans(&snapshot, RATE);
+        let key = spans[0].render.as_ref().expect("a ramp carries a render key");
+        assert!(!key.curve.is_empty(), "the ramp identity is part of the cache key");
+
+        let mut readers = HashMap::new();
+        let mut failed = HashMap::new();
+        let mut rendered = HashMap::new();
+        let mut inside = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            4 * BLOCK_FRAMES as i64,
+            RATE,
+            &mut inside,
+        );
+        assert_eq!(rendered.len(), 1, "the variable-rate buffer is rendered + cached");
+        assert!(inside.iter().any(|&s| s != 0.0), "ramped audio plays");
         assert!(
             inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),
             "clamped to [-1, 1]"
@@ -1026,6 +1144,7 @@ mod tests {
                     retimed: false,
                     reversed: false,
                     pitch_factor: 1.0,
+                    speed_curve: None,
                     volume: Param::Constant(1.0),
                     fade_in_ticks: 0,
                     fade_out_ticks: 0,
