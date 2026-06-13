@@ -16,6 +16,7 @@ import { Clip, TrackKind } from "../../models/index.slint";
 import { TextInspector } from "text-inspector.slint";
 import { TransformInspector } from "transform-inspector.slint";
 import { CropInspector } from "crop-inspector.slint";
+import { EffectsInspector } from "effects-inspector.slint";
 
 struct InspectorField {
     label: string,
@@ -425,6 +426,11 @@ component VisualClipInspector inherits VerticalLayout {
             // Speed needs a source to retime: media-backed clips only
             // (generated text/solids have no footage behind them).
             if root.model.media-id != "": SpeedInspector {
+                model: root.model;
+            }
+
+            // Effect chain (M4): every visual clip can carry effects.
+            EffectsInspector {
                 model: root.model;
             }
         }

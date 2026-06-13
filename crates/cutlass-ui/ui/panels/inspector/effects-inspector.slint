@@ -1,0 +1,111 @@
+import { CutlassText, CutlassSlider, SubtleButton } from "../../components/index.slint";
+import { AppStore } from "../../store/index.slint";
+import { Clip, EffectView, EffectParamView } from "../../models/index.slint";
+import { EffectsBackend } from "../../lib/index.slint";
+
+// One scalar parameter of an effect (M4). A slider for coarse control plus a
+// numeric readout; the value comes from the clip-start projection and re-syncs
+// on every republish (the `changed value` watcher), so a committed edit lands
+// back through the projection rather than being held UI-side. Release commits
+// one undoable `SetEffectParam`; animated edits go through the keyframe path
+// (a deliberate follow-up — see the Effects section note).
+component EffectParamRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <float> value;
+    in property <float> minimum;
+    in property <float> maximum;
+    callback commit(value: float);
+
+    spacing: AppStore.theme.metrics.spacing.md;
+
+    changed value => {
+        sl.value = clamp(root.value, root.minimum, root.maximum);
+    }
+
+    CutlassText {
+        width: 72px;
+        text: root.label;
+        style: AppStore.theme.typography.label;
+        foreground: AppStore.theme.text.secondary;
+        vertical-alignment: TextVerticalAlignment.center;
+        overflow: TextOverflow.elide;
+    }
+
+    sl := CutlassSlider {
+        horizontal-stretch: 1;
+        minimum: root.minimum;
+        maximum: root.maximum;
+        step: max(0.001, (root.maximum - root.minimum) / 200);
+        value: clamp(root.value, root.minimum, root.maximum);
+        released(v) => {
+            root.commit(v);
+        }
+    }
+
+    CutlassText {
+        width: 44px;
+        text: (Math.round(root.value * 100) / 100) + "";
+        style: AppStore.theme.typography.label;
+        foreground: AppStore.theme.text.muted;
+        horizontal-alignment: TextHorizontalAlignment.right;
+        vertical-alignment: TextVerticalAlignment.center;
+    }
+}
+
+// The clip's effect chain (M4), one block per effect: a header with the
+// catalog label and a remove button, then a slider per scalar parameter. The
+// chain index drives `remove-effect` / `set-effect-param`, so the order here
+// matches the engine's apply order.
+export component EffectsInspector inherits VerticalLayout {
+    // Named `model` — `clip` is a built-in boolean on Slint elements.
+    in property <Clip> model;
+
+    spacing: AppStore.theme.metrics.spacing.lg;
+    alignment: LayoutAlignment.start;
+
+    CutlassText {
+        text: "Effects";
+        style: AppStore.theme.typography.heading-sm;
+    }
+
+    if root.model.effects.length == 0: CutlassText {
+        text: "No effects yet. Add one from the Effects library.";
+        style: AppStore.theme.typography.caption;
+        foreground: AppStore.theme.text.secondary;
+        wrap: TextWrap.word-wrap;
+    }
+
+    for fx[i] in root.model.effects: VerticalLayout {
+        spacing: AppStore.theme.metrics.spacing.sm;
+
+        HorizontalLayout {
+            spacing: AppStore.theme.metrics.spacing.sm;
+
+            CutlassText {
+                text: fx.label;
+                style: AppStore.theme.typography.label;
+                foreground: AppStore.theme.text.primary;
+                vertical-alignment: TextVerticalAlignment.center;
+                horizontal-stretch: 1;
+                overflow: TextOverflow.elide;
+            }
+
+            SubtleButton {
+                label: "Remove";
+                clicked => {
+                    EffectsBackend.remove-effect(root.model.id, i);
+                }
+            }
+        }
+
+        for p in fx.params: EffectParamRow {
+            label: p.label;
+            value: p.value;
+            minimum: p.min;
+            maximum: p.max;
+            commit(v) => {
+                EffectsBackend.set-effect-param(root.model.id, i, p.name, v);
+            }
+        }
+    }
+}
