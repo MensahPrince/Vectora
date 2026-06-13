@@ -1290,6 +1290,7 @@ fn main() -> Result<(), slint::PlatformError> {
             "enabled" => preview_worker::TrackFlag::Enabled,
             "muted" => preview_worker::TrackFlag::Muted,
             "locked" => preview_worker::TrackFlag::Locked,
+            "duck-source" => preview_worker::TrackFlag::DuckSource,
             other => {
                 tracing::error!(flag = other, "ignoring unknown track flag");
                 return;
@@ -1382,6 +1383,15 @@ fn main() -> Result<(), slint::PlatformError> {
     app.global::<InspectorBackend>()
         .on_set_clip_fades(move |clip_id, fade_in_s, fade_out_s| {
             set_fades_handle.set_clip_fades(clip_id.to_string(), fade_in_s, fade_out_s);
+        });
+    app.global::<InspectorBackend>()
+        .on_can_duck_under_voice(|sequence, track_id| {
+            inspector::can_duck_under_voice(sequence, track_id.as_str())
+        });
+    let duck_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_duck_under_voice(move |clip_id| {
+            duck_handle.duck_under_voice(clip_id.to_string());
         });
     let set_crop_handle = preview_worker.handle();
     app.global::<InspectorBackend>().on_set_clip_crop(

@@ -32,8 +32,9 @@ component HeadToggle inherits Rectangle {
 
 // Header for one lane: name plus the CapCut-style visibility/mute/lock
 // toggles. The lane category decides which of the visual (eye) vs audio
-// (speaker) toggle shows; lock applies to every lane. Each click routes
-// through EditorStore so the worker applies it as an undoable edit.
+// (speaker + voice tag) toggles show; lock applies to every lane. Each
+// click routes through EditorStore so the worker applies it as an
+// undoable edit.
 export component TrackHead inherits Rectangle {
     in property <Track> track;
 
@@ -74,6 +75,16 @@ export component TrackHead inherits Rectangle {
             active: root.track.muted;
             clicked => {
                 EditorStore.on-track-flag-toggled(root.track.id, "muted", !root.track.muted);
+            }
+        }
+        // Voice-lane tag (audio only): marks this lane as the sidechain
+        // "voice" source so a clip's "duck under voice" gesture knows which
+        // talkers to follow (M8 Phase 4).
+        if root.is-audio: HeadToggle {
+            label: "V";
+            active: root.track.duck-source;
+            clicked => {
+                EditorStore.on-track-flag-toggled(root.track.id, "duck-source", !root.track.duck-source);
             }
         }
 

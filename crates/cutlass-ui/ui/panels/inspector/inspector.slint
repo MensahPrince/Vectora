@@ -4,6 +4,7 @@ import {
     CutlassScrollView,
     CutlassDropdown,
     CutlassText,
+    SubtleButton,
 } from "../../components/index.slint";
 import { AppState } from "../../state.slint";
 import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
@@ -510,6 +511,20 @@ component AudioMixInspector inherits VerticalLayout {
         decimals: 1;
         commit(v) => {
             InspectorBackend.set-clip-fades(root.model.id, root.model.fade-in-s, v);
+        }
+    }
+
+    // Sidechain ducking (M8 Phase 4): dip this music under the voice lanes.
+    // Shown only when another audio lane is tagged as a voice source (the
+    // track header "V"); the worker resolves which voice clips overlap and
+    // writes the dip as editable volume keyframes — one undoable edit.
+    if InspectorBackend.can-duck-under-voice(EditorStore.project.sequence, TimelineStore.selected-track-id): HorizontalLayout {
+        alignment: LayoutAlignment.start;
+        SubtleButton {
+            label: "Duck under voice";
+            clicked => {
+                InspectorBackend.duck-under-voice(root.model.id);
+            }
         }
     }
 }

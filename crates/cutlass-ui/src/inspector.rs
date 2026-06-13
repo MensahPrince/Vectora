@@ -110,6 +110,18 @@ pub fn sample_audio(clip: &Clip, playhead: i32) -> AudioSample {
     }
 }
 
+/// Whether a "duck under voice" gesture makes sense for a clip on `track_id`:
+/// true when some *other* audio lane is tagged as a voice source (the track
+/// header "V" toggle, M8 Phase 4). Pure gate for the inspector button — the
+/// worker re-resolves the precise overlapping voice clips when it fires.
+pub fn can_duck_under_voice(sequence: Sequence, track_id: &str) -> bool {
+    (0..sequence.tracks.row_count())
+        .filter_map(|i| sequence.tracks.row_data(i))
+        .any(|track| {
+            track.kind == TrackKind::Audio && track.duck_source && track.id != track_id
+        })
+}
+
 pub fn resolve_selection(
     sequence: Sequence,
     track_id: &str,
@@ -149,5 +161,67 @@ pub fn resolve_selection(
         found: false,
         track_kind: TrackKind::Video,
         clip: Clip::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Track;
+    use slint::{ModelRc, SharedString, VecModel};
+    use std::rc::Rc;
+
+    fn track(id: &str, kind: TrackKind, duck_source: bool) -> Track {
+        Track {
+            id: SharedString::from(id),
+            name: SharedString::from(id),
+            kind,
+            color: slint::Color::default(),
+            clips: ModelRc::default(),
+            enabled: true,
+            muted: false,
+            locked: false,
+            duck_source,
+            transitions: ModelRc::default(),
+        }
+    }
+
+    fn sequence(tracks: Vec<Track>) -> Sequence {
+        Sequence {
+            tracks: ModelRc::from(Rc::new(VecModel::from(tracks))),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn duck_gate_needs_a_voice_lane_other_than_the_clips_own() {
+        // Lane "1" is plain music, lane "2" is tagged as the voice source.
+        let seq = sequence(vec![
+            track("1", TrackKind::Audio, false),
+            track("2", TrackKind::Audio, true),
+        ]);
+        // A music clip on "1" can duck under the voice on "2".
+        assert!(can_duck_under_voice(seq.clone(), "1"));
+        // From the voice lane itself there is no *other* voice lane.
+        assert!(!can_duck_under_voice(seq, "2"));
+    }
+
+    #[test]
+    fn duck_gate_is_false_without_any_voice_lane() {
+        let seq = sequence(vec![
+            track("1", TrackKind::Audio, false),
+            track("2", TrackKind::Audio, false),
+        ]);
+        assert!(!can_duck_under_voice(seq, "1"));
+    }
+
+    #[test]
+    fn duck_gate_ignores_a_voice_flag_on_a_non_audio_lane() {
+        // A duck_source flag is inert on a video lane (the toggle is audio-only).
+        let seq = sequence(vec![
+            track("1", TrackKind::Audio, false),
+            track("2", TrackKind::Video, true),
+        ]);
+        assert!(!can_duck_under_voice(seq, "1"));
     }
 }

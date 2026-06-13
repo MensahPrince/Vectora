@@ -173,6 +173,7 @@ fn track_to_slint(
         enabled: track.enabled,
         muted: track.muted,
         locked: track.locked,
+        duck_source: track.duck_source,
         transitions: project_transitions(track),
     }
 }

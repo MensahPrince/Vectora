@@ -142,6 +142,13 @@ enum WorkerMsg {
         fade_in_s: f32,
         fade_out_s: f32,
     },
+    /// Duck a music clip under the voice lanes (M8 Phase 4): gather every clip
+    /// on a voice-tagged (`duck_source`) audio lane overlapping `clip` and dip
+    /// its volume under them, written as ordinary M8 volume keyframes. One
+    /// undoable history entry.
+    DuckUnderVoice {
+        clip: String,
+    },
     /// Set a visual clip's crop window + mirroring (CapCut crop, M1): the
     /// normalized kept-region rect plus flip flags. One undoable history
     /// entry; the engine rejects audio-lane clips and degenerate rects.
@@ -396,6 +403,8 @@ pub enum TrackFlag {
     Muted,
     /// Clips can't be selected / moved / trimmed (the lock toggle).
     Locked,
+    /// Audio: tagged as a sidechain "voice" source for ducking (M8 Phase 4).
+    DuckSource,
 }
 
 /// Worker-side clipboard: one member of the copied block, everything needed
@@ -599,6 +608,11 @@ impl WorkerHandle {
             fade_in_s,
             fade_out_s,
         });
+    }
+
+    /// Duck `clip` (a music clip) under the voice-tagged lanes (M8 Phase 4).
+    pub fn duck_under_voice(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::DuckUnderVoice { clip });
     }
 
     /// Set only the fades, preserving the clip's gain (constant or a
@@ -1031,6 +1045,7 @@ fn worker_loop(
                 fade_in_s,
                 fade_out_s,
             } => set_clip_audio_and_publish(engine, &clip, volume, fade_in_s, fade_out_s, &ui),
+            WorkerMsg::DuckUnderVoice { clip } => duck_under_voice_and_publish(engine, &clip, &ui),
             WorkerMsg::SetClipCrop {
                 clip,
                 crop,
@@ -2482,6 +2497,65 @@ fn set_clip_audio_and_publish(
     publish_projection(engine, ui);
 }
 
+/// Duck a music clip under the voice lanes (M8 Phase 4). Gathers every clip on
+/// a voice-tagged (`duck_source`) audio lane that overlaps the selected music
+/// clip and lowers `DuckLanes` onto it — the engine writes the dip as ordinary
+/// M8 volume keyframes, so the result is one undoable edit, audible on the next
+/// mixer snapshot and editable through the volume envelope afterwards. The
+/// defaults mirror the decoder's broadcast-typical ducker (and the agent
+/// `duck` tool); the linear speech-band threshold stays an internal detail.
+fn duck_under_voice_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
+    let Some(music_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "duck-under-voice ignored: unparsable clip id");
+        return;
+    };
+
+    // Resolve the overlapping voice clips against an immutable view, never
+    // ducking a clip under its own lane.
+    let voice: Vec<ClipId> = {
+        let project = engine.project();
+        let timeline = project.timeline();
+        let Some(music) = project.clip(music_id) else {
+            warn!(%music_id, "duck-under-voice ignored: unknown clip");
+            return;
+        };
+        let music_track = timeline.track_of(music_id);
+        let music_range = music.timeline;
+        timeline
+            .tracks_ordered()
+            .filter(|track| {
+                track.kind == TrackKind::Audio
+                    && track.duck_source
+                    && Some(track.id) != music_track
+            })
+            .flat_map(|track| track.clips_ordered())
+            .filter(|c| c.timeline.overlaps(music_range).unwrap_or(false))
+            .map(|c| c.id)
+            .collect()
+    };
+    if voice.is_empty() {
+        warn!(%music_id, "duck-under-voice: no voice-lane clips overlap the selected music");
+        return;
+    }
+
+    match engine.apply(Command::Edit(EditCommand::DuckLanes {
+        voice,
+        music: vec![music_id],
+        // Mirror `DuckSettings::default()` / the agent `duck` tool defaults.
+        threshold: 0.025,
+        amount: 0.66,
+        attack: 0.08,
+        release: 0.32,
+    })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::Updated(_))) => {
+            info!(%music_id, "ducked music under voice");
+            publish_projection(engine, ui);
+        }
+        Ok(other) => error!(%music_id, "unexpected duck-under-voice outcome: {other:?}"),
+        Err(e) => error!(%music_id, "duck under voice failed: {e}"),
+    }
+}
+
 /// Set the project canvas settings (M1): aspect preset + background color
 /// in one undoable history entry. An out-of-range preset index falls back
 /// to auto (defensive — the dialog's list is index-aligned with the model).
@@ -3246,6 +3320,10 @@ fn set_track_flag_and_publish(
         TrackFlag::Locked => EditCommand::SetTrackLocked {
             track: track_id,
             locked: value,
+        },
+        TrackFlag::DuckSource => EditCommand::SetTrackDuckSource {
+            track: track_id,
+            duck_source: value,
         },
     };
     match engine.apply(Command::Edit(command)) {

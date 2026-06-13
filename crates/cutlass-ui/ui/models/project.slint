@@ -316,9 +316,12 @@ export struct Track {
     // a visual track contributes to the composite (the eye toggle).
     // `muted`: an audio track is silenced. `locked`: clips can't be
     // selected / moved / trimmed (drags resolve past the lane).
+    // `duck-source`: an audio lane tagged as a sidechain "voice" source —
+    // its clips drive the "duck under voice" gesture (M8 Phase 4).
     enabled: bool,
     muted: bool,
     locked: bool,
+    duck-source: bool,
     // Transitions at this track's clip junctions (M4), keyed by the left
     // (outgoing) clip. Empty ⇔ none.
     transitions: [TransitionView],

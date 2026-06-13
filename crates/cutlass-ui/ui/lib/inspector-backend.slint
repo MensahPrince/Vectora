@@ -137,6 +137,18 @@ export global InspectorBackend {
         fade-out-s: float,
     );
 
+    // Whether a "duck under voice" gesture is possible for a clip on
+    // `track-id`: true when some *other* audio lane is tagged as a voice
+    // source (the track header "V" toggle, M8 Phase 4). Gates the inspector
+    // button; the worker re-resolves the exact overlapping voice clips.
+    pure callback can-duck-under-voice(sequence: Sequence, track-id: string) -> bool;
+
+    // Duck the given music clip under the voice lanes (M8 Phase 4): the worker
+    // gathers every clip on a voice-tagged audio lane that overlaps this clip
+    // and writes the ducking dip as ordinary volume keyframes — one undoable
+    // edit, editable afterwards through the volume envelope.
+    callback duck-under-voice(clip-id: string);
+
     // Set a visual clip's crop window + mirroring (CapCut crop, M1):
     // normalized inset fractions measured in from each content edge
     // (0,0,0,0 ⇔ uncropped) plus flip flags. main.rs converts insets to the
