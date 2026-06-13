@@ -9,6 +9,61 @@ import { AppStore, EditorStore } from "../../store/index.slint";
 import { AppState } from "../../state.slint";
 import { Media, TrackKind } from "../../models/index.slint";
 
+// One effect/transition catalog tile (M4). Unlike media/generator tiles these
+// don't drop onto a lane — they apply to the current timeline selection
+// (effects → the selected clip; transitions → that clip's right junction), so
+// a click commits and `enabled` reflects whether a target exists. A gradient
+// swatch keeps the grid lively without per-effect art.
+export component CatalogTile inherits Rectangle {
+    in property <string> label;
+    in property <bool> enabled: true;
+    in property <color> swatch: #3A6FC8;
+    callback apply();
+
+    background: AppStore.theme.surface.content-background;
+    border-radius: 4px;
+    clip: true;
+    opacity: root.enabled ? 1.0 : 0.45;
+
+    Rectangle {
+        width: parent.width - 16px;
+        height: parent.height - 16px - 22px;
+        y: 8px;
+        x: 8px;
+        border-radius: 4px;
+        background: @linear-gradient(135deg, root.swatch 0%, root.swatch.darker(0.4) 100%);
+
+        CutlassText {
+            text: "fx";
+            style: { size: 16px, weight: 600, italic: false };
+            foreground: #ffffffcc;
+        }
+    }
+
+    VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 22px;
+            background: #000000a0;
+            CutlassText {
+                text: root.label;
+                style: AppStore.theme.typography.label;
+                overflow: elide;
+                x: 4px;
+                width: parent.width - 8px;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    if root.enabled: TouchArea {
+        clicked => {
+            root.apply();
+        }
+    }
+}
+
 // One imported source from the media pool: poster frame / waveform card,
 // duration badge, name strip. Dragging targets a video lane — or an audio
 // lane for audio-only media, so the landing ghost tracks lanes the worker

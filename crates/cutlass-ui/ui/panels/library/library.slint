@@ -12,9 +12,10 @@ import {
     VerticalDivider,
     HorizontalDivider,
 } from "../../components/index.slint";
-import { AppStore, EditorStore } from "../../store/index.slint";
-import { Media, TrackKind } from "../../models/index.slint";
-import { MediaTile, GeneratedTile } from "tiles.slint";
+import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
+import { Media, TrackKind, CatalogEntry } from "../../models/index.slint";
+import { EffectsBackend } from "../../lib/index.slint";
+import { MediaTile, GeneratedTile, CatalogTile } from "tiles.slint";
 import { SectionPlaceholder } from "placeholder.slint";
 
 // Active tab + per-tab section. A global rather than panel state: the panel
@@ -187,10 +188,21 @@ export component LibraryPanel inherits PanelBase {
                     label: "Stickers";
                 }
 
-                // Effects / Transitions / Filters / Adjustment tabs return
-                // when their engines land (v1 roadmap M4/M5). The model's
-                // TrackKind catalog keeps those lanes; the UI hides dead
-                // features until then (M0 "hide phantom kinds").
+                LibraryTab {
+                    tab-id: "effects";
+                    icon: @image-url("../../../../../assets/icon/library/effects.svg");
+                    label: "Effects";
+                }
+
+                LibraryTab {
+                    tab-id: "transitions";
+                    icon: @image-url("../../../../../assets/icon/library/transitions.svg");
+                    label: "Transitions";
+                }
+
+                // Filters / Adjustment tabs return when their engines land
+                // (v1 roadmap M5). The model's TrackKind catalog keeps those
+                // lanes; the UI hides dead features until then.
             }
         }
 
@@ -241,6 +253,18 @@ export component LibraryPanel inherits PanelBase {
                     width: parent.width;
                     sections: [{ id: "shapes", label: "Shapes" }];
                     active: "shapes";
+                }
+
+                if LibraryState.active-tab == "effects": SectionList {
+                    width: parent.width;
+                    sections: [{ id: "all", label: "All effects" }];
+                    active: "all";
+                }
+
+                if LibraryState.active-tab == "transitions": SectionList {
+                    width: parent.width;
+                    sections: [{ id: "all", label: "All transitions" }];
+                    active: "all";
                 }
             }
 
@@ -451,6 +475,110 @@ export component LibraryPanel inherits PanelBase {
                         seconds: 5;
                         swatch: #E0E0E0;
                         round-swatch: true;
+                    }
+                }
+
+                // ---- Effects ------------------------------------------------
+                // Click applies to the selected clip (no lane drop — effects
+                // ride a clip's chain). Disabled tiles when nothing's selected.
+                if LibraryState.active-tab == "effects": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    Rectangle {
+                        height: 34px;
+                        background: AppStore.theme.panel.header-background;
+                        CutlassText {
+                            x: AppStore.theme.metrics.spacing.md;
+                            width: parent.width - 2 * AppStore.theme.metrics.spacing.md;
+                            height: parent.height;
+                            vertical-alignment: center;
+                            text: TimelineStore.selected-clip-id == ""
+                                ? "Select a clip to add an effect"
+                                : "Click an effect to add it to the selected clip";
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            overflow: elide;
+                        }
+                    }
+
+                    effects-grid := CutlassGridView {
+                        show-horizontal-scrollbar: false;
+                        show-vertical-scrollbar: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
+                            / (100px + AppStore.theme.metrics.spacing.md)));
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: EffectsBackend.effect-catalog.length;
+
+                        for fx[i] in EffectsBackend.effect-catalog: CatalogTile {
+                            x: effects-grid.cell-x(i);
+                            y: effects-grid.cell-y(i);
+                            width: effects-grid.cell-width;
+                            height: effects-grid.cell-height;
+                            label: fx.label;
+                            swatch: #6C4AC8;
+                            enabled: TimelineStore.selected-clip-id != "";
+                            apply => {
+                                EffectsBackend.add-effect(TimelineStore.selected-clip-id, fx.id);
+                            }
+                        }
+                    }
+                }
+
+                // ---- Transitions --------------------------------------------
+                // Click applies at the selected clip's right junction; the
+                // engine rejects when there's no abutting neighbor.
+                if LibraryState.active-tab == "transitions": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    Rectangle {
+                        height: 34px;
+                        background: AppStore.theme.panel.header-background;
+                        CutlassText {
+                            x: AppStore.theme.metrics.spacing.md;
+                            width: parent.width - 2 * AppStore.theme.metrics.spacing.md;
+                            height: parent.height;
+                            vertical-alignment: center;
+                            text: TimelineStore.selected-clip-id == ""
+                                ? "Select a clip to add a transition after it"
+                                : "Click to add a transition at the selected clip's end";
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            overflow: elide;
+                        }
+                    }
+
+                    transitions-grid := CutlassGridView {
+                        show-horizontal-scrollbar: false;
+                        show-vertical-scrollbar: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
+                            / (100px + AppStore.theme.metrics.spacing.md)));
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: EffectsBackend.transition-catalog.length;
+
+                        for tr[i] in EffectsBackend.transition-catalog: CatalogTile {
+                            x: transitions-grid.cell-x(i);
+                            y: transitions-grid.cell-y(i);
+                            width: transitions-grid.cell-width;
+                            height: transitions-grid.cell-height;
+                            label: tr.label;
+                            swatch: #C84A8F;
+                            enabled: TimelineStore.selected-clip-id != "";
+                            apply => {
+                                EffectsBackend.add-transition(TimelineStore.selected-clip-id, tr.id);
+                            }
+                        }
                     }
                 }
 
