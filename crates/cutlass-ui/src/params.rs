@@ -93,6 +93,11 @@ pub(crate) fn sampled_transform(clip: &Clip, playhead: i32) -> ClipTransform {
             [clip.transform_position_x, clip.transform_position_y],
         )
         .sample(tick),
+        anchor_point: vec2_param(
+            &clip.kf_anchor,
+            [clip.transform_anchor_x, clip.transform_anchor_y],
+        )
+        .sample(tick),
         scale: scalar_param(&clip.kf_scale, clip.transform_scale).sample(tick),
         rotation: scalar_param(&clip.kf_rotation, clip.transform_rotation).sample(tick),
         opacity: scalar_param(&clip.kf_opacity, clip.transform_opacity).sample(tick),
@@ -114,6 +119,8 @@ pub(crate) fn apply_sampled_transform(clip: &mut Clip, playhead: i32) {
     let t = sampled_transform(clip, playhead);
     clip.transform_position_x = t.position[0];
     clip.transform_position_y = t.position[1];
+    clip.transform_anchor_x = t.anchor_point[0];
+    clip.transform_anchor_y = t.anchor_point[1];
     clip.transform_scale = t.scale;
     clip.transform_rotation = t.rotation;
     clip.transform_opacity = t.opacity;
@@ -125,6 +132,7 @@ pub(crate) fn apply_sampled_transform(clip: &mut Clip, playhead: i32) {
 pub(crate) fn merged_keyframe_ticks(clip: &Clip) -> slint::ModelRc<i32> {
     let mut ticks: Vec<i32> = [
         &clip.kf_position,
+        &clip.kf_anchor,
         &clip.kf_scale,
         &clip.kf_rotation,
         &clip.kf_opacity,
@@ -203,6 +211,8 @@ mod tests {
             },
             transform_scale: 1.0,
             transform_opacity: 1.0,
+            transform_anchor_x: 0.5,
+            transform_anchor_y: 0.5,
             ..Default::default()
         }
     }

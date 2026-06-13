@@ -238,6 +238,8 @@ export struct Clip {
     // rendered frame without a projection republish per playhead tick.
     transform-position-x: float,
     transform-position-y: float,
+    transform-anchor-x: float,
+    transform-anchor-y: float,
     transform-scale: float,
     transform-rotation: float,
     transform-opacity: float,
@@ -257,6 +259,7 @@ export struct Clip {
     // from `transform-*` above). Edits go through
     // `InspectorBackend.set/remove-param-keyframe` on the worker.
     kf-position: [ParamKeyframe],
+    kf-anchor: [ParamKeyframe],
     kf-scale: [ParamKeyframe],
     kf-rotation: [ParamKeyframe],
     kf-opacity: [ParamKeyframe],

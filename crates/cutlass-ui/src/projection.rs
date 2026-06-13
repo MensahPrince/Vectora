@@ -255,6 +255,8 @@ fn clip_to_slint(
         // that need playhead accuracy sample it UI-side (src/params.rs).
         transform_position_x: transform.position[0],
         transform_position_y: transform.position[1],
+        transform_anchor_x: transform.anchor_point[0],
+        transform_anchor_y: transform.anchor_point[1],
         transform_scale: transform.scale,
         transform_rotation: transform.rotation,
         transform_opacity: transform.opacity,
@@ -265,6 +267,7 @@ fn clip_to_slint(
         flip_h: clip.flip_h,
         flip_v: clip.flip_v,
         kf_position: keyframes_to_slint(&clip.transform.position, clip_start, |v| (v[0], v[1])),
+        kf_anchor: keyframes_to_slint(&clip.transform.anchor_point, clip_start, |v| (v[0], v[1])),
         kf_scale: keyframes_to_slint(&clip.transform.scale, clip_start, |v| (*v, 0.0)),
         kf_rotation: keyframes_to_slint(&clip.transform.rotation, clip_start, |v| (*v, 0.0)),
         kf_opacity: keyframes_to_slint(&clip.transform.opacity, clip_start, |v| (*v, 0.0)),
