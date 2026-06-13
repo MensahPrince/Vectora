@@ -16,6 +16,7 @@ pub mod set_crop;
 pub mod set_effect;
 pub mod set_generator;
 pub mod set_param;
+pub mod set_pitch;
 pub mod set_speed;
 pub mod set_speed_curve;
 pub mod set_track_flags;

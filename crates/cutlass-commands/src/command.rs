@@ -121,6 +121,12 @@ pub enum EditCommand {
         clip: ClipId,
         curve: Option<Param<f32>>,
     },
+    /// Toggle pitch preservation on a retimed media clip (CapCut's "pitch"
+    /// switch, M8 Phase 3): `true` time-stretches so the audio keeps its
+    /// pitch, `false` lets pitch follow the speed ("chipmunk"). A pure audio
+    /// property — changes no duration. Rejected on generated clips. The
+    /// inverse restores the previous clip state.
+    SetClipPitch { clip: ClipId, preserve_pitch: bool },
     /// Set a clip's framing (CapCut crop, M1): `crop` is the normalized
     /// kept region of the content (applied before placement, so the kept
     /// pixels aspect-fit and transform exactly like the full frame did);

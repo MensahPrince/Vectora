@@ -927,6 +927,29 @@ impl Project {
         Ok(())
     }
 
+    /// Toggle whether a retimed media clip preserves pitch while it plays
+    /// (CapCut's "pitch" switch, M8 Phase 3): `true` time-stretches so the
+    /// audio keeps its pitch, `false` lets pitch ride the speed ("chipmunk").
+    /// Pure audio property — it changes no duration, so there is no overlap
+    /// check. Rejected on generated clips (nothing to hear).
+    pub fn set_clip_pitch(
+        &mut self,
+        clip_id: ClipId,
+        preserve_pitch: bool,
+    ) -> Result<(), ModelError> {
+        let clip = self
+            .timeline
+            .clip_mut(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        if clip.source_range().is_none() {
+            return Err(ModelError::InvalidParam(
+                "pitch lock requires a media-backed clip".into(),
+            ));
+        }
+        clip.preserve_pitch = preserve_pitch;
+        Ok(())
+    }
+
     /// Set a media clip's audio mix (CapCut volume + fades): `volume` is
     /// `Some` to set a flat gain (`0` mutes, `1` unchanged, up to
     /// [`crate::MAX_CLIP_VOLUME`]× boost), overwriting any M8 envelope
@@ -1717,6 +1740,33 @@ mod tests {
         // Slow motion stretches it.
         project.set_clip_speed(clip, Rational::new(1, 2), false).unwrap();
         assert_eq!(project.clip(clip).unwrap().timeline, tr(0, 200));
+    }
+
+    #[test]
+    fn set_clip_pitch_toggles_the_flag_without_moving_the_clip() {
+        let (mut project, media_id, track) = project_with_media(500);
+        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        project.set_clip_speed(clip, Rational::new(2, 1), false).unwrap();
+        assert!(project.clip(clip).unwrap().preserve_pitch, "locked by default");
+
+        // Unlocking pitch keeps the retimed footprint (pure audio property).
+        project.set_clip_pitch(clip, false).unwrap();
+        let c = project.clip(clip).unwrap();
+        assert!(!c.preserve_pitch);
+        assert_eq!(c.timeline, tr(0, 50));
+
+        project.set_clip_pitch(clip, true).unwrap();
+        assert!(project.clip(clip).unwrap().preserve_pitch);
+    }
+
+    #[test]
+    fn set_clip_pitch_rejects_generated_clips() {
+        let mut project = Project::new("p", R24);
+        let track = project.add_track(TrackKind::Sticker, "T1");
+        let clip = project
+            .add_generated(track, Generator::SolidColor { rgba: [0, 0, 0, 255] }, tr(0, 10))
+            .unwrap();
+        assert!(project.set_clip_pitch(clip, false).is_err(), "no audio to retime");
     }
 
     #[test]

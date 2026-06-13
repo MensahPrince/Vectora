@@ -153,6 +153,13 @@ fn dispatch_edit(
             let inverse = edit::set_speed_curve::set_speed_curve(ctx, clip, curve)?;
             Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
         }
+        EditCommand::SetClipPitch {
+            clip,
+            preserve_pitch,
+        } => {
+            let inverse = edit::set_pitch::set_pitch(ctx, clip, preserve_pitch)?;
+            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+        }
         EditCommand::SetClipCrop {
             clip,
             crop,
