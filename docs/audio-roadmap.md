@@ -46,9 +46,9 @@ beat markers all mirror CapCut desktop's audio panel.
   Values are validated in `0..=MAX_CLIP_VOLUME` per keyframe, finite.
 - **A keyframed envelope is never "silent."** `Clip::is_silent` is true
   only for a constant gain of `0`; an envelope is kept by both mixers (it
-  may be non-zero elsewhere) and sampled. Constant-speed and reversed clips
-  now play time-stretched audio (Phase 3); only speed-curve (M2) clips still
-  mute, pending the variable-ratio render.
+  may be non-zero elsewhere) and sampled. Every retimed clip — constant
+  speed, reverse, and speed ramps — now plays time-stretched audio (Phase 3);
+  only a constant-zero gain mutes.
 
 ---
 
@@ -121,10 +121,14 @@ beat markers all mirror CapCut desktop's audio panel.
       in the Speed inspector (flips the whole link group when linkage is on,
       so an A/V pair stays consistent). Replaces the old "audio is muted while
       retimed" caption.
-- [ ] **Speed-curve audio (M2)**: variable-ratio ramps still mute — the
-      offline render takes one ratio per call, so a ramp needs a
-      variable-rate pass. Follow-up before the velocity graph can claim
-      audible ramps.
+- [x] **Speed-curve audio (M2)**: ramps play too. `render_stretched_curve`
+      generalizes the offline render to a *time-varying* rate — one continuous
+      phase-vocoder pass that reuses `exact`'s latency compensation but feeds
+      the interior in blocks whose ratio tracks the ramp. Both mixers warp the
+      sound along `speed_curve_source_fraction` (the same normalized integral
+      `source_time_at` uses for the picture), so audio and video stay in step
+      and preview matches export. The agent vocabulary and inspector captions
+      no longer call ramp audio muted.
 
 ## Phase 4 — Audio ducking
 
