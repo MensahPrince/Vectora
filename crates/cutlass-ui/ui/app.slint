@@ -84,13 +84,14 @@ export component AppWindow inherits Window {
     // the Dock icon is set at runtime in src/main.rs instead.
     icon: @image-url("../../../assets/icon/cutlass-in-app.png");
 
-    // Custom chrome: the TitleBar below replaces the OS decorations (drag
-    // region, minimize/maximize/close), wired to winit in src/main.rs through
-    // WindowBackend. On macOS we instead keep the OS-drawn frame (rounded
-    // corners + shadow + traffic lights) and only hide its titlebar
-    // (src/window.rs), so there `no-frame` is off and the title bar adapts;
-    // every other platform stays fully frameless.
-    no-frame: !AppState.is-macos;
+    // Custom chrome: the TitleBar below stands in for the OS title bar (drag
+    // region, project name, and — off macOS — the minimize/maximize/close
+    // buttons), wired to winit in src/main.rs through WindowBackend. macOS and
+    // Windows keep the OS-drawn frame (rounded corners + shadow + native
+    // resize/snap) and only suppress the caption so the custom bar shows
+    // through (src/window.rs), so `no-frame` stays off there. Only Linux/BSD,
+    // which have no such "frame minus titlebar" mode, go fully frameless.
+    no-frame: AppState.frameless;
 
     preferred-width: 1280px;
     preferred-height: 800px;

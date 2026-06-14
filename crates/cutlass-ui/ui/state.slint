@@ -16,9 +16,18 @@ export global AppState {
     // True on macOS, where the shell keeps the OS-drawn window frame (rounded
     // corners, drop shadow, traffic lights) and only hides the titlebar
     // (src/window.rs). There `no-frame` stays off and the title bar insets
-    // past the traffic lights with no custom caption buttons; elsewhere the
-    // shell is fully frameless. Set once at startup from src/main.rs.
+    // past the traffic lights with no custom caption buttons. Windows does the
+    // same trick with a different mechanism (a Win32 NCCALCSIZE subclass, also
+    // in src/window.rs) but keeps the custom caption buttons. Set once at
+    // startup from src/main.rs.
     in-out property <bool> is-macos: false;
+
+    // True only where the shell must be fully frameless (`no-frame`) and draw
+    // its own chrome end to end — Linux/BSD, whose Wayland/X11 surfaces have no
+    // "native frame minus titlebar" mode to borrow (unlike macOS and Windows,
+    // which keep the OS frame and only suppress the caption). Set once at
+    // startup from src/main.rs.
+    in-out property <bool> frameless: false;
 
     // AI assistant chat panel (ai-agent roadmap Phase 4): docked at the
     // far right, toggled from the title bar.

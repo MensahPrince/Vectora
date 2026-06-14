@@ -315,13 +315,17 @@ fn main() -> Result<(), slint::PlatformError> {
     #[cfg(target_os = "macos")]
     set_dock_icon();
 
-    // On macOS the shell keeps the OS-drawn frame (rounded corners, drop
-    // shadow, traffic lights) and only hides the titlebar, so `no-frame`
-    // stays off there and the title bar insets past the traffic lights with
-    // no custom caption buttons (see app.slint / shell/title-bar.slint). Set
-    // before the window is shown so `no-frame` resolves correctly at creation.
-    app.global::<AppState>()
-        .set_is_macos(cfg!(target_os = "macos"));
+    // macOS and Windows both keep the OS-drawn frame (rounded corners, drop
+    // shadow, native resize/snap) and only suppress the native caption, so the
+    // custom title bar shows through (window::apply_native_chrome). `is-macos`
+    // drives the macOS-only bits — caption buttons drop out (the traffic lights
+    // handle min/max/close) and the brand insets past them. Only Linux/BSD,
+    // which have no "frame minus titlebar" mode, go fully frameless (`no-frame`
+    // ← `frameless`) and draw the whole chrome. Set before the window is shown
+    // so `no-frame` resolves correctly at creation.
+    let app_state = app.global::<AppState>();
+    app_state.set_is_macos(cfg!(target_os = "macos"));
+    app_state.set_frameless(cfg!(not(any(target_os = "macos", target_os = "windows"))));
 
     let app_weak = app.as_weak();
     slint::invoke_from_event_loop(move || {

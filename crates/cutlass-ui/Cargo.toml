@@ -49,3 +49,11 @@ objc2-app-kit = { version = "0.3.2", features = [
 ] }
 objc2-foundation = { version = "0.3.2", features = ["NSData"] }
 raw-window-handle = "0.6"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+raw-window-handle = "0.6"
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
