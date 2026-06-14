@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [alpha-0.3.0] — 2026-06-14
+
+The **effects alpha**: the GPU effect engine, transitions, adjustment
+layers, and the M1 close-out (canvas settings, crop & flip) all ship,
+the editor gets a restyled dark-blue/gold theme with a cold-start launch
+screen and a settings dialog, and a batch of animation-smoothness fixes
+land in preview and export.
+
 ### Fixed
 
 - **Preview no longer freezes keyframed motion after a drag.** Releasing a
@@ -112,6 +120,40 @@
   share the path.
 - Deliberate gap: no draggable crop-handles mode in the preview yet —
   numeric insets only.
+
+### Downloads
+
+| Platform | Artifact |
+| --- | --- |
+| macOS (Apple Silicon) | `Cutlass-*-macos-arm64.zip` — unzip, drag `Cutlass.app` to Applications. **First launch:** right-click → Open (not notarized). See `INSTALL-macos.txt`. |
+| Linux (x86_64) | `Cutlass-*-linux-x86_64.tar.gz` — extract and run `./cutlass-ui`; requires FFmpeg |
+
+### Using the AI agent
+
+The agent needs an LLM endpoint — none is bundled. Point
+`~/.cutlass/config.toml` at any OpenAI-compatible server, local or cloud:
+
+```toml
+[ai]
+base_url = "http://localhost:11434/v1"   # e.g. Ollama
+model = "qwen2.5:14b"
+# api_key = "sk-..."                     # for cloud endpoints
+```
+
+### Known limitations
+
+- **Retimed clips are silent** — audio on speed ≠ 1× clips mutes until
+  varispeed lands (M8).
+- **Crop is numeric-only** — no draggable crop-handles mode in the
+  preview yet.
+- **Agent quality tracks the model you give it** — small local models
+  may tool-call poorly; dry-run mode previews every plan before it
+  touches the timeline.
+- **Alpha stability** — crashes and UI polish gaps are expected; please
+  file issues.
+- **macOS Intel** — not built in CI; build from source or use Rosetta.
+- **MP3 seek accuracy** — mid-stream seeks on MP3 can be tens of ms off;
+  MP4/AAC is sample-accurate.
 
 ## [alpha-0.2.0] — 2026-06-12
 
@@ -339,5 +381,6 @@ cargo run --release -p cutlass-ui
 
 See [README.md](README.md) for prerequisites and the `cutlass-app` CLI smoke test.
 
+[alpha-0.3.0]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.3.0
 [alpha-0.2.0]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.2.0
 [alpha-0.1.0]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.1.0
