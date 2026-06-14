@@ -313,21 +313,24 @@ export component LaunchScreen inherits Rectangle {
                     horizontal-stretch: 1;
                 }
 
-                WinButton {
+                // Custom controls only off macOS — there the native traffic
+                // lights (kept on the hidden titlebar) sit over the empty left
+                // of this drag strip.
+                if !AppState.is-macos: WinButton {
                     glyph: "─";
                     clicked => {
                         WindowBackend.minimize();
                     }
                 }
 
-                WinButton {
+                if !AppState.is-macos: WinButton {
                     glyph: WindowBackend.maximized ? "❐" : "□";
                     clicked => {
                         WindowBackend.toggle-maximize();
                     }
                 }
 
-                WinButton {
+                if !AppState.is-macos: WinButton {
                     glyph: "✕";
                     danger: true;
                     clicked => {
