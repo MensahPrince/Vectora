@@ -13,7 +13,9 @@
 #   - release build: cargo build --release -p cutlass-ui
 
 param(
-    [switch]$NoFfmpeg
+    [switch]$NoFfmpeg,
+    [ValidateSet("x86_64", "arm64")]
+    [string]$Arch = "x86_64"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,7 +25,8 @@ Set-Location $Root
 
 $VersionLine = (Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1).Line
 $Version = $VersionLine -replace '.*"(.*)".*', '$1'
-$Arch = "x86_64"
+# vcpkg triplet that matches the target architecture.
+$Triplet = if ($Arch -eq "arm64") { "arm64-windows" } else { "x64-windows" }
 $Dist = "dist"
 $Staging = Join-Path $Dist "staging-windows-$Arch"
 $Pkg = "cutlass-$Version-windows-$Arch"
@@ -62,7 +65,7 @@ if (-not $NoFfmpeg) {
     if (-not $env:VCPKG_ROOT) {
         throw "VCPKG_ROOT is not set; required to bundle FFmpeg DLLs (or pass -NoFfmpeg for local dev)"
     }
-    $VcpkgBin = Join-Path $env:VCPKG_ROOT "installed\x64-windows\bin"
+    $VcpkgBin = Join-Path $env:VCPKG_ROOT "installed\$Triplet\bin"
     if (-not (Test-Path $VcpkgBin)) {
         throw "vcpkg FFmpeg bin dir not found: $VcpkgBin"
     }

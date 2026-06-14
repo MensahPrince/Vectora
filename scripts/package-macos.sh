@@ -57,14 +57,19 @@ cp "$BINARY_SRC" "$APP/Contents/MacOS/cutlass-ui"
 chmod +x "$APP/Contents/MacOS/cutlass-ui"
 
 # App icon (.icns) from the same PNG the dock icon uses at runtime.
-ICONSET="$STAGING/AppIcon.iconset"
-mkdir -p "$ICONSET"
-for size in 16 32 128 256 512; do
-    sips -z $size $size "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
-    dbl=$((size * 2))
-    sips -z $dbl $dbl "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
-done
-iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+# Optional: skip if the source PNG isn't present so packaging still succeeds.
+if [[ -f "$ICON_PNG" ]]; then
+    ICONSET="$STAGING/AppIcon.iconset"
+    mkdir -p "$ICONSET"
+    for size in 16 32 128 256 512; do
+        sips -z $size $size "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+        dbl=$((size * 2))
+        sips -z $dbl $dbl "$ICON_PNG" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+else
+    echo "==> note: $ICON_PNG missing; building .app without a custom icon"
+fi
 
 if [[ "$BUNDLE_FFMPEG" -eq 1 ]]; then
     if ! command -v dylibbundler >/dev/null; then

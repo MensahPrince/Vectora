@@ -33,6 +33,30 @@ cargo build --release -p cutlass-ui
 # → dist/Cutlass-0.1.0-alpha.0-windows-x86_64.zip
 ```
 
+### Windows installer (Setup.exe)
+
+The portable zip above runs in place. For a real setup wizard (Start-menu
+shortcut, uninstaller, optional desktop icon) build an Inno Setup installer:
+
+```powershell
+# one-time: install the Inno Setup compiler
+choco install innosetup
+
+# stages the payload (reusing package-windows.ps1) and compiles the installer
+.\scripts\package-windows-installer.ps1
+# → dist/Cutlass-0.1.0-alpha.0-windows-x86_64-Setup.exe
+
+# native ARM64 installer (run on an ARM64 Windows host with the
+# arm64-windows vcpkg FFmpeg triplet installed):
+.\scripts\package-windows-installer.ps1 -Arch arm64
+# → dist/Cutlass-0.1.0-alpha.0-windows-arm64-Setup.exe
+```
+
+The Inno Setup script lives at `packaging/windows/cutlass.iss`; the PowerShell
+wrapper passes the version, staged source dir, and output path as `/D` defines.
+The installer is unsigned for now — Windows SmartScreen will warn on first run
+until the `Setup.exe` is Authenticode-signed.
+
 `dist/` is gitignored. Use `--no-ffmpeg` on the macOS script only for local
 smoke tests — distributed builds must bundle FFmpeg or users on machines
 without Homebrew will fail to launch.
