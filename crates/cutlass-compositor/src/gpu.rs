@@ -54,6 +54,13 @@ impl GpuContext {
         pollster::block_on(Self::new_headless())
     }
 
+    /// Whether the adapter is a CPU/software rasterizer (e.g. Mesa lavapipe in
+    /// CI). Exact-pixel golden comparisons aren't portable across a software
+    /// rasterizer and real GPU drivers, so callers use this to skip them.
+    pub fn is_software(&self) -> bool {
+        self.adapter.get_info().device_type == wgpu::DeviceType::Cpu
+    }
+
     /// Adopt an existing WGPU setup (future Slint `WGPUConfiguration::Manual` path).
     pub fn from_parts(
         instance: wgpu::Instance,
