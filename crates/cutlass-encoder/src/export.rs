@@ -392,17 +392,15 @@ impl VideoExport {
         // Fast path only when the frame is already exactly what the encoder
         // wants: matching dimensions *and* a YUV420P encoder. Otherwise swscale
         // resizes and/or converts to the encoder's format (e.g. YUV420P→NV12).
-        let mut frame = if width == self.width
-            && height == self.height
-            && self.enc_fmt == Pixel::YUV420P
-        {
-            yuv
-        } else {
-            let scaler = self.yuv_scaler_for(width, height)?;
-            let mut scaled = VideoFrame::empty();
-            scaler.run(&yuv, &mut scaled).map_err(EncodeError::Encode)?;
-            scaled
-        };
+        let mut frame =
+            if width == self.width && height == self.height && self.enc_fmt == Pixel::YUV420P {
+                yuv
+            } else {
+                let scaler = self.yuv_scaler_for(width, height)?;
+                let mut scaled = VideoFrame::empty();
+                scaler.run(&yuv, &mut scaled).map_err(EncodeError::Encode)?;
+                scaled
+            };
         frame.set_pts(Some(self.frame_index));
         self.encoder
             .send_frame(&frame)
