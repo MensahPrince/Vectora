@@ -333,6 +333,7 @@ impl GeneratorRaster {
     /// into a canvas-sized 0..=255 mask. Centering, alignment, letter spacing
     /// and underline are all resolved here; effect passes only reshape this
     /// mask.
+    #[allow(clippy::too_many_arguments)]
     fn text_coverage(
         &mut self,
         text: &str,
@@ -651,6 +652,7 @@ fn transpose(src: &[u8], w: usize, h: usize) -> Vec<u8> {
 
 /// Fill an axis-aligned rounded rectangle (straight-alpha src-over) using
 /// tiny-skia, then composite onto `out`. Used for the text background card.
+#[allow(clippy::too_many_arguments)]
 fn fill_rounded_rect(
     out: &mut [u8],
     w: usize,

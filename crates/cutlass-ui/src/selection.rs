@@ -204,18 +204,18 @@ pub fn prune_selection(
     let clips = placed_clips(sequence);
     let kept: Vec<SharedString> = (0..ids.row_count())
         .filter_map(|i| ids.row_data(i))
-        .filter(|id| clips.iter().any(|c| &c.clip_id == id))
+        .filter(|id| clips.iter().any(|c| c.clip_id == id))
         .collect();
 
     let anchor = |c: &PlacedClip| (c.track_id.clone(), c.clip_id.clone());
     let primary = clips
         .iter()
-        .find(|c| c.clip_id == primary_clip_id && kept.iter().any(|id| *id == c.clip_id))
+        .find(|c| c.clip_id == primary_clip_id && kept.contains(&c.clip_id))
         .map(anchor)
         .or_else(|| {
             clips
                 .iter()
-                .filter(|c| kept.iter().any(|id| *id == c.clip_id))
+                .filter(|c| kept.contains(&c.clip_id))
                 .min_by_key(|c| (c.row, c.start))
                 .map(anchor)
         })
@@ -260,6 +260,7 @@ pub fn group_floaters(sequence: &Sequence, ids: &ModelRc<SharedString>) -> Model
 /// snapped or row-shifted variants don't fit, progressively weaker variants
 /// are tried (raw dx, then horizontal-only); when nothing fits the
 /// resolution is invalid and release commits nothing.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_group_drag(
     sequence: &Sequence,
     ids: &ModelRc<SharedString>,

@@ -164,6 +164,7 @@ fn placement_contains(p: &LayerPlacement, x: f32, y: f32) -> bool {
 /// px) at `tick`. Lanes walk top-first; hidden lanes aren't composited and
 /// locked lanes don't hit-test (same rule as timeline selection), both fall
 /// through to the layer below. Empty `clip_id` ⇔ miss.
+#[allow(dead_code)]
 pub fn hit_test(
     sequence: &Sequence,
     tick: i32,
@@ -253,6 +254,7 @@ fn placement_corners(p: &LayerPlacement, scale: f32, ox: f32, oy: f32) -> [[f32;
 /// panel passes the gesture's resolution to keep the box glued to the
 /// content — position for moves, scale for corner drags, rotation for the
 /// rotate affordance.
+#[allow(dead_code)]
 pub fn selection_box(
     sequence: &Sequence,
     clip_id: &str,

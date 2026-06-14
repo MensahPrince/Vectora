@@ -810,10 +810,10 @@ fn main() -> Result<(), slint::PlatformError> {
             .unwrap_or_default();
         let task = slint::spawn_local(async move {
             let current = std::path::PathBuf::from(current);
-            if let Some(path) = pick_export_path(current).await {
-                if let Some(backend) = backend_weak.upgrade() {
-                    backend.set_output_path(path.to_string_lossy().into_owned().into());
-                }
+            if let Some(path) = pick_export_path(current).await
+                && let Some(backend) = backend_weak.upgrade()
+            {
+                backend.set_output_path(path.to_string_lossy().into_owned().into());
             }
         });
         if let Err(e) = task {

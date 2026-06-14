@@ -69,6 +69,7 @@ pub fn legacy_decoded_to_rgba(frame: &DecodedFrame) -> Result<RgbaFrame, EngineE
 }
 
 /// Legacy alias used by older tests and [`ColorConvertPath::LegacyCpu`].
+#[allow(dead_code)]
 pub fn decoded_to_rgba(frame: &DecodedFrame) -> Result<RgbaFrame, EngineError> {
     legacy_decoded_to_rgba(frame)
 }

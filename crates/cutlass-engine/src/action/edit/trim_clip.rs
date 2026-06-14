@@ -4,6 +4,7 @@ use crate::action::edit::restore_clip::RestoreClipAction;
 use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 
+#[allow(dead_code)]
 pub struct TrimClipAction {
     pub clip: ClipId,
     pub timeline: TimeRange,
@@ -28,6 +29,6 @@ impl EditAction for TrimClipAction {
         self: Box<Self>,
         ctx: &mut ApplyContext<'_>,
     ) -> Result<Box<dyn EditAction>, EngineError> {
-        execute(ctx, self.clip, self.timeline).map(|inv| inv)
+        execute(ctx, self.clip, self.timeline)
     }
 }

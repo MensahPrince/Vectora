@@ -246,10 +246,10 @@ fn rdp(curve: &[f32], lo: usize, hi: usize, eps: f32, keep: &mut [bool]) {
     let span = (hi - lo) as f32;
     let mut worst = 0.0f32;
     let mut worst_i = lo;
-    for i in (lo + 1)..hi {
+    for (i, &sample) in curve.iter().enumerate().take(hi).skip(lo + 1) {
         let t = (i - lo) as f32 / span;
         let line = y0 + (y1 - y0) * t;
-        let dist = (curve[i] - line).abs();
+        let dist = (sample - line).abs();
         if dist > worst {
             worst = dist;
             worst_i = i;
@@ -364,7 +364,7 @@ mod tests {
         };
         // 0.5 s voice, then 0.5 s silence.
         let mut energy = vec![0.5f32; 50];
-        energy.extend(std::iter::repeat(0.0).take(50));
+        energy.extend(std::iter::repeat_n(0.0, 50));
         let gain = duck_gain(&energy, &settings);
         // Down move within the first few steps is larger than the up move over
         // the same number of steps after the voice stops.

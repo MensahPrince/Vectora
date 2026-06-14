@@ -16,7 +16,7 @@
 //! this harness exists because playback cost is a *sequence* property (GOP
 //! position matters), which criterion's repeated-measurement model hides.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
@@ -68,7 +68,7 @@ fn targets(seconds: u64) -> Vec<Duration> {
         .collect()
 }
 
-fn bench_decoder(path: &PathBuf, seconds: u64) {
+fn bench_decoder(path: &Path, seconds: u64) {
     let opts = DecodeOptions::default().hw_accel(HwAccel::None);
     let targets = targets(seconds);
 
@@ -89,7 +89,7 @@ fn bench_decoder(path: &PathBuf, seconds: u64) {
     );
 }
 
-fn bench_engine(path: &PathBuf, seconds: u64) {
+fn bench_engine(path: &Path, seconds: u64) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = EngineConfig {
         cache_dir: dir.path().join("cache"),
@@ -101,7 +101,7 @@ fn bench_engine(path: &PathBuf, seconds: u64) {
 
     let media = match engine
         .apply(Command::Project(ProjectCommand::Import {
-            path: path.clone(),
+            path: path.to_path_buf(),
         }))
         .expect("import")
     {

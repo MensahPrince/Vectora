@@ -33,7 +33,9 @@ use serde::{Deserialize, Serialize};
 /// 13: M8 varispeed pitch lock (`set_clip_pitch`); retimed-audio descriptions
 ///     drop the "muted" language now that speed/reverse/ramp clips sound.
 /// 14: M8 sidechain ducking (`duck`).
-pub const TOOL_SCHEMA_VERSION: u32 = 15;
+/// 15: shape generators gain optional width/height.
+/// 16: optional `anchor_x`/`anchor_y` on `set_clip_transform`.
+pub const TOOL_SCHEMA_VERSION: u32 = 16;
 
 /// Track lane categories the agent may create or target.
 ///

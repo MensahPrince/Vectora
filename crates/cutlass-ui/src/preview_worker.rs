@@ -2252,6 +2252,7 @@ fn register_media_with_workers(
 ///   linked audio clip at the same tick (an existing unlocked audio lane
 ///   with the span free, else a fresh bottom lane) — one history entry for
 ///   the pair.
+#[allow(clippy::too_many_arguments)]
 fn add_clip_and_publish(
     engine: &mut Engine,
     media: &str,
@@ -3097,6 +3098,7 @@ fn lane_of_kind(engine: &Engine, track: &str, kind: TrackKind) -> Option<TrackId
 /// magnet) the landing is an insertion on the main lane; with the magnet on,
 /// a move *off* the main lane also closes the gap it leaves. Every variant
 /// is one history group, so one undo reverts the whole gesture.
+#[allow(clippy::too_many_arguments)]
 fn move_clip_and_publish(
     engine: &mut Engine,
     clip: &str,

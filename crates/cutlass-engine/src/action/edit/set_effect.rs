@@ -4,9 +4,9 @@ use crate::action::edit::restore_clip::RestoreClipAction;
 use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 
-/// Effect-chain edits (M4). All three share the `set_crop` inverse shape: a
-/// full-clip snapshot restore, since the chain is small and a snapshot rolls
-/// back add / remove / param-edit unconditionally.
+// Effect-chain edits (M4). All three share the `set_crop` inverse shape: a
+// full-clip snapshot restore, since the chain is small and a snapshot rolls
+// back add / remove / param-edit unconditionally.
 
 pub fn add_effect(
     ctx: &mut ApplyContext<'_>,

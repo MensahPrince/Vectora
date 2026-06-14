@@ -40,11 +40,11 @@ pub fn compute_drag_snap(
 
     let mut consider = |candidate: i32| {
         let d_leading = (candidate - cursor_start_value).abs();
-        if d_leading <= snap_threshold_ticks && best.map_or(true, |(d, _, _)| d_leading < d) {
+        if d_leading <= snap_threshold_ticks && best.is_none_or(|(d, _, _)| d_leading < d) {
             best = Some((d_leading, candidate, candidate));
         }
         let d_trailing = (candidate - cursor_end).abs();
-        if d_trailing <= snap_threshold_ticks && best.map_or(true, |(d, _, _)| d_trailing < d) {
+        if d_trailing <= snap_threshold_ticks && best.is_none_or(|(d, _, _)| d_trailing < d) {
             let snapped_start = candidate.saturating_sub(clip_duration_ticks);
             best = Some((d_trailing, snapped_start, candidate));
         }
@@ -88,6 +88,7 @@ pub fn compute_drag_snap(
 /// With `main_magnet` on, hovering the main lane (bottom video lane) with a
 /// video clip resolves to an insertion between clips instead of a free spot.
 /// O(total clips) per call — evaluated per drag frame, fine at editing scale.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_clip_drag(
     sequence: &Sequence,
     source_track_id: &str,
@@ -214,6 +215,7 @@ pub fn resolve_clip_drag(
 /// *video* tile on the main lane resolves to an insertion between clips (the
 /// worker ripple-inserts, shifting later clips right); generated lanes are
 /// never the main track, so they always land freeform.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_library_drop(
     sequence: &Sequence,
     lane_kind: TrackKind,
@@ -387,6 +389,7 @@ fn resolve_insertion(track: &crate::Track, exclude: Option<&str>, desired: i32) 
 ///
 /// With `main_magnet` on, a trim on the main lane (bottom video track) skips
 /// neighbor clamping — downstream clips ripple on commit instead.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_clip_trim(
     sequence: &Sequence,
     track_id: &str,

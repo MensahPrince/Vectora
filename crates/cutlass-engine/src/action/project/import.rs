@@ -7,6 +7,7 @@ use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 use crate::import::import_media;
 
+#[allow(dead_code)]
 pub struct ImportAction {
     pub path: PathBuf,
 }

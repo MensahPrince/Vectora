@@ -157,7 +157,7 @@ mod tests {
     fn copy_and_clone_preserve_raw_value() {
         let original = MediaId::from_raw(77);
         let copied = original;
-        let cloned = original.clone();
+        let cloned = original;
         assert_eq!(original, copied);
         assert_eq!(original, cloned);
         assert_eq!(copied.raw(), 77);

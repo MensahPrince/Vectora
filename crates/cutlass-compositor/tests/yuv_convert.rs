@@ -17,9 +17,9 @@ fn solid_yuv420p(width: u32, height: u32, y: u8, u: u8, v: u8) -> Yuv420pLayer {
         vec![y; w * h],
         width,
         vec![u; (w / 2) * (h / 2)],
-        (width / 2) as u32,
+        width / 2,
         vec![v; (w / 2) * (h / 2)],
-        (width / 2) as u32,
+        width / 2,
     )
 }
 

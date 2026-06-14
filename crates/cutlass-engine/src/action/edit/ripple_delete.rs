@@ -33,7 +33,7 @@ impl EditAction for RippleDeleteAction {
         self: Box<Self>,
         ctx: &mut ApplyContext<'_>,
     ) -> Result<Box<dyn EditAction>, EngineError> {
-        execute(ctx, self.clip).map(|inv| inv)
+        execute(ctx, self.clip)
     }
 }
 

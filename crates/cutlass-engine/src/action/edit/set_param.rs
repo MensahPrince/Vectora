@@ -4,9 +4,9 @@ use crate::action::edit::restore_clip::RestoreClipAction;
 use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 
-/// Parameter keyframe edits (M2). All three commands share the same inverse
-/// shape: a full-clip restore, like `SetTransformAction` — parameter state
-/// is tiny and the restore is unconditionally correct.
+// Parameter keyframe edits (M2). All three commands share the same inverse
+// shape: a full-clip restore, like `SetTransformAction` — parameter state
+// is tiny and the restore is unconditionally correct.
 
 pub fn set_keyframe(
     ctx: &mut ApplyContext<'_>,

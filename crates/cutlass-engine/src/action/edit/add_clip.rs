@@ -4,6 +4,7 @@ use crate::action::edit::remove_clip::RemoveClipAction;
 use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 
+#[allow(dead_code)]
 pub struct AddClipAction {
     pub track: TrackId,
     pub media: MediaId,

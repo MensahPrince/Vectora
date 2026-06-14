@@ -38,6 +38,6 @@ impl EditAction for MoveClipAction {
         self: Box<Self>,
         ctx: &mut ApplyContext<'_>,
     ) -> Result<Box<dyn EditAction>, EngineError> {
-        execute(ctx, self.clip, self.to_track, self.start).map(|inv| inv)
+        execute(ctx, self.clip, self.to_track, self.start)
     }
 }

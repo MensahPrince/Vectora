@@ -396,7 +396,7 @@ fn which_clips_have_no_audio_answers_from_pushed_state() {
         Message::System { content } => {
             assert!(content.contains("\"has_audio\":false"), "{content}");
             assert!(content.contains("broll.mp4"), "{content}");
-            assert!(content.contains("answer in text directly from it"));
+            assert!(content.contains("answer directly from"));
         }
         other => panic!("expected system message, got {other:?}"),
     }

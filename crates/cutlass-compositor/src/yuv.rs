@@ -14,6 +14,7 @@ pub struct Yuv420pLayer {
 }
 
 impl Yuv420pLayer {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         width: u32,
         height: u32,

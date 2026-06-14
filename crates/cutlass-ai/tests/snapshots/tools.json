@@ -363,6 +363,22 @@
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "description": "Change a clip's placement on the canvas. Omitted fields keep their\ncurrent value. Rejected for clips on audio tracks.",
         "properties": {
+          "anchor_x": {
+            "description": "Horizontal anchor within the content bounds (0 = left, 0.5 = center).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "anchor_y": {
+            "description": "Vertical anchor within the content bounds (0 = top, 0.5 = center).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
           "clip": {
             "format": "uint64",
             "minimum": 0,
@@ -1566,5 +1582,5 @@
       }
     }
   ],
-  "version": 15
+  "version": 16
 }

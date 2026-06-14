@@ -259,6 +259,6 @@ fn load_tolerates_missing_media() {
     assert_eq!(engine2.project().media_count(), 1);
     assert_eq!(
         engine2.project().media_iter().next().unwrap().path(),
-        PathBuf::from(missing).as_path()
+        missing.as_path()
     );
 }

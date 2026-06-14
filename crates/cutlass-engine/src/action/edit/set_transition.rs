@@ -4,10 +4,10 @@ use crate::action::edit::restore_transitions::RestoreTransitionsAction;
 use crate::action::{ApplyContext, EditAction};
 use crate::error::EngineError;
 
-/// Transition edits (M4). All three share a transitions-snapshot inverse: the
-/// per-track sets are tiny, and a snapshot rolls back add / remove /
-/// duration-edit unconditionally — mirroring the clip-snapshot shape used by
-/// the effect edits.
+// Transition edits (M4). All three share a transitions-snapshot inverse: the
+// per-track sets are tiny, and a snapshot rolls back add / remove /
+// duration-edit unconditionally — mirroring the clip-snapshot shape used by
+// the effect edits.
 
 pub fn add_transition(
     ctx: &mut ApplyContext<'_>,

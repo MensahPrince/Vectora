@@ -155,6 +155,7 @@ pub fn system_prompt(summary: &ProjectSummary, context: &EditorContext) -> Strin
 /// regenerated here so the current project state always wins); `on_event`
 /// receives streamed text and applied actions for the UI. The returned
 /// [`PromptOutcome::turn_messages`] is this turn's contribution to append.
+#[allow(clippy::too_many_arguments)]
 pub fn run_prompt(
     provider: &dyn ChatProvider,
     bridge: &mut dyn EngineBridge,

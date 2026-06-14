@@ -7,6 +7,7 @@ use crate::error::EngineError;
 /// Replace a generated clip's content (title text, shape color, …). The
 /// inverse is a full-clip restore, so it oscillates like trim's
 /// `RestoreClipAction`.
+#[allow(dead_code)]
 pub struct SetGeneratorAction {
     pub clip: ClipId,
     pub generator: Generator,

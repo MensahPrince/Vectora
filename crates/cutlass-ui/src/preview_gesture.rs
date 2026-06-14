@@ -69,7 +69,7 @@ fn invalid() -> PreviewDragResolution {
 /// `moved` is false when the resolved position equals the committed one —
 /// a click without displacement (or a drag that snapped back home) commits
 /// nothing on release.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn resolve_drag(
     sequence: &Sequence,
     clip_id: &str,
@@ -193,7 +193,7 @@ fn pivot_in_viewport(
 /// cursor distance from anchor ÷ press distance from anchor (the grabbed
 /// corner stays under the cursor along its anchor ray), clamped at
 /// [`MIN_SCALE`]. Position, anchor, rotation, and opacity pass through.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn resolve_scale(
     sequence: &Sequence,
     clip_id: &str,
@@ -272,7 +272,7 @@ fn normalize_degrees(angle: f32) -> f32 {
 /// relative to where the press grabbed the handle, added to the clip's
 /// committed rotation — so the handle tracks the cursor. Magnets to the
 /// nearest cardinal angle (0/90/180/270) within `snap_tolerance_deg`.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn resolve_rotate(
     sequence: &Sequence,
     clip_id: &str,
@@ -393,7 +393,7 @@ pub fn nudge(
 
 /// Resolve an anchor-handle drag: the pivot follows the cursor while the
 /// rendered frame stays fixed — both `anchor_point` and `position` update.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn resolve_anchor(
     sequence: &Sequence,
     clip_id: &str,

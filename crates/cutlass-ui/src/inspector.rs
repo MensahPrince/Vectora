@@ -199,7 +199,7 @@ pub fn resolve_selection(sequence: Sequence, track_id: &str, clip_id: &str) -> S
 mod tests {
     use super::*;
     use crate::Track;
-    use crate::{Rational, RationalTime, TimeRange};
+
     use slint::{ModelRc, SharedString, VecModel};
     use std::rc::Rc;
 

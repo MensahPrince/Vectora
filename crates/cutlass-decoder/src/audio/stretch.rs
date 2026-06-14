@@ -72,6 +72,7 @@ pub fn render_stretched(
 /// interior in blocks whose input/output ratio tracks the curve. The whole span
 /// resolves into one buffer the mixers cache and serve 1:1, same as the
 /// constant path.
+#[allow(clippy::too_many_arguments)]
 pub fn render_stretched_curve<F>(
     path: &Path,
     out_rate: u32,

@@ -857,7 +857,7 @@ mod tests {
         // Absurd window: tile count stays bounded.
         let grid =
             plan_tiles(0.0, i32::MAX, 1000, 1, 1.0, 100.0, 0, i32::MAX / 256, 64.0).expect("grid");
-        assert!(grid.i1 - grid.i0 + 1 <= MAX_TILES);
+        assert!(grid.i1 - grid.i0 < MAX_TILES);
     }
 
     #[test]

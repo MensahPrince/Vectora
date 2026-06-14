@@ -35,20 +35,23 @@ impl TrackKind {
 
     /// Whether `content` may be placed on a track of this kind.
     pub fn accepts_content(self, content: &ClipSource) -> bool {
-        match (self, content) {
-            (Self::Video | Self::Audio, ClipSource::Media { .. }) => true,
-            (Self::Text, ClipSource::Generated(Generator::Text { .. })) => true,
-            (
-                Self::Sticker,
-                ClipSource::Generated(
-                    Generator::Sticker | Generator::SolidColor { .. } | Generator::Shape { .. },
-                ),
-            ) => true,
-            (Self::Effect, ClipSource::Generated(Generator::Effect)) => true,
-            (Self::Filter, ClipSource::Generated(Generator::Filter)) => true,
-            (Self::Adjustment, ClipSource::Generated(Generator::Adjustment)) => true,
-            _ => false,
-        }
+        matches!(
+            (self, content),
+            (Self::Video | Self::Audio, ClipSource::Media { .. })
+                | (Self::Text, ClipSource::Generated(Generator::Text { .. }))
+                | (
+                    Self::Sticker,
+                    ClipSource::Generated(
+                        Generator::Sticker | Generator::SolidColor { .. } | Generator::Shape { .. },
+                    ),
+                )
+                | (Self::Effect, ClipSource::Generated(Generator::Effect))
+                | (Self::Filter, ClipSource::Generated(Generator::Filter))
+                | (
+                    Self::Adjustment,
+                    ClipSource::Generated(Generator::Adjustment)
+                )
+        )
     }
 
     /// Whether `clip` may be placed on a track of this kind.

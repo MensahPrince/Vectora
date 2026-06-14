@@ -10,6 +10,7 @@ use crate::error::EngineError;
 ///
 /// `at: Some(playhead)` writes keyframes on already-animated properties
 /// instead of flattening them (M2 compose semantics).
+#[allow(dead_code)]
 pub struct SetTransformAction {
     pub clip: ClipId,
     pub transform: ClipTransform,
