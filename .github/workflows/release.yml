@@ -45,6 +45,7 @@ jobs:
             pkg-config clang \
             libavcodec-dev libavformat-dev libavutil-dev \
             libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev \
+            fontconfig libfontconfig1-dev \
             libasound2-dev
 
       - uses: dtolnay/rust-toolchain@stable
