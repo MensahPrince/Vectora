@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::sync::mpsc;
 
 use bytemuck::{Pod, Zeroable};
@@ -114,6 +116,9 @@ pub struct Compositor {
     /// and reused while the canvas size holds (no allocation when no layer
     /// carries effects).
     scratch: Option<ScratchTargets>,
+    /// Per-layer upload textures reused across frames (see [`UploadPool`]).
+    /// `RefCell` because layer encoding runs behind `&self`.
+    upload_pool: RefCell<UploadPool>,
 }
 
 struct CachedTarget {
@@ -135,6 +140,51 @@ struct ScratchTargets {
     a: wgpu::TextureView,
     b: wgpu::TextureView,
     _textures: [wgpu::Texture; 3],
+}
+
+/// Reusable per-layer upload textures, bucketed by `(format, width, height)`.
+///
+/// Compositing a media layer used to allocate a fresh GPU texture per plane
+/// *every frame* — at 4K that's three ~R8 textures (~12MB) created and dropped
+/// per preview frame, which dominated the per-frame cost on the playback hot
+/// path. Instead we keep textures alive and hand them back out on later frames.
+///
+/// Safety of cross-frame reuse: [`Compositor::composite`] blocks on the readback
+/// map (`device.poll(Wait)`) before returning, so the GPU is idle by the time a
+/// texture is reacquired — no in-flight submit still references it. Within a
+/// single frame, `cursor` hands out a *distinct* texture per `acquire` so two
+/// same-sized layers (e.g. the equal-sized U and V planes) never collide.
+#[derive(Default)]
+struct UploadPool {
+    buckets: HashMap<(wgpu::TextureFormat, u32, u32), Vec<wgpu::Texture>>,
+    cursor: HashMap<(wgpu::TextureFormat, u32, u32), usize>,
+}
+
+impl UploadPool {
+    /// Mark every pooled texture available again for a new frame.
+    fn begin_frame(&mut self) {
+        self.cursor.clear();
+    }
+
+    /// Hand out a texture of the requested shape, creating one only when the
+    /// bucket can't satisfy this frame's demand.
+    fn acquire(
+        &mut self,
+        gpu: &GpuContext,
+        format: wgpu::TextureFormat,
+        width: u32,
+        height: u32,
+    ) -> wgpu::Texture {
+        let key = (format, width, height);
+        let bucket = self.buckets.entry(key).or_default();
+        let idx = self.cursor.entry(key).or_insert(0);
+        if *idx >= bucket.len() {
+            bucket.push(create_upload_texture(gpu, format, width, height));
+        }
+        let texture = bucket[*idx].clone();
+        *idx += 1;
+        texture
+    }
 }
 
 impl Compositor {
@@ -319,10 +369,14 @@ impl Compositor {
             rgba_to_yuv_params,
             target: None,
             scratch: None,
+            upload_pool: RefCell::new(UploadPool::default()),
         })
     }
 
     /// Composite layers bottom-to-top and read back RGBA8 bytes.
+    ///
+    /// Render and texture→buffer copy share one command encoder and one submit;
+    /// the CPU then blocks on the readback map.
     pub fn composite(
         &mut self,
         gpu: &GpuContext,
@@ -331,8 +385,15 @@ impl Compositor {
     ) -> Result<RgbaImage, CompositorError> {
         validate_layers(config, layers)?;
         self.ensure_target(gpu, config)?;
-        self.render_layers(gpu, config, layers)?;
-        self.readback_rgba(gpu, config)
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("composite_encoder"),
+            });
+        self.render_layers_into(&mut encoder, gpu, config, layers)?;
+        self.encode_readback_copy(&mut encoder, config);
+        gpu.queue.submit(Some(encoder.finish()));
+        self.map_readback(gpu, config)
     }
 
     /// Composite layers, convert the canvas to YUV420P on GPU, and read back.
@@ -376,22 +437,6 @@ impl Compositor {
         })
     }
 
-    fn render_layers(
-        &mut self,
-        gpu: &GpuContext,
-        config: &CompositorConfig,
-        layers: &[CompositeLayer],
-    ) -> Result<(), CompositorError> {
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("composite_encoder"),
-            });
-        self.render_layers_into(&mut encoder, gpu, config, layers)?;
-        gpu.queue.submit(Some(encoder.finish()));
-        Ok(())
-    }
-
     fn render_layers_into(
         &mut self,
         encoder: &mut wgpu::CommandEncoder,
@@ -399,6 +444,9 @@ impl Compositor {
         config: &CompositorConfig,
         layers: &[CompositeLayer],
     ) -> Result<(), CompositorError> {
+        // Reclaim last frame's upload textures for reuse on this one.
+        self.upload_pool.borrow_mut().begin_frame();
+
         // Effect and transition layers need offscreen ping-pong targets;
         // allocate them only when something actually needs them.
         if layers
@@ -574,7 +622,11 @@ impl Compositor {
                 width,
                 height,
             } => {
-                let texture = upload_rgba_texture(gpu, bytes, *width, *height);
+                let texture = self
+                    .upload_pool
+                    .borrow_mut()
+                    .acquire(gpu, FORMAT, *width, *height);
+                write_rgba_texture(gpu, &texture, bytes, *width, *height);
                 let view = texture.create_view(&Default::default());
                 let buffer = uniform_buffer(gpu, "blit_placement", &placement);
                 let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -600,12 +652,21 @@ impl Compositor {
                 pass.draw(0..6, 0..1);
             }
             LayerContent::Yuv420p(yuv) => {
-                let y_tex =
-                    upload_r8_texture(gpu, "y_plane", &yuv.tight_y(), yuv.width, yuv.height);
                 let uv_w = yuv.width / 2;
                 let uv_h = yuv.height / 2;
-                let u_tex = upload_r8_texture(gpu, "u_plane", &yuv.tight_u(), uv_w, uv_h);
-                let v_tex = upload_r8_texture(gpu, "v_plane", &yuv.tight_v(), uv_w, uv_h);
+                // Acquire all three planes first: the U and V planes share a
+                // shape, so the pool must hand back distinct textures for them.
+                let (y_tex, u_tex, v_tex) = {
+                    let mut pool = self.upload_pool.borrow_mut();
+                    (
+                        pool.acquire(gpu, R8, yuv.width, yuv.height),
+                        pool.acquire(gpu, R8, uv_w, uv_h),
+                        pool.acquire(gpu, R8, uv_w, uv_h),
+                    )
+                };
+                write_r8_texture(gpu, &y_tex, &yuv.tight_y(), yuv.width, yuv.height);
+                write_r8_texture(gpu, &u_tex, &yuv.tight_u(), uv_w, uv_h);
+                write_r8_texture(gpu, &v_tex, &yuv.tight_v(), uv_w, uv_h);
                 let buffer = uniform_buffer(gpu, "yuv_placement", &placement);
                 let bind = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: Some("yuv_bind"),
@@ -1109,17 +1170,10 @@ impl Compositor {
         Ok(())
     }
 
-    fn readback_rgba(
-        &mut self,
-        gpu: &GpuContext,
-        config: &CompositorConfig,
-    ) -> Result<RgbaImage, CompositorError> {
+    /// Record the canvas → readback-buffer copy into the caller's encoder so
+    /// it rides the same submit as the render passes (no second submit).
+    fn encode_readback_copy(&self, encoder: &mut wgpu::CommandEncoder, config: &CompositorConfig) {
         let target = self.target.as_ref().expect("target initialized");
-        let mut encoder = gpu
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("rgba_readback_encoder"),
-            });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target.texture,
@@ -1141,8 +1195,16 @@ impl Compositor {
                 depth_or_array_layers: 1,
             },
         );
-        gpu.queue.submit(Some(encoder.finish()));
+    }
 
+    /// Map the already-copied readback buffer (blocks on the GPU) and de-pad
+    /// the aligned rows into a tight RGBA image.
+    fn map_readback(
+        &mut self,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+    ) -> Result<RgbaImage, CompositorError> {
+        let target = self.target.as_ref().expect("target initialized");
         let row_bytes = usize::try_from(config.width * 4).expect("width");
         let padded_row = usize::try_from(target.readback_stride).expect("stride");
         let height = usize::try_from(config.height).expect("height");
@@ -1428,8 +1490,15 @@ fn storage_buffer(gpu: &GpuContext, label: &str, size: u64) -> wgpu::Buffer {
     })
 }
 
-fn upload_rgba_texture(gpu: &GpuContext, bytes: &[u8], width: u32, height: u32) -> wgpu::Texture {
-    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
+/// Create a bare upload texture (no contents). Pooled by [`UploadPool`] and
+/// filled per frame by [`write_rgba_texture`] / [`write_r8_texture`].
+fn create_upload_texture(
+    gpu: &GpuContext,
+    format: wgpu::TextureFormat,
+    width: u32,
+    height: u32,
+) -> wgpu::Texture {
+    gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("layer_upload"),
         size: wgpu::Extent3d {
             width,
@@ -1439,56 +1508,43 @@ fn upload_rgba_texture(gpu: &GpuContext, bytes: &[u8], width: u32, height: u32) 
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
-        format: FORMAT,
+        format,
         usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
-    });
-    gpu.queue.write_texture(
-        wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        bytes,
-        wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(width * 4),
-            rows_per_image: Some(height),
-        },
-        wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    texture
+    })
 }
 
-fn upload_r8_texture(
+fn write_rgba_texture(
     gpu: &GpuContext,
-    label: &str,
+    texture: &wgpu::Texture,
     bytes: &[u8],
     width: u32,
     height: u32,
-) -> wgpu::Texture {
-    let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
-        label: Some(label),
-        size: wgpu::Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format: R8,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
+) {
+    write_texture_rows(gpu, texture, bytes, width * 4, width, height);
+}
+
+fn write_r8_texture(
+    gpu: &GpuContext,
+    texture: &wgpu::Texture,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+) {
+    write_texture_rows(gpu, texture, bytes, width, width, height);
+}
+
+fn write_texture_rows(
+    gpu: &GpuContext,
+    texture: &wgpu::Texture,
+    bytes: &[u8],
+    bytes_per_row: u32,
+    width: u32,
+    height: u32,
+) {
     gpu.queue.write_texture(
         wgpu::TexelCopyTextureInfo {
-            texture: &texture,
+            texture,
             mip_level: 0,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
@@ -1496,7 +1552,7 @@ fn upload_r8_texture(
         bytes,
         wgpu::TexelCopyBufferLayout {
             offset: 0,
-            bytes_per_row: Some(width),
+            bytes_per_row: Some(bytes_per_row),
             rows_per_image: Some(height),
         },
         wgpu::Extent3d {
@@ -1505,7 +1561,6 @@ fn upload_r8_texture(
             depth_or_array_layers: 1,
         },
     );
-    texture
 }
 
 fn map_read_buffer<F>(gpu: &GpuContext, buffer: &wgpu::Buffer, f: F) -> Result<(), CompositorError>
