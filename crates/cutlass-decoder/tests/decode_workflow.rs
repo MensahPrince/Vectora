@@ -115,5 +115,8 @@ fn multiple_assets_open_and_decode() {
             }
         }
     }
-    assert!(opened >= 1, "expected at least one mp4 in local-assets/assets/");
+    assert!(
+        opened >= 1,
+        "expected at least one mp4 in local-assets/assets/"
+    );
 }

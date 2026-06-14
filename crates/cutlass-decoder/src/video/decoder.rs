@@ -409,11 +409,13 @@ mod tests {
 
     fn any_video_asset() -> Option<PathBuf> {
         workspace_asset("6137050-hd_1920_1080_24fps.mp4").or_else(|| {
-            std::fs::read_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local-assets/assets"))
-                .ok()?
-                .filter_map(|e| e.ok())
-                .map(|e| e.path())
-                .find(|p| p.extension().is_some_and(|e| e == "mp4"))
+            std::fs::read_dir(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local-assets/assets"),
+            )
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|e| e == "mp4"))
         })
     }
 

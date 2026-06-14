@@ -60,7 +60,8 @@ mod tests {
     use std::path::PathBuf;
 
     fn png_asset() -> Option<PathBuf> {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local-assets/assets/texture.png");
+        let path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local-assets/assets/texture.png");
         path.exists().then_some(path)
     }
 

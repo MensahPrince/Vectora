@@ -165,7 +165,9 @@ fn bench_get_frame_solid(c: &mut Criterion) {
 
 fn bench_get_frame_media(c: &mut Criterion) {
     let Some(path) = bench_asset() else {
-        eprintln!("preview bench: no CUTLASS_BENCH_ASSET or local-assets/assets/*.mp4, skipping media cases");
+        eprintln!(
+            "preview bench: no CUTLASS_BENCH_ASSET or local-assets/assets/*.mp4, skipping media cases"
+        );
         return;
     };
     let (_dir, mut engine) = engine_with_media(&path, 120);

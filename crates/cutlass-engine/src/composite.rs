@@ -1177,8 +1177,8 @@ mod tests {
     }
 
     fn png_asset() -> Option<std::path::PathBuf> {
-        let path =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local-assets/assets/texture.png");
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../local-assets/assets/texture.png");
         path.exists().then_some(path)
     }
 

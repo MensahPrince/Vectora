@@ -260,11 +260,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn any_audio_asset() -> Option<PathBuf> {
-        std::fs::read_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local-assets/assets"))
-            .ok()?
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .find(|p| p.extension().is_some_and(|e| e == "mp3"))
+        std::fs::read_dir(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local-assets/assets"),
+        )
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "mp3"))
     }
 
     #[test]
