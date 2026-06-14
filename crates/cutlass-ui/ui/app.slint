@@ -24,6 +24,7 @@ import { FullscreenPreview } from "fullscreen-preview.slint";
 import { TitleBar } from "shell/title-bar.slint";
 import { ExportDialog } from "shell/export-dialog.slint";
 import { CanvasDialog } from "shell/canvas-dialog.slint";
+import { SettingsDialog } from "shell/settings-dialog.slint";
 import { MessageDialog } from "shell/message-dialog.slint";
 import { RelinkDialog } from "shell/relink-dialog.slint";
 import { ExportBackend } from "lib/export-backend.slint";
@@ -103,6 +104,24 @@ export component AppWindow inherits Window {
     in-out property <length> right-pane-width: 350px;
     in-out property <length> agent-pane-width: 350px;
     in-out property <length> timeline-height: 400px;
+
+    // Native menu bar — on macOS Slint renders this through muda as the
+    // top-of-screen system menu, so the first menu becomes the bold app
+    // menu. macOS-only: elsewhere the shell is frameless with a custom title
+    // bar, and a Slint-drawn in-window bar would double up on it. The flag is
+    // set once at startup (src/main.rs) before the window shows, so this is
+    // present from the first layout pass rather than toggled at runtime.
+    if AppState.is-macos: MenuBar {
+        Menu {
+            title: "Cutlass";
+            MenuItem {
+                title: "Settings…";
+                activated => {
+                    AppState.settings-open = true;
+                }
+            }
+        }
+    }
 
     background: AppState.preview-maximized ? AppStore.theme.panel.background : AppStore.theme.surface.app-background;
 
@@ -232,6 +251,15 @@ export component AppWindow inherits Window {
 
     shortcuts := FocusScope {
         key-pressed(event) => {
+            // Settings screen is modal and can sit over the launch screen or
+            // the editor, so it's checked first: Escape dismisses, everything
+            // else is swallowed.
+            if (AppState.settings-open) {
+                if (event.text == Key.Escape) {
+                    AppState.settings-open = false;
+                }
+                return accept;
+            }
             // Start screen: only the New / Open project shortcuts make sense
             // here; swallow everything else so timeline keys never fire under
             // it. (An open failure can raise the error dialog over the launch
@@ -521,6 +549,13 @@ export component AppWindow inherits Window {
 
     // Canvas settings dialog (M1 canvas settings: ratio + background).
     if AppState.canvas-dialog-open: CanvasDialog {
+        width: root.width;
+        height: root.height;
+    }
+
+    // App settings screen — opened from the native Cutlass menu. Placed with
+    // the other modals so it paints above every panel and the title bar.
+    if AppState.settings-open: SettingsDialog {
         width: root.width;
         height: root.height;
     }

@@ -31,6 +31,10 @@ export global AppState {
     // shell/canvas-dialog.slint).
     in-out property <bool> canvas-dialog-open: false;
 
+    // App settings screen (modal overlay; see shell/settings-dialog.slint).
+    // Opened from the native "Cutlass" menu → Settings… on macOS.
+    in-out property <bool> settings-open: false;
+
     // Missing-media relink dialog (modal overlay; see
     // shell/relink-dialog.slint). Raised by app.slint when a freshly
     // opened/restored session has pool entries whose file is gone;
