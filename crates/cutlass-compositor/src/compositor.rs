@@ -622,7 +622,10 @@ impl Compositor {
                 width,
                 height,
             } => {
-                let texture = self.upload_pool.borrow_mut().acquire(gpu, FORMAT, *width, *height);
+                let texture = self
+                    .upload_pool
+                    .borrow_mut()
+                    .acquire(gpu, FORMAT, *width, *height);
                 write_rgba_texture(gpu, &texture, bytes, *width, *height);
                 let view = texture.create_view(&Default::default());
                 let buffer = uniform_buffer(gpu, "blit_placement", &placement);
@@ -1511,11 +1514,23 @@ fn create_upload_texture(
     })
 }
 
-fn write_rgba_texture(gpu: &GpuContext, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
+fn write_rgba_texture(
+    gpu: &GpuContext,
+    texture: &wgpu::Texture,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+) {
     write_texture_rows(gpu, texture, bytes, width * 4, width, height);
 }
 
-fn write_r8_texture(gpu: &GpuContext, texture: &wgpu::Texture, bytes: &[u8], width: u32, height: u32) {
+fn write_r8_texture(
+    gpu: &GpuContext,
+    texture: &wgpu::Texture,
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+) {
     write_texture_rows(gpu, texture, bytes, width, width, height);
 }
 
