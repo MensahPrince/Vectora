@@ -166,37 +166,37 @@ export component LibraryPanel inherits PanelBase {
 
                 LibraryTab {
                     tab-id: "media";
-                    icon: @image-url("../../../../../assets/icon/library/media.svg");
+                    icon: @image-url("../../assets/icon/library/media.svg");
                     label: "Media";
                 }
 
                 LibraryTab {
                     tab-id: "audio";
-                    icon: @image-url("../../../../../assets/icon/library/audio.svg");
+                    icon: @image-url("../../assets/icon/library/audio.svg");
                     label: "Audio";
                 }
 
                 LibraryTab {
                     tab-id: "text";
-                    icon: @image-url("../../../../../assets/icon/library/text.svg");
+                    icon: @image-url("../../assets/icon/library/text.svg");
                     label: "Text";
                 }
 
                 LibraryTab {
                     tab-id: "stickers";
-                    icon: @image-url("../../../../../assets/icon/library/stickers.svg");
+                    icon: @image-url("../../assets/icon/library/stickers.svg");
                     label: "Stickers";
                 }
 
                 LibraryTab {
                     tab-id: "effects";
-                    icon: @image-url("../../../../../assets/icon/library/effects.svg");
+                    icon: @image-url("../../assets/icon/library/effects.svg");
                     label: "Effects";
                 }
 
                 LibraryTab {
                     tab-id: "transitions";
-                    icon: @image-url("../../../../../assets/icon/library/transitions.svg");
+                    icon: @image-url("../../assets/icon/library/transitions.svg");
                     label: "Transitions";
                 }
 
@@ -308,7 +308,7 @@ export component LibraryPanel inherits PanelBase {
                 if LibraryState.active-tab == "media" && LibraryState.media-section == "stock": SectionPlaceholder {
                     width: parent.width;
                     height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/stock.svg");
+                    icon: @image-url("../../assets/icon/library/stock.svg");
                     title: "Stock library";
                     message: "Royalty-free clips and backgrounds, browsable without leaving the editor. Coming soon.";
                 }
@@ -316,7 +316,7 @@ export component LibraryPanel inherits PanelBase {
                 if LibraryState.active-tab == "media" && LibraryState.media-section == "ai": SectionPlaceholder {
                     width: parent.width;
                     height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/ai.svg");
+                    icon: @image-url("../../assets/icon/library/ai.svg");
                     title: "AI media";
                     message: "Generate images and video clips from a prompt, straight into the library. Coming soon.";
                 }
@@ -376,7 +376,7 @@ export component LibraryPanel inherits PanelBase {
                 if LibraryState.active-tab == "audio" && LibraryState.audio-section == "sfx": SectionPlaceholder {
                     width: parent.width;
                     height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/sfx.svg");
+                    icon: @image-url("../../assets/icon/library/sfx.svg");
                     title: "Sound effects";
                     message: "A built-in pack of whooshes, dings, and ambience. Coming soon.";
                 }
@@ -384,7 +384,7 @@ export component LibraryPanel inherits PanelBase {
                 if LibraryState.active-tab == "audio" && LibraryState.audio-section == "stock": SectionPlaceholder {
                     width: parent.width;
                     height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/audio.svg");
+                    icon: @image-url("../../assets/icon/library/audio.svg");
                     title: "Stock music";
                     message: "Royalty-free tracks to score your edit. Coming soon.";
                 }
@@ -392,7 +392,7 @@ export component LibraryPanel inherits PanelBase {
                 if LibraryState.active-tab == "audio" && LibraryState.audio-section == "ai": SectionPlaceholder {
                     width: parent.width;
                     height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/ai.svg");
+                    icon: @image-url("../../assets/icon/library/ai.svg");
                     title: "AI generated";
                     message: "Generate music and voice-overs from a prompt. Coming soon.";
                 }

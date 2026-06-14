@@ -332,7 +332,7 @@ fn set_dock_icon() {
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::NSData;
 
-    static ICON_PNG: &[u8] = include_bytes!("../../../assets/icon/cutlass-in-app.png");
+    static ICON_PNG: &[u8] = include_bytes!("../ui/assets/icon/cutlass-in-app.png");
 
     let Some(mtm) = MainThreadMarker::new() else {
         tracing::warn!("skipping dock icon: not on the main thread");
