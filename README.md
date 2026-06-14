@@ -99,6 +99,10 @@ Each crate has its own README under `crates/` with the details for that part of 
 
 Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, project layout, coding conventions, commit style, and how to open a pull request.
 
+## AI-Assisted Development
+
+Cutlass is built with significant help from AI coding tools. A large part of the code is AI-generated or AI-assisted, then reviewed and integrated by maintainers. We welcome contributions on the same footing whether they come from humans or AI, as long as they are useful and meet the project's quality bar — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## License
 
 Cutlass is licensed under either of:
