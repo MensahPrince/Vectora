@@ -50,14 +50,14 @@ component LibraryTab inherits Rectangle {
 
     VerticalLayout {
         alignment: center;
-        spacing: 3px;
+        spacing: 5px;
 
         HorizontalLayout {
             alignment: center;
 
             Image {
-                width: 14px;
-                height: 14px;
+                width: 20px;
+                height: 20px;
                 source: root.icon;
                 colorize: root.ink;
             }
@@ -66,7 +66,7 @@ component LibraryTab inherits Rectangle {
         lbl := CutlassText {
             text: root.label;
             horizontal-alignment: center;
-            style: { size: 9px, weight: 500, italic: false };
+            style: { size: 12px, weight: 500, italic: false };
             foreground: root.ink;
         }
     }
@@ -163,6 +163,7 @@ export component LibraryPanel inherits PanelBase {
             HorizontalLayout {
                 padding-left: AppStore.theme.metrics.spacing.xs;
                 alignment: start;
+                spacing: AppStore.theme.metrics.spacing.md;
 
                 LibraryTab {
                     tab-id: "media";
@@ -581,7 +582,6 @@ export component LibraryPanel inherits PanelBase {
                         }
                     }
                 }
-
             }
         }
     }
