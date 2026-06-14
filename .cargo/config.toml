@@ -1,0 +1,12 @@
+# Slint's compiler and generated UI code can exceed Windows' default 1 MiB stack
+# (build scripts and debug binaries). Match typical Linux stack size (~10 MiB).
+# https://github.com/slint-ui/slint/issues/4586
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:10000000"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "link-arg=/STACK:10000000"]
+
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "link-arg=-Wl,--stack,10000000"]

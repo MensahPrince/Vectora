@@ -3,8 +3,8 @@ name: Release
 on:
   push:
     tags:
-      - "alpha-*"
-      - "v*"
+      - 'alpha-*'
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,19 +34,21 @@ jobs:
           name: cutlass-macos-arm64
           path: dist/Cutlass-*-macos-*.zip
 
+          
   build-linux:
     name: linux / x86_64
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-
       - name: Install FFmpeg development libraries
-        run: |
+        run: | 
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             pkg-config clang \
             libavcodec-dev libavformat-dev libavutil-dev \
-            libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
+            libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev \
+            fontconfig libfontconfig1-dev \
+            libasound2-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -62,10 +64,58 @@ jobs:
         with:
           name: cutlass-linux-x86_64
           path: dist/Cutlass-*-linux-*.tar.gz
+  build-windows:
+    name: windows / x86_64
+    runs-on: windows-latest
+    env:
+      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install LLVM (bindgen)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1"
+          directory: ${{ github.workspace }}/llvm
+
+      - name: Cache vcpkg
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg
+          key: vcpkg-ffmpeg-x64-windows-v1
+
+      - name: Install FFmpeg (vcpkg)
+        shell: pwsh
+        run: |
+          if (-not (Test-Path vcpkg)) {
+            git clone https://github.com/microsoft/vcpkg --depth 1 vcpkg
+          }
+          ./vcpkg/bootstrap-vcpkg.bat
+          ./vcpkg/vcpkg.exe install `
+            "ffmpeg[core,avcodec,avdevice,avfilter,avformat,swresample,swscale]:x64-windows"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build cutlass-ui (release)
+        env:
+          LIBCLANG_PATH: ${{ github.workspace }}/llvm/bin
+        run: cargo build --release -p cutlass-ui
+
+      - name: Package zip
+        shell: pwsh
+        run: ./scripts/package-windows.ps1
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cutlass-windows-x86_64
+          path: dist/Cutlass-*-windows-*.zip
 
   publish:
     name: github release
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -24,6 +24,13 @@ cargo build --release -p cutlass-ui
 cargo build --release -p cutlass-ui
 ./scripts/package-linux.sh
 # → dist/Cutlass-0.1.0-alpha.0-linux-x86_64.tar.gz
+
+# Windows zip (bundles vcpkg FFmpeg DLLs)
+# See Slint's FFmpeg example for vcpkg + LLVM setup on Windows:
+# https://github.com/slint-ui/slint/tree/master/examples/ffmpeg#building
+cargo build --release -p cutlass-ui
+.\scripts\package-windows.ps1
+# → dist/Cutlass-0.1.0-alpha.0-windows-x86_64.zip
 ```
 
 `dist/` is gitignored. Use `--no-ffmpeg` on the macOS script only for local
@@ -46,8 +53,9 @@ git tag alpha-0.1.0
 git push origin alpha-0.1.0
 ```
 
-The workflow builds macOS (arm64) and Linux (x86_64) artifacts, attaches them
-to a GitHub Release, and uses `CHANGELOG.md` for the release body.
+The workflow builds macOS (arm64), Linux (x86_64), and Windows (x86_64)
+artifacts, attaches them to a GitHub Release, and uses `CHANGELOG.md` for the
+release body.
 
 ## FFmpeg / licensing
 
