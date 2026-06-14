@@ -48,7 +48,9 @@ impl Easing {
             Easing::EaseIn => t * t,
             Easing::EaseOut => t * (2.0 - t),
             Easing::EaseInOut => t * t * (3.0 - 2.0 * t),
-            Easing::Bezier { points: [x1, y1, x2, y2] } => cubic_bezier(t, x1, y1, x2, y2),
+            Easing::Bezier {
+                points: [x1, y1, x2, y2],
+            } => cubic_bezier(t, x1, y1, x2, y2),
         }
     }
 
@@ -73,7 +75,9 @@ impl Easing {
                 let t3 = t * t * t;
                 t3 - 0.5 * t3 * t
             }
-            Easing::Bezier { points: [x1, y1, x2, y2] } => {
+            Easing::Bezier {
+                points: [x1, y1, x2, y2],
+            } => {
                 // Simpson's rule over [0, t] with an even step count.
                 const STEPS: usize = 32;
                 let h = t / STEPS as f32;
@@ -97,7 +101,9 @@ impl Easing {
     pub fn validate(self) -> Result<(), ModelError> {
         if let Easing::Bezier { points } = self {
             if points.iter().any(|v| !v.is_finite()) {
-                return Err(ModelError::InvalidParam("bezier easing has non-finite control point".into()));
+                return Err(ModelError::InvalidParam(
+                    "bezier easing has non-finite control point".into(),
+                ));
             }
             let [x1, _, x2, _] = points;
             if !(0.0..=1.0).contains(&x1) || !(0.0..=1.0).contains(&x2) {
@@ -280,13 +286,30 @@ impl<T: Copy> Param<T> {
         match self {
             Param::Constant(_) => {
                 *self = Param::Keyframed {
-                    keyframes: vec![Keyframe { tick, value, easing }],
+                    keyframes: vec![Keyframe {
+                        tick,
+                        value,
+                        easing,
+                    }],
                 };
             }
             Param::Keyframed { keyframes } => {
                 match keyframes.binary_search_by_key(&tick, |kf| kf.tick) {
-                    Ok(i) => keyframes[i] = Keyframe { tick, value, easing },
-                    Err(i) => keyframes.insert(i, Keyframe { tick, value, easing }),
+                    Ok(i) => {
+                        keyframes[i] = Keyframe {
+                            tick,
+                            value,
+                            easing,
+                        }
+                    }
+                    Err(i) => keyframes.insert(
+                        i,
+                        Keyframe {
+                            tick,
+                            value,
+                            easing,
+                        },
+                    ),
                 }
             }
         }
@@ -359,7 +382,9 @@ impl<T> Param<T> {
             return Ok(());
         };
         if keyframes.is_empty() {
-            return Err(ModelError::InvalidParam("keyframed param with no keyframes".into()));
+            return Err(ModelError::InvalidParam(
+                "keyframed param with no keyframes".into(),
+            ));
         }
         for pair in keyframes.windows(2) {
             if pair[1].tick <= pair[0].tick {
@@ -400,7 +425,11 @@ mod tests {
     use super::*;
 
     fn kf(tick: i64, value: f32) -> Keyframe<f32> {
-        Keyframe { tick, value, easing: Easing::Linear }
+        Keyframe {
+            tick,
+            value,
+            easing: Easing::Linear,
+        }
     }
 
     // --- sampling -----------------------------------------------------------
@@ -415,7 +444,9 @@ mod tests {
 
     #[test]
     fn keyframed_clamps_outside_range() {
-        let p = Param::Keyframed { keyframes: vec![kf(10, 1.0), kf(20, 3.0)] };
+        let p = Param::Keyframed {
+            keyframes: vec![kf(10, 1.0), kf(20, 3.0)],
+        };
         assert_eq!(p.sample(0), 1.0);
         assert_eq!(p.sample(10), 1.0);
         assert_eq!(p.sample(20), 3.0);
@@ -424,7 +455,9 @@ mod tests {
 
     #[test]
     fn linear_interpolation_between_keyframes() {
-        let p = Param::Keyframed { keyframes: vec![kf(0, 0.0), kf(10, 10.0)] };
+        let p = Param::Keyframed {
+            keyframes: vec![kf(0, 0.0), kf(10, 10.0)],
+        };
         assert_eq!(p.sample(5), 5.0);
         assert_eq!(p.sample(1), 1.0);
         assert_eq!(p.sample(9), 9.0);
@@ -432,7 +465,9 @@ mod tests {
 
     #[test]
     fn single_keyframe_acts_constant() {
-        let p = Param::Keyframed { keyframes: vec![kf(50, 7.0)] };
+        let p = Param::Keyframed {
+            keyframes: vec![kf(50, 7.0)],
+        };
         assert_eq!(p.sample(0), 7.0);
         assert_eq!(p.sample(50), 7.0);
         assert_eq!(p.sample(100), 7.0);
@@ -450,7 +485,9 @@ mod tests {
 
     #[test]
     fn fractional_sampling_interpolates_between_ticks() {
-        let p = Param::Keyframed { keyframes: vec![kf(0, 0.0), kf(10, 10.0)] };
+        let p = Param::Keyframed {
+            keyframes: vec![kf(0, 0.0), kf(10, 10.0)],
+        };
         // Whole ticks agree with the integer path.
         assert_eq!(p.sample_at(5.0), p.sample(5));
         // Sub-tick positions land between frame values.
@@ -466,8 +503,16 @@ mod tests {
     fn vec2_lerp() {
         let p = Param::Keyframed {
             keyframes: vec![
-                Keyframe { tick: 0, value: [0.0, 0.0], easing: Easing::Linear },
-                Keyframe { tick: 10, value: [1.0, -1.0], easing: Easing::Linear },
+                Keyframe {
+                    tick: 0,
+                    value: [0.0, 0.0],
+                    easing: Easing::Linear,
+                },
+                Keyframe {
+                    tick: 10,
+                    value: [1.0, -1.0],
+                    easing: Easing::Linear,
+                },
             ],
         };
         assert_eq!(p.sample(5), [0.5, -0.5]);
@@ -482,7 +527,9 @@ mod tests {
             Easing::EaseIn,
             Easing::EaseOut,
             Easing::EaseInOut,
-            Easing::Bezier { points: [0.42, 0.0, 0.58, 1.0] },
+            Easing::Bezier {
+                points: [0.42, 0.0, 0.58, 1.0],
+            },
         ] {
             assert_eq!(easing.apply(0.0), 0.0, "{easing:?} at 0");
             assert!((easing.apply(1.0) - 1.0).abs() < 1e-4, "{easing:?} at 1");
@@ -500,7 +547,9 @@ mod tests {
     #[test]
     fn bezier_matches_css_ease_in_out_shape() {
         // cubic-bezier(0.42, 0, 0.58, 1) — CSS "ease-in-out".
-        let e = Easing::Bezier { points: [0.42, 0.0, 0.58, 1.0] };
+        let e = Easing::Bezier {
+            points: [0.42, 0.0, 0.58, 1.0],
+        };
         assert!(e.apply(0.1) < 0.1);
         assert!(e.apply(0.9) > 0.9);
         assert!((e.apply(0.5) - 0.5).abs() < 1e-3);
@@ -521,10 +570,17 @@ mod tests {
         assert!((Easing::EaseOut.integral_to(1.0) - 2.0 / 3.0).abs() < 1e-6);
         assert!((Easing::EaseInOut.integral_to(1.0) - 0.5).abs() < 1e-6);
         // The symmetric CSS ease-in-out bezier integrates to ½ by symmetry.
-        let e = Easing::Bezier { points: [0.42, 0.0, 0.58, 1.0] };
+        let e = Easing::Bezier {
+            points: [0.42, 0.0, 0.58, 1.0],
+        };
         assert!((e.integral_to(1.0) - 0.5).abs() < 1e-3);
         // Integral is 0 at t=0 and monotonic increasing.
-        for easing in [Easing::Linear, Easing::EaseIn, Easing::EaseOut, Easing::EaseInOut] {
+        for easing in [
+            Easing::Linear,
+            Easing::EaseIn,
+            Easing::EaseOut,
+            Easing::EaseInOut,
+        ] {
             assert_eq!(easing.integral_to(0.0), 0.0);
             let mut prev = 0.0;
             for i in 0..=20 {
@@ -537,11 +593,35 @@ mod tests {
 
     #[test]
     fn bezier_validation_rejects_bad_x() {
-        assert!(Easing::Bezier { points: [1.5, 0.0, 0.5, 1.0] }.validate().is_err());
-        assert!(Easing::Bezier { points: [0.5, 0.0, -0.1, 1.0] }.validate().is_err());
-        assert!(Easing::Bezier { points: [0.5, f32::NAN, 0.5, 1.0] }.validate().is_err());
+        assert!(
+            Easing::Bezier {
+                points: [1.5, 0.0, 0.5, 1.0]
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Easing::Bezier {
+                points: [0.5, 0.0, -0.1, 1.0]
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            Easing::Bezier {
+                points: [0.5, f32::NAN, 0.5, 1.0]
+            }
+            .validate()
+            .is_err()
+        );
         // Overshooting y is allowed (CSS semantics).
-        assert!(Easing::Bezier { points: [0.3, -0.5, 0.7, 1.5] }.validate().is_ok());
+        assert!(
+            Easing::Bezier {
+                points: [0.3, -0.5, 0.7, 1.5]
+            }
+            .validate()
+            .is_ok()
+        );
     }
 
     // --- mutation ---------------------------------------------------------------
@@ -611,8 +691,16 @@ mod tests {
     fn keyframed_roundtrips_compactly() {
         let p = Param::Keyframed {
             keyframes: vec![
-                Keyframe { tick: 0, value: 1.0f32, easing: Easing::Linear },
-                Keyframe { tick: 24, value: 2.0, easing: Easing::EaseInOut },
+                Keyframe {
+                    tick: 0,
+                    value: 1.0f32,
+                    easing: Easing::Linear,
+                },
+                Keyframe {
+                    tick: 24,
+                    value: 2.0,
+                    easing: Easing::EaseInOut,
+                },
             ],
         };
         let json = serde_json::to_string(&p).unwrap();
@@ -632,9 +720,15 @@ mod tests {
                 Keyframe {
                     tick: 0,
                     value: 0.0f32,
-                    easing: Easing::Bezier { points: [0.42, 0.0, 0.58, 1.0] },
+                    easing: Easing::Bezier {
+                        points: [0.42, 0.0, 0.58, 1.0],
+                    },
                 },
-                Keyframe { tick: 10, value: 1.0, easing: Easing::Linear },
+                Keyframe {
+                    tick: 10,
+                    value: 1.0,
+                    easing: Easing::Linear,
+                },
             ],
         };
         let json = serde_json::to_string(&p).unwrap();
@@ -646,8 +740,16 @@ mod tests {
     fn vec2_keyframed_roundtrips() {
         let p = Param::Keyframed {
             keyframes: vec![
-                Keyframe { tick: 0, value: [0.0f32, 0.0], easing: Easing::Linear },
-                Keyframe { tick: 48, value: [0.5, -0.5], easing: Easing::EaseOut },
+                Keyframe {
+                    tick: 0,
+                    value: [0.0f32, 0.0],
+                    easing: Easing::Linear,
+                },
+                Keyframe {
+                    tick: 48,
+                    value: [0.5, -0.5],
+                    easing: Easing::EaseOut,
+                },
             ],
         };
         let json = serde_json::to_string(&p).unwrap();

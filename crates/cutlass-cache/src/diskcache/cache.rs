@@ -24,9 +24,9 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(any(test, debug_assertions))]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::SystemTime;
@@ -308,8 +308,7 @@ impl SourceCache {
             return Err(synthetic_no_space_error());
         }
 
-        let buf = bincode::serialize(&self.manifest)
-            .map_err(std::io::Error::other)?;
+        let buf = bincode::serialize(&self.manifest).map_err(std::io::Error::other)?;
         let tmp = self.manifest_path.with_extension("idx.tmp");
         fs::write(&tmp, &buf)?;
         fs::rename(&tmp, &self.manifest_path)?;
@@ -526,9 +525,7 @@ impl FrameCache {
 
     /// Allow cache writes to resume after the user frees disk space.
     pub fn clear_disk_pressure(&self) {
-        self.inner
-            .disk_pressure
-            .store(false, Ordering::Release);
+        self.inner.disk_pressure.store(false, Ordering::Release);
     }
 
     /// Block until all queued writes are applied and manifests are flushed.
@@ -595,11 +592,20 @@ fn handle_write(msg: WriteMsg, state: &Arc<Mutex<CacheState>>, disk_pressure: &A
     let access = st.access_counter;
 
     let mut appended = false;
-    if st.sources.get(&msg.source_id).is_some_and(|sc| sc.manifest.index.contains_key(&msg.pts)) {
-        // Already cached.
-    } else if let Some(written) =
-        try_append_frame(&mut st, msg.source_id, msg.pts, &msg.bytes, access, disk_pressure)
+    if st
+        .sources
+        .get(&msg.source_id)
+        .is_some_and(|sc| sc.manifest.index.contains_key(&msg.pts))
     {
+        // Already cached.
+    } else if let Some(written) = try_append_frame(
+        &mut st,
+        msg.source_id,
+        msg.pts,
+        &msg.bytes,
+        access,
+        disk_pressure,
+    ) {
         st.total_bytes += written;
         appended = true;
     }
@@ -820,9 +826,7 @@ mod tests {
         }
 
         let cache = open_cache(dir.path(), 1024 * 1024);
-        let reopened = cache
-            .register_source(fp, test_spec())
-            .expect("re-register");
+        let reopened = cache.register_source(fp, test_spec()).expect("re-register");
         assert_eq!(reopened, source_id);
         assert_eq!(cache.get(source_id, 7), Some(frame_bytes(7, 512)));
         assert_eq!(cache.frame_count(source_id), 1);
@@ -1013,7 +1017,11 @@ mod tests {
             cache_and_sync(&cache, source_id, 11, frame_bytes(11, 48));
             let idx = dir.path().join(format!("{source_id:016x}.idx"));
             assert!(idx.exists());
-            assert!(!dir.path().join(format!("{source_id:016x}.idx.tmp")).exists());
+            assert!(
+                !dir.path()
+                    .join(format!("{source_id:016x}.idx.tmp"))
+                    .exists()
+            );
         }
 
         let cache = open_cache(dir.path(), 1024 * 1024);

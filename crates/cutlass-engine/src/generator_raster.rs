@@ -50,7 +50,14 @@ enum RasterKey {
         w: u32,
         h: u32,
     },
-    Shape { shape: ShapeKey, rgba: [u8; 4], w: u32, h: u32, width_bits: u32, height_bits: u32 },
+    Shape {
+        shape: ShapeKey,
+        rgba: [u8; 4],
+        w: u32,
+        h: u32,
+        width_bits: u32,
+        height_bits: u32,
+    },
 }
 
 /// Hashable mirror of [`TextStyle`]: `f32` fields are stored as their IEEE bit
@@ -150,7 +157,12 @@ impl GeneratorRaster {
     /// Returns `None` for generators that have no raster representation yet
     /// (sticker/effect/filter/adjustment) or for a zero-size canvas — callers
     /// skip those layers, as before.
-    pub fn raster(&mut self, generator: &Generator, width: u32, height: u32) -> Option<Arc<Vec<u8>>> {
+    pub fn raster(
+        &mut self,
+        generator: &Generator,
+        width: u32,
+        height: u32,
+    ) -> Option<Arc<Vec<u8>>> {
         self.entry(generator, width, height).map(|e| e.bytes)
     }
 
@@ -240,7 +252,13 @@ impl GeneratorRaster {
         self.cache.push_back((key, value));
     }
 
-    fn raster_text(&mut self, content: &str, style: &TextStyle, width: u32, height: u32) -> Vec<u8> {
+    fn raster_text(
+        &mut self,
+        content: &str,
+        style: &TextStyle,
+        width: u32,
+        height: u32,
+    ) -> Vec<u8> {
         let mut out = vec![0u8; (width as usize) * (height as usize) * 4];
 
         // The string actually shaped: the casing transform is applied up front
@@ -468,7 +486,15 @@ fn add_coverage(mask: &mut [u8], w: i32, h: i32, x: i32, y: i32, cov: u8) {
 /// Straight-alpha src-over of a flat `rgba` color, weighted per-pixel by a
 /// coverage `mask`, onto `out`. `(dx, dy)` shifts the mask sample (used by the
 /// shadow pass), with off-canvas samples treated as zero coverage.
-fn composite_mask(out: &mut [u8], w: usize, h: usize, mask: &[u8], rgba: [u8; 4], dx: i32, dy: i32) {
+fn composite_mask(
+    out: &mut [u8],
+    w: usize,
+    h: usize,
+    mask: &[u8],
+    rgba: [u8; 4],
+    dx: i32,
+    dy: i32,
+) {
     let src_a = rgba[3] as f32 / 255.0;
     if src_a <= 0.0 {
         return;
@@ -656,7 +682,13 @@ fn fill_rounded_rect(
     let Some(path) = pb.finish() else {
         return;
     };
-    pixmap.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);
+    pixmap.fill_path(
+        &path,
+        &paint,
+        FillRule::Winding,
+        Transform::identity(),
+        None,
+    );
 
     for (i, px) in pixmap.pixels().iter().enumerate() {
         let c = px.demultiply();
@@ -806,12 +838,17 @@ mod tests {
             height: 540.0,
         };
         let (ew, eh) = raster.content_size(&ellipse, 64, 64).unwrap();
-        assert!((55..=58).contains(&ew) && (30..=32).contains(&eh), "{ew}x{eh}");
+        assert!(
+            (55..=58).contains(&ew) && (30..=32).contains(&eh),
+            "{ew}x{eh}"
+        );
         // Drop-size shapes at 1080p canvas land at 200×200 px.
         let small = Generator::shape(Shape::Rectangle, [255, 255, 255, 255]);
         assert_eq!(raster.content_size(&small, 1920, 1080), Some((200, 200)));
         // Solids cover the whole canvas (no raster involved).
-        let solid = Generator::SolidColor { rgba: [1, 2, 3, 255] };
+        let solid = Generator::SolidColor {
+            rgba: [1, 2, 3, 255],
+        };
         assert_eq!(raster.content_size(&solid, 64, 48), Some((64, 48)));
         // Text measures its laid-out block — smaller than the canvas.
         let text = Generator::text("Hi");
@@ -861,7 +898,10 @@ mod tests {
             .chunks_exact(4)
             .find(|p| p[3] > 220)
             .expect("an opaque glyph pixel");
-        assert!(px[0] > 180 && px[1] < 80 && px[2] < 80, "fill not red: {px:?}");
+        assert!(
+            px[0] > 180 && px[1] < 80 && px[2] < 80,
+            "fill not red: {px:?}"
+        );
     }
 
     #[test]
@@ -908,7 +948,9 @@ mod tests {
     #[test]
     fn stroke_grows_content_box() {
         let mut raster = GeneratorRaster::new();
-        let base = raster.content_size(&Generator::text("Hi"), 512, 256).unwrap();
+        let base = raster
+            .content_size(&Generator::text("Hi"), 512, 256)
+            .unwrap();
         let stroked = styled(
             "Hi",
             TextStyle {
@@ -963,6 +1005,9 @@ mod tests {
         let has_blue = buf
             .chunks_exact(4)
             .any(|p| p[3] > 220 && p[2] > 180 && p[0] < 80 && p[1] < 80);
-        assert!(has_blue, "background card should paint blue pixels behind the text");
+        assert!(
+            has_blue,
+            "background card should paint blue pixels behind the text"
+        );
     }
 }

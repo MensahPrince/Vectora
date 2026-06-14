@@ -285,9 +285,8 @@ pub fn summarize(project: &Project) -> ProjectSummary {
                     duration_frames: clip.timeline.duration.value,
                     content: clip_content(project, &clip.content),
                     link: clip.link.map(|l| l.raw()),
-                    speed: (clip.speed.num != clip.speed.den).then(|| {
-                        f64::from(clip.speed.num) / f64::from(clip.speed.den)
-                    }),
+                    speed: (clip.speed.num != clip.speed.den)
+                        .then(|| f64::from(clip.speed.num) / f64::from(clip.speed.den)),
                     reversed: clip.reversed.then_some(true),
                     speed_ramp: clip.has_speed_curve().then_some(true),
                     pitch_follows_speed: (!clip.preserve_pitch).then_some(true),
@@ -406,10 +405,20 @@ mod tests {
 
         // Insert out of timeline order to prove ordering is by start time.
         let late = project
-            .add_clip(video, media, TimeRange::at_rate(0, 48, R24), RationalTime::new(96, R24))
+            .add_clip(
+                video,
+                media,
+                TimeRange::at_rate(0, 48, R24),
+                RationalTime::new(96, R24),
+            )
             .unwrap();
         let early = project
-            .add_clip(video, media, TimeRange::at_rate(48, 48, R24), RationalTime::new(0, R24))
+            .add_clip(
+                video,
+                media,
+                TimeRange::at_rate(48, 48, R24),
+                RationalTime::new(0, R24),
+            )
             .unwrap();
         project
             .add_generated(
@@ -483,10 +492,12 @@ mod tests {
         let mut project = Project::new("canvas", R24);
         assert_eq!(summarize(&project).canvas, None);
 
-        project.timeline_mut().set_canvas(cutlass_models::CanvasSettings {
-            aspect: cutlass_models::CanvasAspect::Tall9x16,
-            background: [20, 20, 28],
-        });
+        project
+            .timeline_mut()
+            .set_canvas(cutlass_models::CanvasSettings {
+                aspect: cutlass_models::CanvasAspect::Tall9x16,
+                background: [20, 20, 28],
+            });
         assert_eq!(
             summarize(&project).canvas,
             Some(CanvasSummary {
@@ -501,11 +512,7 @@ mod tests {
         let mut project = Project::new("json", R24);
         let track = project.add_track(TrackKind::Text, "T");
         project
-            .add_generated(
-                track,
-                Generator::text("hi"),
-                TimeRange::at_rate(0, 24, R24),
-            )
+            .add_generated(track, Generator::text("hi"), TimeRange::at_rate(0, 24, R24))
             .unwrap();
 
         let summary_json = serde_json::to_value(summarize(&project)).unwrap();

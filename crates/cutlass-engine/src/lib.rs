@@ -17,7 +17,8 @@ pub use composite::{
     anchor_canvas_position, composite_canvas_config, composite_canvas_size, content_uv,
     cropped_layer_placement, layer_placement, position_preserving_center, reposition_anchor,
 };
-pub use generator_raster::system_font_families;
+pub use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
+pub use cutlass_encoder::{ExportConfig, ExportStats};
 pub use engine::{ColorConvertPath, DEFAULT_CACHE_BUDGET_BYTES, Engine, EngineConfig};
 pub use error::EngineError;
 pub use export::{
@@ -26,8 +27,7 @@ pub use export::{
 };
 pub use export_audio::EXPORT_AUDIO_RATE;
 pub use frame::RgbaFrame;
-pub use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
-pub use cutlass_encoder::{ExportConfig, ExportStats};
+pub use generator_raster::system_font_families;
 
 use tracing::info;
 

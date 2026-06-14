@@ -26,7 +26,10 @@ pub fn execute(
 }
 
 impl EditAction for RemoveTrackAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let order_index = ctx
             .project
             .timeline()
@@ -39,15 +42,15 @@ impl EditAction for RemoveTrackAction {
             .timeline_mut()
             .remove_track(self.track_id)
             .ok_or(ModelError::UnknownTrack(self.track_id))?;
-        Ok(Box::new(InsertTrackAction {
-            track,
-            order_index,
-        }))
+        Ok(Box::new(InsertTrackAction { track, order_index }))
     }
 }
 
 impl EditAction for InsertTrackAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let id = self.track.id;
         ctx.project
             .timeline_mut()

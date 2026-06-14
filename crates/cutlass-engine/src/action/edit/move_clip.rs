@@ -34,7 +34,10 @@ pub fn execute(
 }
 
 impl EditAction for MoveClipAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         execute(ctx, self.clip, self.to_track, self.start).map(|inv| inv)
     }
 }

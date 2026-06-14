@@ -22,6 +22,7 @@ pub fn set_audio(
         .clip(clip)
         .cloned()
         .ok_or(ModelError::UnknownClip(clip))?;
-    ctx.project.set_clip_audio(clip, volume, fade_in, fade_out)?;
+    ctx.project
+        .set_clip_audio(clip, volume, fade_in, fade_out)?;
     Ok(Box::new(RestoreClipAction { clip: before }))
 }

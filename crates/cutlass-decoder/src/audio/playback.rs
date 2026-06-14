@@ -82,7 +82,9 @@ impl AudioReader {
 
         let rate = decoder.rate();
         if rate == 0 {
-            return Err(DecodeError::unsupported("audio stream reports zero sample rate"));
+            return Err(DecodeError::unsupported(
+                "audio stream reports zero sample rate",
+            ));
         }
         let in_layout = if decoder.channel_layout().channels() == 0 {
             ChannelLayout::default(i32::from(decoder.channels()))
@@ -153,7 +155,10 @@ impl AudioReader {
         let us = (i128::from(target) * 1_000_000 / i128::from(self.out_rate)) as i64;
         let us = (us - PREROLL_US).max(0);
         if self.input.seek(us, ..us).is_err() {
-            debug!(target, us, "audio seek failed; decoding from current position");
+            debug!(
+                target,
+                us, "audio seek failed; decoding from current position"
+            );
         }
         self.decoder.flush();
         // swresample keeps cross-call state; recreate instead of flushing so
@@ -252,8 +257,7 @@ impl AudioReader {
                             * i128::from(self.time_base.numerator())
                             * i128::from(self.out_rate)
                             / i128::from(self.time_base.denominator().max(1));
-                        self.position =
-                            Some(frames.clamp(0, i128::from(i64::MAX)) as i64);
+                        self.position = Some(frames.clamp(0, i128::from(i64::MAX)) as i64);
                     }
                     let mut converted = Audio::empty();
                     self.resampler
@@ -397,9 +401,7 @@ mod tests {
         let mut all = vec![0f32; total * CHANNELS];
         let mut filled = 0;
         while filled < total {
-            let n = seq
-                .read(&mut all[filled * CHANNELS..])
-                .expect("read");
+            let n = seq.read(&mut all[filled * CHANNELS..]).expect("read");
             if n == 0 {
                 return; // asset shorter than 1s: nothing to compare
             }
@@ -480,7 +482,9 @@ mod tests {
         };
         let mut reader = AudioReader::open(&path, RATE).expect("open");
         // Jump far past any sane asset length.
-        reader.seek_to_frame(i64::from(RATE) * 36_000).expect("seek");
+        reader
+            .seek_to_frame(i64::from(RATE) * 36_000)
+            .expect("seek");
         let mut buf = vec![0f32; 256 * CHANNELS];
         let n = reader.read(&mut buf).expect("read");
         assert_eq!(n, 0, "stream exhausted past EOF");

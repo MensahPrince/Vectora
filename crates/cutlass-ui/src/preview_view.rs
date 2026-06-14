@@ -143,7 +143,10 @@ mod tests {
         approx(clamp_view(CW, CH, VW, VH, 0.0001, 0.0, 0.0).zoom, MIN_ZOOM);
         approx(clamp_view(CW, CH, VW, VH, 999.0, 0.0, 0.0).zoom, MAX_ZOOM);
         // A non-finite zoom (degenerate divide upstream) falls back to fit.
-        approx(clamp_view(CW, CH, VW, VH, f32::NAN, 0.0, 0.0).zoom, FIT_ZOOM);
+        approx(
+            clamp_view(CW, CH, VW, VH, f32::NAN, 0.0, 0.0).zoom,
+            FIT_ZOOM,
+        );
     }
 
     #[test]
@@ -185,16 +188,39 @@ mod tests {
         let cursor = (720.0, 405.0); // arbitrary off-center point
         let before = clamp_view(CW, CH, VW, VH, 1.0, 0.0, 0.0);
         let after = zoom_to(
-            CW, CH, VW, VH, before.zoom, before.pan_x, before.pan_y, cursor.0, cursor.1, 3.0,
+            CW,
+            CH,
+            VW,
+            VH,
+            before.zoom,
+            before.pan_x,
+            before.pan_y,
+            cursor.0,
+            cursor.1,
+            3.0,
         );
 
         // Canvas point under the cursor before the zoom.
-        let (s0, ox0, oy0) =
-            crate::preview_select::viewport_mapping(CW, CH, VW, VH, before.zoom, before.pan_x, before.pan_y);
+        let (s0, ox0, oy0) = crate::preview_select::viewport_mapping(
+            CW,
+            CH,
+            VW,
+            VH,
+            before.zoom,
+            before.pan_x,
+            before.pan_y,
+        );
         let canvas_pt = ((cursor.0 - ox0) / s0, (cursor.1 - oy0) / s0);
         // Where that canvas point sits after the zoom.
-        let (s1, ox1, oy1) =
-            crate::preview_select::viewport_mapping(CW, CH, VW, VH, after.zoom, after.pan_x, after.pan_y);
+        let (s1, ox1, oy1) = crate::preview_select::viewport_mapping(
+            CW,
+            CH,
+            VW,
+            VH,
+            after.zoom,
+            after.pan_x,
+            after.pan_y,
+        );
         approx(ox1 + canvas_pt.0 * s1, cursor.0);
         approx(oy1 + canvas_pt.1 * s1, cursor.1);
     }
@@ -204,8 +230,16 @@ mod tests {
         // Zooming anchored at the extreme corner can't push pan past the
         // legal range for the new zoom.
         let v = zoom_to(CW, CH, VW, VH, 1.0, 0.0, 0.0, VW, VH, 2.0);
-        assert!(v.pan_x.abs() <= 480.0 + 1e-3, "pan_x {} out of range", v.pan_x);
-        assert!(v.pan_y.abs() <= 270.0 + 1e-3, "pan_y {} out of range", v.pan_y);
+        assert!(
+            v.pan_x.abs() <= 480.0 + 1e-3,
+            "pan_x {} out of range",
+            v.pan_x
+        );
+        assert!(
+            v.pan_y.abs() <= 270.0 + 1e-3,
+            "pan_y {} out of range",
+            v.pan_y
+        );
     }
 
     #[test]

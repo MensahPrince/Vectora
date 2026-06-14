@@ -197,18 +197,15 @@ mod tests {
             ClipId::from_raw(20),
         ];
         ids.sort();
-        assert_eq!(
-            ids.map(|id| id.raw()),
-            [10, 20, 30]
-        );
+        assert_eq!(ids.map(|id| id.raw()), [10, 20, 30]);
     }
 
     // --- Hash -------------------------------------------------------------
 
     #[test]
     fn hash_is_stable_for_equal_ids() {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         fn hash_of<T: Hash>(value: &T) -> u64 {
             let mut hasher = DefaultHasher::new();

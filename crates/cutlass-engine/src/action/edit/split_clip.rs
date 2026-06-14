@@ -38,18 +38,23 @@ pub fn execute(
 }
 
 impl EditAction for SplitClipAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         execute(ctx, self.clip, self.at).map(|(_, inv)| inv)
     }
 }
 
 impl EditAction for MergeSplitAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         ctx.project
             .remove_clip(self.right_id)
             .ok_or(ModelError::UnknownClip(self.right_id))?;
-        *ctx
-            .project
+        *ctx.project
             .timeline_mut()
             .clip_mut(self.left_id)
             .ok_or(ModelError::UnknownClip(self.left_id))? = self.restored;

@@ -7,10 +7,10 @@
 
 use std::sync::atomic::AtomicBool;
 
-use cutlass_ai::agent::{run_prompt, AgentConfig, AgentEvent, EngineBridge};
+use cutlass_ai::agent::{AgentConfig, AgentEvent, EngineBridge, run_prompt};
 use cutlass_ai::config::{default_config_path, load_ai_config};
 use cutlass_ai::providers::OpenAiCompatProvider;
-use cutlass_ai::{summarize, validate, EditorContext, ProjectSummary, WireCommand};
+use cutlass_ai::{EditorContext, ProjectSummary, WireCommand, summarize, validate};
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, ColorConvertPath, Engine, EngineConfig};
 use cutlass_models::{MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind};

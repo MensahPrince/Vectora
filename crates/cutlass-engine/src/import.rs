@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use cutlass_cache::{CacheSpec, FrameCache, SourceFingerprint};
-use cutlass_probe::probe;
 use cutlass_models::MediaSource;
+use cutlass_probe::probe;
 use tracing::debug;
 
 use crate::error::EngineError;

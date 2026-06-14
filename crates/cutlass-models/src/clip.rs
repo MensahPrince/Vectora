@@ -366,9 +366,13 @@ impl CropRect {
     /// finite fields, `w`/`h` at least [`MIN_CROP_FRACTION`], edges within
     /// `0..=1`.
     pub fn validate(&self) -> Result<(), ModelError> {
-        let finite = [self.x, self.y, self.w, self.h].iter().all(|v| v.is_finite());
+        let finite = [self.x, self.y, self.w, self.h]
+            .iter()
+            .all(|v| v.is_finite());
         if !finite {
-            return Err(ModelError::InvalidParam("crop: non-finite component".into()));
+            return Err(ModelError::InvalidParam(
+                "crop: non-finite component".into(),
+            ));
         }
         if self.w < MIN_CROP_FRACTION || self.h < MIN_CROP_FRACTION {
             return Err(ModelError::InvalidParam(format!(
@@ -449,10 +453,14 @@ impl ClipTransform {
             return Err(ModelError::InvalidTransform("non-finite component".into()));
         }
         if self.scale <= 0.0 {
-            return Err(ModelError::InvalidTransform("scale must be positive".into()));
+            return Err(ModelError::InvalidTransform(
+                "scale must be positive".into(),
+            ));
         }
         if !(0.0..=1.0).contains(&self.opacity) {
-            return Err(ModelError::InvalidTransform("opacity must be in 0..=1".into()));
+            return Err(ModelError::InvalidTransform(
+                "opacity must be in 0..=1".into(),
+            ));
         }
         Ok(())
     }
@@ -490,7 +498,10 @@ pub enum ClipParam {
     /// index into [`Clip::effects`], `param` the catalog slot. Routed to the
     /// effect's `Param<f32>` instead of the transform, so the same keyframe
     /// commands drive effect curves. Always carries a [`ParamValue::Scalar`].
-    Effect { effect: u32, param: u32 },
+    Effect {
+        effect: u32,
+        param: u32,
+    },
 }
 
 /// A value for a [`ClipParam`]: scalar properties take `Scalar`, `position`
@@ -536,7 +547,10 @@ pub struct AnimatedTransform {
     #[serde(default = "default_position_param")]
     pub position: Param<[f32; 2]>,
     /// Pivot within the content bounds (see [`ClipTransform::anchor_point`]).
-    #[serde(default = "default_anchor_point_param", skip_serializing_if = "is_default_anchor_param")]
+    #[serde(
+        default = "default_anchor_point_param",
+        skip_serializing_if = "is_default_anchor_param"
+    )]
     pub anchor_point: Param<[f32; 2]>,
     /// Uniform scale (see [`ClipTransform::scale`]).
     #[serde(default = "default_scale_param")]
@@ -622,7 +636,8 @@ impl AnimatedTransform {
     /// clip behaves exactly like the pre-M2 `set_constant`.
     pub fn compose_at(&mut self, transform: ClipTransform, tick: i64) {
         if self.position.is_animated() {
-            self.position.set_keyframe(tick, transform.position, Easing::Linear);
+            self.position
+                .set_keyframe(tick, transform.position, Easing::Linear);
         } else {
             self.position.set_constant(transform.position);
         }
@@ -633,17 +648,20 @@ impl AnimatedTransform {
             self.anchor_point.set_constant(transform.anchor_point);
         }
         if self.scale.is_animated() {
-            self.scale.set_keyframe(tick, transform.scale, Easing::Linear);
+            self.scale
+                .set_keyframe(tick, transform.scale, Easing::Linear);
         } else {
             self.scale.set_constant(transform.scale);
         }
         if self.rotation.is_animated() {
-            self.rotation.set_keyframe(tick, transform.rotation, Easing::Linear);
+            self.rotation
+                .set_keyframe(tick, transform.rotation, Easing::Linear);
         } else {
             self.rotation.set_constant(transform.rotation);
         }
         if self.opacity.is_animated() {
-            self.opacity.set_keyframe(tick, transform.opacity, Easing::Linear);
+            self.opacity
+                .set_keyframe(tick, transform.opacity, Easing::Linear);
         } else {
             self.opacity.set_constant(transform.opacity);
         }
@@ -715,7 +733,11 @@ impl AnimatedTransform {
     }
 
     /// Replace one property with a constant, dropping its keyframes.
-    pub fn set_param_constant(&mut self, param: ClipParam, value: ParamValue) -> Result<(), ModelError> {
+    pub fn set_param_constant(
+        &mut self,
+        param: ClipParam,
+        value: ParamValue,
+    ) -> Result<(), ModelError> {
         match param {
             ClipParam::Position => {
                 let v = value.vec2()?;
@@ -796,7 +818,9 @@ fn validate_scale(v: f32) -> Result<(), ModelError> {
         return Err(ModelError::InvalidTransform("non-finite component".into()));
     }
     if v <= 0.0 {
-        return Err(ModelError::InvalidTransform("scale must be positive".into()));
+        return Err(ModelError::InvalidTransform(
+            "scale must be positive".into(),
+        ));
     }
     Ok(())
 }
@@ -814,7 +838,9 @@ fn validate_opacity(v: f32) -> Result<(), ModelError> {
         return Err(ModelError::InvalidTransform("non-finite component".into()));
     }
     if !(0.0..=1.0).contains(&v) {
-        return Err(ModelError::InvalidTransform("opacity must be in 0..=1".into()));
+        return Err(ModelError::InvalidTransform(
+            "opacity must be in 0..=1".into(),
+        ));
     }
     Ok(())
 }
@@ -883,7 +909,10 @@ pub struct Clip {
     /// re-derives from the curve's average (see [`Clip::source_time_at`] and
     /// [`crate::Project::set_clip_speed_curve`]). Meaningful on media clips
     /// only.
-    #[serde(default = "default_speed_curve", skip_serializing_if = "is_unit_speed_curve")]
+    #[serde(
+        default = "default_speed_curve",
+        skip_serializing_if = "is_unit_speed_curve"
+    )]
     pub speed_curve: Param<f32>,
     /// Preserve pitch while retiming (CapCut's "pitch" toggle, M8 Phase 3).
     /// `true` (the default) time-stretches the audio so a sped-up clip keeps
@@ -1222,7 +1251,10 @@ impl Clip {
     /// rate). `reversed` walks the source window backward from its end. The
     /// result clamps into the source window so duration rounding can never
     /// read past an edge.
-    pub fn source_time_at(&self, timeline_pos: RationalTime) -> Result<Option<RationalTime>, ModelError> {
+    pub fn source_time_at(
+        &self,
+        timeline_pos: RationalTime,
+    ) -> Result<Option<RationalTime>, ModelError> {
         if !self.timeline.contains(timeline_pos)? {
             return Ok(None);
         }
@@ -1249,7 +1281,8 @@ impl Clip {
                 } else {
                     // Flat ramp: the exact rational fast path (zero f64 drift),
                     // identical to M1 constant speed.
-                    let scaled = RationalTime::new(self.scale_by_speed(offset_tl.value), offset_tl.rate);
+                    let scaled =
+                        RationalTime::new(self.scale_by_speed(offset_tl.value), offset_tl.rate);
                     resample(scaled, source.start.rate).value
                 };
                 let tick = if self.reversed {
@@ -1407,11 +1440,7 @@ mod tests {
         TimeRange::at_rate(start, duration, rate)
     }
 
-    fn media_clip(
-        media: MediaId,
-        source: TimeRange,
-        timeline: TimeRange,
-    ) -> Clip {
+    fn media_clip(media: MediaId, source: TimeRange, timeline: TimeRange) -> Clip {
         Clip::from_media(media, source, timeline)
     }
 
@@ -1424,13 +1453,7 @@ mod tests {
         let timeline = tr(10, 40, R24);
         let clip = media_clip(media, source, timeline);
 
-        assert_eq!(
-            clip.content,
-            ClipSource::Media {
-                media,
-                source,
-            }
-        );
+        assert_eq!(clip.content, ClipSource::Media { media, source });
         assert_eq!(clip.timeline, timeline);
         assert!(!clip.is_generated());
     }
@@ -1539,11 +1562,7 @@ mod tests {
     #[test]
     fn source_time_at_same_rate_maps_one_to_one() {
         // source [100, 110) placed at timeline [10, 20) — 1:1 at 24fps.
-        let clip = media_clip(
-            MediaId::from_raw(1),
-            tr(100, 10, R24),
-            tr(10, 10, R24),
-        );
+        let clip = media_clip(MediaId::from_raw(1), tr(100, 10, R24), tr(10, 10, R24));
 
         assert_eq!(
             clip.source_time_at(rt(15, R24)).unwrap(),
@@ -1561,11 +1580,7 @@ mod tests {
 
     #[test]
     fn source_time_at_half_open_boundaries() {
-        let clip = media_clip(
-            MediaId::from_raw(1),
-            tr(0, 10, R24),
-            tr(10, 10, R24),
-        );
+        let clip = media_clip(MediaId::from_raw(1), tr(0, 10, R24), tr(10, 10, R24));
 
         // Exclusive end is not contained.
         assert_eq!(clip.source_time_at(rt(20, R24)).unwrap(), None);
@@ -1586,11 +1601,7 @@ mod tests {
     #[test]
     fn source_time_at_resamples_across_rates() {
         // 120 source ticks @ 30fps -> 96 timeline ticks @ 24fps.
-        let clip = media_clip(
-            MediaId::from_raw(1),
-            tr(0, 120, R30),
-            tr(0, 96, R24),
-        );
+        let clip = media_clip(MediaId::from_raw(1), tr(0, 120, R30), tr(0, 96, R24));
 
         // Timeline midpoint should land near source midpoint after resample.
         let src = clip.source_time_at(rt(48, R24)).unwrap().unwrap();
@@ -1599,20 +1610,13 @@ mod tests {
         assert_eq!(src.value, 60);
 
         // Timeline start maps to source start regardless of rate.
-        assert_eq!(
-            clip.source_time_at(rt(0, R24)).unwrap(),
-            Some(rt(0, R30))
-        );
+        assert_eq!(clip.source_time_at(rt(0, R24)).unwrap(), Some(rt(0, R30)));
     }
 
     #[test]
     fn source_time_at_offset_from_nonzero_source_start() {
         // source [200, 300) @ 30fps at timeline [0, 80) @ 24fps.
-        let clip = media_clip(
-            MediaId::from_raw(1),
-            tr(200, 100, R30),
-            tr(0, 80, R24),
-        );
+        let clip = media_clip(MediaId::from_raw(1), tr(200, 100, R30), tr(0, 80, R24));
 
         let at_start = clip.source_time_at(rt(0, R24)).unwrap().unwrap();
         assert_eq!(at_start, rt(200, R30));
@@ -1631,8 +1635,14 @@ mod tests {
         clip.speed = Rational::new(2, 1);
         assert!(clip.is_retimed());
         assert_eq!(clip.source_time_at(rt(0, R24)).unwrap(), Some(rt(100, R24)));
-        assert_eq!(clip.source_time_at(rt(20, R24)).unwrap(), Some(rt(140, R24)));
-        assert_eq!(clip.source_time_at(rt(49, R24)).unwrap(), Some(rt(198, R24)));
+        assert_eq!(
+            clip.source_time_at(rt(20, R24)).unwrap(),
+            Some(rt(140, R24))
+        );
+        assert_eq!(
+            clip.source_time_at(rt(49, R24)).unwrap(),
+            Some(rt(198, R24))
+        );
     }
 
     #[test]
@@ -1653,8 +1663,14 @@ mod tests {
         clip.reversed = true;
         assert!(clip.is_retimed());
         assert_eq!(clip.source_time_at(rt(0, R24)).unwrap(), Some(rt(149, R24)));
-        assert_eq!(clip.source_time_at(rt(25, R24)).unwrap(), Some(rt(124, R24)));
-        assert_eq!(clip.source_time_at(rt(49, R24)).unwrap(), Some(rt(100, R24)));
+        assert_eq!(
+            clip.source_time_at(rt(25, R24)).unwrap(),
+            Some(rt(124, R24))
+        );
+        assert_eq!(
+            clip.source_time_at(rt(49, R24)).unwrap(),
+            Some(rt(100, R24))
+        );
     }
 
     #[test]
@@ -1664,8 +1680,14 @@ mod tests {
         clip.speed = Rational::new(2, 1);
         clip.reversed = true;
         assert_eq!(clip.source_time_at(rt(0, R24)).unwrap(), Some(rt(149, R24)));
-        assert_eq!(clip.source_time_at(rt(10, R24)).unwrap(), Some(rt(129, R24)));
-        assert_eq!(clip.source_time_at(rt(24, R24)).unwrap(), Some(rt(101, R24)));
+        assert_eq!(
+            clip.source_time_at(rt(10, R24)).unwrap(),
+            Some(rt(129, R24))
+        );
+        assert_eq!(
+            clip.source_time_at(rt(24, R24)).unwrap(),
+            Some(rt(101, R24))
+        );
     }
 
     #[test]
@@ -1745,8 +1767,16 @@ mod tests {
     fn linear_ramp(v0: f32, v1: f32) -> Param<f32> {
         Param::Keyframed {
             keyframes: vec![
-                Keyframe { tick: 0, value: v0, easing: Easing::Linear },
-                Keyframe { tick: SPEED_CURVE_SCALE, value: v1, easing: Easing::Linear },
+                Keyframe {
+                    tick: 0,
+                    value: v0,
+                    easing: Easing::Linear,
+                },
+                Keyframe {
+                    tick: SPEED_CURVE_SCALE,
+                    value: v1,
+                    easing: Easing::Linear,
+                },
             ],
         }
     }
@@ -1779,7 +1809,10 @@ mod tests {
         // Linear 1 → 3 ramp: ∫₀ᵖ (1+2q) dq / 2 = (p + p²)/2.
         let curve = linear_ramp(1.0, 3.0);
         assert_eq!(speed_curve_source_fraction(&curve, 0.0), 0.0);
-        assert!((speed_curve_source_fraction(&curve, 1.0) - 1.0).abs() < 1e-9, "ends at 1");
+        assert!(
+            (speed_curve_source_fraction(&curve, 1.0) - 1.0).abs() < 1e-9,
+            "ends at 1"
+        );
         assert!(
             (speed_curve_source_fraction(&curve, 0.5) - (0.5 + 0.25) / 2.0).abs() < 1e-9,
             "midpoint sweeps the analytic fraction"
@@ -1798,7 +1831,10 @@ mod tests {
             .unwrap()
             .unwrap();
         let expected = (src_dur * speed_curve_source_fraction(&curve, 0.5)).round() as i64;
-        assert_eq!(src.value, expected, "audio fraction matches the video mapping");
+        assert_eq!(
+            src.value, expected,
+            "audio fraction matches the video mapping"
+        );
     }
 
     #[test]
@@ -1806,7 +1842,11 @@ mod tests {
         let mut clip = media_clip(MediaId::from_raw(1), tr(0, 100, R24), tr(0, 100, R24));
         // One mid keyframe: constant 2.0 everywhere (flat extrapolation).
         clip.speed_curve = Param::Keyframed {
-            keyframes: vec![Keyframe { tick: SPEED_CURVE_SCALE / 2, value: 2.0, easing: Easing::Linear }],
+            keyframes: vec![Keyframe {
+                tick: SPEED_CURVE_SCALE / 2,
+                value: 2.0,
+                easing: Easing::Linear,
+            }],
         };
         assert!((clip.speed_curve_integral(0.25) - 0.5).abs() < 1e-6);
         assert!((clip.speed_curve_average() - 2.0).abs() < 1e-6);
@@ -1819,9 +1859,21 @@ mod tests {
         let mut clip = media_clip(MediaId::from_raw(1), tr(0, 100, R24), tr(0, 100, R24));
         clip.speed_curve = Param::Keyframed {
             keyframes: vec![
-                Keyframe { tick: 0, value: 0.5, easing: Easing::Linear },
-                Keyframe { tick: SPEED_CURVE_SCALE / 2, value: 2.0, easing: Easing::Linear },
-                Keyframe { tick: SPEED_CURVE_SCALE, value: 0.5, easing: Easing::Linear },
+                Keyframe {
+                    tick: 0,
+                    value: 0.5,
+                    easing: Easing::Linear,
+                },
+                Keyframe {
+                    tick: SPEED_CURVE_SCALE / 2,
+                    value: 2.0,
+                    easing: Easing::Linear,
+                },
+                Keyframe {
+                    tick: SPEED_CURVE_SCALE,
+                    value: 0.5,
+                    easing: Easing::Linear,
+                },
             ],
         };
         let start = clip.source_time_at(rt(0, R24)).unwrap().unwrap();
@@ -1852,7 +1904,11 @@ mod tests {
         assert!(validate_speed_curve(&linear_ramp(0.0, 1.0)).is_err());
         // Tick outside the normalized span.
         let bad_tick = Param::Keyframed {
-            keyframes: vec![Keyframe { tick: SPEED_CURVE_SCALE + 1, value: 1.0, easing: Easing::Linear }],
+            keyframes: vec![Keyframe {
+                tick: SPEED_CURVE_SCALE + 1,
+                value: 1.0,
+                easing: Easing::Linear,
+            }],
         };
         assert!(validate_speed_curve(&bad_tick).is_err());
         // A sane ramp passes.
@@ -1929,8 +1985,16 @@ mod tests {
         let mut clip = media_clip(MediaId::from_raw(1), tr(0, 48, R24), tr(0, 48, R24));
         clip.volume = Param::Keyframed {
             keyframes: vec![
-                Keyframe { tick: 0, value: 0.0, easing: Easing::Linear },
-                Keyframe { tick: 24, value: 1.0, easing: Easing::EaseOut },
+                Keyframe {
+                    tick: 0,
+                    value: 0.0,
+                    easing: Easing::Linear,
+                },
+                Keyframe {
+                    tick: 24,
+                    value: 1.0,
+                    easing: Easing::EaseOut,
+                },
             ],
         };
         assert!(clip.has_volume_envelope());
@@ -1982,8 +2046,16 @@ mod tests {
         // A 0→1 ramp envelope over the span: the gain tracks the curve.
         let env = Param::Keyframed {
             keyframes: vec![
-                Keyframe { tick: 0, value: 0.0, easing: Easing::Linear },
-                Keyframe { tick: 100, value: 1.0, easing: Easing::Linear },
+                Keyframe {
+                    tick: 0,
+                    value: 0.0,
+                    easing: Easing::Linear,
+                },
+                Keyframe {
+                    tick: 100,
+                    value: 1.0,
+                    easing: Easing::Linear,
+                },
             ],
         };
         assert_eq!(audio_gain_at(0, 100, &env, 0, 0), 0.0);
@@ -2046,19 +2118,58 @@ mod tests {
         // Degenerate extents.
         for (w, h) in [(0.0, 1.0), (1.0, 0.0), (0.001, 1.0)] {
             assert!(
-                CropRect { x: 0.0, y: 0.0, w, h }.validate().is_err(),
+                CropRect {
+                    x: 0.0,
+                    y: 0.0,
+                    w,
+                    h
+                }
+                .validate()
+                .is_err(),
                 "w={w} h={h} must be rejected"
             );
         }
         // Out of frame.
-        assert!(CropRect { x: -0.1, y: 0.0, w: 0.5, h: 0.5 }.validate().is_err());
-        assert!(CropRect { x: 0.6, y: 0.0, w: 0.5, h: 0.5 }.validate().is_err());
-        assert!(CropRect { x: 0.0, y: 0.9, w: 0.5, h: 0.2 }.validate().is_err());
+        assert!(
+            CropRect {
+                x: -0.1,
+                y: 0.0,
+                w: 0.5,
+                h: 0.5
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            CropRect {
+                x: 0.6,
+                y: 0.0,
+                w: 0.5,
+                h: 0.5
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            CropRect {
+                x: 0.0,
+                y: 0.9,
+                w: 0.5,
+                h: 0.2
+            }
+            .validate()
+            .is_err()
+        );
         // Non-finite.
         assert!(
-            CropRect { x: f32::NAN, y: 0.0, w: 1.0, h: 1.0 }
-                .validate()
-                .is_err()
+            CropRect {
+                x: f32::NAN,
+                y: 0.0,
+                w: 1.0,
+                h: 1.0
+            }
+            .validate()
+            .is_err()
         );
     }
 
@@ -2149,10 +2260,20 @@ mod tests {
     fn keyframed_transform_roundtrips() {
         let mut clip = Clip::generated(Generator::Adjustment, tr(0, 48, R24));
         clip.transform
-            .set_param_keyframe(ClipParam::Opacity, 0, ParamValue::Scalar(0.0), Easing::Linear)
+            .set_param_keyframe(
+                ClipParam::Opacity,
+                0,
+                ParamValue::Scalar(0.0),
+                Easing::Linear,
+            )
             .unwrap();
         clip.transform
-            .set_param_keyframe(ClipParam::Opacity, 24, ParamValue::Scalar(1.0), Easing::EaseOut)
+            .set_param_keyframe(
+                ClipParam::Opacity,
+                24,
+                ParamValue::Scalar(1.0),
+                Easing::EaseOut,
+            )
             .unwrap();
         let json = serde_json::to_string(&clip).expect("serialize");
         let loaded: Clip = serde_json::from_str(&json).expect("deserialize");
@@ -2167,8 +2288,13 @@ mod tests {
         let mut t = AnimatedTransform::identity();
         t.set_param_keyframe(ClipParam::Scale, 0, ParamValue::Scalar(1.0), Easing::Linear)
             .unwrap();
-        t.set_param_keyframe(ClipParam::Scale, 10, ParamValue::Scalar(2.0), Easing::Linear)
-            .unwrap();
+        t.set_param_keyframe(
+            ClipParam::Scale,
+            10,
+            ParamValue::Scalar(2.0),
+            Easing::Linear,
+        )
+        .unwrap();
         // Scale animates; everything else stays constant.
         let mid = t.sample(5);
         assert_eq!(mid.scale, 1.5);
@@ -2181,8 +2307,13 @@ mod tests {
         let mut t = AnimatedTransform::identity();
         t.set_param_keyframe(ClipParam::Scale, 0, ParamValue::Scalar(1.0), Easing::Linear)
             .unwrap();
-        t.set_param_keyframe(ClipParam::Scale, 20, ParamValue::Scalar(3.0), Easing::Linear)
-            .unwrap();
+        t.set_param_keyframe(
+            ClipParam::Scale,
+            20,
+            ParamValue::Scalar(3.0),
+            Easing::Linear,
+        )
+        .unwrap();
 
         let edit = ClipTransform {
             position: [0.3, 0.0],
@@ -2218,7 +2349,12 @@ mod tests {
     fn param_kind_mismatch_rejected() {
         let mut t = AnimatedTransform::identity();
         assert!(matches!(
-            t.set_param_keyframe(ClipParam::Scale, 0, ParamValue::Vec2([1.0, 1.0]), Easing::Linear),
+            t.set_param_keyframe(
+                ClipParam::Scale,
+                0,
+                ParamValue::Vec2([1.0, 1.0]),
+                Easing::Linear
+            ),
             Err(ModelError::InvalidParam(_))
         ));
         assert!(matches!(
@@ -2230,15 +2366,28 @@ mod tests {
     #[test]
     fn param_values_validated_per_property() {
         let mut t = AnimatedTransform::identity();
-        assert!(t
-            .set_param_keyframe(ClipParam::Scale, 0, ParamValue::Scalar(-1.0), Easing::Linear)
-            .is_err());
-        assert!(t
-            .set_param_keyframe(ClipParam::Opacity, 0, ParamValue::Scalar(1.5), Easing::Linear)
-            .is_err());
-        assert!(t
-            .set_param_constant(ClipParam::Position, ParamValue::Vec2([f32::NAN, 0.0]))
-            .is_err());
+        assert!(
+            t.set_param_keyframe(
+                ClipParam::Scale,
+                0,
+                ParamValue::Scalar(-1.0),
+                Easing::Linear
+            )
+            .is_err()
+        );
+        assert!(
+            t.set_param_keyframe(
+                ClipParam::Opacity,
+                0,
+                ParamValue::Scalar(1.5),
+                Easing::Linear
+            )
+            .is_err()
+        );
+        assert!(
+            t.set_param_constant(ClipParam::Position, ParamValue::Vec2([f32::NAN, 0.0]))
+                .is_err()
+        );
     }
 
     #[test]
@@ -2291,11 +2440,7 @@ mod tests {
         }"#;
         let clip: Clip = serde_json::from_str(json).expect("deserialize legacy shape clip");
         match clip.content {
-            ClipSource::Generated(Generator::Shape {
-                width,
-                height,
-                ..
-            }) => {
+            ClipSource::Generated(Generator::Shape { width, height, .. }) => {
                 assert_eq!(width, 960.0);
                 assert_eq!(height, 540.0);
             }
@@ -2342,7 +2487,10 @@ mod tests {
         let json = serde_json::to_string(&clip).expect("serialize");
         let loaded: Clip = serde_json::from_str(&json).expect("deserialize");
         match loaded.content {
-            ClipSource::Generated(Generator::Text { content, style: got }) => {
+            ClipSource::Generated(Generator::Text {
+                content,
+                style: got,
+            }) => {
                 assert_eq!(content, "Styled");
                 assert_eq!(got, style);
             }
@@ -2406,11 +2554,7 @@ mod tests {
 
     #[test]
     fn source_time_at_rate_mismatch_errors() {
-        let clip = media_clip(
-            MediaId::from_raw(1),
-            tr(0, 10, R24),
-            tr(0, 10, R24),
-        );
+        let clip = media_clip(MediaId::from_raw(1), tr(0, 10, R24), tr(0, 10, R24));
         let err = clip.source_time_at(rt(5, R30)).unwrap_err();
         assert_eq!(
             err,

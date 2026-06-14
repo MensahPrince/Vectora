@@ -142,7 +142,8 @@ impl Project {
         name: impl Into<String>,
         order_index: usize,
     ) -> TrackId {
-        self.timeline.insert_track(Track::new(kind, name), order_index)
+        self.timeline
+            .insert_track(Track::new(kind, name), order_index)
     }
 
     /// Place a clip referencing `media_id` on `track_id`.
@@ -171,9 +172,7 @@ impl Project {
         // Stills have no real material bound: one frame repeats for any
         // extent, and the pool duration is only the default placement
         // length — so any window length is legal on image media.
-        if source.start.value < 0
-            || (!media.is_image && source.end_tick() > media.duration.value)
-        {
+        if source.start.value < 0 || (!media.is_image && source.end_tick() > media.duration.value) {
             return Err(ModelError::SourceOutOfBounds);
         }
 
@@ -384,7 +383,9 @@ impl Project {
                 let v = scalar_param(value)?;
                 effect_mut(clip, effect)?.set_param_keyframe(param as usize, tick, v, easing)
             }
-            _ => clip.transform.set_param_keyframe(param, tick, value, easing),
+            _ => clip
+                .transform
+                .set_param_keyframe(param, tick, value, easing),
         }
     }
 
@@ -520,11 +521,15 @@ impl Project {
             .timeline
             .track_of(left)
             .ok_or(ModelError::UnknownClip(left))?;
-        let right = self
-            .right_neighbor(track_id, left)
-            .ok_or_else(|| ModelError::InvalidParam("clip has no abutting clip to its right".into()))?;
-        let transition =
-            Transition::new(left, right, transition_id, crate::transition::DEFAULT_TRANSITION_TICKS);
+        let right = self.right_neighbor(track_id, left).ok_or_else(|| {
+            ModelError::InvalidParam("clip has no abutting clip to its right".into())
+        })?;
+        let transition = Transition::new(
+            left,
+            right,
+            transition_id,
+            crate::transition::DEFAULT_TRANSITION_TICKS,
+        );
         self.timeline
             .track_mut(track_id)
             .ok_or(ModelError::UnknownClip(left))?
@@ -754,7 +759,10 @@ impl Project {
 
         let new_source = match clip.content.clone() {
             ClipSource::Media { media, source } => {
-                let media = self.media.get(&media).ok_or(ModelError::UnknownMedia(media))?;
+                let media = self
+                    .media
+                    .get(&media)
+                    .ok_or(ModelError::UnknownMedia(media))?;
                 // Source ticks consumed per timeline tick scale with the
                 // clip's speed (1:1 for never-retimed clips).
                 let head_delta = clip.scale_by_speed(
@@ -843,7 +851,12 @@ impl Project {
         let src_dur_tl = resample(source.duration, tl_rate).value;
         // Faster average ⇒ less timeline. A flat ramp keeps the exact integer
         // path (no f64 drift); any active ramp folds in its average.
-        let new_dur = retimed_duration(src_dur_tl, speed, clip.speed_curve_average(), clip.has_speed_curve());
+        let new_dur = retimed_duration(
+            src_dur_tl,
+            speed,
+            clip.speed_curve_average(),
+            clip.has_speed_curve(),
+        );
         let new_timeline = TimeRange::at_rate(clip.timeline.start.value, new_dur, tl_rate);
 
         if self
@@ -1296,7 +1309,12 @@ mod tests {
     fn add_transition_links_abutting_pair() {
         let (mut project, left, right, track) = project_with_abutting_pair();
         project.add_transition(left, "crossfade").unwrap();
-        let t = project.timeline().track(track).unwrap().transition_at(left).unwrap();
+        let t = project
+            .timeline()
+            .track(track)
+            .unwrap()
+            .transition_at(left)
+            .unwrap();
         assert_eq!(t.right, right);
         assert_eq!(t.transition_id, "crossfade");
         assert_eq!(t.duration, crate::transition::DEFAULT_TRANSITION_TICKS);
@@ -1326,11 +1344,24 @@ mod tests {
         project.add_transition(left, "wipe_left").unwrap();
         project.set_transition_duration(left, 12).unwrap();
         assert_eq!(
-            project.timeline().track(track).unwrap().transition_at(left).unwrap().duration,
+            project
+                .timeline()
+                .track(track)
+                .unwrap()
+                .transition_at(left)
+                .unwrap()
+                .duration,
             12
         );
         project.remove_transition(left).unwrap();
-        assert!(project.timeline().track(track).unwrap().transition_at(left).is_none());
+        assert!(
+            project
+                .timeline()
+                .track(track)
+                .unwrap()
+                .transition_at(left)
+                .is_none()
+        );
         assert!(matches!(
             project.remove_transition(left),
             Err(ModelError::InvalidParam(_))
@@ -1416,7 +1447,10 @@ mod tests {
             project.find_media_by_path(Path::new("/tmp/sample.mp4")),
             Some(id)
         );
-        assert_eq!(project.find_media_by_path(Path::new("/tmp/other.mp4")), None);
+        assert_eq!(
+            project.find_media_by_path(Path::new("/tmp/other.mp4")),
+            None
+        );
     }
 
     #[test]
@@ -1527,7 +1561,9 @@ mod tests {
     #[test]
     fn add_clip_rejects_overlap() {
         let (mut project, media_id, track) = project_with_media(1000);
-        project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
         assert_eq!(
             project.add_clip(track, media_id, tr(0, 50), rt(50)),
             Err(ModelError::Overlap(track))
@@ -1576,7 +1612,9 @@ mod tests {
     fn remove_clip_returns_clip_and_leaves_gap() {
         let (mut project, media_id, track) = project_with_media(200);
         let a = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
-        let b = project.add_clip(track, media_id, tr(50, 50), rt(100)).unwrap();
+        let b = project
+            .add_clip(track, media_id, tr(50, 50), rt(100))
+            .unwrap();
 
         let removed = project.remove_clip(a).unwrap();
         assert_eq!(removed.id, a);
@@ -1609,10 +1647,7 @@ mod tests {
             .unwrap();
         let generated_right = project.split_clip(generated, rt(250)).unwrap();
         assert_eq!(project.clip(generated).unwrap().timeline, tr(200, 50));
-        assert_eq!(
-            project.clip(generated_right).unwrap().timeline,
-            tr(250, 50)
-        );
+        assert_eq!(project.clip(generated_right).unwrap().timeline, tr(250, 50));
     }
 
     #[test]
@@ -1621,8 +1656,14 @@ mod tests {
         let clip = project
             .add_clip(track, media_id, tr(0, 100), rt(10))
             .unwrap();
-        assert_eq!(project.split_clip(clip, rt(10)), Err(ModelError::InvalidRange));
-        assert_eq!(project.split_clip(clip, rt(110)), Err(ModelError::InvalidRange));
+        assert_eq!(
+            project.split_clip(clip, rt(10)),
+            Err(ModelError::InvalidRange)
+        );
+        assert_eq!(
+            project.split_clip(clip, rt(110)),
+            Err(ModelError::InvalidRange)
+        );
     }
 
     #[test]
@@ -1638,9 +1679,7 @@ mod tests {
     #[test]
     fn split_clip_rejects_wrong_timeline_rate() {
         let (mut project, media_id, track) = project_with_media(100);
-        let clip = project
-            .add_clip(track, media_id, tr(0, 50), rt(0))
-            .unwrap();
+        let clip = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
         assert_eq!(
             project.split_clip(clip, RationalTime::new(25, R30)),
             Err(ModelError::RateMismatch {
@@ -1721,30 +1760,45 @@ mod tests {
     #[test]
     fn set_clip_speed_rescales_timeline_duration() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
 
         // 2× halves the footprint; the source window is untouched.
-        project.set_clip_speed(clip, Rational::new(2, 1), false).unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(2, 1), false)
+            .unwrap();
         let c = project.clip(clip).unwrap();
         assert_eq!(c.timeline, tr(0, 50));
         assert_eq!(c.source_range(), Some(tr(0, 100)));
         assert_eq!(c.speed, Rational::new(2, 1));
 
         // Back to 1× restores the original footprint.
-        project.set_clip_speed(clip, Rational::new(1, 1), false).unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(1, 1), false)
+            .unwrap();
         assert_eq!(project.clip(clip).unwrap().timeline, tr(0, 100));
 
         // Slow motion stretches it.
-        project.set_clip_speed(clip, Rational::new(1, 2), false).unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(1, 2), false)
+            .unwrap();
         assert_eq!(project.clip(clip).unwrap().timeline, tr(0, 200));
     }
 
     #[test]
     fn set_clip_pitch_toggles_the_flag_without_moving_the_clip() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
-        project.set_clip_speed(clip, Rational::new(2, 1), false).unwrap();
-        assert!(project.clip(clip).unwrap().preserve_pitch, "locked by default");
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(2, 1), false)
+            .unwrap();
+        assert!(
+            project.clip(clip).unwrap().preserve_pitch,
+            "locked by default"
+        );
 
         // Unlocking pitch keeps the retimed footprint (pure audio property).
         project.set_clip_pitch(clip, false).unwrap();
@@ -1761,15 +1815,26 @@ mod tests {
         let mut project = Project::new("p", R24);
         let track = project.add_track(TrackKind::Sticker, "T1");
         let clip = project
-            .add_generated(track, Generator::SolidColor { rgba: [0, 0, 0, 255] }, tr(0, 10))
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 0, 255],
+                },
+                tr(0, 10),
+            )
             .unwrap();
-        assert!(project.set_clip_pitch(clip, false).is_err(), "no audio to retime");
+        assert!(
+            project.set_clip_pitch(clip, false).is_err(),
+            "no audio to retime"
+        );
     }
 
     #[test]
     fn set_clip_speed_curve_rederives_duration_from_average() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
 
         // Average 2× ramp halves the footprint (source ÷ avg), like constant 2×.
         let ramp = crate::clip::speed_preset("montage").unwrap();
@@ -1792,22 +1857,39 @@ mod tests {
     #[test]
     fn set_clip_speed_curve_rejects_bad_targets() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
         // Out-of-range ramp value.
         let bad = Param::Keyframed {
             keyframes: vec![
-                crate::param::Keyframe { tick: 0, value: 0.0, easing: Easing::Linear },
-                crate::param::Keyframe { tick: 1000, value: 1.0, easing: Easing::Linear },
+                crate::param::Keyframe {
+                    tick: 0,
+                    value: 0.0,
+                    easing: Easing::Linear,
+                },
+                crate::param::Keyframe {
+                    tick: 1000,
+                    value: 1.0,
+                    easing: Easing::Linear,
+                },
             ],
         };
         assert!(project.set_clip_speed_curve(clip, Some(bad)).is_err());
         // Generated clips cannot be retimed.
         let sticker = project.add_track(TrackKind::Sticker, "S");
         let generated = project
-            .add_generated(sticker, Generator::SolidColor { rgba: [0, 0, 0, 255] }, tr(200, 10))
+            .add_generated(
+                sticker,
+                Generator::SolidColor {
+                    rgba: [0, 0, 0, 255],
+                },
+                tr(200, 10),
+            )
             .unwrap();
         assert!(matches!(
-            project.set_clip_speed_curve(generated, Some(crate::clip::speed_preset("hero").unwrap())),
+            project
+                .set_clip_speed_curve(generated, Some(crate::clip::speed_preset("hero").unwrap())),
             Err(ModelError::InvalidParam(_))
         ));
     }
@@ -1815,9 +1897,13 @@ mod tests {
     #[test]
     fn set_clip_speed_reverse_keeps_duration() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
 
-        project.set_clip_speed(clip, Rational::new(1, 1), true).unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(1, 1), true)
+            .unwrap();
         let c = project.clip(clip).unwrap();
         assert_eq!(c.timeline, tr(0, 100));
         assert!(c.reversed && c.is_retimed());
@@ -1826,7 +1912,9 @@ mod tests {
     #[test]
     fn set_clip_speed_rejects_invalid_targets() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
 
         assert!(matches!(
             project.set_clip_speed(clip, Rational::new(0, 1), false),
@@ -1855,9 +1943,13 @@ mod tests {
     #[test]
     fn set_clip_speed_rejects_overlap_with_neighbor() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
         // Neighbor right behind the clip: slowing to ½× (200 ticks) collides.
-        project.add_clip(track, media_id, tr(0, 50), rt(100)).unwrap();
+        project
+            .add_clip(track, media_id, tr(0, 50), rt(100))
+            .unwrap();
 
         assert_eq!(
             project.set_clip_speed(clip, Rational::new(1, 2), false),
@@ -1874,9 +1966,13 @@ mod tests {
     #[test]
     fn set_clip_audio_sets_volume_and_fades() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
 
-        project.set_clip_audio(clip, Some(0.5), rt(10), rt(20)).unwrap();
+        project
+            .set_clip_audio(clip, Some(0.5), rt(10), rt(20))
+            .unwrap();
         let c = project.clip(clip).unwrap();
         assert_eq!(c.volume.constant(), Some(0.5));
         assert_eq!((c.fade_in, c.fade_out), (10, 20));
@@ -1889,20 +1985,36 @@ mod tests {
         assert_eq!((c.fade_in, c.fade_out), (5, 0));
 
         // Back to defaults clears the custom-audio state.
-        project.set_clip_audio(clip, Some(1.0), rt(0), rt(0)).unwrap();
+        project
+            .set_clip_audio(clip, Some(1.0), rt(0), rt(0))
+            .unwrap();
         assert!(!project.clip(clip).unwrap().has_custom_audio());
     }
 
     #[test]
     fn set_clip_audio_none_volume_preserves_envelope() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
         // A keyframed gain envelope (dips to 0.2 mid-clip).
         project
-            .set_param_keyframe(clip, ClipParam::Volume, rt(0), ParamValue::Scalar(1.0), Easing::Linear)
+            .set_param_keyframe(
+                clip,
+                ClipParam::Volume,
+                rt(0),
+                ParamValue::Scalar(1.0),
+                Easing::Linear,
+            )
             .unwrap();
         project
-            .set_param_keyframe(clip, ClipParam::Volume, rt(50), ParamValue::Scalar(0.2), Easing::Linear)
+            .set_param_keyframe(
+                clip,
+                ClipParam::Volume,
+                rt(50),
+                ParamValue::Scalar(0.2),
+                Easing::Linear,
+            )
             .unwrap();
         assert!(project.clip(clip).unwrap().has_volume_envelope());
 
@@ -1917,7 +2029,9 @@ mod tests {
     #[test]
     fn set_clip_audio_rejects_invalid_inputs() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
 
         for volume in [-0.1, 11.0, f32::NAN, f32::INFINITY] {
             assert!(matches!(
@@ -1953,15 +2067,22 @@ mod tests {
     #[test]
     fn split_keeps_volume_and_partitions_fades() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
-        project.set_clip_audio(clip, Some(0.5), rt(10), rt(20)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+        project
+            .set_clip_audio(clip, Some(0.5), rt(10), rt(20))
+            .unwrap();
 
         let right = project.split_clip(clip, rt(60)).unwrap();
         let left = project.clip(clip).unwrap();
         let right = project.clip(right).unwrap();
         // Volume rides both halves; the fade-in stays with the head, the
         // fade-out moves to the tail.
-        assert_eq!((left.volume.constant(), right.volume.constant()), (Some(0.5), Some(0.5)));
+        assert_eq!(
+            (left.volume.constant(), right.volume.constant()),
+            (Some(0.5), Some(0.5))
+        );
         assert_eq!((left.fade_in, left.fade_out), (10, 0));
         assert_eq!((right.fade_in, right.fade_out), (0, 20));
     }
@@ -1971,9 +2092,16 @@ mod tests {
     #[test]
     fn set_clip_crop_sets_framing() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
 
-        let crop = CropRect { x: 0.25, y: 0.0, w: 0.5, h: 1.0 };
+        let crop = CropRect {
+            x: 0.25,
+            y: 0.0,
+            w: 0.5,
+            h: 1.0,
+        };
         project.set_clip_crop(clip, crop, true, false).unwrap();
         let c = project.clip(clip).unwrap();
         assert_eq!(c.crop, crop);
@@ -1981,18 +2109,32 @@ mod tests {
         assert!(c.has_custom_crop());
 
         // Back to the full frame clears the custom-framing state.
-        project.set_clip_crop(clip, CropRect::FULL, false, false).unwrap();
+        project
+            .set_clip_crop(clip, CropRect::FULL, false, false)
+            .unwrap();
         assert!(!project.clip(clip).unwrap().has_custom_crop());
     }
 
     #[test]
     fn set_clip_crop_rejects_invalid_targets() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
 
         // Invalid rects bounce.
         assert!(matches!(
-            project.set_clip_crop(clip, CropRect { x: 0.8, y: 0.0, w: 0.5, h: 1.0 }, false, false),
+            project.set_clip_crop(
+                clip,
+                CropRect {
+                    x: 0.8,
+                    y: 0.0,
+                    w: 0.5,
+                    h: 1.0
+                },
+                false,
+                false
+            ),
             Err(ModelError::InvalidParam(_))
         ));
 
@@ -2013,8 +2155,15 @@ mod tests {
     #[test]
     fn split_keeps_crop_and_flips_on_both_halves() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
-        let crop = CropRect { x: 0.1, y: 0.1, w: 0.8, h: 0.8 };
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+        let crop = CropRect {
+            x: 0.1,
+            y: 0.1,
+            w: 0.8,
+            h: 0.8,
+        };
         project.set_clip_crop(clip, crop, true, true).unwrap();
 
         let right = project.split_clip(clip, rt(60)).unwrap();
@@ -2028,8 +2177,12 @@ mod tests {
     #[test]
     fn trim_scales_source_consumption_by_speed() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(100, 100), rt(0)).unwrap();
-        project.set_clip_speed(clip, Rational::new(2, 1), false).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(100, 100), rt(0))
+            .unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(2, 1), false)
+            .unwrap();
         // Now timeline [0, 50) over source [100, 200).
 
         // Head trim by 10 timeline ticks eats 20 source ticks.
@@ -2039,30 +2192,47 @@ mod tests {
 
         // Tail trim to 20 timeline ticks keeps 40 source ticks.
         project.trim_clip(clip, tr(10, 20)).unwrap();
-        assert_eq!(project.clip(clip).unwrap().source_range(), Some(tr(120, 40)));
+        assert_eq!(
+            project.clip(clip).unwrap().source_range(),
+            Some(tr(120, 40))
+        );
     }
 
     #[test]
     fn trim_reversed_clip_mirrors_source_window() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(100, 100), rt(0)).unwrap();
-        project.set_clip_speed(clip, Rational::new(1, 1), true).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(100, 100), rt(0))
+            .unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(1, 1), true)
+            .unwrap();
 
         // The timeline head shows the source END: a head trim by 10 drops
         // the top 10 source ticks, keeping the bottom.
         project.trim_clip(clip, tr(10, 90)).unwrap();
-        assert_eq!(project.clip(clip).unwrap().source_range(), Some(tr(100, 90)));
+        assert_eq!(
+            project.clip(clip).unwrap().source_range(),
+            Some(tr(100, 90))
+        );
 
         // A tail trim drops the source BOTTOM.
         project.trim_clip(clip, tr(10, 80)).unwrap();
-        assert_eq!(project.clip(clip).unwrap().source_range(), Some(tr(110, 80)));
+        assert_eq!(
+            project.clip(clip).unwrap().source_range(),
+            Some(tr(110, 80))
+        );
     }
 
     #[test]
     fn split_retimed_clip_inherits_speed_and_partitions_source() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
-        project.set_clip_speed(clip, Rational::new(2, 1), false).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(2, 1), false)
+            .unwrap();
         // Timeline [0, 50) over source [0, 100).
 
         let right = project.split_clip(clip, rt(20)).unwrap();
@@ -2078,8 +2248,12 @@ mod tests {
     #[test]
     fn split_reversed_clip_hands_window_top_to_the_left() {
         let (mut project, media_id, track) = project_with_media(500);
-        let clip = project.add_clip(track, media_id, tr(100, 100), rt(0)).unwrap();
-        project.set_clip_speed(clip, Rational::new(1, 1), true).unwrap();
+        let clip = project
+            .add_clip(track, media_id, tr(100, 100), rt(0))
+            .unwrap();
+        project
+            .set_clip_speed(clip, Rational::new(1, 1), true)
+            .unwrap();
 
         let right = project.split_clip(clip, rt(30)).unwrap();
         let left = project.clip(clip).unwrap();
@@ -2096,9 +2270,7 @@ mod tests {
     #[test]
     fn move_clip_repositions_on_same_track() {
         let (mut project, media_id, track) = project_with_media(200);
-        let clip = project
-            .add_clip(track, media_id, tr(0, 50), rt(0))
-            .unwrap();
+        let clip = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
 
         project.move_clip(clip, track, rt(80)).unwrap();
         assert_eq!(project.clip(clip).unwrap().timeline, tr(80, 50));
@@ -2108,9 +2280,7 @@ mod tests {
     #[test]
     fn move_clip_rejects_negative_start_and_unknown_track() {
         let (mut project, media_id, track) = project_with_media(200);
-        let clip = project
-            .add_clip(track, media_id, tr(0, 50), rt(0))
-            .unwrap();
+        let clip = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
         let missing = TrackId::from_raw(77);
 
         assert_eq!(
@@ -2128,8 +2298,12 @@ mod tests {
     fn packed_track() -> (Project, MediaId, TrackId, [ClipId; 3]) {
         let (mut project, media_id, track) = project_with_media(1000);
         let a = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
-        let b = project.add_clip(track, media_id, tr(50, 50), rt(50)).unwrap();
-        let c = project.add_clip(track, media_id, tr(100, 50), rt(100)).unwrap();
+        let b = project
+            .add_clip(track, media_id, tr(50, 50), rt(50))
+            .unwrap();
+        let c = project
+            .add_clip(track, media_id, tr(100, 50), rt(100))
+            .unwrap();
         (project, media_id, track, [a, b, c])
     }
 
@@ -2198,8 +2372,12 @@ mod tests {
     fn ripple_delete_shifts_later_clips() {
         let (mut project, media_id, track) = project_with_media(300);
         let a = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
-        let b = project.add_clip(track, media_id, tr(50, 50), rt(50)).unwrap();
-        let c = project.add_clip(track, media_id, tr(100, 50), rt(150)).unwrap();
+        let b = project
+            .add_clip(track, media_id, tr(50, 50), rt(50))
+            .unwrap();
+        let c = project
+            .add_clip(track, media_id, tr(100, 50), rt(150))
+            .unwrap();
 
         project.ripple_delete(b).unwrap();
         assert!(project.clip(b).is_none());
@@ -2214,7 +2392,10 @@ mod tests {
         let mut project = Project::new("test", R24);
         let track = project.add_track(TrackKind::Audio, "A1");
         assert_eq!(project.timeline_mut().track_count(), 1);
-        assert_eq!(project.timeline().track(track).unwrap().kind, TrackKind::Audio);
+        assert_eq!(
+            project.timeline().track(track).unwrap().kind,
+            TrackKind::Audio
+        );
     }
 
     // --- Clone ------------------------------------------------------------

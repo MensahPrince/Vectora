@@ -7,10 +7,10 @@
 
 use std::sync::atomic::AtomicBool;
 
-use cutlass_ai::agent::{run_prompt, AgentConfig, AgentEvent, EngineBridge, PromptStatus};
+use cutlass_ai::agent::{AgentConfig, AgentEvent, EngineBridge, PromptStatus, run_prompt};
 use cutlass_ai::provider::{ChatTurn, FinishReason, Message, ToolCall};
 use cutlass_ai::providers::ScriptedProvider;
-use cutlass_ai::{summarize, validate, EditorContext, ProjectSummary, WireCommand};
+use cutlass_ai::{EditorContext, ProjectSummary, WireCommand, summarize, validate};
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, ColorConvertPath, Engine, EngineConfig};
 use cutlass_models::{MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind};
@@ -254,7 +254,10 @@ fn model_corrects_course_after_a_rejection() {
     match last {
         Message::ToolResult { call_id, content } => {
             assert_eq!(call_id, "call_1");
-            assert!(content.contains("rejected: clip 999 does not exist"), "{content}");
+            assert!(
+                content.contains("rejected: clip 999 does not exist"),
+                "{content}"
+            );
             assert!(content.contains(&clip.to_string()), "{content}");
         }
         other => panic!("expected tool result, got {other:?}"),
@@ -296,7 +299,10 @@ fn cap_trip_rolls_the_whole_prompt_back() {
     // The split that did apply was rolled back; nothing remains.
     assert_eq!(host.engine.project().timeline().clip_count(), 1);
     assert_eq!(host.engine.project().timeline().track_count(), 1);
-    assert!(!host.engine.undo(), "a rolled-back prompt leaves no history");
+    assert!(
+        !host.engine.undo(),
+        "a rolled-back prompt leaves no history"
+    );
 }
 
 #[test]
@@ -315,10 +321,11 @@ fn questions_answer_without_editing() {
     assert_eq!(outcome.status, PromptStatus::Completed);
     assert!(outcome.actions.is_empty());
     assert_eq!(outcome.text, "The timeline is 10.00s long.");
-    assert!(events
-        .iter()
-        .all(|e| matches!(e, AgentEvent::TextDelta(_))));
-    assert!(!host.engine.undo(), "answering a question records no history");
+    assert!(events.iter().all(|e| matches!(e, AgentEvent::TextDelta(_))));
+    assert!(
+        !host.engine.undo(),
+        "answering a question records no history"
+    );
 }
 
 #[test]
@@ -346,7 +353,12 @@ fn which_clips_have_no_audio_answers_from_pushed_state() {
     ));
     let track = project.add_track(TrackKind::Video, "V1");
     project
-        .add_clip(track, talk, TimeRange::at_rate(0, 120, R24), RationalTime::new(0, R24))
+        .add_clip(
+            track,
+            talk,
+            TimeRange::at_rate(0, 120, R24),
+            RationalTime::new(0, R24),
+        )
         .unwrap();
     let silent_clip = project
         .add_clip(
@@ -567,10 +579,12 @@ fn add_a_title_that_says_intro() {
 
     // One undo removes both the clip and the track.
     assert!(host.engine.undo());
-    assert!(summarize(host.engine.project())
-        .tracks
-        .iter()
-        .all(|t| t.name != "Titles"));
+    assert!(
+        summarize(host.engine.project())
+            .tracks
+            .iter()
+            .all(|t| t.name != "Titles")
+    );
     assert!(!host.engine.undo());
 }
 
@@ -702,20 +716,39 @@ fn lower_music_volume_with_fades() {
     assert_eq!((c.fade_in, c.fade_out), (24, 48));
     // The summary the next prompt would see carries the new mix.
     let summary = summarize(host.engine.project());
-    let summarized = &summary.tracks.iter().find(|t| t.name == "Music").unwrap().clips[0];
+    let summarized = &summary
+        .tracks
+        .iter()
+        .find(|t| t.name == "Music")
+        .unwrap()
+        .clips[0];
     assert_eq!(summarized.volume, Some(0.5));
     assert_eq!(summarized.fade_in, Some(1.0));
 
     // One undo restores the default mix.
     assert!(host.engine.undo());
-    assert!(!host.engine.project().clip(clip_id).unwrap().has_custom_audio());
+    assert!(
+        !host
+            .engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .has_custom_audio()
+    );
 }
 
 #[test]
 fn volume_envelope_with_keyframes() {
     // Fixture with an audio lane holding one music clip (10s at 24fps).
     let mut project = Project::new("eval-envelope", R24);
-    let media = project.add_media(MediaSource::new("/tmp/music.mp3", 0, 0, R24, 120 * 24, true));
+    let media = project.add_media(MediaSource::new(
+        "/tmp/music.mp3",
+        0,
+        0,
+        R24,
+        120 * 24,
+        true,
+    ));
     let music = project.add_track(TrackKind::Audio, "Music");
     let clip = project
         .add_clip(
@@ -776,7 +809,14 @@ fn volume_envelope_with_keyframes() {
 
     // One prompt = one undo: the whole envelope disappears as a unit.
     assert!(host.engine.undo());
-    assert!(!host.engine.project().clip(clip_id).unwrap().has_volume_envelope());
+    assert!(
+        !host
+            .engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .has_volume_envelope()
+    );
 }
 
 #[test]
@@ -1066,14 +1106,31 @@ fn add_a_blur_to_the_clip() {
 #[test]
 fn crossfade_between_two_clips() {
     let mut project = Project::new("eval", R24);
-    let media = project.add_media(MediaSource::new("/tmp/eval.mp4", 1920, 1080, R24, 60 * 24, true));
+    let media = project.add_media(MediaSource::new(
+        "/tmp/eval.mp4",
+        1920,
+        1080,
+        R24,
+        60 * 24,
+        true,
+    ));
     let track = project.add_track(TrackKind::Video, "V1");
     let first = project
-        .add_clip(track, media, TimeRange::at_rate(0, 120, R24), RationalTime::new(0, R24))
+        .add_clip(
+            track,
+            media,
+            TimeRange::at_rate(0, 120, R24),
+            RationalTime::new(0, R24),
+        )
         .unwrap()
         .raw();
     let _second = project
-        .add_clip(track, media, TimeRange::at_rate(0, 120, R24), RationalTime::new(120, R24))
+        .add_clip(
+            track,
+            media,
+            TimeRange::at_rate(0, 120, R24),
+            RationalTime::new(120, R24),
+        )
         .unwrap();
     let mut host = EngineHost::new(project);
 
@@ -1143,7 +1200,9 @@ fn add_marker_at_playhead() {
     assert_eq!(outcome.status, PromptStatus::Completed);
     assert_eq!(outcome.actions.len(), 1);
     assert!(
-        outcome.actions[0].description.contains("added marker 'beat drop' at 5.00s"),
+        outcome.actions[0]
+            .description
+            .contains("added marker 'beat drop' at 5.00s"),
         "{}",
         outcome.actions[0].description
     );
@@ -1291,11 +1350,7 @@ fn session_history_threads_prior_turns_into_the_next_prompt() {
 
     // The turn carries: the user prompt, the assistant's tool call, the
     // tool result, and the final text answer.
-    let kinds: Vec<&str> = outcome1
-        .turn_messages
-        .iter()
-        .map(message_kind)
-        .collect();
+    let kinds: Vec<&str> = outcome1.turn_messages.iter().map(message_kind).collect();
     assert_eq!(kinds, ["user", "assistant", "tool", "assistant"]);
 
     let second = ScriptedProvider::new(vec![text_turn("I split it into two clips.")]);

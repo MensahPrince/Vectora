@@ -237,8 +237,8 @@ impl KeyframeIndex {
             return 0;
         }
         // seconds = value · fps_den / fps_num; ticks = seconds · tb_den / tb_num.
-        let ticks = i128::from(value) * i128::from(fps_den) * tb_den
-            / (i128::from(fps_num) * tb_num);
+        let ticks =
+            i128::from(value) * i128::from(fps_den) * tb_den / (i128::from(fps_num) * tb_num);
         ticks.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
     }
 

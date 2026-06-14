@@ -48,7 +48,10 @@ fn dirty_state_tracks_edits_saves_and_history() {
     assert!(!engine.is_dirty(), "open rebaselines as clean");
 
     common::add_track(&mut engine, TrackKind::Video, "V2");
-    assert!(engine.is_dirty(), "edits after open dirty the session again");
+    assert!(
+        engine.is_dirty(),
+        "edits after open dirty the session again"
+    );
 }
 
 #[test]
@@ -63,8 +66,14 @@ fn new_session_resets_project_path_history_and_dirty() {
 
     engine.new_session();
     assert!(!engine.is_dirty(), "a fresh session starts clean");
-    assert!(engine.project_path().is_none(), "the file binding is dropped");
-    assert!(!engine.can_undo() && !engine.can_redo(), "history is cleared");
+    assert!(
+        engine.project_path().is_none(),
+        "the file binding is dropped"
+    );
+    assert!(
+        !engine.can_undo() && !engine.can_redo(),
+        "history is cleared"
+    );
     assert_eq!(engine.project().timeline().clip_count(), 0);
     assert_eq!(engine.project().media_count(), 0);
     assert_eq!(engine.project().timeline().tracks_ordered().count(), 0);
@@ -81,7 +90,10 @@ fn restore_session_binds_to_source_and_reads_dirty() {
 
     // The autosave sidecar is an ordinary project file written elsewhere.
     let autosave = dir.path().join("autosave-slot.cutlass");
-    engine.project().save_to_file(&autosave).expect("write autosave");
+    engine
+        .project()
+        .save_to_file(&autosave)
+        .expect("write autosave");
 
     let source = dir.path().join("the-real-project.cutlass");
     let mut engine2 = Engine::new(engine_config(dir.path().join("cache-restore"))).expect("engine");
@@ -103,7 +115,9 @@ fn restore_session_binds_to_source_and_reads_dirty() {
 
     // An unsaved-session orphan restores with no binding.
     let mut engine3 = Engine::new(engine_config(dir.path().join("cache-orphan"))).expect("engine");
-    engine3.restore_session(&autosave, None).expect("restore orphan");
+    engine3
+        .restore_session(&autosave, None)
+        .expect("restore orphan");
     assert!(engine3.project_path().is_none());
     assert!(engine3.is_dirty());
 }
@@ -136,7 +150,10 @@ fn save_and_open_roundtrip_restores_session() {
         ApplyOutcome::Saved
     ));
     assert_eq!(engine.project_path(), Some(&project_file));
-    assert!(engine.can_undo(), "save does not push undo but keeps prior history");
+    assert!(
+        engine.can_undo(),
+        "save does not push undo but keeps prior history"
+    );
 
     let clip_id = engine
         .project()
@@ -189,14 +206,14 @@ fn open_fails_when_media_missing() {
         100,
         false,
     ));
-    let mut engine2 = Engine::with_project(
-        engine_config(dir.path().join("cache2")),
-        offline_project,
-    )
-    .expect("engine");
+    let mut engine2 =
+        Engine::with_project(engine_config(dir.path().join("cache2")), offline_project)
+            .expect("engine");
     let offline = dir.path().join("missing_media.cutlass");
     engine2
-        .apply(Command::Project(ProjectCommand::Save { path: offline.clone() }))
+        .apply(Command::Project(ProjectCommand::Save {
+            path: offline.clone(),
+        }))
         .expect("save offline");
 
     let err = engine
@@ -220,11 +237,8 @@ fn load_tolerates_missing_media() {
     ));
     fixture.add_track(TrackKind::Video, "V1");
 
-    let mut engine = Engine::with_project(
-        engine_config(dir.path().join("cache")),
-        fixture,
-    )
-    .expect("engine");
+    let mut engine =
+        Engine::with_project(engine_config(dir.path().join("cache")), fixture).expect("engine");
 
     let project_file = dir.path().join("ghost.cutlass");
     engine

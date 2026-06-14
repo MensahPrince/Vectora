@@ -10,7 +10,10 @@ pub struct InsertClipAction {
 }
 
 impl EditAction for InsertClipAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let id = self.clip.id;
         ctx.project.timeline_mut().add_clip(self.track, self.clip)?;
         Ok(Box::new(RemoveClipAction { clip: id }))

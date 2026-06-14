@@ -279,7 +279,11 @@ impl Timeline {
         let mut audio: Vec<TrackId> = Vec::with_capacity(self.order.len());
         let mut visual: Vec<TrackId> = Vec::with_capacity(self.order.len());
         for &id in &self.order {
-            if self.tracks.get(&id).is_some_and(|t| t.kind == TrackKind::Audio) {
+            if self
+                .tracks
+                .get(&id)
+                .is_some_and(|t| t.kind == TrackKind::Audio)
+            {
                 audio.push(id);
             } else {
                 visual.push(id);
@@ -450,7 +454,9 @@ impl Timeline {
         name: String,
         color: MarkerColor,
     ) -> Result<(), ModelError> {
-        let mut marker = self.remove_marker(id).ok_or(ModelError::UnknownMarker(id))?;
+        let mut marker = self
+            .remove_marker(id)
+            .ok_or(ModelError::UnknownMarker(id))?;
         let before = marker.clone();
         marker.tick = tick;
         marker.name = name;
@@ -583,10 +589,7 @@ mod tests {
         let mut timeline = Timeline::new(R24);
         timeline.add_track(Track::new(TrackKind::Video, "bottom"));
         timeline.add_track(Track::new(TrackKind::Video, "top"));
-        let names: Vec<&str> = timeline
-            .tracks_ordered()
-            .map(|t| t.name.as_str())
-            .collect();
+        let names: Vec<&str> = timeline.tracks_ordered().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["bottom", "top"]);
     }
 
@@ -608,9 +611,7 @@ mod tests {
         assert_eq!(timeline.track_count(), 0);
         assert!(timeline.clip(clip_id).is_none());
 
-        timeline
-            .restore_track(track, 0)
-            .expect("restore");
+        timeline.restore_track(track, 0).expect("restore");
         assert_eq!(timeline.track_count(), 1);
         assert_eq!(timeline.track_of(clip_id), Some(track_id));
     }
@@ -628,16 +629,16 @@ mod tests {
         let removed = timeline.remove_track(v1).expect("remove");
         assert_eq!(timeline.order(), &[a1, v2]);
 
-        timeline.restore_track(removed, order_index).expect("restore");
+        timeline
+            .restore_track(removed, order_index)
+            .expect("restore");
         assert_eq!(timeline.order(), &[a1, v1, v2]);
     }
 
     #[test]
     fn remove_track_purges_clips_from_index() {
         let (mut timeline, track) = timeline_with_track();
-        let clip = timeline
-            .add_clip(track, generated_clip(0, 50))
-            .unwrap();
+        let clip = timeline.add_clip(track, generated_clip(0, 50)).unwrap();
 
         let removed = timeline.remove_track(track).unwrap();
         assert_eq!(removed.len(), 1);
@@ -856,7 +857,12 @@ mod tests {
         assert_eq!(moved.color, MarkerColor::Green);
 
         assert_eq!(
-            timeline.set_marker(MarkerId::from_raw(999), rt(0), String::new(), MarkerColor::Teal),
+            timeline.set_marker(
+                MarkerId::from_raw(999),
+                rt(0),
+                String::new(),
+                MarkerColor::Teal
+            ),
             Err(ModelError::UnknownMarker(MarkerId::from_raw(999)))
         );
         // A rejected move leaves the marker untouched.
@@ -923,7 +929,10 @@ mod tests {
         });
         let json = serde_json::to_value(&timeline).unwrap();
         assert_eq!(json["canvas"]["aspect"], "9:16");
-        assert_eq!(json["canvas"]["background"], serde_json::json!([20, 30, 40]));
+        assert_eq!(
+            json["canvas"]["background"],
+            serde_json::json!([20, 30, 40])
+        );
         let back: Timeline = serde_json::from_value(json).unwrap();
         assert_eq!(back.canvas(), timeline.canvas());
     }
@@ -947,7 +956,10 @@ mod tests {
         });
         let json = serde_json::to_value(&timeline).unwrap();
         assert!(json["canvas"].get("aspect").is_none());
-        assert_eq!(json["canvas"]["background"], serde_json::json!([255, 255, 255]));
+        assert_eq!(
+            json["canvas"]["background"],
+            serde_json::json!([255, 255, 255])
+        );
         let back: Timeline = serde_json::from_value(json).unwrap();
         assert_eq!(back.canvas().background, [255, 255, 255]);
         assert_eq!(back.canvas().aspect, CanvasAspect::Auto);

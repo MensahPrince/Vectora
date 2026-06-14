@@ -162,7 +162,11 @@ fn plan_tiles(
     if duration_ticks <= 0 || fps_num <= 0 || fps_den <= 0 || zoom <= 0.0 || zoom.is_nan() {
         return None;
     }
-    let speed = if speed.is_finite() && speed > 0.0 { speed } else { 1.0 };
+    let speed = if speed.is_finite() && speed > 0.0 {
+        speed
+    } else {
+        1.0
+    };
     let ticks_per_s = f64::from(fps_num) / f64::from(fps_den);
     let px_per_s = zoom * ticks_per_s / speed;
     if px_per_s <= 0.0 || !px_per_s.is_finite() {
@@ -429,7 +433,11 @@ impl StripHandle {
     }
 
     fn request_waveform(&self, media_id: u64, k: i32, times_us: Vec<i64>) {
-        let _ = self.tx.send(StripMsg::Waveform { media_id, k, times_us });
+        let _ = self.tx.send(StripMsg::Waveform {
+            media_id,
+            k,
+            times_us,
+        });
     }
 }
 
@@ -491,7 +499,11 @@ fn worker_loop(rx: &Receiver<StripMsg>, backend: &slint::Weak<StripBackend<'stat
                 StripMsg::Filmstrip { media_id, times_us } => {
                     process_filmstrip(&state, media_id, &times_us, backend);
                 }
-                StripMsg::Waveform { media_id, k, times_us } => {
+                StripMsg::Waveform {
+                    media_id,
+                    k,
+                    times_us,
+                } => {
                     process_waveform(&mut state, media_id, k, &times_us, backend);
                 }
                 StripMsg::Register { .. } => unreachable!("registrations apply in triage"),
@@ -518,7 +530,11 @@ fn process_filmstrip(
 ) {
     let Some(path) = state.paths.get(&media_id) else {
         error!(media_id, "filmstrip request for unregistered media");
-        deliver_frames(media_id, times_us.iter().map(|&t| (t, None)).collect(), backend);
+        deliver_frames(
+            media_id,
+            times_us.iter().map(|&t| (t, None)).collect(),
+            backend,
+        );
         return;
     };
 
@@ -613,11 +629,8 @@ struct RgbaImage {
 
 impl RgbaImage {
     fn into_image(self) -> Image {
-        let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-            &self.rgba,
-            self.width,
-            self.height,
-        );
+        let buffer =
+            SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(&self.rgba, self.width, self.height);
         Image::from_rgba8(buffer)
     }
 }
@@ -638,7 +651,13 @@ fn deliver_frames(
             for (t_us, image) in frames {
                 PENDING_FRAMES.with(|p| p.borrow_mut().remove(&(media_id, t_us)));
                 let image = image.map(RgbaImage::into_image).unwrap_or_default();
-                cache.insert((media_id, t_us), CacheEntry { image, last_used: tick });
+                cache.insert(
+                    (media_id, t_us),
+                    CacheEntry {
+                        image,
+                        last_used: tick,
+                    },
+                );
             }
             evict_lru(&mut cache);
         });
@@ -665,7 +684,13 @@ fn deliver_waves(
             for (t_us, image) in tiles {
                 PENDING_WAVES.with(|p| p.borrow_mut().remove(&(media_id, t_us, k)));
                 let image = image.map(RgbaImage::into_image).unwrap_or_default();
-                cache.insert((media_id, t_us, k), CacheEntry { image, last_used: tick });
+                cache.insert(
+                    (media_id, t_us, k),
+                    CacheEntry {
+                        image,
+                        last_used: tick,
+                    },
+                );
             }
             evict_lru(&mut cache);
         });
@@ -720,8 +745,8 @@ fn render_wave_tile(
         let peak = peaks[lo..hi].iter().copied().fold(0.0f32, f32::max);
 
         // Quiet audio keeps a visible 1px center line, like CapCut.
-        let half = ((f64::from(peak.clamp(0.0, 1.0)) * max_half as f64) as usize)
-            .clamp(1, max_half);
+        let half =
+            ((f64::from(peak.clamp(0.0, 1.0)) * max_half as f64) as usize).clamp(1, max_half);
         let x0 = bar * WAVE_BAR_PITCH;
         for y in mid.saturating_sub(half)..(mid + half).min(height) {
             let row = y * width * 4;
@@ -830,8 +855,8 @@ mod tests {
     #[test]
     fn plan_caps_the_tile_count() {
         // Absurd window: tile count stays bounded.
-        let grid = plan_tiles(0.0, i32::MAX, 1000, 1, 1.0, 100.0, 0, i32::MAX / 256, 64.0)
-            .expect("grid");
+        let grid =
+            plan_tiles(0.0, i32::MAX, 1000, 1, 1.0, 100.0, 0, i32::MAX / 256, 64.0).expect("grid");
         assert!(grid.i1 - grid.i0 + 1 <= MAX_TILES);
     }
 
@@ -889,7 +914,13 @@ mod tests {
     fn lru_eviction_keeps_recently_used_entries() {
         let mut map: HashMap<u32, CacheEntry> = HashMap::new();
         for i in 0..(CACHE_CAP as u32 + 100) {
-            map.insert(i, CacheEntry { image: Image::default(), last_used: u64::from(i) });
+            map.insert(
+                i,
+                CacheEntry {
+                    image: Image::default(),
+                    last_used: u64::from(i),
+                },
+            );
         }
         evict_lru(&mut map);
         assert!(map.len() <= CACHE_CAP);

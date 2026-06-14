@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::error::ModelError;
 use crate::project::Project;
-use crate::schema::{ProjectSchema, PROJECT_SCHEMA_VERSION};
+use crate::schema::{PROJECT_SCHEMA_VERSION, ProjectSchema};
 
 /// Recommended extension for Cutlass project files.
 pub const PROJECT_FILE_EXTENSION: &str = "cutlass";
@@ -66,7 +66,9 @@ impl Project {
 /// to the bare project document, pushing the envelope version into the
 /// inner schema when the project carries none (or a placeholder version 0).
 fn unwrap_legacy_envelope(doc: &mut serde_json::Value) {
-    let Some(obj) = doc.as_object_mut() else { return };
+    let Some(obj) = doc.as_object_mut() else {
+        return;
+    };
     // A real project document has a schema (or its legacy alias); only the
     // envelope nests the project under "project". Unknown root fields named
     // "project"/"version" on a current file must not trip this.
@@ -87,8 +89,7 @@ fn unwrap_legacy_envelope(doc: &mut serde_json::Value) {
             .and_then(|s| s.get("version"))
             .and_then(serde_json::Value::as_u64)
             == Some(0);
-        let missing =
-            !inner.contains_key("schema") && !inner.contains_key("schema_version");
+        let missing = !inner.contains_key("schema") && !inner.contains_key("schema_version");
         if missing || placeholder {
             inner.insert("schema".into(), serde_json::json!(version));
         }
@@ -219,7 +220,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("shape.cutlass");
         project.save_to_file(&path).unwrap();
-        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let schema = json.get("schema").expect("schema object");
         assert_eq!(schema["version"], PROJECT_SCHEMA_VERSION);
         assert_eq!(schema["kind"], "cutlass.project");
@@ -298,10 +300,7 @@ mod tests {
         )
         .unwrap();
         let err = Project::load_from_file(&path).unwrap_err();
-        assert!(matches!(
-            err,
-            ModelError::UnsupportedProjectSchema { .. }
-        ));
+        assert!(matches!(err, ModelError::UnsupportedProjectSchema { .. }));
     }
 
     #[test]
@@ -355,8 +354,7 @@ mod tests {
         // The media pool serializes as `[id, source]` pairs.
         doc["media"][0][1]["pixel_aspect"] = serde_json::json!(1.0);
         doc["timeline"]["markers_future"] = serde_json::json!([{ "tick": 5, "name": "beat" }]);
-        doc["timeline"]["tracks"][0][1]["clips"][0][1]["future_field"] =
-            serde_json::json!(true);
+        doc["timeline"]["tracks"][0][1]["clips"][0][1]["future_field"] = serde_json::json!(true);
         std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
 
         let loaded = Project::load_from_file(&path).unwrap();

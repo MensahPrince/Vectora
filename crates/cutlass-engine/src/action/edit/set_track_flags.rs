@@ -55,7 +55,10 @@ pub fn execute(
 }
 
 impl EditAction for SetTrackFlagsAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         execute(
             ctx,
             self.track,

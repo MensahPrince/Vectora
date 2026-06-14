@@ -24,7 +24,11 @@ fn manifest_and_blob_files_use_source_id_hex_names() {
     assert!(idx.exists());
     assert!(blob.metadata().unwrap().len() >= 64);
     assert!(idx.metadata().unwrap().len() > 0);
-    assert!(!dir.path().join(format!("{source_id:016x}.idx.tmp")).exists());
+    assert!(
+        !dir.path()
+            .join(format!("{source_id:016x}.idx.tmp"))
+            .exists()
+    );
 }
 
 #[test]
@@ -91,9 +95,7 @@ fn re_register_same_source_after_restart_is_idempotent() {
     let first = cache
         .register_source(fp.clone(), yuv420p_1080p_spec())
         .unwrap();
-    let second = cache
-        .register_source(fp, yuv420p_1080p_spec())
-        .unwrap();
+    let second = cache.register_source(fp, yuv420p_1080p_spec()).unwrap();
     assert_eq!(first, second);
     assert_eq!(first, source_id);
     assert_eq!(cache.frame_count(source_id), 1);

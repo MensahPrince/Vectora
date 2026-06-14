@@ -230,10 +230,7 @@ pub fn prune_selection(
 
 /// Press-time rectangles of the selected clips, for the floating copies that
 /// follow the cursor during a group drag.
-pub fn group_floaters(
-    sequence: &Sequence,
-    ids: &ModelRc<SharedString>,
-) -> ModelRc<GroupGhost> {
+pub fn group_floaters(sequence: &Sequence, ids: &ModelRc<SharedString>) -> ModelRc<GroupGhost> {
     let clips = placed_clips(sequence);
     let mut selected: Vec<&PlacedClip> = clips
         .iter()
@@ -456,7 +453,10 @@ fn track_id_at(sequence: &Sequence, row: i32) -> SharedString {
 }
 
 fn track_color_at(sequence: &Sequence, row: i32) -> Option<slint::Color> {
-    sequence.tracks.row_data(row.max(0) as usize).map(|t| t.color)
+    sequence
+        .tracks
+        .row_data(row.max(0) as usize)
+        .map(|t| t.color)
 }
 
 fn invalid_resolution() -> GroupDragResolution {
@@ -553,11 +553,7 @@ mod tests {
                 vec![linked_clip("A", 0, 50, "L"), clip("B", 100, 40)],
             ),
             track("1", TrackKind::Video, vec![clip("C", 0, 80)]),
-            track(
-                "9",
-                TrackKind::Audio,
-                vec![linked_clip("D", 0, 50, "L")],
-            ),
+            track("9", TrackKind::Audio, vec![linked_clip("D", 0, 50, "L")]),
         ])
     }
 
@@ -622,7 +618,10 @@ mod tests {
     fn marquee_skips_locked_lanes_and_misses() {
         let mut locked = track("2", TrackKind::Video, vec![clip("A", 0, 50)]);
         locked.locked = true;
-        let seq = sequence(vec![locked, track("1", TrackKind::Video, vec![clip("C", 0, 80)])]);
+        let seq = sequence(vec![
+            locked,
+            track("1", TrackKind::Video, vec![clip("C", 0, 80)]),
+        ]);
         let upd = resolve_marquee(&seq, 0, 100, -0.5, 2.0, true);
         assert_eq!(ids_vec(&upd.ids), vec!["C"]);
 
@@ -781,7 +780,10 @@ mod tests {
         let floaters = group_floaters(&seq, &ids(&["A", "D"]));
         assert_eq!(floaters.row_count(), 2);
         let first = floaters.row_data(0).unwrap();
-        assert_eq!((first.row, first.start_tick, first.duration_ticks), (0, 0, 50));
+        assert_eq!(
+            (first.row, first.start_tick, first.duration_ticks),
+            (0, 0, 50)
+        );
         let second = floaters.row_data(1).unwrap();
         assert_eq!(second.row, 2);
     }

@@ -25,14 +25,38 @@ pub struct TransitionSpec {
 /// The starter set (M4). Ids must stay in lockstep with
 /// `cutlass_compositor::transition_descriptors`.
 const CATALOG: &[TransitionSpec] = &[
-    TransitionSpec { id: "crossfade", label: "Cross Fade" },
-    TransitionSpec { id: "dip_to_black", label: "Dip to Black" },
-    TransitionSpec { id: "dip_to_white", label: "Dip to White" },
-    TransitionSpec { id: "wipe_left", label: "Wipe Left" },
-    TransitionSpec { id: "wipe_right", label: "Wipe Right" },
-    TransitionSpec { id: "wipe_up", label: "Wipe Up" },
-    TransitionSpec { id: "wipe_down", label: "Wipe Down" },
-    TransitionSpec { id: "slide", label: "Slide" },
+    TransitionSpec {
+        id: "crossfade",
+        label: "Cross Fade",
+    },
+    TransitionSpec {
+        id: "dip_to_black",
+        label: "Dip to Black",
+    },
+    TransitionSpec {
+        id: "dip_to_white",
+        label: "Dip to White",
+    },
+    TransitionSpec {
+        id: "wipe_left",
+        label: "Wipe Left",
+    },
+    TransitionSpec {
+        id: "wipe_right",
+        label: "Wipe Right",
+    },
+    TransitionSpec {
+        id: "wipe_up",
+        label: "Wipe Up",
+    },
+    TransitionSpec {
+        id: "wipe_down",
+        label: "Wipe Down",
+    },
+    TransitionSpec {
+        id: "slide",
+        label: "Slide",
+    },
 ];
 
 /// Default transition window length, in timeline ticks (centered on the cut).
@@ -64,7 +88,12 @@ pub struct Transition {
 }
 
 impl Transition {
-    pub fn new(left: ClipId, right: ClipId, transition_id: impl Into<String>, duration: i64) -> Self {
+    pub fn new(
+        left: ClipId,
+        right: ClipId,
+        transition_id: impl Into<String>,
+        duration: i64,
+    ) -> Self {
         Self {
             left,
             right,

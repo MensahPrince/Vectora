@@ -2,10 +2,10 @@
 //!
 //! Run: `cargo bench -p cutlass-engine --bench export`
 
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use cutlass_commands::{Command, EditCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
 use cutlass_models::{Generator, Rational, TimeRange, TrackKind};
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 fn tr(start: i64, duration: i64) -> TimeRange {
     TimeRange::at_rate(start, duration, Rational::FPS_24)

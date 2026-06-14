@@ -121,9 +121,18 @@ mod tests {
 
     #[test]
     fn from_ffmpeg_maps_supported_pixels() {
-        assert_eq!(PixelFormat::from_ffmpeg(Pixel::YUV420P), Some(PixelFormat::Yuv420p));
-        assert_eq!(PixelFormat::from_ffmpeg(Pixel::NV12), Some(PixelFormat::Nv12));
-        assert_eq!(PixelFormat::from_ffmpeg(Pixel::RGBA), Some(PixelFormat::Rgba8));
+        assert_eq!(
+            PixelFormat::from_ffmpeg(Pixel::YUV420P),
+            Some(PixelFormat::Yuv420p)
+        );
+        assert_eq!(
+            PixelFormat::from_ffmpeg(Pixel::NV12),
+            Some(PixelFormat::Nv12)
+        );
+        assert_eq!(
+            PixelFormat::from_ffmpeg(Pixel::RGBA),
+            Some(PixelFormat::Rgba8)
+        );
     }
 
     #[test]
@@ -146,8 +155,14 @@ mod tests {
             PixelFormat::Yuv420p.plane_heights(1080).unwrap(),
             vec![1080, 540, 540]
         );
-        assert_eq!(PixelFormat::Yuv420p.plane_heights(1079), Err("YUV420P requires even height"));
-        assert_eq!(PixelFormat::Nv12.plane_heights(1079), Err("NV12 requires even height"));
+        assert_eq!(
+            PixelFormat::Yuv420p.plane_heights(1079),
+            Err("YUV420P requires even height")
+        );
+        assert_eq!(
+            PixelFormat::Nv12.plane_heights(1079),
+            Err("NV12 requires even height")
+        );
     }
 
     #[test]

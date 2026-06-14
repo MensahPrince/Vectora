@@ -139,7 +139,9 @@ pub(crate) fn scale_to_rgba(
     .map_err(DecodeError::Decode)?;
 
     let mut scaled = Video::empty();
-    scaler.run(frame, &mut scaled).map_err(DecodeError::Decode)?;
+    scaler
+        .run(frame, &mut scaled)
+        .map_err(DecodeError::Decode)?;
 
     // Drop swscale row padding.
     let stride = scaled.stride(0);

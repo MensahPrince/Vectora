@@ -9,15 +9,17 @@ pub struct RestoreClipAction {
 }
 
 impl EditAction for RestoreClipAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let id = self.clip.id;
         let current = ctx
             .project
             .clip(id)
             .cloned()
             .ok_or(ModelError::UnknownClip(id))?;
-        *ctx
-            .project
+        *ctx.project
             .timeline_mut()
             .clip_mut(id)
             .ok_or(ModelError::UnknownClip(id))? = self.clip;

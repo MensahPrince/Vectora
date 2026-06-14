@@ -26,7 +26,10 @@ pub fn execute(
 }
 
 impl EditAction for ImportAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let (_, inverse) = execute(ctx, &self.path)?;
         inverse.ok_or_else(|| {
             EngineError::Import(format!(

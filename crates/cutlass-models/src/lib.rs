@@ -40,17 +40,15 @@ pub use clip::{
     speed_curve_source_fraction, speed_preset, validate_speed_curve, validate_volume,
     validate_volume_envelope,
 };
-pub use effects::{
-    EffectInstance, EffectParamSpec, EffectSpec, effect_catalog, effect_spec,
-};
+pub use effects::{EffectInstance, EffectParamSpec, EffectSpec, effect_catalog, effect_spec};
 pub use error::ModelError;
-pub use param::{Easing, Keyframe, Lerp, Param};
 pub use ids::{ClipId, LinkId, MarkerId, MediaId, ProjectId, TrackId};
 pub use media::{MediaKind, MediaSource, STILL_DEFAULT_DURATION_TICKS, STILL_TICK_RATE};
 pub use metadata::ProjectMetadata;
+pub use param::{Easing, Keyframe, Lerp, Param};
 pub use persist::{PROJECT_FILE_EXTENSION, PROJECT_FILE_VERSION};
 pub use project::Project;
-pub use schema::{ProjectSchema, PROJECT_SCHEMA_KIND, PROJECT_SCHEMA_VERSION};
+pub use schema::{PROJECT_SCHEMA_KIND, PROJECT_SCHEMA_VERSION, ProjectSchema};
 pub use time::{
     Rational, RationalTime, TimeRange, check_same_rate, rate_eq, resample, time_add, time_sub,
 };

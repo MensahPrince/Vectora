@@ -4,7 +4,9 @@
 
 mod common;
 
-use common::{add_generated, add_track, add_media_clip, import_asset, rt, small_video_asset, temp_engine, tr};
+use common::{
+    add_generated, add_media_clip, add_track, import_asset, rt, small_video_asset, temp_engine, tr,
+};
 use cutlass_commands::{Command, EditCommand, EditOutcome};
 use cutlass_engine::ApplyOutcome;
 use cutlass_models::{ClipId, Generator, TrackKind};
@@ -16,7 +18,14 @@ fn adjustment() -> Generator {
 fn starts(engine: &cutlass_engine::Engine, clips: &[ClipId]) -> Vec<i64> {
     clips
         .iter()
-        .map(|c| engine.project().clip(*c).expect("clip placed").start().value)
+        .map(|c| {
+            engine
+                .project()
+                .clip(*c)
+                .expect("clip placed")
+                .start()
+                .value
+        })
         .collect()
 }
 
@@ -198,11 +207,17 @@ fn ripple_insert_command_is_single_history_entry() {
     assert_eq!(engine.project().clip(inserted).unwrap().start().value, 24);
     assert_eq!(engine.project().clip(first).unwrap().start().value, 0);
 
-    assert!(engine.undo(), "one undo removes the insert and closes the hole");
+    assert!(
+        engine.undo(),
+        "one undo removes the insert and closes the hole"
+    );
     assert!(engine.project().clip(inserted).is_none());
     assert_eq!(engine.project().clip(second).unwrap().start().value, 24);
 
     assert!(engine.redo());
     assert_eq!(engine.project().timeline().clip_count(), 3);
-    assert_eq!(engine.project().clip(second).unwrap().start().value, shifted);
+    assert_eq!(
+        engine.project().clip(second).unwrap().start().value,
+        shifted
+    );
 }

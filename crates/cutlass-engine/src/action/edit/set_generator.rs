@@ -27,7 +27,10 @@ pub fn execute(
 }
 
 impl EditAction for SetGeneratorAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         execute(ctx, self.clip, self.generator)
     }
 }

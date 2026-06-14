@@ -41,9 +41,7 @@ impl TrackKind {
             (
                 Self::Sticker,
                 ClipSource::Generated(
-                    Generator::Sticker
-                        | Generator::SolidColor { .. }
-                        | Generator::Shape { .. },
+                    Generator::Sticker | Generator::SolidColor { .. } | Generator::Shape { .. },
                 ),
             ) => true,
             (Self::Effect, ClipSource::Generated(Generator::Effect)) => true,
@@ -167,7 +165,11 @@ impl Track {
 
     /// Whether `range` would collide with any existing clip, optionally
     /// ignoring one clip (useful when re-placing an existing clip).
-    pub fn has_overlap(&self, range: TimeRange, ignore: Option<ClipId>) -> Result<bool, ModelError> {
+    pub fn has_overlap(
+        &self,
+        range: TimeRange,
+        ignore: Option<ClipId>,
+    ) -> Result<bool, ModelError> {
         for clip in self.clips.values().filter(|c| Some(c.id) != ignore) {
             if clip.timeline.overlaps(range)? {
                 return Ok(true);
@@ -431,7 +433,9 @@ mod tests {
         let mut track = video_track("V1");
         track.insert_clip(generated_clip(0, 10));
         assert_eq!(
-            track.clip_at(RationalTime::new(5, Rational::FPS_30)).unwrap_err(),
+            track
+                .clip_at(RationalTime::new(5, Rational::FPS_30))
+                .unwrap_err(),
             ModelError::RateMismatch {
                 expected: Rational::FPS_30,
                 got: R24,
@@ -549,18 +553,9 @@ mod tests {
     fn track_kind_accepts_clip_by_lane() {
         use crate::clip::{Clip, Generator};
 
-        let media = Clip::from_media(
-            crate::ids::MediaId::next(),
-            tr(0, 10),
-            tr(0, 10),
-        );
+        let media = Clip::from_media(crate::ids::MediaId::next(), tr(0, 10), tr(0, 10));
         let text = Clip::generated(Generator::text("hi"), tr(0, 10));
-        let sticker = Clip::generated(
-            Generator::SolidColor {
-                rgba: [1, 2, 3, 4],
-            },
-            tr(0, 10),
-        );
+        let sticker = Clip::generated(Generator::SolidColor { rgba: [1, 2, 3, 4] }, tr(0, 10));
         let adj = Clip::generated(Generator::Adjustment, tr(0, 10));
 
         assert!(TrackKind::Video.accepts_clip(&media));

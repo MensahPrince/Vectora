@@ -20,9 +20,9 @@ mod timeline;
 mod transport;
 
 use slint::BackendSelector;
+use slint::Global;
 use slint::Model;
 use slint::ModelRc;
-use slint::Global;
 use slint::SharedString;
 use slint::VecModel;
 use slint::wgpu_28::WGPUConfiguration;
@@ -107,7 +107,11 @@ async fn pick_import_path() -> Option<std::path::PathBuf> {
 /// "Untitled" before the first save); the `.cutlass` extension is enforced
 /// on whatever the user types.
 async fn pick_save_path(default_stem: String) -> Option<std::path::PathBuf> {
-    let stem = if default_stem.is_empty() { "Untitled".to_owned() } else { default_stem };
+    let stem = if default_stem.is_empty() {
+        "Untitled".to_owned()
+    } else {
+        default_stem
+    };
     let mut path = rfd::AsyncFileDialog::new()
         .add_filter("Cutlass project", &["cutlass"])
         .set_file_name(format!("{stem}.cutlass"))
@@ -275,7 +279,10 @@ fn discard_session_autosave(app: &AppWindow) {
     let source = editor
         .get_project_has_path()
         .then(|| std::path::PathBuf::from(editor.get_project_file_path().to_string()));
-    autosave::discard(&autosave::slot_for(&autosave::default_dir(), source.as_deref()));
+    autosave::discard(&autosave::slot_for(
+        &autosave::default_dir(),
+        source.as_deref(),
+    ));
 }
 
 async fn pick_export_path(current: std::path::PathBuf) -> Option<std::path::PathBuf> {
@@ -289,7 +296,10 @@ async fn pick_export_path(current: std::path::PathBuf) -> Option<std::path::Path
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "untitled.mp4".into()),
     );
-    dialog.save_file().await.map(|file| file.path().to_path_buf())
+    dialog
+        .save_file()
+        .await
+        .map(|file| file.path().to_path_buf())
 }
 
 /// Prefilled export destination: ~/Movies when present, else the home
@@ -306,7 +316,10 @@ fn default_export_path() -> SharedString {
         }
         None => std::path::PathBuf::from("."),
     };
-    dir.join("untitled.mp4").to_string_lossy().into_owned().into()
+    dir.join("untitled.mp4")
+        .to_string_lossy()
+        .into_owned()
+        .into()
 }
 
 // The Dock icon of a bare (non-bundled) binary is the generic executable
@@ -845,9 +858,10 @@ fn main() -> Result<(), slint::PlatformError> {
         ))
     });
 
-    app.global::<RulerBackend>().on_ticks(|scroll_x, viewport_w, zoom, fps_num, fps_den| {
-        ruler::ticks_model(scroll_x, viewport_w, zoom, fps_num, fps_den)
-    });
+    app.global::<RulerBackend>()
+        .on_ticks(|scroll_x, viewport_w, zoom, fps_num, fps_den| {
+            ruler::ticks_model(scroll_x, viewport_w, zoom, fps_num, fps_den)
+        });
 
     // Playback clock (playback roadmap Phases 1 + 3): at speed 1/1 with a
     // live output device, *consumed audio frames* are the clock — video
@@ -862,7 +876,13 @@ fn main() -> Result<(), slint::PlatformError> {
                     .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
             } else {
                 transport::playback_tick_scaled(
-                    anchor_tick, anchor_ms, now_ms, fps_num, fps_den, speed_num, speed_den,
+                    anchor_tick,
+                    anchor_ms,
+                    now_ms,
+                    fps_num,
+                    fps_den,
+                    speed_num,
+                    speed_den,
                 )
             }
         },
@@ -871,18 +891,20 @@ fn main() -> Result<(), slint::PlatformError> {
     // Transport intent → audio engine. Play doubles as the mid-playback
     // seek; non-1x speeds play muted (varispeed audio is a later phase).
     let play_audio = audio_system.handle();
-    app.global::<TransportBackend>().on_transport_play(move |tick, speed_num, speed_den| {
-        if speed_num == 1 && speed_den == 1 {
-            play_audio.play(i64::from(tick));
-        } else {
-            play_audio.pause();
-        }
-    });
+    app.global::<TransportBackend>()
+        .on_transport_play(move |tick, speed_num, speed_den| {
+            if speed_num == 1 && speed_den == 1 {
+                play_audio.play(i64::from(tick));
+            } else {
+                play_audio.pause();
+            }
+        });
 
     let pause_audio = audio_system.handle();
-    app.global::<TransportBackend>().on_transport_pause(move || {
-        pause_audio.pause();
-    });
+    app.global::<TransportBackend>()
+        .on_transport_pause(move || {
+            pause_audio.pause();
+        });
 
     // End-of-playback auto-stop, deferred off the playback Timer's own
     // callback. `playback-step` calls this instead of flipping
@@ -909,7 +931,16 @@ fn main() -> Result<(), slint::PlatformError> {
     // take exists only to re-trigger evaluation on delivery).
     let filmstrip_handle = strip_worker.handle();
     app.global::<StripBackend>().on_filmstrip_tiles(
-        move |media_id, source_in_s, duration, fps_num, fps_den, speed, zoom, from_bucket, to_bucket, _generation| {
+        move |media_id,
+              source_in_s,
+              duration,
+              fps_num,
+              fps_den,
+              speed,
+              zoom,
+              from_bucket,
+              to_bucket,
+              _generation| {
             strips::filmstrip_tiles(
                 &filmstrip_handle,
                 media_id.as_str(),
@@ -927,7 +958,16 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let waveform_handle = strip_worker.handle();
     app.global::<StripBackend>().on_waveform_tiles(
-        move |media_id, source_in_s, duration, fps_num, fps_den, speed, zoom, from_bucket, to_bucket, _generation| {
+        move |media_id,
+              source_in_s,
+              duration,
+              fps_num,
+              fps_den,
+              speed,
+              zoom,
+              from_bucket,
+              to_bucket,
+              _generation| {
             strips::waveform_tiles(
                 &waveform_handle,
                 media_id.as_str(),
@@ -964,7 +1004,14 @@ fn main() -> Result<(), slint::PlatformError> {
     );
 
     app.global::<DragBackend>().on_resolve_clip_drag(
-        |sequence, source_track_id, dragging_clip_id, dx_ticks, hover_row, playhead_tick, snap_threshold_ticks, main_magnet| {
+        |sequence,
+         source_track_id,
+         dragging_clip_id,
+         dx_ticks,
+         hover_row,
+         playhead_tick,
+         snap_threshold_ticks,
+         main_magnet| {
             snap::resolve_clip_drag(
                 &sequence,
                 source_track_id.as_str(),
@@ -979,7 +1026,14 @@ fn main() -> Result<(), slint::PlatformError> {
     );
 
     app.global::<DragBackend>().on_resolve_library_drop(
-        |sequence, lane_kind, duration_ticks, cursor_tick, drop_row, playhead_tick, snap_threshold_ticks, main_magnet| {
+        |sequence,
+         lane_kind,
+         duration_ticks,
+         cursor_tick,
+         drop_row,
+         playhead_tick,
+         snap_threshold_ticks,
+         main_magnet| {
             snap::resolve_library_drop(
                 &sequence,
                 lane_kind,
@@ -1027,8 +1081,8 @@ fn main() -> Result<(), slint::PlatformError> {
             selection::select_clip(&sequence, track_id.as_str(), clip_id.as_str(), link_enabled)
         });
 
-    app.global::<SelectionBackend>()
-        .on_toggle_clip(|sequence, current, track_id, clip_id, link_enabled| {
+    app.global::<SelectionBackend>().on_toggle_clip(
+        |sequence, current, track_id, clip_id, link_enabled| {
             selection::toggle_clip(
                 &sequence,
                 &current,
@@ -1036,30 +1090,34 @@ fn main() -> Result<(), slint::PlatformError> {
                 clip_id.as_str(),
                 link_enabled,
             )
-        });
+        },
+    );
 
-    app.global::<SelectionBackend>()
-        .on_resolve_marquee(|sequence, tick0, tick1, row0, row1, link_enabled| {
+    app.global::<SelectionBackend>().on_resolve_marquee(
+        |sequence, tick0, tick1, row0, row1, link_enabled| {
             selection::resolve_marquee(&sequence, tick0, tick1, row0, row1, link_enabled)
-        });
+        },
+    );
 
     // Selection survives undo/redo (v1 roadmap M0): every projection
     // republish reconciles the selection against the new clip set.
-    app.global::<SelectionBackend>().on_prune(|sequence, current, primary_clip_id| {
-        selection::prune_selection(&sequence, &current, primary_clip_id.as_str())
-    });
+    app.global::<SelectionBackend>()
+        .on_prune(|sequence, current, primary_clip_id| {
+            selection::prune_selection(&sequence, &current, primary_clip_id.as_str())
+        });
 
     app.global::<SelectionBackend>()
         .on_has_link(|sequence, ids| selection::selection_has_link(&sequence, &ids));
 
     // --- preview roadmap Phase 2: click-to-select in the viewport ---------
 
-    app.global::<PreviewBackend>()
-        .on_hit_test(|sequence, tick, x, y, view_w, view_h, zoom, pan_x, pan_y| {
+    app.global::<PreviewBackend>().on_hit_test(
+        |sequence, tick, x, y, view_w, view_h, zoom, pan_x, pan_y| {
             preview_select::hit_test_in_viewport(
                 &sequence, tick, x, y, view_w, view_h, zoom, pan_x, pan_y,
             )
-        });
+        },
+    );
 
     app.global::<PreviewBackend>().on_selection_box(
         |sequence, clip_id, tick, view_w, view_h, zoom, pan_x, pan_y, gesture_active, gesture| {
@@ -1111,9 +1169,10 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
-    app.global::<PreviewBackend>().on_nudge(|sequence, clip_id, tick, dx, dy| {
-        preview_gesture::nudge(&sequence, clip_id.as_str(), tick, dx, dy)
-    });
+    app.global::<PreviewBackend>()
+        .on_nudge(|sequence, clip_id, tick, dx, dy| {
+            preview_gesture::nudge(&sequence, clip_id.as_str(), tick, dx, dy)
+        });
 
     // --- preview roadmap Phase 4: scale & rotate handles -------------------
 
@@ -1218,9 +1277,26 @@ fn main() -> Result<(), slint::PlatformError> {
     );
 
     app.global::<PreviewBackend>().on_zoom_to(
-        |canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y, cursor_x, cursor_y, target_zoom| {
+        |canvas_w,
+         canvas_h,
+         view_w,
+         view_h,
+         zoom,
+         pan_x,
+         pan_y,
+         cursor_x,
+         cursor_y,
+         target_zoom| {
             preview_view::zoom_to(
-                canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y, cursor_x, cursor_y,
+                canvas_w,
+                canvas_h,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+                cursor_x,
+                cursor_y,
                 target_zoom,
             )
         },
@@ -1228,7 +1304,9 @@ fn main() -> Result<(), slint::PlatformError> {
 
     app.global::<PreviewBackend>().on_pan_view(
         |canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y, dx, dy| {
-            preview_view::pan_by(canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y, dx, dy)
+            preview_view::pan_by(
+                canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y, dx, dy,
+            )
         },
     );
 
@@ -1275,7 +1353,14 @@ fn main() -> Result<(), slint::PlatformError> {
         .on_group_floaters(|sequence, ids| selection::group_floaters(&sequence, &ids));
 
     app.global::<DragBackend>().on_resolve_group_drag(
-        |sequence, ids, anchor_track_id, anchor_clip_id, dx_ticks, hover_row, playhead_tick, snap_threshold_ticks| {
+        |sequence,
+         ids,
+         anchor_track_id,
+         anchor_clip_id,
+         dx_ticks,
+         hover_row,
+         playhead_tick,
+         snap_threshold_ticks| {
             selection::resolve_group_drag(
                 &sequence,
                 &ids,
@@ -1343,11 +1428,7 @@ fn main() -> Result<(), slint::PlatformError> {
     let marker_handle = preview_worker.handle();
     let timeline = app.global::<TimelineStore>();
     timeline.on_on_marker_added(move |at_tick, name, color| {
-        marker_handle.add_marker(
-            i64::from(at_tick),
-            name.to_string(),
-            color.to_string(),
-        );
+        marker_handle.add_marker(i64::from(at_tick), name.to_string(), color.to_string());
     });
     let marker_remove_handle = preview_worker.handle();
     timeline.on_on_marker_removed(move |marker_id| {
@@ -1409,19 +1490,14 @@ fn main() -> Result<(), slint::PlatformError> {
 
     app.global::<InspectorBackend>()
         .on_sample_transform(|clip, playhead| inspector::sample_transform(&clip, playhead));
-    app.global::<InspectorBackend>().on_compensate_anchor_position(
-        |clip, sequence, playhead, anchor_x, anchor_y, scale, rotation| {
-            inspector::compensate_anchor_position(
-                &clip,
-                sequence,
-                playhead,
-                anchor_x,
-                anchor_y,
-                scale,
-                rotation,
-            )
-        },
-    );
+    app.global::<InspectorBackend>()
+        .on_compensate_anchor_position(
+            |clip, sequence, playhead, anchor_x, anchor_y, scale, rotation| {
+                inspector::compensate_anchor_position(
+                    &clip, sequence, playhead, anchor_x, anchor_y, scale, rotation,
+                )
+            },
+        );
 
     app.global::<InspectorBackend>()
         .on_sample_audio(|clip, playhead| inspector::sample_audio(&clip, playhead));
@@ -1447,7 +1523,10 @@ fn main() -> Result<(), slint::PlatformError> {
     app.global::<InspectorBackend>()
         .on_remove_param_keyframe(move |clip_id, param, tick| {
             let Some((param, _)) = clip_param_value(param.as_str(), 0.0, 0.0) else {
-                tracing::error!(param = param.as_str(), "ignoring keyframe removal on unknown param");
+                tracing::error!(
+                    param = param.as_str(),
+                    "ignoring keyframe removal on unknown param"
+                );
                 return;
             };
             kf_remove_handle.remove_param_keyframe(clip_id.to_string(), param, i64::from(tick));
@@ -1467,9 +1546,10 @@ fn main() -> Result<(), slint::PlatformError> {
             );
         });
     let kf_remove_at_handle = preview_worker.handle();
-    app.global::<KeyframeBackend>().on_remove_at(move |clip_id, tick| {
-        kf_remove_at_handle.remove_keyframes_at(clip_id.to_string(), i64::from(tick));
-    });
+    app.global::<KeyframeBackend>()
+        .on_remove_at(move |clip_id, tick| {
+            kf_remove_at_handle.remove_keyframes_at(clip_id.to_string(), i64::from(tick));
+        });
     let set_speed_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
         .on_set_clip_speed(move |clip_id, num, den, reversed| {
@@ -1491,10 +1571,11 @@ fn main() -> Result<(), slint::PlatformError> {
             set_curve_point_handle.set_speed_curve_point(clip_id.to_string(), index, value);
         });
     let set_audio_handle = preview_worker.handle();
-    app.global::<InspectorBackend>()
-        .on_set_clip_audio(move |clip_id, volume, fade_in_s, fade_out_s| {
+    app.global::<InspectorBackend>().on_set_clip_audio(
+        move |clip_id, volume, fade_in_s, fade_out_s| {
             set_audio_handle.set_clip_audio(clip_id.to_string(), volume, fade_in_s, fade_out_s);
-        });
+        },
+    );
     let set_fades_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
         .on_set_clip_fades(move |clip_id, fade_in_s, fade_out_s| {
@@ -1532,8 +1613,8 @@ fn main() -> Result<(), slint::PlatformError> {
         });
 
     let set_text_handle = preview_worker.handle();
-    app.global::<InspectorBackend>()
-        .on_set_text_generator(move |_track_id, clip_id, content, style| {
+    app.global::<InspectorBackend>().on_set_text_generator(
+        move |_track_id, clip_id, content, style| {
             // Route the edit through the engine (undoable) rather than mutating
             // the Slint model, which the next projection republish would revert.
             // The inspector sends the full style each time, so one committed
@@ -1545,11 +1626,12 @@ fn main() -> Result<(), slint::PlatformError> {
                     style: inspector::text_style_from_ui(&style),
                 },
             );
-        });
+        },
+    );
 
     let preview_text_handle = preview_worker.handle();
-    app.global::<InspectorBackend>()
-        .on_preview_text_generator(move |clip_id, content, style, tick| {
+    app.global::<InspectorBackend>().on_preview_text_generator(
+        move |clip_id, content, style, tick| {
             // Live, uncommitted preview (e.g. font-size drag): render the clip
             // from this generator without touching history. Release commits.
             preview_text_handle.generator_override(
@@ -1560,7 +1642,8 @@ fn main() -> Result<(), slint::PlatformError> {
                 },
                 i64::from(tick),
             );
-        });
+        },
+    );
 
     let clear_text_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
@@ -1575,15 +1658,16 @@ fn main() -> Result<(), slint::PlatformError> {
         });
 
     let preview_shape_handle = preview_worker.handle();
-    app.global::<InspectorBackend>()
-        .on_preview_shape_generator(move |clip_id, width, height, tick| {
+    app.global::<InspectorBackend>().on_preview_shape_generator(
+        move |clip_id, width, height, tick| {
             preview_shape_handle.preview_shape_size(
                 clip_id.to_string(),
                 width,
                 height,
                 i64::from(tick),
             );
-        });
+        },
+    );
 
     let clear_shape_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
@@ -1596,7 +1680,9 @@ fn main() -> Result<(), slint::PlatformError> {
             let needle = query.to_lowercase();
             let filtered: Vec<SharedString> = items
                 .iter()
-                .filter(|family| needle.is_empty() || family.as_str().to_lowercase().contains(&needle))
+                .filter(|family| {
+                    needle.is_empty() || family.as_str().to_lowercase().contains(&needle)
+                })
                 .collect();
             ModelRc::new(VecModel::from(filtered))
         });

@@ -7,7 +7,9 @@ use std::path::{Path, PathBuf};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_encoder::ExportStats;
 use cutlass_engine::{ApplyOutcome, ColorConvertPath, Engine, EngineConfig};
-use cutlass_models::{ClipId, Generator, MediaId, Rational, RationalTime, TimeRange, TrackId, TrackKind};
+use cutlass_models::{
+    ClipId, Generator, MediaId, Rational, RationalTime, TimeRange, TrackId, TrackKind,
+};
 
 pub fn assets_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets")

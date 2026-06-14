@@ -127,7 +127,10 @@ where
     // Prime on the centre of the input, exactly like `exact` (rate is only a
     // phase-prediction hint, so the overall ratio is fine for a ramp too).
     let prime = l_in.min(in_frames);
-    stretch.seek(&input[..prime * CHANNELS], in_frames as f64 / out_frames as f64);
+    stretch.seek(
+        &input[..prime * CHANNELS],
+        in_frames as f64 / out_frames as f64,
+    );
 
     // Cumulative source frames the processor should have consumed by output
     // frame `o` (0 → `in_frames` over 0 → `out_frames`), following the curve.
@@ -273,7 +276,10 @@ mod tests {
         // speed clip. Output must be exactly the requested length and audible.
         let out = render_stretched(&path, RATE, 0, 48_000, 96_000, false, 1.0).expect("render");
         assert_eq!(out.len(), 96_000 * CHANNELS);
-        assert!(out.iter().any(|&s| s != 0.0), "stretched audio is not silent");
+        assert!(
+            out.iter().any(|&s| s != 0.0),
+            "stretched audio is not silent"
+        );
         assert!(out.iter().all(|&s| s.is_finite()), "no NaNs/infs");
     }
 
@@ -296,9 +302,17 @@ mod tests {
 
     #[test]
     fn curve_zero_output_is_silence() {
-        let out =
-            render_stretched_curve(Path::new("/nope.mp3"), RATE, 0, 48_000, 0, false, 1.0, |p| p)
-                .expect("zero output never touches the file");
+        let out = render_stretched_curve(
+            Path::new("/nope.mp3"),
+            RATE,
+            0,
+            48_000,
+            0,
+            false,
+            1.0,
+            |p| p,
+        )
+        .expect("zero output never touches the file");
         assert!(out.is_empty());
     }
 
@@ -310,8 +324,8 @@ mod tests {
         // An identity fraction is a constant rate, so the variable-rate path
         // should land in the same ballpark as the proven `exact` constant path
         // (not byte-identical — the streaming head/tail handling differs).
-        let curve =
-            render_stretched_curve(&path, RATE, 0, 48_000, 96_000, false, 1.0, |p| p).expect("curve");
+        let curve = render_stretched_curve(&path, RATE, 0, 48_000, 96_000, false, 1.0, |p| p)
+            .expect("curve");
         let constant = render_stretched(&path, RATE, 0, 48_000, 96_000, false, 1.0).expect("const");
         assert_eq!(curve.len(), constant.len());
         assert!(curve.iter().any(|&s| s != 0.0), "curve render is audible");
@@ -321,7 +335,10 @@ mod tests {
         if ce > 0.0 {
             // Same order of magnitude: the streaming pass isn't dropping or
             // doubling the signal.
-            assert!(ke > ce * 0.2 && ke < ce * 5.0, "energy {ke} vs constant {ce}");
+            assert!(
+                ke > ce * 0.2 && ke < ce * 5.0,
+                "energy {ke} vs constant {ce}"
+            );
         }
     }
 
@@ -331,8 +348,8 @@ mod tests {
             return;
         };
         // A slow-then-fast ramp: monotonic, 0→0, 1→1, source advances as p².
-        let out =
-            render_stretched_curve(&path, RATE, 0, 96_000, 96_000, false, 1.0, |p| p * p).expect("ramp");
+        let out = render_stretched_curve(&path, RATE, 0, 96_000, 96_000, false, 1.0, |p| p * p)
+            .expect("ramp");
         assert_eq!(out.len(), 96_000 * CHANNELS);
         assert!(out.iter().any(|&s| s != 0.0), "ramped audio plays");
         assert!(out.iter().all(|&s| s.is_finite()), "no NaNs/infs");

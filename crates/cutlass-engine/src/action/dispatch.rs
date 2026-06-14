@@ -96,7 +96,10 @@ fn dispatch_edit(
     match edit {
         EditCommand::AddTrack { kind, name, index } => {
             let (id, inverse) = edit::add_track::execute(ctx, kind, name, index)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::CreatedTrack(id)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::CreatedTrack(id)),
+                Some(inverse),
+            ))
         }
         EditCommand::AddClip {
             track,
@@ -105,7 +108,10 @@ fn dispatch_edit(
             start,
         } => {
             let (id, inverse) = edit::add_clip::execute(ctx, track, media, source, start)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Created(id)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
         }
         EditCommand::AddGenerated {
             track,
@@ -113,15 +119,28 @@ fn dispatch_edit(
             timeline,
         } => {
             let (id, inverse) = edit::add_generated::execute(ctx, track, generator, timeline)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Created(id)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetGenerator { clip, generator } => {
             let inverse = edit::set_generator::execute(ctx, clip, generator)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
-        EditCommand::SetClipTransform { clip, transform, at } => {
+        EditCommand::SetClipTransform {
+            clip,
+            transform,
+            at,
+        } => {
             let inverse = edit::set_transform::execute(ctx, clip, transform, at)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetParamKeyframe {
             clip,
@@ -131,15 +150,24 @@ fn dispatch_edit(
             easing,
         } => {
             let inverse = edit::set_param::set_keyframe(ctx, clip, param, at, value, easing)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::RemoveParamKeyframe { clip, param, at } => {
             let inverse = edit::set_param::remove_keyframe(ctx, clip, param, at)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetParamConstant { clip, param, value } => {
             let inverse = edit::set_param::set_constant(ctx, clip, param, value)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetClipSpeed {
             clip,
@@ -147,18 +175,27 @@ fn dispatch_edit(
             reversed,
         } => {
             let inverse = edit::set_speed::set_speed(ctx, clip, speed, reversed)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetSpeedCurve { clip, curve } => {
             let inverse = edit::set_speed_curve::set_speed_curve(ctx, clip, curve)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetClipPitch {
             clip,
             preserve_pitch,
         } => {
             let inverse = edit::set_pitch::set_pitch(ctx, clip, preserve_pitch)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetClipCrop {
             clip,
@@ -167,7 +204,10 @@ fn dispatch_edit(
             flip_v,
         } => {
             let inverse = edit::set_crop::set_crop(ctx, clip, crop, flip_h, flip_v)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetClipAudio {
             clip,
@@ -176,15 +216,24 @@ fn dispatch_edit(
             fade_out,
         } => {
             let inverse = edit::set_audio::set_audio(ctx, clip, volume, fade_in, fade_out)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::AddEffect { clip, effect_id } => {
             let inverse = edit::set_effect::add_effect(ctx, clip, &effect_id)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::RemoveEffect { clip, index } => {
             let inverse = edit::set_effect::remove_effect(ctx, clip, index)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetEffectParam {
             clip,
@@ -193,34 +242,52 @@ fn dispatch_edit(
             value,
         } => {
             let inverse = edit::set_effect::set_effect_param(ctx, clip, index, param, value)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::AddTransition {
             clip,
             transition_id,
         } => {
             let inverse = edit::set_transition::add_transition(ctx, clip, &transition_id)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::RemoveTransition { clip } => {
             let inverse = edit::set_transition::remove_transition(ctx, clip)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetTransition { clip, duration } => {
             let inverse = edit::set_transition::set_transition(ctx, clip, duration)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::SplitClip { clip, at } => {
             let guard = transitions_guard(ctx);
             let (id, primary) = edit::split_clip::execute(ctx, clip, at)?;
             let inverse = finalize_structural(ctx, guard, primary);
-            Ok((ApplyOutcome::Edited(EditOutcome::Created(id)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
         }
         EditCommand::TrimClip { clip, timeline } => {
             let guard = transitions_guard(ctx);
             let primary = edit::trim_clip::execute(ctx, clip, timeline)?;
             let inverse = finalize_structural(ctx, guard, primary);
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::MoveClip {
             clip,
@@ -230,51 +297,78 @@ fn dispatch_edit(
             let guard = transitions_guard(ctx);
             let primary = edit::move_clip::execute(ctx, clip, to_track, start)?;
             let inverse = finalize_structural(ctx, guard, primary);
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::RemoveClip { clip } => {
             let guard = transitions_guard(ctx);
             let primary = Box::new(RemoveClipAction { clip }).apply(ctx)?;
             let inverse = finalize_structural(ctx, guard, primary);
-            Ok((ApplyOutcome::Edited(EditOutcome::Removed(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Removed(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::RemoveTrack { track } => {
             let guard = transitions_guard(ctx);
             let primary = Box::new(RemoveTrackAction { track_id: track }).apply(ctx)?;
             let inverse = finalize_structural(ctx, guard, primary);
-            Ok((ApplyOutcome::Edited(EditOutcome::RemovedTrack(track)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::RemovedTrack(track)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetTrackEnabled { track, enabled } => {
             let inverse =
                 edit::set_track_flags::execute(ctx, track, Some(enabled), None, None, None)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetTrackMuted { track, muted } => {
             let inverse =
                 edit::set_track_flags::execute(ctx, track, None, Some(muted), None, None)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetTrackLocked { track, locked } => {
             let inverse =
                 edit::set_track_flags::execute(ctx, track, None, None, Some(locked), None)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetTrackDuckSource { track, duck_source } => {
             let inverse =
                 edit::set_track_flags::execute(ctx, track, None, None, None, Some(duck_source))?;
-            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::UpdatedTrack(track)),
+                Some(inverse),
+            ))
         }
         EditCommand::RippleDelete { clip } => {
             let guard = transitions_guard(ctx);
             let primary = edit::ripple_delete::execute(ctx, clip)?;
             let inverse = finalize_structural(ctx, guard, primary);
-            Ok((ApplyOutcome::Edited(EditOutcome::Removed(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Removed(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::ShiftClips { track, from, delta } => {
             let guard = transitions_guard(ctx);
             let primary = edit::shift_clips::execute(ctx, track, from, delta)?;
             let inverse = finalize_structural(ctx, guard, primary);
-            Ok((ApplyOutcome::Edited(EditOutcome::ShiftedTrack(track)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::ShiftedTrack(track)),
+                Some(inverse),
+            ))
         }
         EditCommand::RippleInsert {
             track,
@@ -285,14 +379,21 @@ fn dispatch_edit(
             let guard = transitions_guard(ctx);
             let (id, primary) = edit::ripple_insert::execute(ctx, track, media, source, at)?;
             let inverse = finalize_structural(ctx, guard, primary);
-            Ok((ApplyOutcome::Edited(EditOutcome::Created(id)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
         }
         EditCommand::LinkClips { clips } => {
-            let first = clips.first().copied().ok_or_else(|| {
-                EngineError::from(cutlass_models::ModelError::InvalidRange)
-            })?;
+            let first = clips
+                .first()
+                .copied()
+                .ok_or_else(|| EngineError::from(cutlass_models::ModelError::InvalidRange))?;
             let inverse = edit::link_clips::execute(ctx, &clips)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(first)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(first)),
+                Some(inverse),
+            ))
         }
         EditCommand::DuckLanes {
             voice,
@@ -304,15 +405,24 @@ fn dispatch_edit(
         } => {
             let (clip, inverse) =
                 edit::duck::duck(ctx, &voice, &music, threshold, amount, attack, release)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::Updated(clip)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
         }
         EditCommand::AddMarker { at, name, color } => {
             let (id, inverse) = edit::marker::add(ctx, at, name, color)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::CreatedMarker(id)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::CreatedMarker(id)),
+                Some(inverse),
+            ))
         }
         EditCommand::RemoveMarker { marker } => {
             let inverse = Box::new(edit::marker::RemoveMarkerAction { marker }).apply(ctx)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::RemovedMarker(marker)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::RemovedMarker(marker)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetMarker {
             marker,
@@ -321,11 +431,17 @@ fn dispatch_edit(
             color,
         } => {
             let inverse = edit::marker::set(ctx, marker, at, name, color)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedMarker(marker)), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::UpdatedMarker(marker)),
+                Some(inverse),
+            ))
         }
         EditCommand::SetCanvas { aspect, background } => {
             let inverse = edit::set_canvas::set_canvas(ctx, aspect, background)?;
-            Ok((ApplyOutcome::Edited(EditOutcome::UpdatedCanvas), Some(inverse)))
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::UpdatedCanvas),
+                Some(inverse),
+            ))
         }
     }
 }

@@ -4,9 +4,7 @@ mod common;
 
 use std::time::Duration;
 
-use common::{
-    assert_frame_shape, build_index, open_software, small_video_asset, target_ticks,
-};
+use common::{assert_frame_shape, build_index, open_software, small_video_asset, target_ticks};
 
 #[test]
 fn keyframe_index_and_seek_to_frame_agree() {
@@ -63,10 +61,7 @@ fn scrub_session_jumps_non_monotonically() {
 
     for target in targets {
         let ticks = target_ticks(&index, target);
-        let frame = dec
-            .seek_to_frame(target)
-            .expect("seek")
-            .expect("frame");
+        let frame = dec.seek_to_frame(target).expect("seek").expect("frame");
         assert!(frame.pts_ticks >= ticks);
         assert_frame_shape(&frame);
     }

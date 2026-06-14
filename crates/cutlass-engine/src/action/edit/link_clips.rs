@@ -27,7 +27,10 @@ pub fn execute(
 }
 
 impl EditAction for SetClipLinksAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         // Validate the whole set before mutating anything, so a missing clip
         // can't leave the group half-applied.
         for (clip, _) in &self.links {

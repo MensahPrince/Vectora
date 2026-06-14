@@ -171,7 +171,9 @@ pub fn export_timeline_with(
 ) -> Result<ExportStats, EngineError> {
     let tl_frames = project.timeline().duration().value;
     if tl_frames <= 0 {
-        return Err(EngineError::Export("timeline has no content to export".into()));
+        return Err(EngineError::Export(
+            "timeline has no content to export".into(),
+        ));
     }
 
     let mut mixer = ExportAudioMixer::for_project(project);
@@ -315,11 +317,14 @@ mod tests {
     #[test]
     fn settings_override_resolution_fps_and_quality() {
         let project = Project::new("test", Rational::FPS_24);
-        let cfg = export_config_with(&project, ExportSettings {
-            target_height: Some(720),
-            fps: Some(Rational::FPS_30),
-            quality: Some(23),
-        })
+        let cfg = export_config_with(
+            &project,
+            ExportSettings {
+                target_height: Some(720),
+                fps: Some(Rational::FPS_30),
+                quality: Some(23),
+            },
+        )
         .unwrap();
         assert_eq!((cfg.width, cfg.height), (1280, 720));
         assert_eq!((cfg.frame_rate_num, cfg.frame_rate_den), (30, 1));
@@ -331,10 +336,13 @@ mod tests {
         // 4K preset over the default 1080p canvas: the pick wins (CapCut
         // behavior), so the file really is 3840×2160.
         let project = Project::new("test", Rational::FPS_24);
-        let cfg = export_config_with(&project, ExportSettings {
-            target_height: Some(2160),
-            ..Default::default()
-        })
+        let cfg = export_config_with(
+            &project,
+            ExportSettings {
+                target_height: Some(2160),
+                ..Default::default()
+            },
+        )
         .unwrap();
         assert_eq!((cfg.width, cfg.height), (3840, 2160));
     }

@@ -206,9 +206,7 @@ mod tests {
         assert_eq!((w, h), (50, 50));
         assert_eq!(rgba.len(), 50 * 50 * 4);
 
-        let count = |color: [u8; 4]| {
-            rgba.chunks_exact(4).filter(|px| *px == color).count()
-        };
+        let count = |color: [u8; 4]| rgba.chunks_exact(4).filter(|px| *px == color).count();
         let bar = count(WAVEFORM_BAR);
         let bg = count(WAVEFORM_BG);
         assert!(bar > 0, "bars should be painted");

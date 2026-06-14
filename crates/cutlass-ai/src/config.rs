@@ -123,7 +123,11 @@ model = "qwen3:14b"
         assert_eq!(load_ai_config(&path), Ok(None));
 
         std::fs::write(&path, "[ai]\nbase_url = \n").unwrap();
-        assert!(load_ai_config(&path).unwrap_err().contains("could not parse"));
+        assert!(
+            load_ai_config(&path)
+                .unwrap_err()
+                .contains("could not parse")
+        );
     }
 
     #[test]

@@ -5,9 +5,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use cutlass_decoder::{
-    DecodeOptions, DecodedFrame, Decoder, HwAccel, KeyframeIndex, PixelFormat,
-};
+use cutlass_decoder::{DecodeOptions, DecodedFrame, Decoder, HwAccel, KeyframeIndex, PixelFormat};
 
 pub fn assets_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets")
@@ -56,7 +54,9 @@ pub fn target_ticks(index: &KeyframeIndex, target: Duration) -> i64 {
 }
 
 pub fn decode_first_frame(dec: &mut Decoder) -> DecodedFrame {
-    dec.next_frame().expect("decode").expect("at least one frame")
+    dec.next_frame()
+        .expect("decode")
+        .expect("at least one frame")
 }
 
 pub fn assert_frame_shape(frame: &DecodedFrame) {

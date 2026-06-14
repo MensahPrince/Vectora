@@ -14,11 +14,10 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use cutlass_models::{
-    Clip as EngineClip, ClipSource, Generator, Keyframe, Lerp, Marker as EngineMarker,
-    MediaSource, Param, Project as EngineProject,
-    Rational as EngineRational, RationalTime as EngineTime, TextAlignH, TextAlignV, TextCase,
-    TextStyle as EngineTextStyle, TimeRange as EngineRange, Track as EngineTrack,
-    TrackKind as EngineKind, rate_eq, resample,
+    Clip as EngineClip, ClipSource, Generator, Keyframe, Lerp, Marker as EngineMarker, MediaSource,
+    Param, Project as EngineProject, Rational as EngineRational, RationalTime as EngineTime,
+    TextAlignH, TextAlignV, TextCase, TextStyle as EngineTextStyle, TimeRange as EngineRange,
+    Track as EngineTrack, TrackKind as EngineKind, rate_eq, resample,
 };
 use slint::{Color, ModelRc, VecModel};
 
@@ -27,7 +26,6 @@ use crate::{
     Clip, EffectParamView, EffectView, Media, ParamKeyframe, Project, Rational, RationalTime,
     Sequence, TextClipStyle, TimeRange, TimelineMarker, Track, TrackKind, TransitionView,
 };
-
 
 /// Project the engine's project state into the Slint view model.
 ///
@@ -109,7 +107,11 @@ fn media_pool(project: &EngineProject, missing_media: &HashSet<u64>) -> Vec<Medi
         .collect()
 }
 
-fn media_to_slint(media: &MediaSource, tl_rate: cutlass_models::Rational, is_missing: bool) -> Media {
+fn media_to_slint(
+    media: &MediaSource,
+    tl_rate: cutlass_models::Rational,
+    is_missing: bool,
+) -> Media {
     Media {
         id: media.id.raw().to_string().into(),
         name: media_name(media).into(),
@@ -192,9 +194,10 @@ fn clip_to_slint(
     let (generator_kind, fill_color) = clip_generator_visual(clip);
     let (head_room, tail_room) = trim_rooms(project, clip);
     let (media_id, source_in_s) = match &clip.content {
-        ClipSource::Media { media, source } => {
-            (media.raw().to_string(), time_to_seconds(source.start) as f32)
-        }
+        ClipSource::Media { media, source } => (
+            media.raw().to_string(),
+            time_to_seconds(source.start) as f32,
+        ),
         ClipSource::Generated(_) => (String::new(), 0.0),
     };
     // Natural content size for preview placement: the media's native pixels
@@ -473,7 +476,12 @@ fn speed_label(clip: &EngineClip) -> String {
     // A ramp's effective rate is the base speed times the curve's average;
     // the `~` marks that the instantaneous rate varies across the clip.
     let ramped = clip.has_speed_curve();
-    let factor = speed_factor(clip.speed) * if ramped { clip.speed_curve_average() as f32 } else { 1.0 };
+    let factor = speed_factor(clip.speed)
+        * if ramped {
+            clip.speed_curve_average() as f32
+        } else {
+            1.0
+        };
     if ramped || (factor - 1.0).abs() > f32::EPSILON {
         let mut s = format!("{factor:.2}");
         while s.ends_with('0') {
@@ -894,8 +902,22 @@ mod tests {
         use slint::Model;
 
         let mut project = EngineProject::new("test", EngineRational::FPS_24);
-        let here = project.add_media(MediaSource::new("/tmp/a.mp4", 1920, 1080, EngineRational::FPS_24, 48, true));
-        let gone = project.add_media(MediaSource::new("/tmp/b.mp4", 1920, 1080, EngineRational::FPS_24, 48, true));
+        let here = project.add_media(MediaSource::new(
+            "/tmp/a.mp4",
+            1920,
+            1080,
+            EngineRational::FPS_24,
+            48,
+            true,
+        ));
+        let gone = project.add_media(MediaSource::new(
+            "/tmp/b.mp4",
+            1920,
+            1080,
+            EngineRational::FPS_24,
+            48,
+            true,
+        ));
 
         let missing: HashSet<u64> = [gone.raw()].into();
         let projected = project_to_slint(&project, &HashMap::new(), &missing);
@@ -907,7 +929,11 @@ mod tests {
         assert_eq!(first.id.as_str(), here.raw().to_string());
         assert!(!first.is_missing);
         assert!(second.is_missing);
-        assert_eq!(second.path.as_str(), "/tmp/b.mp4", "dialog shows where the file used to be");
+        assert_eq!(
+            second.path.as_str(),
+            "/tmp/b.mp4",
+            "dialog shows where the file used to be"
+        );
     }
 
     #[test]
@@ -916,15 +942,24 @@ mod tests {
         use slint::Model;
 
         let constant: Param<f32> = Param::Constant(1.0);
-        assert_eq!(keyframes_to_slint(&constant, 100, |v| (*v, 0.0)).row_count(), 0);
+        assert_eq!(
+            keyframes_to_slint(&constant, 100, |v| (*v, 0.0)).row_count(),
+            0
+        );
 
         let param = Param::Keyframed {
             keyframes: vec![
-                Keyframe { tick: 0, value: 0.5f32, easing: Easing::EaseOut },
+                Keyframe {
+                    tick: 0,
+                    value: 0.5f32,
+                    easing: Easing::EaseOut,
+                },
                 Keyframe {
                     tick: 24,
                     value: 1.0,
-                    easing: Easing::Bezier { points: [0.42, 0.0, 0.58, 1.0] },
+                    easing: Easing::Bezier {
+                        points: [0.42, 0.0, 0.58, 1.0],
+                    },
                 },
             ],
         };
@@ -975,8 +1010,14 @@ mod tests {
         );
         clip.speed_curve = speed_preset("montage").unwrap();
         let label = speed_label(&clip);
-        assert!(label.starts_with('~'), "ramp badge is tilde-prefixed: {label}");
-        assert!(label.ends_with('x'), "ramp badge reports an effective rate: {label}");
+        assert!(
+            label.starts_with('~'),
+            "ramp badge is tilde-prefixed: {label}"
+        );
+        assert!(
+            label.ends_with('x'),
+            "ramp badge reports an effective rate: {label}"
+        );
     }
 
     #[test]

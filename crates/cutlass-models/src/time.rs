@@ -127,11 +127,7 @@ impl TimeRange {
         }
         let start = self.start.value.max(other.start.value);
         let end = self.end_tick().min(other.end_tick());
-        Ok(Some(Self::at_rate(
-            start,
-            end - start,
-            self.start.rate,
-        )))
+        Ok(Some(Self::at_rate(start, end - start, self.start.rate)))
     }
 }
 
@@ -145,7 +141,10 @@ pub fn check_same_rate(actual: Rational, expected: Rational) -> Result<(), Model
     if rate_eq(actual, expected) {
         Ok(())
     } else {
-        Err(ModelError::RateMismatch { expected, got: actual })
+        Err(ModelError::RateMismatch {
+            expected,
+            got: actual,
+        })
     }
 }
 
@@ -177,8 +176,7 @@ pub fn resample(time: RationalTime, to: Rational) -> RationalTime {
     if rate_eq(time.rate, to) {
         return time;
     }
-    let numer =
-        i128::from(time.value) * i128::from(to.num) * i128::from(time.rate.den);
+    let numer = i128::from(time.value) * i128::from(to.num) * i128::from(time.rate.den);
     let denom = i128::from(to.den) * i128::from(time.rate.num);
     if denom == 0 {
         return RationalTime::zero(to);
@@ -489,10 +487,7 @@ mod tests {
         assert_eq!(resample(rt(80, R24), R30).value, 100);
 
         // 1001 frames @ 24000/1001 (~41.75s) -> 1002 frames @ 24.
-        assert_eq!(
-            resample(rt(1001, Rational::FPS_23_976), R24).value,
-            1002
-        );
+        assert_eq!(resample(rt(1001, Rational::FPS_23_976), R24).value, 1002);
     }
 
     #[test]

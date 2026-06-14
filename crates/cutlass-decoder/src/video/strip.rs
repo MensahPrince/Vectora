@@ -74,7 +74,11 @@ pub fn video_strip(
     // Don't chase targets past the end of the stream; the decode loop would
     // walk the whole tail GOP just to land on the last frame anyway.
     let duration_s = input.duration().max(0) as f64 / 1e6;
-    let max_target = if duration_s > 0.0 { (duration_s - 0.05).max(0.0) } else { f64::MAX };
+    let max_target = if duration_s > 0.0 {
+        (duration_s - 0.05).max(0.0)
+    } else {
+        f64::MAX
+    };
 
     // Visit ascending so forward decode rolls from target to target; deliver
     // under the caller's original index.
@@ -118,7 +122,13 @@ pub fn video_strip(
             if steps >= MAX_DECODE_STEPS {
                 break;
             }
-            if next_frame(&mut input, &mut decoder, stream_index, &mut demuxer_done, &mut frame)? {
+            if next_frame(
+                &mut input,
+                &mut decoder,
+                stream_index,
+                &mut demuxer_done,
+                &mut frame,
+            )? {
                 have_frame = true;
                 ever_decoded = true;
                 steps += 1;
@@ -246,7 +256,10 @@ mod tests {
         let mut indices: Vec<usize> = seen.iter().map(|(i, ..)| *i).collect();
         indices.sort_unstable();
         assert_eq!(indices, vec![0, 1, 2]);
-        assert!(seen.iter().all(|&(_, w, h)| w <= 256 && h <= 128 && w > 0 && h > 0));
+        assert!(
+            seen.iter()
+                .all(|&(_, w, h)| w <= 256 && h <= 128 && w > 0 && h > 0)
+        );
     }
 
     #[test]
@@ -256,7 +269,10 @@ mod tests {
         };
         let mut count = 0;
         video_strip(&path, &[1e9], 128, 128, &mut |_, _| count += 1).expect("strip");
-        assert_eq!(count, 1, "an out-of-range target resolves to the last frame");
+        assert_eq!(
+            count, 1,
+            "an out-of-range target resolves to the last frame"
+        );
     }
 
     #[test]

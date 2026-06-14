@@ -35,7 +35,11 @@ pub fn read(path: &Path) -> Vec<PathBuf> {
         warn!(path = %path.display(), "recent-projects file unparsable; treating as empty");
         return Vec::new();
     };
-    entries.into_iter().filter(|p| p.exists()).take(MAX_ENTRIES).collect()
+    entries
+        .into_iter()
+        .filter(|p| p.exists())
+        .take(MAX_ENTRIES)
+        .collect()
 }
 
 /// Move `project` to the front of the list at `path` (dedup, prune, cap)
@@ -131,7 +135,10 @@ mod tests {
         let entries = read(&list);
         assert_eq!(entries.len(), MAX_ENTRIES);
         // Newest survives, oldest fell off.
-        assert_eq!(entries[0], dir.path().join(format!("p{}.cutlass", MAX_ENTRIES + 2)));
+        assert_eq!(
+            entries[0],
+            dir.path().join(format!("p{}.cutlass", MAX_ENTRIES + 2))
+        );
         assert!(!entries.contains(&dir.path().join("p0.cutlass")));
     }
 

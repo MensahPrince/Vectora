@@ -24,7 +24,10 @@ struct RestoreCanvasAction {
 }
 
 impl EditAction for RestoreCanvasAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let timeline = ctx.project.timeline_mut();
         let current = timeline.canvas();
         timeline.set_canvas(self.settings);

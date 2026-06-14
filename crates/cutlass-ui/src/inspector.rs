@@ -154,16 +154,10 @@ pub fn sample_audio(clip: &Clip, playhead: i32) -> AudioSample {
 pub fn can_duck_under_voice(sequence: Sequence, track_id: &str) -> bool {
     (0..sequence.tracks.row_count())
         .filter_map(|i| sequence.tracks.row_data(i))
-        .any(|track| {
-            track.kind == TrackKind::Audio && track.duck_source && track.id != track_id
-        })
+        .any(|track| track.kind == TrackKind::Audio && track.duck_source && track.id != track_id)
 }
 
-pub fn resolve_selection(
-    sequence: Sequence,
-    track_id: &str,
-    clip_id: &str,
-) -> SelectedClipInfo {
+pub fn resolve_selection(sequence: Sequence, track_id: &str, clip_id: &str) -> SelectedClipInfo {
     if track_id.is_empty() || clip_id.is_empty() {
         return SelectedClipInfo {
             found: false,

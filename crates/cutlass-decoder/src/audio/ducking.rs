@@ -314,7 +314,11 @@ mod tests {
         let rate = 16_000;
         // 1 s at 100 Hz control rate → ~100 hops.
         let energy = speech_band_energy(&tone(1_000.0, 0.3, rate, 1.0), rate);
-        assert!((energy.len() as i32 - 100).abs() <= 1, "got {}", energy.len());
+        assert!(
+            (energy.len() as i32 - 100).abs() <= 1,
+            "got {}",
+            energy.len()
+        );
     }
 
     // --- duck_gain ---------------------------------------------------------
@@ -323,7 +327,10 @@ mod tests {
     fn quiet_voice_never_ducks() {
         let energy = vec![0.001f32; 200];
         let gain = duck_gain(&energy, &DuckSettings::default());
-        assert!(gain.iter().all(|&g| (g - 1.0).abs() < 1e-6), "stays at unity");
+        assert!(
+            gain.iter().all(|&g| (g - 1.0).abs() < 1e-6),
+            "stays at unity"
+        );
     }
 
     #[test]
@@ -363,7 +370,10 @@ mod tests {
         // the same number of steps after the voice stops.
         let attack_drop = gain[0] - gain[5];
         let release_rise = gain[55] - gain[50];
-        assert!(attack_drop > release_rise, "{attack_drop} vs {release_rise}");
+        assert!(
+            attack_drop > release_rise,
+            "{attack_drop} vs {release_rise}"
+        );
     }
 
     #[test]

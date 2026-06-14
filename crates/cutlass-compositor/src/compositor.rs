@@ -4,11 +4,11 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::effects::EffectRegistry;
-use crate::transitions::TransitionRegistry;
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
 use crate::image::RgbaImage;
 use crate::layer::{CompositeLayer, CompositorConfig, LayerContent, LayerEffect, LayerPlacement};
+use crate::transitions::TransitionRegistry;
 use crate::yuv::{Yuv420pImage, Yuv420pLayer};
 
 const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -55,12 +55,7 @@ fn placement_uniforms(
     let d = cos * p.size[1]; // ∂pos.y/∂corner.y
     // Canvas px → clip space: x' = 2x/cw − 1, y' = 1 − 2y/ch (flip y).
     PlacementUniforms {
-        linear: [
-            2.0 * a / cw,
-            -2.0 * b / ch,
-            2.0 * c / cw,
-            -2.0 * d / ch,
-        ],
+        linear: [2.0 * a / cw, -2.0 * b / ch, 2.0 * c / cw, -2.0 * d / ch],
         trans_opacity: [
             2.0 * p.center[0] / cw - 1.0,
             1.0 - 2.0 * p.center[1] / ch,
@@ -158,12 +153,12 @@ impl Compositor {
         // Placement matrices live in the vertex stage; opacity in the fragment.
         let uniform_stages = wgpu::ShaderStages::VERTEX_FRAGMENT;
 
-        let solid_bind_layout = gpu
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("solid_bind"),
-                entries: &[uniform_binding(0, uniform_stages)],
-            });
+        let solid_bind_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("solid_bind"),
+                    entries: &[uniform_binding(0, uniform_stages)],
+                });
 
         let blit_bind_layout =
             gpu.device
@@ -276,14 +271,13 @@ impl Compositor {
             gpu.device
                 .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                     label: Some("rgba_to_yuv_pipeline"),
-                    layout: Some(
-                        &gpu.device
-                            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                                label: Some("rgba_to_yuv_layout"),
-                                bind_group_layouts: &[&rgba_to_yuv_bind_layout],
-                                push_constant_ranges: &[],
-                            }),
-                    ),
+                    layout: Some(&gpu.device.create_pipeline_layout(
+                        &wgpu::PipelineLayoutDescriptor {
+                            label: Some("rgba_to_yuv_layout"),
+                            bind_group_layouts: &[&rgba_to_yuv_bind_layout],
+                            push_constant_ranges: &[],
+                        },
+                    )),
                     module: &rgba_to_yuv_shader,
                     entry_point: Some("cs"),
                     compilation_options: Default::default(),
@@ -367,14 +361,7 @@ impl Compositor {
                 label: Some("composite_yuv_encoder"),
             });
         self.render_layers_into(&mut encoder, gpu, config, layers)?;
-        self.encode_yuv_into(
-            &mut encoder,
-            gpu,
-            config,
-            &y_buf,
-            &u_buf,
-            &v_buf,
-        )?;
+        self.encode_yuv_into(&mut encoder, gpu, config, &y_buf, &u_buf, &v_buf)?;
         gpu.queue.submit(Some(encoder.finish()));
 
         let y = read_storage_u8(gpu, &y_buf, y_count as usize)?;
@@ -1340,34 +1327,35 @@ fn render_pipeline(
     layout: &wgpu::PipelineLayout,
     blend: wgpu::BlendState,
 ) -> wgpu::RenderPipeline {
-    gpu.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: Some(label),
-        layout: Some(layout),
-        vertex: wgpu::VertexState {
-            module: shader,
-            entry_point: Some("vs"),
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(wgpu::FragmentState {
-            module: shader,
-            entry_point: Some("fs"),
-            targets: &[Some(wgpu::ColorTargetState {
-                format: FORMAT,
-                blend: Some(blend),
-                write_mask: wgpu::ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive: wgpu::PrimitiveState {
-            topology: wgpu::PrimitiveTopology::TriangleList,
-            ..Default::default()
-        },
-        depth_stencil: None,
-        multisample: wgpu::MultisampleState::default(),
-        multiview: None,
-        cache: None,
-    })
+    gpu.device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(layout),
+            vertex: wgpu::VertexState {
+                module: shader,
+                entry_point: Some("vs"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: shader,
+                entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: FORMAT,
+                    blend: Some(blend),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None,
+        })
 }
 
 fn texture_binding(binding: u32, visibility: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
@@ -1423,11 +1411,12 @@ fn storage_binding(binding: u32, read_write: bool) -> wgpu::BindGroupLayoutEntry
 }
 
 fn uniform_buffer<T: Pod>(gpu: &GpuContext, label: &str, value: &T) -> wgpu::Buffer {
-    gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some(label),
-        contents: bytemuck::bytes_of(value),
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-    })
+    gpu.device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(label),
+            contents: bytemuck::bytes_of(value),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        })
 }
 
 fn storage_buffer(gpu: &GpuContext, label: &str, size: u64) -> wgpu::Buffer {
@@ -1439,12 +1428,7 @@ fn storage_buffer(gpu: &GpuContext, label: &str, size: u64) -> wgpu::Buffer {
     })
 }
 
-fn upload_rgba_texture(
-    gpu: &GpuContext,
-    bytes: &[u8],
-    width: u32,
-    height: u32,
-) -> wgpu::Texture {
+fn upload_rgba_texture(gpu: &GpuContext, bytes: &[u8], width: u32, height: u32) -> wgpu::Texture {
     let texture = gpu.device.create_texture(&wgpu::TextureDescriptor {
         label: Some("layer_upload"),
         size: wgpu::Extent3d {

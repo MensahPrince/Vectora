@@ -190,9 +190,7 @@ pub fn run_prompt(
     if !config.dry_run {
         bridge.begin_group();
     }
-    let abort = |bridge: &mut dyn EngineBridge,
-                 actions: Vec<ActionLogEntry>,
-                 reason: String| {
+    let abort = |bridge: &mut dyn EngineBridge, actions: Vec<ActionLogEntry>, reason: String| {
         if !config.dry_run {
             bridge.rollback_group();
         }
@@ -304,7 +302,8 @@ pub fn run_prompt(
         }
     }
 
-    let turn_messages = collect_turn_messages(messages, turn_start, &describe_call_ids, &final_text);
+    let turn_messages =
+        collect_turn_messages(messages, turn_start, &describe_call_ids, &final_text);
     if config.dry_run {
         return PromptOutcome {
             text: final_text,
@@ -337,9 +336,8 @@ fn collect_turn_messages(
     for message in &mut turn {
         if let Message::ToolResult { call_id, content } = message {
             if describe_call_ids.iter().any(|id| id == call_id) {
-                *content =
-                    "(project state omitted — see the current state in the system message)"
-                        .to_string();
+                *content = "(project state omitted — see the current state in the system message)"
+                    .to_string();
             }
         }
     }
@@ -422,8 +420,7 @@ fn generator_phrase(generator: &wire::WireGenerator) -> String {
 /// `outcome` is `None` for dry-run (planned, not applied).
 pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> String {
     let mut line = match command {
-        WireCommand::AddTrack(a) => format!("added {:?} track '{}'", a.kind, a.name)
-            .to_lowercase(),
+        WireCommand::AddTrack(a) => format!("added {:?} track '{}'", a.kind, a.name).to_lowercase(),
         WireCommand::AddClip(a) => format!(
             "placed media {} ({}–{} of source) at {} on track {}",
             a.media,
@@ -475,10 +472,24 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
                 parts.push(format!("cropped {}", edges.join(", ")));
             }
             if let Some(h) = a.flip_h {
-                parts.push(if h { "flipped horizontally" } else { "unflipped horizontally" }.into());
+                parts.push(
+                    if h {
+                        "flipped horizontally"
+                    } else {
+                        "unflipped horizontally"
+                    }
+                    .into(),
+                );
             }
             if let Some(v) = a.flip_v {
-                parts.push(if v { "flipped vertically" } else { "unflipped vertically" }.into());
+                parts.push(
+                    if v {
+                        "flipped vertically"
+                    } else {
+                        "unflipped vertically"
+                    }
+                    .into(),
+                );
             }
             if parts.is_empty() {
                 parts.push("framing unchanged".into());
@@ -510,7 +521,11 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
                 parts.push(format!("speed {s}x"));
             }
             if let Some(r) = a.reversed {
-                parts.push(if r { "reversed".into() } else { "forward".to_string() });
+                parts.push(if r {
+                    "reversed".into()
+                } else {
+                    "forward".to_string()
+                });
             }
             if parts.is_empty() {
                 parts.push("retiming unchanged".into());
@@ -560,7 +575,10 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             format!("removed effect {} from clip {}", a.index, a.clip)
         }
         WireCommand::SetEffectParam(a) => {
-            format!("set clip {} effect {} {} = {}", a.clip, a.index, a.param, a.value)
+            format!(
+                "set clip {} effect {} {} = {}",
+                a.clip, a.index, a.param, a.value
+            )
         }
         WireCommand::AddTransition(a) => {
             format!("added {} transition after clip {}", a.transition, a.clip)
@@ -579,7 +597,12 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             secs(a.start + a.duration)
         ),
         WireCommand::MoveClip(a) => {
-            format!("moved clip {} to {} on track {}", a.clip, secs(a.start), a.to_track)
+            format!(
+                "moved clip {} to {} on track {}",
+                a.clip,
+                secs(a.start),
+                a.to_track
+            )
         }
         WireCommand::RemoveClip(a) => format!("removed clip {}", a.clip),
         WireCommand::RemoveTrack(a) => format!("removed track {}", a.track),
@@ -599,11 +622,16 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             a.track
         ),
         WireCommand::RippleDelete(a) => {
-            format!("ripple-deleted clip {} (later clips closed the gap)", a.clip)
+            format!(
+                "ripple-deleted clip {} (later clips closed the gap)",
+                a.clip
+            )
         }
         WireCommand::ShiftClips(a) => format!(
             "shifted clips on track {} from {} by {:+.2}s",
-            a.track, secs(a.from), a.delta
+            a.track,
+            secs(a.from),
+            a.delta
         ),
         WireCommand::RippleInsert(a) => format!(
             "ripple-inserted media {} at {} on track {} (later clips moved right)",

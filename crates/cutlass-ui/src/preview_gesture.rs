@@ -147,8 +147,7 @@ pub fn resolve_drag_in_viewport(
 
     PreviewDragResolution {
         valid: true,
-        moved: position_x != clip.transform_position_x
-            || position_y != clip.transform_position_y,
+        moved: position_x != clip.transform_position_x || position_y != clip.transform_position_y,
         position_x,
         position_y,
         anchor_x: clip.transform_anchor_x,
@@ -331,9 +330,10 @@ pub fn resolve_rotate_in_viewport(
     // atan2 in y-down screen coords increases clockwise — the same sense as
     // `ClipTransform::rotation`, so the delta adds directly.
     let press_angle = (press_y - center_y).atan2(press_x - center_x).to_degrees();
-    let cursor_angle = (cursor_y - center_y).atan2(cursor_x - center_x).to_degrees();
-    let mut rotation =
-        normalize_degrees(clip.transform_rotation + (cursor_angle - press_angle));
+    let cursor_angle = (cursor_y - center_y)
+        .atan2(cursor_x - center_x)
+        .to_degrees();
+    let mut rotation = normalize_degrees(clip.transform_rotation + (cursor_angle - press_angle));
 
     let cardinal = normalize_degrees((rotation / 90.0).round() * 90.0);
     if (normalize_degrees(rotation - cardinal)).abs() <= snap_tolerance_deg {
@@ -611,7 +611,11 @@ mod tests {
         locked.locked = true;
         let mut hidden = track("3", vec![media_clip("H", 1920, 1080)]);
         hidden.enabled = false;
-        let seq = sequence(vec![locked, hidden, track("1", vec![media_clip("A", 1920, 1080)])]);
+        let seq = sequence(vec![
+            locked,
+            hidden,
+            track("1", vec![media_clip("A", 1920, 1080)]),
+        ]);
         assert!(!resolve_drag(&seq, "L", 10, 0.0, 0.0, 50.0, 0.0, VW, VH, 0.0).valid);
         assert!(!resolve_drag(&seq, "H", 10, 0.0, 0.0, 50.0, 0.0, VW, VH, 0.0).valid);
         assert!(!resolve_drag(&seq, "404", 10, 0.0, 0.0, 50.0, 0.0, VW, VH, 0.0).valid);
@@ -760,10 +764,8 @@ mod tests {
 
         let mut scaled = base.clone();
         scaled.transform_scale = r.scale;
-        let a1 = anchor_canvas_position(
-            &clip_transform(&scaled),
-            &clip_placement(&scaled, &canvas),
-        );
+        let a1 =
+            anchor_canvas_position(&clip_transform(&scaled), &clip_placement(&scaled, &canvas));
         assert!((a0[0] - a1[0]).abs() < 1e-2);
         assert!((a0[1] - a1[1]).abs() < 1e-2);
     }
@@ -775,8 +777,16 @@ mod tests {
         // Scale animates 1.0 → 2.0 over ticks 0..40: at tick 20 the frame
         // renders 1.5, and that's what a scale gesture must compound.
         clip.kf_scale = ModelRc::from(Rc::new(VecModel::from(vec![
-            ParamKeyframe { tick: 0, value_x: 1.0, ..Default::default() },
-            ParamKeyframe { tick: 40, value_x: 2.0, ..Default::default() },
+            ParamKeyframe {
+                tick: 0,
+                value_x: 1.0,
+                ..Default::default()
+            },
+            ParamKeyframe {
+                tick: 40,
+                value_x: 2.0,
+                ..Default::default()
+            },
         ])));
         let seq = sequence(vec![track("1", vec![clip])]);
         // Press 200 px from the center, drag to 100 px: halves the sample.
@@ -798,6 +808,9 @@ mod tests {
         assert!(!r.snap_h && !r.snap_v);
 
         let locked_miss = nudge(&seq, "404", 10, 1.0, 0.0);
-        assert!(!locked_miss.valid, "unknown clip falls through to frame-step");
+        assert!(
+            !locked_miss.valid,
+            "unknown clip falls through to frame-step"
+        );
     }
 }

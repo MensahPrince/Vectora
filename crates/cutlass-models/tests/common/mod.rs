@@ -2,9 +2,7 @@
 
 #![allow(dead_code)]
 
-use cutlass_models::{
-    MediaSource, Project, Rational, RationalTime, TimeRange, TrackId, TrackKind,
-};
+use cutlass_models::{MediaSource, Project, Rational, RationalTime, TimeRange, TrackId, TrackKind};
 
 pub const FPS_24: Rational = Rational::FPS_24;
 pub const FPS_30: Rational = Rational::FPS_30;

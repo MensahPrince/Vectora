@@ -20,8 +20,6 @@ pub enum EncodeError {
 
 impl EncodeError {
     pub fn unsupported(what: impl Into<String>) -> Self {
-        EncodeError::Unsupported {
-            what: what.into(),
-        }
+        EncodeError::Unsupported { what: what.into() }
     }
 }

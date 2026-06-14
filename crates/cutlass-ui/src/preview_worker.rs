@@ -83,7 +83,9 @@ enum WorkerMsg {
     /// resolved (existing target lane + start) by the group drag resolver;
     /// the batch lands via park-then-place so members can never transiently
     /// collide with each other regardless of order.
-    MoveGroup { moves: Vec<GroupMove> },
+    MoveGroup {
+        moves: Vec<GroupMove>,
+    },
     /// Re-place `clip` (raw id) at `[start_tick, start_tick + duration_ticks)`
     /// on its own lane (edge trim; the engine re-derives the source in/out).
     TrimClip {
@@ -93,10 +95,15 @@ enum WorkerMsg {
     },
     /// Remove every clip in `clips` (raw ids) as one history entry; lanes
     /// the removals empty are removed too (same policy as drag-moves).
-    RemoveClips { clips: Vec<String> },
+    RemoveClips {
+        clips: Vec<String>,
+    },
     /// Replace a generated clip's content (raw id) — e.g. an inspector title
     /// edit. One undoable history entry per committed edit.
-    SetGenerator { clip: String, generator: Generator },
+    SetGenerator {
+        clip: String,
+        generator: Generator,
+    },
     /// Resize a shape clip's reference-pixel dimensions. Preserves shape kind
     /// and fill from the committed generator.
     SetShapeSize {
@@ -230,7 +237,9 @@ enum WorkerMsg {
     },
     /// Drop the gesture override (no-op release / cancelled drag) and
     /// re-render `tick` from committed state.
-    ClearTransformOverride { tick: i64 },
+    ClearTransformOverride {
+        tick: i64,
+    },
     /// Live inspector edit preview (e.g. font-size slider drag): render `tick`
     /// with `clip`'s generator replaced — session state on the engine, no
     /// history entry, no projection republish. Coalesces with `Frame`/itself
@@ -242,7 +251,9 @@ enum WorkerMsg {
     },
     /// Drop the generator override (control released with no net change) and
     /// re-render `tick` from committed state.
-    ClearGeneratorOverride { tick: i64 },
+    ClearGeneratorOverride {
+        tick: i64,
+    },
     /// Commit a transform gesture: clear any override and apply one undoable
     /// `SetClipTransform`, then re-render `tick` (a nudge has no preceding
     /// override, so the frame must refresh here).
@@ -282,10 +293,16 @@ enum WorkerMsg {
     /// Remove every keyframe sitting at `tick` across all animated
     /// properties of `clip` (timeline diamond right-click). One history
     /// group.
-    RemoveKeyframesAt { clip: String, tick: i64 },
+    RemoveKeyframesAt {
+        clip: String,
+        tick: i64,
+    },
     /// Split `clip` (raw id) at `at_tick` (sequence ticks). The UI gates on
     /// the playhead being strictly inside the clip; the engine re-validates.
-    SplitClip { clip: String, at_tick: i64 },
+    SplitClip {
+        clip: String,
+        at_tick: i64,
+    },
     /// Drop a ruler marker at `at_tick`. `color` is a palette name
     /// ("teal", "blue", …) or empty to cycle. One undoable history entry.
     AddMarker {
@@ -294,24 +311,34 @@ enum WorkerMsg {
         color: String,
     },
     /// Remove a ruler marker by raw id. One undoable history entry.
-    RemoveMarker { marker: String },
+    RemoveMarker {
+        marker: String,
+    },
     /// Step the engine history one entry back / forward.
     Undo,
     Redo,
     /// Snapshot `clips` (raw ids — the whole selection) into the worker
     /// clipboard as one block. A snapshot, not a reference — pasting works
     /// after the originals are deleted.
-    CopyClips { clips: Vec<String> },
+    CopyClips {
+        clips: Vec<String>,
+    },
     /// Place the clipboard block at `tick`: members keep their lanes and
     /// relative placement, the whole block slides right as one unit until
     /// every member fits.
-    PasteAt { tick: i64 },
+    PasteAt {
+        tick: i64,
+    },
     /// Place copies of `clips` (the whole selection) right after the block
     /// they form, keeping lanes and relative placement.
-    DuplicateClips { clips: Vec<String> },
+    DuplicateClips {
+        clips: Vec<String>,
+    },
     /// Dissolve the link group of every clip in `clips` (raw ids): all
     /// members of the touched groups — selected or not — end up unlinked.
-    UnlinkClips { clips: Vec<String> },
+    UnlinkClips {
+        clips: Vec<String>,
+    },
     /// Mirror of the UI's main-track magnet toggle. The worker needs it for
     /// ops without a drag resolution (delete/paste/duplicate); enabling also
     /// packs the main lane gapless (one history entry).
@@ -338,7 +365,9 @@ enum WorkerMsg {
     /// undoable; on success the projection republish clears the dirty dot.
     /// Either way `save-finished(ok)` fires so a pending guarded transition
     /// (open/new/close waiting on "Save") can continue or abort.
-    SaveProject { path: Option<PathBuf> },
+    SaveProject {
+        path: Option<PathBuf>,
+    },
     /// Replace the session from a `.cutlass` file (tolerant: entries whose
     /// media file is gone are kept and surface through the relink flow —
     /// the projection republish carries the missing set, and app.slint
@@ -348,16 +377,23 @@ enum WorkerMsg {
     /// resets its session state (playhead, selection, range). Failure
     /// publishes `session-error`. The unsaved-changes guard ran UI-side
     /// before this message was sent.
-    OpenProject { path: PathBuf },
+    OpenProject {
+        path: PathBuf,
+    },
     /// Re-point a media-pool entry (raw id) at a new file (missing-media
     /// relink, M0): the engine re-probes the file and swaps the entry's
     /// path/metadata in place (id and clips untouched), the tile workers
     /// re-register, and the projection republish drops the entry from the
     /// missing set. Not undoable — state repair, not an edit.
-    RelinkMedia { media: String, path: PathBuf },
+    RelinkMedia {
+        media: String,
+        path: PathBuf,
+    },
     /// Try `folder/<filename>` for every missing pool entry (locate-folder
     /// gesture in the relink dialog).
-    RelinkFolder { folder: PathBuf },
+    RelinkFolder {
+        folder: PathBuf,
+    },
     /// Replace the session with a fresh, empty, unsaved project (File →
     /// New). Same epoch bump as `OpenProject`; guard ran UI-side.
     NewProject,
@@ -378,7 +414,9 @@ enum WorkerMsg {
     /// Clone the live project for the AI agent's sandbox rehearsal
     /// (`src/agent.rs`). Ordered with mutations, so the snapshot always
     /// reflects every edit sent before it.
-    SnapshotProject { reply: Sender<Project> },
+    SnapshotProject {
+        reply: Sender<Project>,
+    },
     /// Replay a rehearsed agent plan as one history group, re-validating
     /// every step against the live project and remapping ids the sandbox
     /// allocated. All-or-nothing: any failure rolls the group back.
@@ -475,7 +513,9 @@ impl WorkerHandle {
     }
 
     pub fn restore_autosave(&self, autosave: PathBuf, source: Option<PathBuf>) {
-        let _ = self.tx.send(WorkerMsg::RestoreAutosave { autosave, source });
+        let _ = self
+            .tx
+            .send(WorkerMsg::RestoreAutosave { autosave, source });
     }
 
     pub fn relink_media(&self, media: String, path: PathBuf) {
@@ -923,9 +963,7 @@ fn worker_main(
         "preview worker ready (empty project)"
     );
     let tl_rate = session.tl_rate;
-    ready_tx
-        .send(Ok(session))
-        .map_err(|e| e.to_string())?;
+    ready_tx.send(Ok(session)).map_err(|e| e.to_string())?;
 
     // Seed the UI with the engine's project so the editor reads from the engine
     // from the first frame (rather than any Slint-side placeholder).
@@ -936,7 +974,15 @@ fn worker_main(
     };
     publish_projection(&mut engine, &ui);
 
-    worker_loop(&mut engine, tl_rate, preview_weak, ui, thumbs, strips, req_rx);
+    worker_loop(
+        &mut engine,
+        tl_rate,
+        preview_weak,
+        ui,
+        thumbs,
+        strips,
+        req_rx,
+    );
     Ok(())
 }
 
@@ -983,9 +1029,7 @@ fn worker_loop(
                   autosave_slot: &mut Option<(PathBuf, u64)>,
                   msg: WorkerMsg| {
         match msg {
-            WorkerMsg::Import(path) => {
-                import_and_publish(engine, &path, &ui, &thumbs, &strips)
-            }
+            WorkerMsg::Import(path) => import_and_publish(engine, &path, &ui, &thumbs, &strips),
             WorkerMsg::AddClip {
                 media,
                 track,
@@ -993,14 +1037,7 @@ fn worker_loop(
                 drop_row,
                 insert,
             } => add_clip_and_publish(
-                engine,
-                &media,
-                &track,
-                start_tick,
-                drop_row,
-                insert,
-                *linkage,
-                &ui,
+                engine, &media, &track, start_tick, drop_row, insert, *linkage, &ui,
             ),
             WorkerMsg::AddGenerated {
                 generator,
@@ -1033,9 +1070,7 @@ fn worker_loop(
                 *main_magnet,
                 &ui,
             ),
-            WorkerMsg::MoveGroup { moves } => {
-                move_group_and_publish(engine, &moves, &ui)
-            }
+            WorkerMsg::MoveGroup { moves } => move_group_and_publish(engine, &moves, &ui),
             WorkerMsg::TrimClip {
                 clip,
                 start_tick,
@@ -1055,7 +1090,11 @@ fn worker_loop(
             WorkerMsg::SetGenerator { clip, generator } => {
                 set_generator_and_publish(engine, &clip, generator, &ui)
             }
-            WorkerMsg::SetShapeSize { clip, width, height } => {
+            WorkerMsg::SetShapeSize {
+                clip,
+                width,
+                height,
+            } => {
                 if let Some(generator) = shape_size_from_engine(engine, &clip, width, height) {
                     set_generator_and_publish(engine, &clip, generator, &ui);
                 }
@@ -1208,9 +1247,7 @@ fn worker_loop(
                 name,
                 color,
             } => add_marker_and_publish(engine, at_tick, &name, &color, tl_rate, &ui),
-            WorkerMsg::RemoveMarker { marker } => {
-                remove_marker_and_publish(engine, &marker, &ui)
-            }
+            WorkerMsg::RemoveMarker { marker } => remove_marker_and_publish(engine, &marker, &ui),
             WorkerMsg::Undo => history_step_and_publish(engine, false, &ui),
             WorkerMsg::Redo => history_step_and_publish(engine, true, &ui),
             WorkerMsg::CopyClips { clips } => {
@@ -1296,9 +1333,14 @@ fn worker_loop(
                             apply_transform_override(engine, &clip, transform);
                             tick = at;
                         }
-                        other => {
-                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
-                        }
+                        other => mutate(
+                            engine,
+                            &mut clipboard,
+                            &mut main_magnet,
+                            &mut linkage,
+                            &mut autosave_slot,
+                            other,
+                        ),
                     }
                 }
                 last_tick = tick;
@@ -1338,7 +1380,14 @@ fn worker_loop(
                             if std::mem::take(&mut pending) {
                                 apply_transform_override(engine, &clip, transform);
                             }
-                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
+                            mutate(
+                                engine,
+                                &mut clipboard,
+                                &mut main_magnet,
+                                &mut linkage,
+                                &mut autosave_slot,
+                                other,
+                            )
                         }
                     }
                 }
@@ -1376,7 +1425,14 @@ fn worker_loop(
                             if std::mem::take(&mut pending) {
                                 apply_generator_override(engine, &clip, generator.clone());
                             }
-                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
+                            mutate(
+                                engine,
+                                &mut clipboard,
+                                &mut main_magnet,
+                                &mut linkage,
+                                &mut autosave_slot,
+                                other,
+                            )
                         }
                     }
                 }
@@ -1420,13 +1476,20 @@ fn worker_loop(
                             {
                                 apply_generator_override(engine, &clip, generator);
                             }
-                            mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other)
+                            mutate(
+                                engine,
+                                &mut clipboard,
+                                &mut main_magnet,
+                                &mut linkage,
+                                &mut autosave_slot,
+                                other,
+                            )
                         }
                     }
                 }
                 last_tick = tick;
-                if pending && let Some(generator) =
-                    shape_size_from_engine(engine, &clip, width, height)
+                if pending
+                    && let Some(generator) = shape_size_from_engine(engine, &clip, width, height)
                 {
                     apply_generator_override(engine, &clip, generator);
                 }
@@ -1434,7 +1497,14 @@ fn worker_loop(
             }
             other => {
                 let redraw = mutation_redraws_preview(&other);
-                mutate(engine, &mut clipboard, &mut main_magnet, &mut linkage, &mut autosave_slot, other);
+                mutate(
+                    engine,
+                    &mut clipboard,
+                    &mut main_magnet,
+                    &mut linkage,
+                    &mut autosave_slot,
+                    other,
+                );
                 // Edits otherwise only repaint when the playhead moves; refresh
                 // the current frame so the change is visible immediately.
                 if redraw {
@@ -1573,9 +1643,7 @@ fn fit_clip_transform(
     let fit = (cw / w).min(ch / h);
     let cover = (cw / w).max(ch / h);
     let scale = if fill { cover / fit } else { 1.0 };
-    let sampled = clip
-        .transform
-        .sample_at(clip.animation_tick_f(tick as f64));
+    let sampled = clip.transform.sample_at(clip.animation_tick_f(tick as f64));
     Some(ClipTransform {
         position: [0.0, 0.0],
         anchor_point: sampled.anchor_point,
@@ -1833,12 +1901,7 @@ fn remove_keyframes_at_and_publish(
 /// shuttle) only warms the cache.
 const READ_AHEAD_TICKS: i64 = 4;
 
-fn prefetch_ahead(
-    engine: &mut Engine,
-    tl_rate: Rational,
-    tick: i64,
-    req_rx: &Receiver<WorkerMsg>,
-) {
+fn prefetch_ahead(engine: &mut Engine, tl_rate: Rational, tick: i64, req_rx: &Receiver<WorkerMsg>) {
     let end = engine.project().timeline().duration().value;
     for ahead in 1..=READ_AHEAD_TICKS {
         let target = tick + ahead;
@@ -1893,7 +1956,9 @@ fn save_project_and_publish(engine: &mut Engine, path: Option<PathBuf>, ui: &UiS
         notify_save_finished(ui, false);
         return;
     };
-    match engine.apply(Command::Project(ProjectCommand::Save { path: path.clone() })) {
+    match engine.apply(Command::Project(ProjectCommand::Save {
+        path: path.clone(),
+    })) {
         Ok(ApplyOutcome::Saved) => {
             info!(path = %path.display(), "project saved");
             note_recent_project(&path, ui);
@@ -1906,7 +1971,10 @@ fn save_project_and_publish(engine: &mut Engine, path: Option<PathBuf>, ui: &UiS
         }
         Err(e) => {
             error!(path = %path.display(), "save failed: {e}");
-            publish_session_error(ui, format!("Couldn't save the project to {}: {e}", path.display()));
+            publish_session_error(
+                ui,
+                format!("Couldn't save the project to {}: {e}", path.display()),
+            );
             notify_save_finished(ui, false);
         }
     }
@@ -1930,7 +1998,9 @@ fn open_project_and_publish(
     thumbs: &ThumbnailHandle,
     strips: &StripHandle,
 ) {
-    match engine.apply(Command::Project(ProjectCommand::Load { path: path.clone() })) {
+    match engine.apply(Command::Project(ProjectCommand::Load {
+        path: path.clone(),
+    })) {
         Ok(ApplyOutcome::Loaded) => {
             info!(
                 path = %path.display(),
@@ -1987,10 +2057,7 @@ fn relink_media_and_publish(
         Ok(other) => error!(path = %path.display(), "unexpected relink outcome: {other:?}"),
         Err(e) => {
             error!(path = %path.display(), "relink failed: {e}");
-            publish_session_error(
-                ui,
-                format!("Couldn't relink to {}: {e}", path.display()),
-            );
+            publish_session_error(ui, format!("Couldn't relink to {}: {e}", path.display()));
         }
     }
 }
@@ -2141,7 +2208,10 @@ fn restore_autosave_and_publish(
             error!(autosave = %autosave.display(), "restore failed: {e}");
             publish_session_error(
                 ui,
-                format!("Couldn't restore the recovered project {}: {e}", autosave.display()),
+                format!(
+                    "Couldn't restore the recovered project {}: {e}",
+                    autosave.display()
+                ),
             );
         }
     }
@@ -2329,7 +2399,10 @@ fn add_generated_and_publish(
     ui: &UiSink,
 ) {
     let Some(lane_kind) = TrackKind::for_generator(&generator) else {
-        error!(?generator, "generated drop ignored: no lane kind for generator");
+        error!(
+            ?generator,
+            "generated drop ignored: no lane kind for generator"
+        );
         return;
     };
     let desired = start_tick.max(0);
@@ -2349,7 +2422,10 @@ fn add_generated_and_publish(
         None => match create_track(engine, lane_kind, drop_row) {
             Ok(id) => (id, desired),
             Err(e) => {
-                error!(?generator, "generated drop failed creating {lane_kind:?} track: {e}");
+                error!(
+                    ?generator,
+                    "generated drop failed creating {lane_kind:?} track: {e}"
+                );
                 engine.rollback_group();
                 return;
             }
@@ -2569,8 +2645,7 @@ fn set_clip_audio_and_publish(
 
     let tl_rate = engine.project().timeline().frame_rate;
     let to_ticks = |seconds: f32| {
-        let ticks =
-            (f64::from(seconds) * f64::from(tl_rate.num) / f64::from(tl_rate.den)).round();
+        let ticks = (f64::from(seconds) * f64::from(tl_rate.num) / f64::from(tl_rate.den)).round();
         RationalTime::new(ticks.max(0.0) as i64, tl_rate)
     };
     let (fade_in, fade_out) = (to_ticks(fade_in_s), to_ticks(fade_out_s));
@@ -2621,9 +2696,7 @@ fn duck_under_voice_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
         timeline
             .tracks_ordered()
             .filter(|track| {
-                track.kind == TrackKind::Audio
-                    && track.duck_source
-                    && Some(track.id) != music_track
+                track.kind == TrackKind::Audio && track.duck_source && Some(track.id) != music_track
             })
             .flat_map(|track| track.clips_ordered())
             .filter(|c| c.timeline.overlaps(music_range).unwrap_or(false))
@@ -2656,7 +2729,12 @@ fn duck_under_voice_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
 /// Set the project canvas settings (M1): aspect preset + background color
 /// in one undoable history entry. An out-of-range preset index falls back
 /// to auto (defensive — the dialog's list is index-aligned with the model).
-fn set_canvas_and_publish(engine: &mut Engine, aspect_index: i32, background: [u8; 3], ui: &UiSink) {
+fn set_canvas_and_publish(
+    engine: &mut Engine,
+    aspect_index: i32,
+    background: [u8; 3],
+    ui: &UiSink,
+) {
     let aspect = usize::try_from(aspect_index)
         .ok()
         .and_then(|i| cutlass_models::CanvasAspect::ALL.get(i).copied())
@@ -2800,7 +2878,9 @@ fn remove_transition_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
         error!(clip, "remove-transition ignored: unparsable clip id");
         return;
     };
-    if let Err(e) = engine.apply(Command::Edit(EditCommand::RemoveTransition { clip: clip_id })) {
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::RemoveTransition {
+        clip: clip_id,
+    })) {
         error!(%clip_id, "remove transition failed: {e}");
         return;
     }
@@ -2956,9 +3036,7 @@ fn add_linked_audio(
         let timeline = engine.project().timeline();
         timeline.order().iter().rev().copied().find(|id| {
             timeline.track(*id).is_some_and(|t| {
-                t.kind == TrackKind::Audio
-                    && !t.locked
-                    && span_free(t, start_tick, duration_ticks)
+                t.kind == TrackKind::Audio && !t.locked && span_free(t, start_tick, duration_ticks)
             })
         })
     };
@@ -2981,9 +3059,12 @@ fn add_linked_audio(
         Ok(other) => return Err(format!("unexpected audio add outcome: {other:?}")),
         Err(e) => return Err(e.to_string()),
     };
-    apply_edit(engine, EditCommand::LinkClips {
-        clips: vec![video_clip, audio_clip],
-    })?;
+    apply_edit(
+        engine,
+        EditCommand::LinkClips {
+            clips: vec![video_clip, audio_clip],
+        },
+    )?;
     info!(%video_clip, %audio_clip, %lane, start_tick, "linked audio companion");
     Ok(())
 }
@@ -3166,28 +3247,40 @@ fn ripple_reorder(
         .ok_or("main lane missing")?
         .content_end();
 
-    apply_edit(engine, EditCommand::MoveClip {
-        clip: clip_id,
-        to_track: track,
-        start: RationalTime::new(park, tl_rate),
-    })?;
+    apply_edit(
+        engine,
+        EditCommand::MoveClip {
+            clip: clip_id,
+            to_track: track,
+            start: RationalTime::new(park, tl_rate),
+        },
+    )?;
     // Both shifts also carry the parked clip along (its start stays past the
     // rest of the lane), so it never collides with the clips in between.
-    apply_edit(engine, EditCommand::ShiftClips {
-        track,
-        from: placed.start,
-        delta: RationalTime::new(-duration, tl_rate),
-    })?;
-    apply_edit(engine, EditCommand::ShiftClips {
-        track,
-        from: RationalTime::new(at, tl_rate),
-        delta: RationalTime::new(duration, tl_rate),
-    })?;
-    apply_edit(engine, EditCommand::MoveClip {
-        clip: clip_id,
-        to_track: track,
-        start: RationalTime::new(at, tl_rate),
-    })
+    apply_edit(
+        engine,
+        EditCommand::ShiftClips {
+            track,
+            from: placed.start,
+            delta: RationalTime::new(-duration, tl_rate),
+        },
+    )?;
+    apply_edit(
+        engine,
+        EditCommand::ShiftClips {
+            track,
+            from: RationalTime::new(at, tl_rate),
+            delta: RationalTime::new(duration, tl_rate),
+        },
+    )?;
+    apply_edit(
+        engine,
+        EditCommand::MoveClip {
+            clip: clip_id,
+            to_track: track,
+            start: RationalTime::new(at, tl_rate),
+        },
+    )
 }
 
 /// Cross-lane move onto the main lane: open the hole at `at`, move the clip
@@ -3209,16 +3302,22 @@ fn ripple_move_in(
         .duration
         .value;
 
-    apply_edit(engine, EditCommand::ShiftClips {
-        track: to_track,
-        from: RationalTime::new(at, tl_rate),
-        delta: RationalTime::new(duration, tl_rate),
-    })?;
-    apply_edit(engine, EditCommand::MoveClip {
-        clip: clip_id,
-        to_track,
-        start: RationalTime::new(at, tl_rate),
-    })?;
+    apply_edit(
+        engine,
+        EditCommand::ShiftClips {
+            track: to_track,
+            from: RationalTime::new(at, tl_rate),
+            delta: RationalTime::new(duration, tl_rate),
+        },
+    )?;
+    apply_edit(
+        engine,
+        EditCommand::MoveClip {
+            clip: clip_id,
+            to_track,
+            start: RationalTime::new(at, tl_rate),
+        },
+    )?;
     remove_track_if_empty(engine, source_track);
     Ok(())
 }
@@ -3345,11 +3444,7 @@ fn commit_trims(
 ///
 /// The caller wraps members in one history group and rolls back on error,
 /// so a rejected step never leaves a half-applied ripple.
-fn apply_ripple_trim(
-    engine: &mut Engine,
-    clip: ClipId,
-    timeline: TimeRange,
-) -> Result<(), String> {
+fn apply_ripple_trim(engine: &mut Engine, clip: ClipId, timeline: TimeRange) -> Result<(), String> {
     let Some(old) = engine.project().clip(clip).map(|c| c.timeline) else {
         return Err("clip is not on the timeline".into());
     };
@@ -3365,41 +3460,56 @@ fn apply_ripple_trim(
         if delta_dur > 0 {
             // Grow: open room first (the clip and everything after it move
             // right), then trim anchored at the old start.
-            apply_edit(engine, EditCommand::ShiftClips {
-                track,
-                from: old.start,
-                delta: RationalTime::new(delta_dur, tl_rate),
-            })?;
-            apply_edit(engine, EditCommand::TrimClip {
-                clip,
-                timeline: TimeRange::at_rate(old.start.value, timeline.duration.value, tl_rate),
-            })
+            apply_edit(
+                engine,
+                EditCommand::ShiftClips {
+                    track,
+                    from: old.start,
+                    delta: RationalTime::new(delta_dur, tl_rate),
+                },
+            )?;
+            apply_edit(
+                engine,
+                EditCommand::TrimClip {
+                    clip,
+                    timeline: TimeRange::at_rate(old.start.value, timeline.duration.value, tl_rate),
+                },
+            )
         } else {
             // Shrink: trim to the resolved extent (a gap opens at the old
             // start), then slide the clip and downstream left into it.
             apply_edit(engine, trim)?;
-            apply_edit(engine, EditCommand::ShiftClips {
-                track,
-                from: timeline.start,
-                delta: RationalTime::new(old.start.value - timeline.start.value, tl_rate),
-            })
+            apply_edit(
+                engine,
+                EditCommand::ShiftClips {
+                    track,
+                    from: timeline.start,
+                    delta: RationalTime::new(old.start.value - timeline.start.value, tl_rate),
+                },
+            )
         }
     } else if delta_dur > 0 {
         // Trailing grow: push downstream right, then extend into the hole.
-        apply_edit(engine, EditCommand::ShiftClips {
-            track,
-            from: RationalTime::new(old.end_tick(), tl_rate),
-            delta: RationalTime::new(delta_dur, tl_rate),
-        })?;
+        apply_edit(
+            engine,
+            EditCommand::ShiftClips {
+                track,
+                from: RationalTime::new(old.end_tick(), tl_rate),
+                delta: RationalTime::new(delta_dur, tl_rate),
+            },
+        )?;
         apply_edit(engine, trim)
     } else if delta_dur < 0 {
         // Trailing shrink: pull the edge in, then close the gap behind it.
         apply_edit(engine, trim)?;
-        apply_edit(engine, EditCommand::ShiftClips {
-            track,
-            from: RationalTime::new(old.end_tick(), tl_rate),
-            delta: RationalTime::new(delta_dur, tl_rate),
-        })
+        apply_edit(
+            engine,
+            EditCommand::ShiftClips {
+                track,
+                from: RationalTime::new(old.end_tick(), tl_rate),
+                delta: RationalTime::new(delta_dur, tl_rate),
+            },
+        )
     } else {
         // No edge moved (defensive — the UI skips noop trims).
         apply_edit(engine, trim)
@@ -3530,10 +3640,13 @@ fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: E
     let cancel = state.cancel.clone();
     let path = request.path;
 
-    publish_export_state(&export_weak, ExportUiState {
-        running: true,
-        ..Default::default()
-    });
+    publish_export_state(
+        &export_weak,
+        ExportUiState {
+            running: true,
+            ..Default::default()
+        },
+    );
 
     let spawned = std::thread::Builder::new()
         .name("cutlass-export".into())
@@ -3559,12 +3672,15 @@ fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: E
                     {
                         published_once = true;
                         last_publish = Instant::now();
-                        publish_export_state(&weak, ExportUiState {
-                            running: true,
-                            done,
-                            total,
-                            ..Default::default()
-                        });
+                        publish_export_state(
+                            &weak,
+                            ExportUiState {
+                                running: true,
+                                done,
+                                total,
+                                ..Default::default()
+                            },
+                        );
                     }
                     true
                 },
@@ -3619,11 +3735,14 @@ fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: E
     if let Err(e) = spawned {
         error!("failed to spawn export thread: {e}");
         state.active.store(false, Ordering::SeqCst);
-        publish_export_state(&ui.export, ExportUiState {
-            failed: true,
-            status: format!("Export failed to start: {e}"),
-            ..Default::default()
-        });
+        publish_export_state(
+            &ui.export,
+            ExportUiState {
+                failed: true,
+                status: format!("Export failed to start: {e}"),
+                ..Default::default()
+            },
+        );
     }
 }
 
@@ -3632,12 +3751,7 @@ fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: E
 /// use). With the main-track magnet on, main-lane deletions ripple their
 /// gaps closed. Everything forms one history group: one undo restores the
 /// whole selection.
-fn remove_clips_and_publish(
-    engine: &mut Engine,
-    clips: &[String],
-    main_magnet: bool,
-    ui: &UiSink,
-) {
+fn remove_clips_and_publish(engine: &mut Engine, clips: &[String], main_magnet: bool, ui: &UiSink) {
     let main = main_video_track(engine);
     // Resolve every member up front: a single bad id voids the whole batch
     // rather than half-deleting the selection.
@@ -3754,7 +3868,12 @@ fn split_clip_and_publish(
     // Tails are born unlinked (split copies content, not links); pair them
     // back up so each half keeps moving as a unit.
     if tails.len() > 1
-        && let Err(e) = apply_edit(engine, EditCommand::LinkClips { clips: tails.clone() })
+        && let Err(e) = apply_edit(
+            engine,
+            EditCommand::LinkClips {
+                clips: tails.clone(),
+            },
+        )
     {
         error!(%clip_id, "split failed linking tails: {e}");
         engine.rollback_group();
@@ -3773,11 +3892,7 @@ fn split_clip_and_publish(
 /// one undo reverts the whole gesture. Source lanes the moves empty are
 /// removed (same overlay policy as single moves). Group moves are freeform —
 /// the main-track magnet's ripple-insert applies to single-clip drags only.
-fn move_group_and_publish(
-    engine: &mut Engine,
-    moves: &[GroupMove],
-    ui: &UiSink,
-) {
+fn move_group_and_publish(engine: &mut Engine, moves: &[GroupMove], ui: &UiSink) {
     // Resolve raw ids up front; any stale entry voids the batch.
     let mut resolved = Vec::with_capacity(moves.len());
     for entry in moves {
@@ -3786,7 +3901,10 @@ fn move_group_and_publish(
             return;
         };
         let Some(to_track) = parse_raw_id(&entry.track).map(TrackId::from_raw) else {
-            error!(track = entry.track, "group move ignored: unparsable track id");
+            error!(
+                track = entry.track,
+                "group move ignored: unparsable track id"
+            );
             return;
         };
         let Some(source_track) = engine.project().timeline().track_of(clip_id) else {
@@ -3816,11 +3934,14 @@ fn move_group_and_publish(
             .clip(clip_id)
             .map(|c| c.timeline.duration.value)
             .unwrap_or(1);
-        if let Err(e) = apply_edit(engine, EditCommand::MoveClip {
-            clip: clip_id,
-            to_track,
-            start: RationalTime::new(park, tl_rate),
-        }) {
+        if let Err(e) = apply_edit(
+            engine,
+            EditCommand::MoveClip {
+                clip: clip_id,
+                to_track,
+                start: RationalTime::new(park, tl_rate),
+            },
+        ) {
             error!(%clip_id, %to_track, "group move failed parking: {e}");
             engine.rollback_group();
             publish_projection(engine, ui);
@@ -3829,11 +3950,14 @@ fn move_group_and_publish(
         park += duration;
     }
     for &(clip_id, to_track, _, start_tick) in &resolved {
-        if let Err(e) = apply_edit(engine, EditCommand::MoveClip {
-            clip: clip_id,
-            to_track,
-            start: RationalTime::new(start_tick, tl_rate),
-        }) {
+        if let Err(e) = apply_edit(
+            engine,
+            EditCommand::MoveClip {
+                clip: clip_id,
+                to_track,
+                start: RationalTime::new(start_tick, tl_rate),
+            },
+        ) {
             error!(%clip_id, %to_track, start_tick, "group move failed landing: {e}");
             engine.rollback_group();
             publish_projection(engine, ui);
@@ -3854,11 +3978,7 @@ fn move_group_and_publish(
 
 /// Step the engine history (`redo == false` ⇒ undo). Publishes even on a
 /// no-op so the UI's can-undo / can-redo flags stay honest.
-fn history_step_and_publish(
-    engine: &mut Engine,
-    redo: bool,
-    ui: &UiSink,
-) {
+fn history_step_and_publish(engine: &mut Engine, redo: bool, ui: &UiSink) {
     let stepped = if redo { engine.redo() } else { engine.undo() };
     info!(redo, stepped, "history step");
     publish_projection(engine, ui);
@@ -3958,7 +4078,13 @@ fn place_block(
 
     let mut created: Vec<(Option<LinkId>, ClipId)> = Vec::with_capacity(members.len());
     for &(track, start, member) in members {
-        let id = add_clip_content(engine, track, &member.content, member.duration_ticks, start + dx)?;
+        let id = add_clip_content(
+            engine,
+            track,
+            &member.content,
+            member.duration_ticks,
+            start + dx,
+        )?;
         created.push((member.link, id));
     }
 
@@ -4034,12 +4160,17 @@ fn paste_and_publish(
                 .track(track)
                 .expect("paste target track exists");
             let start = nearest_boundary(lane, tick.max(0));
-            let result = apply_edit(engine, EditCommand::ShiftClips {
-                track,
-                from: RationalTime::new(start, tl_rate),
-                delta: RationalTime::new(duration, tl_rate),
-            })
-            .and_then(|_| add_clip_content(engine, track, &only.content, only.duration_ticks, start));
+            let result = apply_edit(
+                engine,
+                EditCommand::ShiftClips {
+                    track,
+                    from: RationalTime::new(start, tl_rate),
+                    delta: RationalTime::new(duration, tl_rate),
+                },
+            )
+            .and_then(|_| {
+                add_clip_content(engine, track, &only.content, only.duration_ticks, start)
+            });
             match result {
                 Ok(clip_id) => {
                     engine.commit_group();
@@ -4057,7 +4188,13 @@ fn paste_and_publish(
 
     let members: Vec<(TrackId, i64, &ClipboardClip)> = block
         .iter()
-        .map(|member| (lanes[&member.track], tick.max(0) + member.offset_ticks, member))
+        .map(|member| {
+            (
+                lanes[&member.track],
+                tick.max(0) + member.offset_ticks,
+                member,
+            )
+        })
         .collect();
     match place_block(engine, &members) {
         Ok(()) => {
@@ -4157,7 +4294,12 @@ fn unlink_clips_and_publish(engine: &mut Engine, clips: &[String], ui: &UiSink) 
 
     engine.begin_group();
     for member in &members {
-        if let Err(e) = apply_edit(engine, EditCommand::LinkClips { clips: vec![*member] }) {
+        if let Err(e) = apply_edit(
+            engine,
+            EditCommand::LinkClips {
+                clips: vec![*member],
+            },
+        ) {
             error!(%member, "unlink failed: {e}");
             engine.rollback_group();
             publish_projection(engine, ui);
@@ -4165,19 +4307,18 @@ fn unlink_clips_and_publish(engine: &mut Engine, clips: &[String], ui: &UiSink) 
         }
     }
     engine.commit_group();
-    info!(groups = links.len(), members = members.len(), "unlinked clip groups");
+    info!(
+        groups = links.len(),
+        members = members.len(),
+        "unlinked clip groups"
+    );
     publish_projection(engine, ui);
 }
 
 /// Place a copy of `clip` immediately after it on its own lane (first gap
 /// that fits from the clip's end). With the main-track magnet on, a main-lane
 /// duplicate ripple-inserts right after the original, shifting later clips.
-fn duplicate_clip_and_publish(
-    engine: &mut Engine,
-    clip: &str,
-    main_magnet: bool,
-    ui: &UiSink,
-) {
+fn duplicate_clip_and_publish(engine: &mut Engine, clip: &str, main_magnet: bool, ui: &UiSink) {
     let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
         error!(clip, "duplicate ignored: unparsable clip id");
         return;
@@ -4199,11 +4340,14 @@ fn duplicate_clip_and_publish(
         // Open a hole right after the original, land the copy in it — one
         // history entry for the pair.
         engine.begin_group();
-        let result = apply_edit(engine, EditCommand::ShiftClips {
-            track,
-            from: RationalTime::new(end_tick, tl_rate),
-            delta: RationalTime::new(duration_ticks, tl_rate),
-        })
+        let result = apply_edit(
+            engine,
+            EditCommand::ShiftClips {
+                track,
+                from: RationalTime::new(end_tick, tl_rate),
+                delta: RationalTime::new(duration_ticks, tl_rate),
+            },
+        )
         .and_then(|_| add_clip_content(engine, track, &content, duration_ticks, end_tick));
         match result {
             Ok(copy_id) => {
@@ -4238,10 +4382,7 @@ fn duplicate_clip_and_publish(
 /// Close every gap on the main lane, including leading space before the
 /// first clip — CapCut's lane is gapless the moment the magnet turns on.
 /// One history group: a single undo restores the gaps.
-fn pack_main_track_and_publish(
-    engine: &mut Engine,
-    ui: &UiSink,
-) {
+fn pack_main_track_and_publish(engine: &mut Engine, ui: &UiSink) {
     let Some(track) = main_video_track(engine) else {
         return;
     };
@@ -4267,11 +4408,14 @@ fn pack_main_track_and_publish(
     for (start, duration) in clips {
         let current = start - shifted_so_far;
         if current > expected {
-            if let Err(e) = apply_edit(engine, EditCommand::ShiftClips {
-                track,
-                from: RationalTime::new(current, tl_rate),
-                delta: RationalTime::new(expected - current, tl_rate),
-            }) {
+            if let Err(e) = apply_edit(
+                engine,
+                EditCommand::ShiftClips {
+                    track,
+                    from: RationalTime::new(current, tl_rate),
+                    delta: RationalTime::new(expected - current, tl_rate),
+                },
+            ) {
                 error!(%track, "magnet pack failed: {e}");
                 engine.rollback_group();
                 publish_projection(engine, ui);
@@ -4290,11 +4434,11 @@ fn pack_main_track_and_publish(
 /// stacks bottom→top, so the first video track in stack order).
 fn main_video_track(engine: &Engine) -> Option<TrackId> {
     let timeline = engine.project().timeline();
-    timeline
-        .order()
-        .iter()
-        .copied()
-        .find(|id| timeline.track(*id).is_some_and(|t| t.kind == TrackKind::Video))
+    timeline.order().iter().copied().find(|id| {
+        timeline
+            .track(*id)
+            .is_some_and(|t| t.kind == TrackKind::Video)
+    })
 }
 
 /// Clip boundary on `track` nearest to `tick`: every clip start plus the
@@ -4727,10 +4871,20 @@ mod tests {
     #[test]
     fn keyframes_at_collects_per_property_hits() {
         let mut t = AnimatedTransform::identity();
-        t.set_param_keyframe(ClipParam::Scale, 10, ParamValue::Scalar(2.0), Easing::EaseIn)
-            .unwrap();
-        t.set_param_keyframe(ClipParam::Scale, 20, ParamValue::Scalar(3.0), Easing::Linear)
-            .unwrap();
+        t.set_param_keyframe(
+            ClipParam::Scale,
+            10,
+            ParamValue::Scalar(2.0),
+            Easing::EaseIn,
+        )
+        .unwrap();
+        t.set_param_keyframe(
+            ClipParam::Scale,
+            20,
+            ParamValue::Scalar(3.0),
+            Easing::Linear,
+        )
+        .unwrap();
         t.set_param_keyframe(
             ClipParam::Position,
             10,
@@ -4738,8 +4892,13 @@ mod tests {
             Easing::Linear,
         )
         .unwrap();
-        t.set_param_keyframe(ClipParam::Opacity, 30, ParamValue::Scalar(0.5), Easing::Linear)
-            .unwrap();
+        t.set_param_keyframe(
+            ClipParam::Opacity,
+            30,
+            ParamValue::Scalar(0.5),
+            Easing::Linear,
+        )
+        .unwrap();
 
         let hits = keyframes_at(&t, 10);
         assert_eq!(
@@ -4837,10 +4996,7 @@ mod tests {
 
         commit_trims(
             &mut engine,
-            &[(
-                b,
-                TimeRange::at_rate(50, 20, Rational::FPS_24),
-            )],
+            &[(b, TimeRange::at_rate(50, 20, Rational::FPS_24))],
             true,
         )
         .expect("ripple tail shrink");
@@ -4859,10 +5015,7 @@ mod tests {
 
         commit_trims(
             &mut engine,
-            &[(
-                a,
-                TimeRange::at_rate(0, 60, Rational::FPS_24),
-            )],
+            &[(a, TimeRange::at_rate(0, 60, Rational::FPS_24))],
             true,
         )
         .expect("ripple tail grow");
@@ -4879,10 +5032,7 @@ mod tests {
 
         commit_trims(
             &mut engine,
-            &[(
-                a,
-                TimeRange::at_rate(10, 40, Rational::FPS_24),
-            )],
+            &[(a, TimeRange::at_rate(10, 40, Rational::FPS_24))],
             true,
         )
         .expect("ripple head shrink");
@@ -4900,10 +5050,7 @@ mod tests {
 
         commit_trims(
             &mut engine,
-            &[(
-                b,
-                TimeRange::at_rate(50, 20, Rational::FPS_24),
-            )],
+            &[(b, TimeRange::at_rate(50, 20, Rational::FPS_24))],
             false,
         )
         .expect("plain trim");
@@ -4931,13 +5078,28 @@ mod tests {
         ));
         let track = project.add_track(TrackKind::Video, "V1");
         let a = project
-            .add_clip(track, media, TimeRange::at_rate(100, 100, r), RationalTime::new(0, r))
+            .add_clip(
+                track,
+                media,
+                TimeRange::at_rate(100, 100, r),
+                RationalTime::new(0, r),
+            )
             .expect("clip A");
         let b = project
-            .add_clip(track, media, TimeRange::at_rate(300, 100, r), RationalTime::new(100, r))
+            .add_clip(
+                track,
+                media,
+                TimeRange::at_rate(300, 100, r),
+                RationalTime::new(100, r),
+            )
             .expect("clip B");
         let c = project
-            .add_clip(track, media, TimeRange::at_rate(500, 100, r), RationalTime::new(200, r))
+            .add_clip(
+                track,
+                media,
+                TimeRange::at_rate(500, 100, r),
+                RationalTime::new(200, r),
+            )
             .expect("clip C");
 
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4977,8 +5139,8 @@ mod tests {
     fn ripple_head_shrink_advances_source_and_stays_anchored() {
         let (_dir, mut engine, [a, b, c], _track) = ripple_fixture();
 
-        let rippled = commit_trims(&mut engine, &[(b, tr24(120, 80))], true)
-            .expect("ripple head shrink");
+        let rippled =
+            commit_trims(&mut engine, &[(b, tr24(120, 80))], true).expect("ripple head shrink");
         assert!(rippled);
 
         assert_eq!(extent(&engine, b), (100, 80));
@@ -4999,8 +5161,8 @@ mod tests {
     fn ripple_head_grow_reveals_earlier_source() {
         let (_dir, mut engine, [a, b, c], _track) = ripple_fixture();
 
-        let rippled = commit_trims(&mut engine, &[(b, tr24(50, 150))], true)
-            .expect("ripple head grow");
+        let rippled =
+            commit_trims(&mut engine, &[(b, tr24(50, 150))], true).expect("ripple head grow");
         assert!(rippled);
 
         assert_eq!(extent(&engine, b), (100, 150));
@@ -5039,13 +5201,17 @@ mod tests {
     #[test]
     fn overlay_lane_trim_does_not_ripple() {
         let (_dir, mut engine, [a, _, _], _track) = ripple_fixture();
-        let media = engine.project().clip(a).expect("clip").media().expect("media");
+        let media = engine
+            .project()
+            .clip(a)
+            .expect("clip")
+            .media()
+            .expect("media");
         let overlay = add_video_track(&mut engine, "V2");
         let d = add_media_clip(&mut engine, overlay, media, 0, 100);
         let e = add_media_clip(&mut engine, overlay, media, 100, 100);
 
-        let rippled = commit_trims(&mut engine, &[(d, tr24(0, 60))], true)
-            .expect("overlay trim");
+        let rippled = commit_trims(&mut engine, &[(d, tr24(0, 60))], true).expect("overlay trim");
         assert!(!rippled);
         assert_eq!(extent(&engine, d), (0, 60));
         assert_eq!(extent(&engine, e), (100, 100));
@@ -5065,7 +5231,10 @@ mod tests {
         assert_eq!(extent(&engine, a), (0, 100));
         assert_eq!(extent(&engine, b), (100, 100));
         assert_eq!(extent(&engine, c), (200, 100));
-        assert!(!engine.can_undo(), "rolled-back group must leave no history");
+        assert!(
+            !engine.can_undo(),
+            "rolled-back group must leave no history"
+        );
     }
 
     /// Linked-pair trim (video on the main lane, audio partner elsewhere):
@@ -5086,20 +5255,23 @@ mod tests {
             ApplyOutcome::Edited(EditOutcome::CreatedTrack(id)) => id,
             other => panic!("expected CreatedTrack, got {other:?}"),
         };
-        let media = engine.project().clip(b).expect("clip B").media().expect("media");
-        let add_audio_clip = |engine: &mut Engine, source: TimeRange, start: i64| {
-            match engine
-                .apply(Command::Edit(EditCommand::AddClip {
-                    track: audio,
-                    media,
-                    source,
-                    start: RationalTime::new(start, r),
-                }))
-                .expect("add audio clip")
-            {
-                ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
-                other => panic!("expected Created, got {other:?}"),
-            }
+        let media = engine
+            .project()
+            .clip(b)
+            .expect("clip B")
+            .media()
+            .expect("media");
+        let add_audio_clip = |engine: &mut Engine, source: TimeRange, start: i64| match engine
+            .apply(Command::Edit(EditCommand::AddClip {
+                track: audio,
+                media,
+                source,
+                start: RationalTime::new(start, r),
+            }))
+            .expect("add audio clip")
+        {
+            ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
+            other => panic!("expected Created, got {other:?}"),
         };
         // P mirrors B; Q sits downstream on the audio lane, aligned with C.
         let p = add_audio_clip(&mut engine, tr24(300, 100), 100);

@@ -21,7 +21,10 @@ pub struct ApplyContext<'a> {
 
 /// A runtime edit action. Consuming `apply` runs the edit and returns its inverse.
 pub trait EditAction: Send {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError>;
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError>;
 }
 
 /// Inverses for a multi-command gesture, undone/redone as one history entry.
@@ -36,7 +39,10 @@ pub(crate) struct CompoundAction {
 }
 
 impl EditAction for CompoundAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let mut inverses = Vec::with_capacity(self.actions.len());
         for action in self.actions.into_iter().rev() {
             inverses.push(action.apply(ctx)?);
@@ -160,8 +166,8 @@ impl History {
 mod tests {
     use super::*;
     use crate::action::edit::{
-        add_clip, add_generated, add_track, link_clips, move_clip, remove_media,
-        ripple_delete, ripple_insert, set_track_flags, shift_clips, split_clip, trim_clip,
+        add_clip, add_generated, add_track, link_clips, move_clip, remove_media, ripple_delete,
+        ripple_insert, set_track_flags, shift_clips, split_clip, trim_clip,
     };
     use cutlass_cache::FrameCache;
     use cutlass_models::{
@@ -305,17 +311,11 @@ mod tests {
         let track = project.add_track(TrackKind::Adjustment, "FX");
         let first = project
             .timeline_mut()
-            .add_clip(
-                track,
-                Clip::generated(Generator::Adjustment, tr(0, 10)),
-            )
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(0, 10)))
             .unwrap();
         let second = project
             .timeline_mut()
-            .add_clip(
-                track,
-                Clip::generated(Generator::Adjustment, tr(20, 10)),
-            )
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(20, 10)))
             .unwrap();
 
         let mut project_path = None;
@@ -324,17 +324,11 @@ mod tests {
 
         let inv1 = ripple_delete::execute(&mut ctx, first).unwrap();
         assert_eq!(ctx.project.timeline().clip_count(), 1);
-        assert_eq!(
-            ctx.project.clip(second).unwrap().timeline.start.value,
-            10
-        );
+        assert_eq!(ctx.project.clip(second).unwrap().timeline.start.value, 10);
 
         let inv2 = inv1.apply(&mut ctx).unwrap();
         assert_eq!(ctx.project.timeline().clip_count(), 2);
-        assert_eq!(
-            ctx.project.clip(second).unwrap().timeline.start.value,
-            20
-        );
+        assert_eq!(ctx.project.clip(second).unwrap().timeline.start.value, 20);
 
         let _ = inv2.apply(&mut ctx).unwrap();
         assert_eq!(ctx.project.timeline().clip_count(), 1);
@@ -421,10 +415,7 @@ mod tests {
         let v2 = project.add_track(TrackKind::Text, "T2");
         let clip_id = project
             .timeline_mut()
-            .add_clip(
-                v1,
-                Clip::generated(Generator::text("x"), tr(5, 15)),
-            )
+            .add_clip(v1, Clip::generated(Generator::text("x"), tr(5, 15)))
             .unwrap();
 
         let mut project_path = None;
@@ -454,9 +445,7 @@ mod tests {
         let (id, inv1) = add_generated::execute(
             &mut ctx,
             track,
-            Generator::SolidColor {
-                rgba: [9, 8, 7, 6],
-            },
+            Generator::SolidColor { rgba: [9, 8, 7, 6] },
             tr(0, 12),
         )
         .unwrap();
@@ -481,10 +470,7 @@ mod tests {
             .timeline_mut()
             .add_clip(
                 track,
-                Clip::generated(
-                    Generator::text("split me"),
-                    tr(0, 20),
-                ),
+                Clip::generated(Generator::text("split me"), tr(0, 20)),
             )
             .unwrap();
 
@@ -531,7 +517,11 @@ mod tests {
         assert_eq!(ctx.project.clip(b).unwrap().start().value, 80);
 
         let redo = inv.apply(&mut ctx).unwrap();
-        assert_eq!(ctx.project.clip(a).unwrap().start().value, 60, "A untouched");
+        assert_eq!(
+            ctx.project.clip(a).unwrap().start().value,
+            60,
+            "A untouched"
+        );
         assert_eq!(ctx.project.clip(b).unwrap().start().value, 100);
 
         let _ = redo.apply(&mut ctx).unwrap();
@@ -630,7 +620,11 @@ mod tests {
         );
         assert!(result.is_err());
         assert_eq!(ctx.project.timeline().clip_count(), 1);
-        assert_eq!(ctx.project.clip(clip).unwrap().start().value, 0, "shift undone");
+        assert_eq!(
+            ctx.project.clip(clip).unwrap().start().value,
+            0,
+            "shift undone"
+        );
     }
 
     #[test]
@@ -644,15 +638,9 @@ mod tests {
         // Gesture: AddTrack + AddGenerated. Inverses are stored in execution
         // order; undo must run them in reverse (remove the clip before its
         // track) or the second inverse hits an unknown clip.
-        let (track, inv_track) =
-            add_track::execute(&mut ctx, TrackKind::Text, "T1", None).unwrap();
-        let (clip, inv_clip) = add_generated::execute(
-            &mut ctx,
-            track,
-            Generator::text("x"),
-            tr(0, 10),
-        )
-        .unwrap();
+        let (track, inv_track) = add_track::execute(&mut ctx, TrackKind::Text, "T1", None).unwrap();
+        let (clip, inv_clip) =
+            add_generated::execute(&mut ctx, track, Generator::text("x"), tr(0, 10)).unwrap();
 
         let compound: Box<dyn EditAction> = Box::new(CompoundAction {
             actions: vec![inv_track, inv_clip],
@@ -691,15 +679,34 @@ mod tests {
 
         let inv1 = set_transition::add_transition(&mut ctx, left, "crossfade").unwrap();
         assert!(
-            ctx.project.timeline().track(track).unwrap().transition_at(left).is_some(),
+            ctx.project
+                .timeline()
+                .track(track)
+                .unwrap()
+                .transition_at(left)
+                .is_some(),
             "transition added"
         );
 
         let inv2 = inv1.apply(&mut ctx).unwrap();
-        assert!(ctx.project.timeline().track(track).unwrap().transition_at(left).is_none());
+        assert!(
+            ctx.project
+                .timeline()
+                .track(track)
+                .unwrap()
+                .transition_at(left)
+                .is_none()
+        );
 
         let _ = inv2.apply(&mut ctx).unwrap();
-        assert!(ctx.project.timeline().track(track).unwrap().transition_at(left).is_some());
+        assert!(
+            ctx.project
+                .timeline()
+                .track(track)
+                .unwrap()
+                .transition_at(left)
+                .is_some()
+        );
     }
 
     #[test]
@@ -735,7 +742,12 @@ mod tests {
         .unwrap();
         let inverse = inverse.expect("structural edit records an inverse");
         assert!(
-            ctx.project.timeline().track(track).unwrap().transition_at(left).is_none(),
+            ctx.project
+                .timeline()
+                .track(track)
+                .unwrap()
+                .transition_at(left)
+                .is_none(),
             "broken junction pruned"
         );
 
@@ -743,14 +755,26 @@ mod tests {
         let redo = inverse.apply(&mut ctx).unwrap();
         assert_eq!(ctx.project.clip(left).unwrap().start().value, 0);
         assert!(
-            ctx.project.timeline().track(track).unwrap().transition_at(left).is_some(),
+            ctx.project
+                .timeline()
+                .track(track)
+                .unwrap()
+                .transition_at(left)
+                .is_some(),
             "undo brings the junction back"
         );
 
         // Redo moves again and re-prunes.
         let _ = redo.apply(&mut ctx).unwrap();
         assert_eq!(ctx.project.clip(left).unwrap().start().value, 100);
-        assert!(ctx.project.timeline().track(track).unwrap().transition_at(left).is_none());
+        assert!(
+            ctx.project
+                .timeline()
+                .track(track)
+                .unwrap()
+                .transition_at(left)
+                .is_none()
+        );
     }
 
     #[test]
@@ -764,7 +788,8 @@ mod tests {
         let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
 
         // Disable the track; only `enabled` changes, the rest stay put.
-        let inv1 = set_track_flags::execute(&mut ctx, track, Some(false), None, None, None).unwrap();
+        let inv1 =
+            set_track_flags::execute(&mut ctx, track, Some(false), None, None, None).unwrap();
         assert!(!ctx.project.timeline().track(track).unwrap().enabled);
         assert!(!ctx.project.timeline().track(track).unwrap().muted);
         assert!(!ctx.project.timeline().track(track).unwrap().locked);
@@ -812,7 +837,11 @@ mod tests {
         assert_eq!(ctx.project.clip(c).unwrap().link, pair);
 
         let redo2 = inv2.apply(&mut ctx).unwrap();
-        assert_eq!(ctx.project.clip(b).unwrap().link, group, "old link restored");
+        assert_eq!(
+            ctx.project.clip(b).unwrap().link,
+            group,
+            "old link restored"
+        );
         assert_eq!(ctx.project.clip(c).unwrap().link, None);
 
         let _ = redo2.apply(&mut ctx).unwrap();
@@ -840,7 +869,11 @@ mod tests {
 
         let missing = cutlass_models::ClipId::from_raw(999);
         assert!(link_clips::execute(&mut ctx, &[a, missing]).is_err());
-        assert_eq!(ctx.project.clip(a).unwrap().link, None, "validated before mutating");
+        assert_eq!(
+            ctx.project.clip(a).unwrap().link,
+            None,
+            "validated before mutating"
+        );
     }
 
     #[test]
@@ -850,7 +883,9 @@ mod tests {
         let mut history = History::new(32);
         let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
         let missing = cutlass_models::TrackId::from_raw(999);
-        assert!(set_track_flags::execute(&mut ctx, missing, Some(false), None, None, None).is_err());
+        assert!(
+            set_track_flags::execute(&mut ctx, missing, Some(false), None, None, None).is_err()
+        );
     }
 
     /// Inert action for history bookkeeping tests.

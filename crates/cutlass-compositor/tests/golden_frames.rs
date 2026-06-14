@@ -161,12 +161,22 @@ macro_rules! golden_effect {
     };
 }
 
-golden_effect!(golden_sharpen, "sharpen", LayerEffect::new("sharpen").with_param(0, 1.0));
-golden_effect!(golden_pixelate, "pixelate", LayerEffect::new("pixelate").with_param(0, 8.0));
+golden_effect!(
+    golden_sharpen,
+    "sharpen",
+    LayerEffect::new("sharpen").with_param(0, 1.0)
+);
+golden_effect!(
+    golden_pixelate,
+    "pixelate",
+    LayerEffect::new("pixelate").with_param(0, 8.0)
+);
 golden_effect!(
     golden_glitch,
     "glitch",
-    LayerEffect::new("glitch").with_param(0, 0.8).with_param(1, 3.0)
+    LayerEffect::new("glitch")
+        .with_param(0, 0.8)
+        .with_param(1, 3.0)
 );
 golden_effect!(
     golden_chromatic_aberration,
@@ -176,15 +186,27 @@ golden_effect!(
 golden_effect!(
     golden_grain,
     "grain",
-    LayerEffect::new("grain").with_param(0, 0.5).with_param(1, 7.0)
+    LayerEffect::new("grain")
+        .with_param(0, 0.5)
+        .with_param(1, 7.0)
 );
 golden_effect!(
     golden_glow,
     "glow",
-    LayerEffect::new("glow").with_param(0, 0.5).with_param(1, 1.2)
+    LayerEffect::new("glow")
+        .with_param(0, 0.5)
+        .with_param(1, 1.2)
 );
-golden_effect!(golden_zoom_blur, "zoom_blur", LayerEffect::new("zoom_blur").with_param(0, 0.8));
-golden_effect!(golden_mirror, "mirror", LayerEffect::new("mirror").with_param(0, 0.0));
+golden_effect!(
+    golden_zoom_blur,
+    "zoom_blur",
+    LayerEffect::new("zoom_blur").with_param(0, 0.8)
+);
+golden_effect!(
+    golden_mirror,
+    "mirror",
+    LayerEffect::new("mirror").with_param(0, 0.0)
+);
 
 fn pixel(image: &RgbaImage, x: u32, y: u32) -> [u8; 4] {
     let i = ((y * image.width + x) * 4) as usize;
@@ -218,7 +240,10 @@ fn vignette_darkens_corners_more_than_center() {
     let corner_vign = pixel(&vign, 1, 1);
     let corner_drop = i32::from(corner_plain[0]) - i32::from(corner_vign[0]);
 
-    assert!(center_drop.abs() <= 4, "center barely changes: {center_drop}");
+    assert!(
+        center_drop.abs() <= 4,
+        "center barely changes: {center_drop}"
+    );
     assert!(
         corner_drop > center_drop + 10,
         "corner darkens much more than center (corner {corner_drop}, center {center_drop})"
@@ -243,9 +268,8 @@ fn blur_softens_bar_edges() {
     );
 
     // Edge between bar 0 (bright) and bar 1 (dark) is at x=8, row 32.
-    let edge_contrast = |img: &RgbaImage| {
-        i32::from(pixel(img, 7, 32)[0]) - i32::from(pixel(img, 9, 32)[0])
-    };
+    let edge_contrast =
+        |img: &RgbaImage| i32::from(pixel(img, 7, 32)[0]) - i32::from(pixel(img, 9, 32)[0]);
     let plain_c = edge_contrast(&plain).abs();
     let blur_c = edge_contrast(&blurred).abs();
     assert!(
@@ -322,10 +346,16 @@ fn every_starter_effect_changes_the_frame() {
     let cases = [
         LayerEffect::new("sharpen").with_param(0, 2.0),
         LayerEffect::new("pixelate").with_param(0, 16.0),
-        LayerEffect::new("glitch").with_param(0, 1.0).with_param(1, 3.0),
+        LayerEffect::new("glitch")
+            .with_param(0, 1.0)
+            .with_param(1, 3.0),
         LayerEffect::new("chromatic_aberration").with_param(0, 1.0),
-        LayerEffect::new("grain").with_param(0, 0.8).with_param(1, 7.0),
-        LayerEffect::new("glow").with_param(0, 0.4).with_param(1, 2.0),
+        LayerEffect::new("grain")
+            .with_param(0, 0.8)
+            .with_param(1, 7.0),
+        LayerEffect::new("glow")
+            .with_param(0, 0.4)
+            .with_param(1, 2.0),
         LayerEffect::new("zoom_blur").with_param(0, 1.0),
         LayerEffect::new("mirror").with_param(0, 0.0),
     ];
@@ -407,7 +437,11 @@ fn unknown_effect_is_skipped() {
     };
     let mut compositor = Compositor::new(&gpu).expect("compositor");
     let plain = render(&mut compositor, &gpu, vec![]);
-    let with_unknown = render(&mut compositor, &gpu, vec![LayerEffect::new("does_not_exist")]);
+    let with_unknown = render(
+        &mut compositor,
+        &gpu,
+        vec![LayerEffect::new("does_not_exist")],
+    );
     // Same content (the unknown effect contributes no pass), within tolerance.
     for (a, b) in plain.bytes.iter().zip(with_unknown.bytes.iter()) {
         assert!((i32::from(*a) - i32::from(*b)).abs() <= TOL);
@@ -447,10 +481,18 @@ fn crossfade_interpolates_from_to_to() {
     let mut compositor = Compositor::new(&gpu).expect("compositor");
 
     let start = render_transition(&mut compositor, &gpu, "crossfade", RED, BLUE, 0.0);
-    assert_eq!(pixel(&start, W / 2, H / 2), RED, "progress 0 is the outgoing clip");
+    assert_eq!(
+        pixel(&start, W / 2, H / 2),
+        RED,
+        "progress 0 is the outgoing clip"
+    );
 
     let end = render_transition(&mut compositor, &gpu, "crossfade", RED, BLUE, 1.0);
-    assert_eq!(pixel(&end, W / 2, H / 2), BLUE, "progress 1 is the incoming clip");
+    assert_eq!(
+        pixel(&end, W / 2, H / 2),
+        BLUE,
+        "progress 1 is the incoming clip"
+    );
 
     let mid = render_transition(&mut compositor, &gpu, "crossfade", RED, BLUE, 0.5);
     let p = pixel(&mid, W / 2, H / 2);
@@ -469,8 +511,16 @@ fn wipe_right_reveals_incoming_from_the_left() {
     };
     let mut compositor = Compositor::new(&gpu).expect("compositor");
     let mid = render_transition(&mut compositor, &gpu, "wipe_right", RED, BLUE, 0.5);
-    assert_eq!(pixel(&mid, 1, H / 2), BLUE, "left edge has been wiped to incoming");
-    assert_eq!(pixel(&mid, W - 2, H / 2), RED, "right edge still shows outgoing");
+    assert_eq!(
+        pixel(&mid, 1, H / 2),
+        BLUE,
+        "left edge has been wiped to incoming"
+    );
+    assert_eq!(
+        pixel(&mid, W - 2, H / 2),
+        RED,
+        "right edge still shows outgoing"
+    );
     assert_golden("transition_wipe_right_mid", &mid);
 }
 

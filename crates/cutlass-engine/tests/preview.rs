@@ -37,7 +37,10 @@ fn get_frame_returns_rgba_for_placed_clip() {
         frame.bytes.len(),
         usize::try_from(width * height * 4).unwrap()
     );
-    assert!(frame.bytes.iter().any(|&b| b != 0), "frame should not be blank");
+    assert!(
+        frame.bytes.iter().any(|&b| b != 0),
+        "frame should not be blank"
+    );
 }
 
 #[test]
@@ -100,10 +103,7 @@ fn get_frame_renders_solid_generated_clip() {
     let frame = engine.get_frame(rt(0)).expect("solid frame");
     assert_eq!(frame.width, 1920);
     assert_eq!(frame.height, 1080);
-    assert!(frame
-        .bytes
-        .chunks_exact(4)
-        .all(|p| p == [10, 20, 30, 255]));
+    assert!(frame.bytes.chunks_exact(4).all(|p| p == [10, 20, 30, 255]));
 }
 
 #[test]
@@ -155,8 +155,16 @@ fn get_frame_places_transformed_solid() {
     };
     assert_eq!(pixel(480, 270), [200, 40, 10, 255], "inside placed quad");
     assert_eq!(pixel(10, 10), [200, 40, 10, 255], "top-left corner covered");
-    assert_eq!(pixel(1440, 810), [0, 0, 0, 255], "rest of canvas stays black");
-    assert_eq!(pixel(1000, 270), [0, 0, 0, 255], "right of the quad is black");
+    assert_eq!(
+        pixel(1440, 810),
+        [0, 0, 0, 255],
+        "rest of canvas stays black"
+    );
+    assert_eq!(
+        pixel(1000, 270),
+        [0, 0, 0, 255],
+        "right of the quad is black"
+    );
 }
 
 #[test]
@@ -194,9 +202,18 @@ fn transform_override_previews_without_touching_state() {
     let frame = engine.get_frame(rt(0)).expect("override frame");
     let pixel = |frame: &cutlass_engine::RgbaFrame, x: u32, y: u32| {
         let i = ((y * frame.width + x) * 4) as usize;
-        [frame.bytes[i], frame.bytes[i + 1], frame.bytes[i + 2], frame.bytes[i + 3]]
+        [
+            frame.bytes[i],
+            frame.bytes[i + 1],
+            frame.bytes[i + 2],
+            frame.bytes[i + 3],
+        ]
     };
-    assert_eq!(pixel(&frame, 480, 270), [200, 40, 10, 255], "override placed quad");
+    assert_eq!(
+        pixel(&frame, 480, 270),
+        [200, 40, 10, 255],
+        "override placed quad"
+    );
     assert_eq!(pixel(&frame, 1440, 810), [0, 0, 0, 255], "rest stays black");
 
     // ...but the project and history never saw it: session state only.
@@ -207,7 +224,11 @@ fn transform_override_previews_without_touching_state() {
     // Clearing restores the committed (full-canvas) render.
     engine.set_transform_override(None);
     let frame = engine.get_frame(rt(0)).expect("committed frame");
-    assert_eq!(pixel(&frame, 1440, 810), [200, 40, 10, 255], "solid covers canvas again");
+    assert_eq!(
+        pixel(&frame, 1440, 810),
+        [200, 40, 10, 255],
+        "solid covers canvas again"
+    );
 }
 
 #[test]
@@ -255,5 +276,8 @@ fn get_frame_composites_solid_over_media() {
         }
     }
     assert!(non_zero > 0, "frame should have content");
-    assert!(dark > 0, "semi-transparent black overlay should darken pixels");
+    assert!(
+        dark > 0,
+        "semi-transparent black overlay should darken pixels"
+    );
 }

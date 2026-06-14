@@ -151,37 +151,36 @@ impl EffectRegistry {
                         label: Some("effect_pass"),
                         source: wgpu::ShaderSource::Wgsl(format!("{header}\n{frag}").into()),
                     });
-                    let pipeline =
-                        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                            label: Some("effect_pipeline"),
-                            layout: Some(layout),
-                            vertex: wgpu::VertexState {
-                                module: &module,
-                                entry_point: Some("vs"),
-                                buffers: &[],
-                                compilation_options: Default::default(),
-                            },
-                            fragment: Some(wgpu::FragmentState {
-                                module: &module,
-                                entry_point: Some("fs"),
-                                // Passes fully cover the target (fullscreen
-                                // triangle) and replace it; no blending.
-                                targets: &[Some(wgpu::ColorTargetState {
-                                    format,
-                                    blend: None,
-                                    write_mask: wgpu::ColorWrites::ALL,
-                                })],
-                                compilation_options: Default::default(),
-                            }),
-                            primitive: wgpu::PrimitiveState {
-                                topology: wgpu::PrimitiveTopology::TriangleList,
-                                ..Default::default()
-                            },
-                            depth_stencil: None,
-                            multisample: wgpu::MultisampleState::default(),
-                            multiview: None,
-                            cache: None,
-                        });
+                    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("effect_pipeline"),
+                        layout: Some(layout),
+                        vertex: wgpu::VertexState {
+                            module: &module,
+                            entry_point: Some("vs"),
+                            buffers: &[],
+                            compilation_options: Default::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &module,
+                            entry_point: Some("fs"),
+                            // Passes fully cover the target (fullscreen
+                            // triangle) and replace it; no blending.
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format,
+                                blend: None,
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: Default::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            ..Default::default()
+                        },
+                        depth_stencil: None,
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview: None,
+                        cache: None,
+                    });
                     pipelines.push(pipeline);
                     pipelines.len() - 1
                 });

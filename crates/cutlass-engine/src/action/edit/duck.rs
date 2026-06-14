@@ -52,11 +52,13 @@ pub fn duck(
     attack: f32,
     release: f32,
 ) -> Result<(ClipId, Box<dyn EditAction>), EngineError> {
-    let representative = *music.first().ok_or_else(|| {
-        ModelError::InvalidParam("ducking needs at least one music clip".into())
-    })?;
+    let representative = *music
+        .first()
+        .ok_or_else(|| ModelError::InvalidParam("ducking needs at least one music clip".into()))?;
     if voice.is_empty() {
-        return Err(ModelError::InvalidParam("ducking needs at least one voice clip".into()).into());
+        return Err(
+            ModelError::InvalidParam("ducking needs at least one voice clip".into()).into(),
+        );
     }
 
     let settings = DuckSettings {
@@ -69,12 +71,18 @@ pub fn duck(
     // Plan against an immutable view (decode happens here), then commit.
     let plans = {
         let project: &Project = ctx.project;
-        plan_ducking(project, voice, music, settings, |clip| clip_energy(clip, project))?
+        plan_ducking(project, voice, music, settings, |clip| {
+            clip_energy(clip, project)
+        })?
     };
 
     let mut inverses: Vec<Box<dyn EditAction>> = Vec::with_capacity(plans.len());
     for (id, new_volume) in plans {
-        let before = ctx.project.clip(id).cloned().ok_or(ModelError::UnknownClip(id))?;
+        let before = ctx
+            .project
+            .clip(id)
+            .cloned()
+            .ok_or(ModelError::UnknownClip(id))?;
         let slot = ctx
             .project
             .timeline_mut()
@@ -83,7 +91,10 @@ pub fn duck(
         slot.volume = new_volume;
         inverses.push(Box::new(RestoreClipAction { clip: before }));
     }
-    Ok((representative, Box::new(CompoundAction { actions: inverses })))
+    Ok((
+        representative,
+        Box::new(CompoundAction { actions: inverses }),
+    ))
 }
 
 /// Pure ducking plan: returns the `(clip, new volume envelope)` for each music
@@ -153,7 +164,11 @@ pub(crate) fn plan_ducking(
             match keyframes.last_mut() {
                 // Control rate can outrun the tick grid; fold collisions.
                 Some(last) if last.tick == tick => last.value = value,
-                _ => keyframes.push(Keyframe { tick, value, easing: Easing::Linear }),
+                _ => keyframes.push(Keyframe {
+                    tick,
+                    value,
+                    easing: Easing::Linear,
+                }),
             }
         }
         let volume = match keyframes.len() {
@@ -283,8 +298,7 @@ fn ticks_to_samples(value: i64, num: i32, den: i32) -> i64 {
     if num <= 0 || den <= 0 {
         return 0;
     }
-    let frames =
-        i128::from(value) * i128::from(den) * i128::from(ANALYSIS_RATE) / i128::from(num);
+    let frames = i128::from(value) * i128::from(den) * i128::from(ANALYSIS_RATE) / i128::from(num);
     frames.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
@@ -395,13 +409,19 @@ mod tests {
             .iter()
             .map(|k| k.value)
             .fold(0.0f32, f32::max);
-        assert!(peak <= 0.5 + 1e-4, "never exceeds the clip's own level: {peak}");
+        assert!(
+            peak <= 0.5 + 1e-4,
+            "never exceeds the clip's own level: {peak}"
+        );
         let deepest = volume
             .keyframes()
             .iter()
             .map(|k| k.value)
             .fold(f32::INFINITY, f32::min);
-        assert!(deepest < 0.5 * 0.5 + 0.05, "dips below the base level: {deepest}");
+        assert!(
+            deepest < 0.5 * 0.5 + 0.05,
+            "dips below the base level: {deepest}"
+        );
     }
 
     #[test]

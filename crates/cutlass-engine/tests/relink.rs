@@ -7,7 +7,9 @@ use cutlass_commands::{Command, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, EngineError};
 use cutlass_models::MediaId;
 
-use common::{add_media_clip, add_track, import_asset, save_project, load_project, temp_engine, tr};
+use common::{
+    add_media_clip, add_track, import_asset, load_project, save_project, temp_engine, tr,
+};
 
 #[test]
 fn relink_recovers_missing_media_after_tolerant_load() {
@@ -34,7 +36,10 @@ fn relink_recovers_missing_media_after_tolerant_load() {
     load_project(&mut engine, &project_file);
 
     let entry = engine.project().media(media).expect("entry survives load");
-    assert!(!entry.path().exists(), "loaded entry still points at the dead path");
+    assert!(
+        !entry.path().exists(),
+        "loaded entry still points at the dead path"
+    );
 
     let outcome = engine
         .apply(Command::Project(ProjectCommand::RelinkMedia {
@@ -46,7 +51,10 @@ fn relink_recovers_missing_media_after_tolerant_load() {
 
     let entry = engine.project().media(media).expect("entry");
     assert_eq!(entry.id, media, "relink keeps the entry's identity");
-    assert_eq!(entry.path(), moved.canonicalize().expect("canonical").as_path());
+    assert_eq!(
+        entry.path(),
+        moved.canonicalize().expect("canonical").as_path()
+    );
     assert!(entry.path().exists());
     // Same file content ⇒ the re-probe reproduces the import's metadata.
     assert_eq!(entry.width, imported.width);
@@ -96,5 +104,9 @@ fn relink_to_missing_file_errors_and_leaves_entry_untouched() {
         }))
         .expect_err("dead target path must fail");
     assert!(matches!(err, EngineError::Io(_)), "got: {err}");
-    assert_eq!(engine.project().media(media), Some(&before), "entry unchanged on failure");
+    assert_eq!(
+        engine.project().media(media),
+        Some(&before),
+        "entry unchanged on failure"
+    );
 }

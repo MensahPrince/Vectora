@@ -12,15 +12,22 @@ use crate::wire::ToolSpec;
 /// One entry in the conversation, provider-agnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
-    System { content: String },
-    User { content: String },
+    System {
+        content: String,
+    },
+    User {
+        content: String,
+    },
     /// A prior model turn (text and/or the tool calls it made).
     Assistant {
         content: String,
         tool_calls: Vec<ToolCall>,
     },
     /// The outcome of one tool call, fed back to the model.
-    ToolResult { call_id: String, content: String },
+    ToolResult {
+        call_id: String,
+        content: String,
+    },
 }
 
 /// A tool invocation the model requested.

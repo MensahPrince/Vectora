@@ -2,12 +2,8 @@
 
 mod common;
 
-use common::{
-    project_with_media, rt, rt_at, sample_media, tr, tr_at, FPS_23_976, FPS_24, FPS_30,
-};
-use cutlass_models::{
-    Generator, ModelError, Project, Shape, TimeRange, TrackKind,
-};
+use common::{FPS_23_976, FPS_24, FPS_30, project_with_media, rt, rt_at, sample_media, tr, tr_at};
+use cutlass_models::{Generator, ModelError, Project, Shape, TimeRange, TrackKind};
 
 #[test]
 fn realistic_edit_session() {
@@ -18,9 +14,7 @@ fn realistic_edit_session() {
     let v1 = project.add_track(TrackKind::Video, "A-roll");
     let v2 = project.add_track(TrackKind::Video, "B-roll");
 
-    let intro = project
-        .add_clip(v1, interview, tr(0, 240), rt(0))
-        .unwrap();
+    let intro = project.add_clip(v1, interview, tr(0, 240), rt(0)).unwrap();
     let body = project
         .add_clip(v1, interview, tr(240, 480), rt(240))
         .unwrap();
@@ -49,9 +43,15 @@ fn realistic_edit_session() {
 fn remove_clip_leaves_gap_ripple_closes_it() {
     let (mut project, media_id, track) = project_with_media(500);
 
-    let a = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
-    let b = project.add_clip(track, media_id, tr(100, 100), rt(100)).unwrap();
-    let c = project.add_clip(track, media_id, tr(200, 100), rt(200)).unwrap();
+    let a = project
+        .add_clip(track, media_id, tr(0, 100), rt(0))
+        .unwrap();
+    let b = project
+        .add_clip(track, media_id, tr(100, 100), rt(100))
+        .unwrap();
+    let c = project
+        .add_clip(track, media_id, tr(200, 100), rt(200))
+        .unwrap();
 
     project.remove_clip(b).unwrap();
     assert_eq!(project.clip(c).unwrap().start().value, 200);
@@ -70,19 +70,12 @@ fn ntsc_media_on_film_timeline_split_and_trim() {
 
     // 1001 source ticks (~41.7s) -> 1002 timeline ticks at 24fps.
     let clip = project
-        .add_clip(
-            track,
-            media_id,
-            tr_at(0, 1_001, FPS_23_976),
-            rt(0),
-        )
+        .add_clip(track, media_id, tr_at(0, 1_001, FPS_23_976), rt(0))
         .unwrap();
     assert_eq!(project.clip(clip).unwrap().timeline.duration.value, 1_002);
 
     let right = project.split_clip(clip, rt(400)).unwrap();
-    project
-        .trim_clip(right, tr(400, 500))
-        .unwrap();
+    project.trim_clip(right, tr(400, 500)).unwrap();
 
     let left = project.clip(clip).unwrap();
     let r = project.clip(right).unwrap();
@@ -103,11 +96,7 @@ fn mixed_generated_and_media_layers() {
         .add_clip(video, media_id, tr(0, 500), rt(0))
         .unwrap();
     let title = project
-        .add_generated(
-            titles,
-            Generator::text("Act I"),
-            tr(0, 48),
-        )
+        .add_generated(titles, Generator::text("Act I"), tr(0, 48))
         .unwrap();
     let lower_third = project
         .add_generated(
@@ -122,10 +111,7 @@ fn mixed_generated_and_media_layers() {
     assert_eq!(project.timeline().clip_count(), 3);
     assert_eq!(project.clip(footage).unwrap().media(), Some(media_id));
     assert!(project.clip(title).unwrap().is_generated());
-    assert_eq!(
-        project.timeline().track_of(lower_third),
-        Some(gfx)
-    );
+    assert_eq!(project.timeline().track_of(lower_third), Some(gfx));
     assert_eq!(project.timeline().duration().value, 500);
 }
 
@@ -151,7 +137,9 @@ fn multiple_clips_reference_same_media() {
 #[test]
 fn project_clone_captures_undo_snapshot() {
     let (mut project, media_id, track) = project_with_media(300);
-    let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+    let clip = project
+        .add_clip(track, media_id, tr(0, 100), rt(0))
+        .unwrap();
     let snapshot = project.clone();
 
     project.ripple_delete(clip).unwrap();
@@ -169,12 +157,8 @@ fn timeline_remove_track_purges_clip_index() {
     let keep = project.add_track(TrackKind::Video, "Keep");
     let drop = project.add_track(TrackKind::Video, "Drop");
 
-    let on_drop = project
-        .add_clip(drop, media_id, tr(0, 100), rt(0))
-        .unwrap();
-    let on_keep = project
-        .add_clip(keep, media_id, tr(0, 50), rt(0))
-        .unwrap();
+    let on_drop = project.add_clip(drop, media_id, tr(0, 100), rt(0)).unwrap();
+    let on_keep = project.add_clip(keep, media_id, tr(0, 50), rt(0)).unwrap();
 
     project.timeline_mut().remove_track(drop).unwrap();
     assert!(project.clip(on_drop).is_none());
@@ -208,7 +192,9 @@ fn shape_generator_and_move_preserves_source() {
 #[test]
 fn rate_mismatch_surfaces_throughout_edit_ops() {
     let (mut project, media_id, track) = project_with_media(200);
-    let clip = project.add_clip(track, media_id, tr(0, 100), rt(0)).unwrap();
+    let clip = project
+        .add_clip(track, media_id, tr(0, 100), rt(0))
+        .unwrap();
     let bad_time = rt_at(50, FPS_30);
 
     assert_eq!(

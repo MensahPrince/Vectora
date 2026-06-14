@@ -17,7 +17,8 @@ pub fn set_keyframe(
     easing: Easing,
 ) -> Result<Box<dyn EditAction>, EngineError> {
     let before = snapshot(ctx, clip)?;
-    ctx.project.set_param_keyframe(clip, param, at, value, easing)?;
+    ctx.project
+        .set_param_keyframe(clip, param, at, value, easing)?;
     Ok(Box::new(RestoreClipAction { clip: before }))
 }
 

@@ -88,7 +88,10 @@ enum AudioMsg {
     Snapshot(AudioSnapshot),
     /// Start (or re-anchor) producing from `tick`. `epoch` was assigned by
     /// the UI thread *before* send; blocks tagged older are already dead.
-    Play { tick: i64, epoch: u64 },
+    Play {
+        tick: i64,
+        epoch: u64,
+    },
     Pause,
 }
 
@@ -211,9 +214,7 @@ impl AudioSystem {
         let device = host
             .default_output_device()
             .ok_or("no default output device")?;
-        let config = device
-            .default_output_config()
-            .map_err(|e| e.to_string())?;
+        let config = device.default_output_config().map_err(|e| e.to_string())?;
         if config.sample_format() != cpal::SampleFormat::F32 {
             return Err(format!(
                 "default output format {:?} is not f32",
@@ -502,10 +503,7 @@ fn mixer_loop(
                 sample_rate,
                 &mut samples,
             );
-            if block_tx
-                .send(AudioBlock { epoch, samples })
-                .is_err()
-            {
+            if block_tx.send(AudioBlock { epoch, samples }).is_err() {
                 return; // device side gone
             }
             write_frame += BLOCK_FRAMES as i64;
@@ -543,7 +541,17 @@ fn mix_block(
         // Retimed clips (M8 Phase 3) play their time-stretched buffer 1:1
         // instead of reading the source at native rate.
         if let Some(key) = &span.render {
-            mix_retimed_span(span, key, rendered, failed_opens, sample_rate, pos, s, e, out);
+            mix_retimed_span(
+                span,
+                key,
+                rendered,
+                failed_opens,
+                sample_rate,
+                pos,
+                s,
+                e,
+                out,
+            );
             continue;
         }
         let want = (e - s) as usize;
@@ -753,8 +761,7 @@ fn ticks_to_frames(value: i64, rate: (i32, i32), sample_rate: u32) -> i64 {
     if num <= 0 || den <= 0 || sample_rate == 0 {
         return 0;
     }
-    let frames =
-        i128::from(value) * i128::from(den) * i128::from(sample_rate) / i128::from(num);
+    let frames = i128::from(value) * i128::from(den) * i128::from(sample_rate) / i128::from(num);
     frames.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
@@ -764,8 +771,7 @@ fn frames_to_ticks(frames: i64, rate: (i32, i32), sample_rate: u32) -> i64 {
     if num <= 0 || den <= 0 || sample_rate == 0 {
         return 0;
     }
-    let ticks = i128::from(frames) * i128::from(num)
-        / (i128::from(den) * i128::from(sample_rate));
+    let ticks = i128::from(frames) * i128::from(num) / (i128::from(den) * i128::from(sample_rate));
     ticks.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
@@ -802,8 +808,16 @@ mod tests {
                 speed_curve: None,
                 volume: Param::Keyframed {
                     keyframes: vec![
-                        Keyframe { tick: 0, value: 0.0, easing: Easing::Linear },
-                        Keyframe { tick: 24, value: 1.0, easing: Easing::Linear },
+                        Keyframe {
+                            tick: 0,
+                            value: 0.0,
+                            easing: Easing::Linear,
+                        },
+                        Keyframe {
+                            tick: 24,
+                            value: 1.0,
+                            easing: Easing::Linear,
+                        },
                     ],
                 },
                 fade_in_ticks: 0,
@@ -848,10 +862,7 @@ mod tests {
         handle.play(100);
         assert_eq!(handle.current_tick(24, 1), 100);
         // 1.5s of consumed audio = 36 ticks at 24fps.
-        handle
-            .shared
-            .frames_played
-            .store(72_000, Ordering::Release);
+        handle.shared.frames_played.store(72_000, Ordering::Release);
         assert_eq!(handle.current_tick(24, 1), 136);
     }
 
@@ -862,7 +873,15 @@ mod tests {
         let mut failed = HashMap::new();
         let mut rendered = HashMap::new();
         let mut out = vec![0.5f32; BLOCK_FRAMES * AUDIO_CHANNELS];
-        mix_block(&[], &mut readers, &mut failed, &mut rendered, 0, 48_000, &mut out);
+        mix_block(
+            &[],
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            0,
+            48_000,
+            &mut out,
+        );
         assert!(out.iter().all(|&s| s == 0.5), "no spans leave input alone");
     }
 
@@ -915,7 +934,15 @@ mod tests {
 
         // Block fully before the clip: silence.
         let mut before = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
-        mix_block(&spans, &mut readers, &mut failed, &mut rendered, 0, RATE, &mut before);
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            0,
+            RATE,
+            &mut before,
+        );
         assert!(before.iter().all(|&s| s == 0.0), "silence before the clip");
 
         // Block inside the clip: real audio.
@@ -929,10 +956,7 @@ mod tests {
             RATE,
             &mut inside,
         );
-        assert!(
-            inside.iter().any(|&s| s != 0.0),
-            "audible inside the clip"
-        );
+        assert!(inside.iter().any(|&s| s != 0.0), "audible inside the clip");
         assert!(
             inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),
             "clamped to [-1, 1]"
@@ -941,7 +965,15 @@ mod tests {
         // Block straddling the clip start: leading samples stay silent.
         let straddle_pos = i64::from(RATE) - (BLOCK_FRAMES / 2) as i64;
         let mut straddle = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
-        mix_block(&spans, &mut readers, &mut failed, &mut rendered, straddle_pos, RATE, &mut straddle);
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            straddle_pos,
+            RATE,
+            &mut straddle,
+        );
         let lead = (BLOCK_FRAMES / 2) * AUDIO_CHANNELS;
         assert!(
             straddle[..lead].iter().all(|&s| s == 0.0),
@@ -980,12 +1012,28 @@ mod tests {
         let pos = 8 * BLOCK_FRAMES as i64;
         let mut full = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
         let spans = resolve_spans(&span_at(1.0, 0), RATE);
-        mix_block(&spans, &mut readers, &mut failed, &mut rendered, pos, RATE, &mut full);
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            pos,
+            RATE,
+            &mut full,
+        );
         assert!(full.iter().any(|&s| s != 0.0), "fixture block is audible");
 
         let mut half = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
         let spans = resolve_spans(&span_at(0.5, 0), RATE);
-        mix_block(&spans, &mut readers, &mut failed, &mut rendered, pos, RATE, &mut half);
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            pos,
+            RATE,
+            &mut half,
+        );
         for (f, h) in full.iter().zip(&half) {
             assert!((f * 0.5 - h).abs() < 1e-4, "half volume halves samples");
         }
@@ -994,11 +1042,27 @@ mod tests {
         // and leaves the block quieter than the flat mix.
         let mut faded = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
         let spans = resolve_spans(&span_at(1.0, 48), RATE);
-        mix_block(&spans, &mut readers, &mut failed, &mut rendered, 0, RATE, &mut faded);
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            0,
+            RATE,
+            &mut faded,
+        );
         assert_eq!(faded[0], 0.0, "fade-in starts from silence");
         let mut flat = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
         let spans = resolve_spans(&span_at(1.0, 0), RATE);
-        mix_block(&spans, &mut readers, &mut failed, &mut rendered, 0, RATE, &mut flat);
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            0,
+            RATE,
+            &mut flat,
+        );
         let energy = |b: &[f32]| b.iter().map(|s| f64::from(s * s)).sum::<f64>();
         if energy(&flat) > 0.0 {
             assert!(energy(&faded) < energy(&flat), "ramp lowers block energy");
@@ -1033,7 +1097,10 @@ mod tests {
             }],
         };
         let spans = resolve_spans(&snapshot, RATE);
-        assert!(spans[0].render.is_some(), "a retimed span carries a render key");
+        assert!(
+            spans[0].render.is_some(),
+            "a retimed span carries a render key"
+        );
 
         let mut readers = HashMap::new();
         let mut failed = HashMap::new();
@@ -1048,7 +1115,11 @@ mod tests {
             RATE,
             &mut inside,
         );
-        assert_eq!(rendered.len(), 1, "the stretched buffer is rendered + cached");
+        assert_eq!(
+            rendered.len(),
+            1,
+            "the stretched buffer is rendered + cached"
+        );
         assert!(inside.iter().any(|&s| s != 0.0), "retimed audio plays");
         assert!(
             inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),
@@ -1080,8 +1151,16 @@ mod tests {
                 pitch_factor: 1.0,
                 speed_curve: Some(Param::Keyframed {
                     keyframes: vec![
-                        Keyframe { tick: 0, value: 1.0, easing: Easing::Linear },
-                        Keyframe { tick: SPEED_CURVE_SCALE, value: 3.0, easing: Easing::Linear },
+                        Keyframe {
+                            tick: 0,
+                            value: 1.0,
+                            easing: Easing::Linear,
+                        },
+                        Keyframe {
+                            tick: SPEED_CURVE_SCALE,
+                            value: 3.0,
+                            easing: Easing::Linear,
+                        },
                     ],
                 }),
                 volume: Param::Constant(1.0),
@@ -1090,8 +1169,14 @@ mod tests {
             }],
         };
         let spans = resolve_spans(&snapshot, RATE);
-        let key = spans[0].render.as_ref().expect("a ramp carries a render key");
-        assert!(!key.curve.is_empty(), "the ramp identity is part of the cache key");
+        let key = spans[0]
+            .render
+            .as_ref()
+            .expect("a ramp carries a render key");
+        assert!(
+            !key.curve.is_empty(),
+            "the ramp identity is part of the cache key"
+        );
 
         let mut readers = HashMap::new();
         let mut failed = HashMap::new();
@@ -1106,7 +1191,11 @@ mod tests {
             RATE,
             &mut inside,
         );
-        assert_eq!(rendered.len(), 1, "the variable-rate buffer is rendered + cached");
+        assert_eq!(
+            rendered.len(),
+            1,
+            "the variable-rate buffer is rendered + cached"
+        );
         assert!(inside.iter().any(|&s| s != 0.0), "ramped audio plays");
         assert!(
             inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),

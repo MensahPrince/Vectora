@@ -56,7 +56,9 @@ pub fn probe(path: &Path) -> Result<MediaProbe, ProbeError> {
         return probe_image(&input);
     }
 
-    let has_audio = input.streams().any(|s| s.parameters().medium() == Type::Audio);
+    let has_audio = input
+        .streams()
+        .any(|s| s.parameters().medium() == Type::Audio);
 
     // mp3/m4a cover art is muxed as a video stream flagged ATTACHED_PIC;
     // treat those files as audio, not as one-frame videos.
@@ -180,10 +182,7 @@ mod tests {
 
     #[test]
     fn duration_ticks_from_micros_one_second_at_24fps() {
-        assert_eq!(
-            duration_ticks_from_micros(Rational::FPS_24, 1_000_000),
-            24
-        );
+        assert_eq!(duration_ticks_from_micros(Rational::FPS_24, 1_000_000), 24);
     }
 
     #[test]
@@ -212,8 +211,8 @@ mod tests {
 
     #[test]
     fn image_file_probes_with_default_still_duration() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/texture.png");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/texture.png");
         if !path.exists() {
             return;
         }
@@ -231,12 +230,16 @@ mod tests {
         let media = probed.to_media_source(&path);
         assert!(media.is_image);
         assert_eq!(media.kind(), cutlass_models::MediaKind::Image);
-        assert_eq!(media.duration.value, cutlass_models::STILL_DEFAULT_DURATION_TICKS);
+        assert_eq!(
+            media.duration.value,
+            cutlass_models::STILL_DEFAULT_DURATION_TICKS
+        );
     }
 
     #[test]
     fn audio_only_file_probes_with_zero_dimensions() {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/baby.mp3");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/baby.mp3");
         if !path.exists() {
             return;
         }

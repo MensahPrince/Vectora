@@ -154,10 +154,7 @@ fn with_transcript(
     let _ = slint::invoke_from_event_loop(move || {
         if let Some(store) = store.upgrade() {
             let transcript = store.get_transcript();
-            if let Some(model) = transcript
-                .as_any()
-                .downcast_ref::<VecModel<AgentEntry>>()
-            {
+            if let Some(model) = transcript.as_any().downcast_ref::<VecModel<AgentEntry>>() {
                 f(model);
             }
         }
@@ -314,7 +311,10 @@ fn agent_main(
 
     // Surface the configured/not-configured state before the first send.
     let config_path = cutlass_ai::config::default_config_path();
-    let configured = matches!(cutlass_ai::config::load_ai_config(&config_path), Ok(Some(_)));
+    let configured = matches!(
+        cutlass_ai::config::load_ai_config(&config_path),
+        Ok(Some(_))
+    );
     let path_text: SharedString = config_path.display().to_string().into();
     with_store(&store, move |s| {
         s.set_configured(configured);
@@ -383,7 +383,11 @@ fn agent_main(
                         history = saved;
                     }
                     preview.clear();
-                    push_entry(&store, "status", "Plan discarded — nothing was applied.".into());
+                    push_entry(
+                        &store,
+                        "status",
+                        "Plan discarded — nothing was applied.".into(),
+                    );
                 }
                 with_store(&store, |s| s.set_plan_pending(false));
             }
@@ -458,7 +462,11 @@ fn run_one_prompt(
     let continue_pending = preview.is_pending() && sandbox_existed;
     if !continue_pending {
         let Some(snapshot) = worker.snapshot_project() else {
-            push_entry(store, "error", "The editor engine is not responding.".into());
+            push_entry(
+                store,
+                "error",
+                "The editor engine is not responding.".into(),
+            );
             return;
         };
         engine.reset_project(snapshot);
@@ -573,7 +581,11 @@ fn apply_plan_live(
                 format!("Could not apply the plan: {e}. Nothing was changed."),
             );
         }
-        None => push_entry(store, "error", "The editor engine is not responding.".into()),
+        None => push_entry(
+            store,
+            "error",
+            "The editor engine is not responding.".into(),
+        ),
     }
 }
 

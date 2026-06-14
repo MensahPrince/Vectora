@@ -47,7 +47,13 @@ fn undo_split_restores_single_clip() {
     assert!(engine.undo());
     assert_eq!(engine.project().timeline().clip_count(), 1);
     assert_eq!(
-        engine.project().clip(clip_id).unwrap().timeline.duration.value,
+        engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .timeline
+            .duration
+            .value,
         48
     );
 }
@@ -85,7 +91,13 @@ fn redo_split_after_undo() {
     assert!(engine.redo());
     assert_eq!(engine.project().timeline().clip_count(), 2);
     assert_eq!(
-        engine.project().clip(clip_id).unwrap().timeline.duration.value,
+        engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .timeline
+            .duration
+            .value,
         24
     );
 }
@@ -122,17 +134,11 @@ fn undo_ripple_delete_restores_gap() {
     engine
         .apply(Command::Edit(EditCommand::RippleDelete { clip: first_id }))
         .expect("ripple");
-    assert_eq!(
-        engine.project().clip(second_id).unwrap().start().value,
-        10
-    );
+    assert_eq!(engine.project().clip(second_id).unwrap().start().value, 10);
 
     assert!(engine.undo());
     assert!(engine.project().clip(first_id).is_some());
-    assert_eq!(
-        engine.project().clip(second_id).unwrap().start().value,
-        20
-    );
+    assert_eq!(engine.project().clip(second_id).unwrap().start().value, 20);
 }
 
 #[test]
@@ -288,10 +294,7 @@ fn undo_trim_restores_timeline_and_source() {
         }))
         .expect("trim");
 
-    assert_ne!(
-        engine.project().clip(clip_id).unwrap().timeline,
-        before_tl
-    );
+    assert_ne!(engine.project().clip(clip_id).unwrap().timeline, before_tl);
 
     assert!(engine.undo());
     let clip = engine.project().clip(clip_id).unwrap();
@@ -377,9 +380,7 @@ fn undo_add_generated() {
         engine
             .apply(Command::Edit(EditCommand::AddGenerated {
                 track,
-                generator: Generator::SolidColor {
-                    rgba: [1, 2, 3, 4],
-                },
+                generator: Generator::SolidColor { rgba: [1, 2, 3, 4] },
                 timeline: tr(0, 24),
             }))
             .expect("add"),
@@ -414,10 +415,13 @@ fn undo_redo_set_generator_oscillates_content() {
         }))
         .expect("set generator");
 
-    let content = |engine: &cutlass_engine::Engine| match &engine.project().clip(clip_id).unwrap().content {
-        cutlass_models::ClipSource::Generated(Generator::Text { content, .. }) => content.clone(),
-        other => panic!("expected text generator, got {other:?}"),
-    };
+    let content =
+        |engine: &cutlass_engine::Engine| match &engine.project().clip(clip_id).unwrap().content {
+            cutlass_models::ClipSource::Generated(Generator::Text { content, .. }) => {
+                content.clone()
+            }
+            other => panic!("expected text generator, got {other:?}"),
+        };
     assert_eq!(content(&engine), "after");
 
     assert!(engine.undo());
@@ -462,10 +466,11 @@ fn undo_redo_set_generator_oscillates_style() {
         }))
         .expect("set generator");
 
-    let style = |engine: &cutlass_engine::Engine| match &engine.project().clip(clip_id).unwrap().content {
-        cutlass_models::ClipSource::Generated(Generator::Text { style, .. }) => style.clone(),
-        other => panic!("expected text generator, got {other:?}"),
-    };
+    let style =
+        |engine: &cutlass_engine::Engine| match &engine.project().clip(clip_id).unwrap().content {
+            cutlass_models::ClipSource::Generated(Generator::Text { style, .. }) => style.clone(),
+            other => panic!("expected text generator, got {other:?}"),
+        };
 
     assert_eq!(style(&engine), styled);
 
@@ -537,9 +542,8 @@ fn undo_redo_set_clip_transform_oscillates() {
         }))
         .expect("set transform");
 
-    let transform = |engine: &cutlass_engine::Engine| {
-        engine.project().clip(clip_id).unwrap().transform.clone()
-    };
+    let transform =
+        |engine: &cutlass_engine::Engine| engine.project().clip(clip_id).unwrap().transform.clone();
     assert_eq!(transform(&engine), moved.into());
 
     assert!(engine.undo());
@@ -577,7 +581,14 @@ fn invalid_transform_rejected_and_state_unchanged() {
             }))
             .is_err()
     );
-    assert!(engine.project().clip(clip_id).unwrap().transform.is_identity());
+    assert!(
+        engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .transform
+            .is_identity()
+    );
 }
 
 /// Add a text clip at [0, 48) and return its id — fixture for param tests.
@@ -619,7 +630,13 @@ fn set_param_keyframe_undo_redo_roundtrip() {
         .expect("second keyframe");
 
     let opacity = |engine: &cutlass_engine::Engine| {
-        engine.project().clip(clip_id).unwrap().transform.opacity.clone()
+        engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .transform
+            .opacity
+            .clone()
     };
     assert_eq!(opacity(&engine).keyframes().len(), 2);
 
@@ -635,7 +652,13 @@ fn set_param_keyframe_undo_redo_roundtrip() {
     assert!(engine.redo());
     assert_eq!(opacity(&engine).keyframes().len(), 2);
     assert_eq!(
-        engine.project().clip(clip_id).unwrap().transform.sample(12).opacity,
+        engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .transform
+            .sample(12)
+            .opacity,
         0.5
     );
 }
@@ -974,7 +997,13 @@ fn remove_param_keyframe_undo_restores_curve() {
         }))
         .expect("remove");
     let scale = |engine: &cutlass_engine::Engine| {
-        engine.project().clip(clip_id).unwrap().transform.scale.clone()
+        engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .transform
+            .scale
+            .clone()
     };
     assert_eq!(scale(&engine).keyframes().len(), 1);
 
@@ -1019,7 +1048,13 @@ fn set_param_constant_undo_restores_keyframes() {
         }))
         .expect("flatten");
     let rotation = |engine: &cutlass_engine::Engine| {
-        engine.project().clip(clip_id).unwrap().transform.rotation.clone()
+        engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .transform
+            .rotation
+            .clone()
     };
     assert_eq!(rotation(&engine).constant(), Some(90.0));
 
@@ -1045,7 +1080,14 @@ fn param_keyframe_outside_clip_rejected() {
             }))
             .is_err()
     );
-    assert!(!engine.project().clip(clip_id).unwrap().transform.is_animated());
+    assert!(
+        !engine
+            .project()
+            .clip(clip_id)
+            .unwrap()
+            .transform
+            .is_animated()
+    );
 }
 
 #[test]
@@ -1213,22 +1255,13 @@ fn redo_trim_after_undo() {
             timeline: tr(12, 20),
         }))
         .expect("trim");
-    assert_eq!(
-        engine.project().clip(clip_id).unwrap().timeline,
-        tr(12, 20)
-    );
+    assert_eq!(engine.project().clip(clip_id).unwrap().timeline, tr(12, 20));
 
     assert!(engine.undo());
-    assert_eq!(
-        engine.project().clip(clip_id).unwrap().timeline,
-        tr(0, 48)
-    );
+    assert_eq!(engine.project().clip(clip_id).unwrap().timeline, tr(0, 48));
 
     assert!(engine.redo());
-    assert_eq!(
-        engine.project().clip(clip_id).unwrap().timeline,
-        tr(12, 20)
-    );
+    assert_eq!(engine.project().clip(clip_id).unwrap().timeline, tr(12, 20));
 }
 
 #[test]
@@ -1395,7 +1428,11 @@ fn undo_add_marker_removes_it_and_redo_restores_same_id() {
     assert_eq!(engine.project().timeline().marker_count(), 0);
 
     assert!(engine.redo());
-    let marker = engine.project().timeline().marker(id).expect("same id restored");
+    let marker = engine
+        .project()
+        .timeline()
+        .marker(id)
+        .expect("same id restored");
     assert_eq!(marker.tick, rt(48));
     assert_eq!(marker.name, "drop");
     assert_eq!(marker.color, cutlass_models::MarkerColor::Red);
@@ -1495,17 +1532,21 @@ fn marker_commands_reject_unknown_ids_without_history() {
     let (_dir, mut engine) = temp_engine();
     let missing = cutlass_models::MarkerId::from_raw(404);
 
-    assert!(engine
-        .apply(Command::Edit(EditCommand::RemoveMarker { marker: missing }))
-        .is_err());
-    assert!(engine
-        .apply(Command::Edit(EditCommand::SetMarker {
-            marker: missing,
-            at: rt(0),
-            name: String::new(),
-            color: cutlass_models::MarkerColor::Teal,
-        }))
-        .is_err());
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::RemoveMarker { marker: missing }))
+            .is_err()
+    );
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetMarker {
+                marker: missing,
+                at: rt(0),
+                name: String::new(),
+                color: cutlass_models::MarkerColor::Teal,
+            }))
+            .is_err()
+    );
     assert!(!engine.can_undo(), "failed marker edits push no history");
 }
 
@@ -1563,9 +1604,8 @@ fn add_effect_undo_redo_roundtrip() {
             effect_id: "gaussian_blur".into(),
         }))
         .expect("add effect");
-    let effects = |engine: &cutlass_engine::Engine| {
-        engine.project().clip(clip_id).unwrap().effects.clone()
-    };
+    let effects =
+        |engine: &cutlass_engine::Engine| engine.project().clip(clip_id).unwrap().effects.clone();
     assert_eq!(effects(&engine).len(), 1);
     assert_eq!(effects(&engine)[0].effect_id, "gaussian_blur");
 
@@ -1643,7 +1683,10 @@ fn effect_param_keyframe_through_clip_param() {
         }))
         .expect("add effect");
 
-    let fx_param = ClipParam::Effect { effect: 0, param: 0 };
+    let fx_param = ClipParam::Effect {
+        effect: 0,
+        param: 0,
+    };
     engine
         .apply(Command::Edit(EditCommand::SetParamKeyframe {
             clip: clip_id,
@@ -1679,18 +1722,22 @@ fn effect_commands_reject_unknown_ids_without_history() {
     let (_dir, mut engine) = temp_engine();
     let clip_id = text_clip(&mut engine);
 
-    assert!(engine
-        .apply(Command::Edit(EditCommand::AddEffect {
-            clip: clip_id,
-            effect_id: "no_such_effect".into(),
-        }))
-        .is_err());
-    assert!(engine
-        .apply(Command::Edit(EditCommand::RemoveEffect {
-            clip: clip_id,
-            index: 0,
-        }))
-        .is_err());
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::AddEffect {
+                clip: clip_id,
+                effect_id: "no_such_effect".into(),
+            }))
+            .is_err()
+    );
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::RemoveEffect {
+                clip: clip_id,
+                index: 0,
+            }))
+            .is_err()
+    );
     // Only the add-track + add-generated steps are undoable; failed effect
     // edits push nothing.
     assert!(engine.undo());

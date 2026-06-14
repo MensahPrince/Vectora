@@ -9,7 +9,10 @@ pub struct RemoveClipAction {
 }
 
 impl EditAction for RemoveClipAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let track = ctx
             .project
             .timeline()

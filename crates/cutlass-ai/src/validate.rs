@@ -269,7 +269,8 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                     args.seconds
                 )));
             }
-            let duration = seconds_to_ticks(args.seconds, timeline_rate(project), "duration")?.max(1);
+            let duration =
+                seconds_to_ticks(args.seconds, timeline_rate(project), "duration")?.max(1);
             EditCommand::SetTransition {
                 clip: clip.id,
                 duration,
@@ -755,17 +756,20 @@ fn reject_audio_lane(
 }
 
 fn track_ref(project: &Project, raw: u64) -> Result<&cutlass_models::Track, Rejection> {
-    project.timeline().track(TrackId::from_raw(raw)).ok_or_else(|| {
-        let existing = project
-            .timeline()
-            .tracks_ordered()
-            .map(|t| t.id.raw())
-            .collect();
-        Rejection::new(format!(
-            "track {raw} does not exist; tracks on the timeline: {}",
-            list_ids(existing)
-        ))
-    })
+    project
+        .timeline()
+        .track(TrackId::from_raw(raw))
+        .ok_or_else(|| {
+            let existing = project
+                .timeline()
+                .tracks_ordered()
+                .map(|t| t.id.raw())
+                .collect();
+            Rejection::new(format!(
+                "track {raw} does not exist; tracks on the timeline: {}",
+                list_ids(existing)
+            ))
+        })
 }
 
 fn media_ref(project: &Project, raw: u64) -> Result<&cutlass_models::MediaSource, Rejection> {
@@ -986,14 +990,11 @@ fn param_value(
         WireClipParam::Scale
         | WireClipParam::Rotation
         | WireClipParam::Opacity
-        | WireClipParam::Volume => value
-            .map(|v| ParamValue::Scalar(v as f32))
-            .ok_or_else(|| {
-                Rejection::new(format!(
-                    "param '{param:?}' needs the 'value' argument (a number)",
-                )
-                .to_lowercase())
-            }),
+        | WireClipParam::Volume => value.map(|v| ParamValue::Scalar(v as f32)).ok_or_else(|| {
+            Rejection::new(
+                format!("param '{param:?}' needs the 'value' argument (a number)",).to_lowercase(),
+            )
+        }),
     }
 }
 
@@ -1028,7 +1029,9 @@ fn seconds_to_ticks(seconds: f64, rate: Rational, what: &str) -> Result<i64, Rej
     }
     let ticks = seconds * f64::from(rate.num) / f64::from(rate.den);
     if !(-(2f64.powi(53))..=2f64.powi(53)).contains(&ticks) {
-        return Err(Rejection::new(format!("{what} of {seconds}s is out of range")));
+        return Err(Rejection::new(format!(
+            "{what} of {seconds}s is out of range"
+        )));
     }
     Ok(ticks.round() as i64)
 }
@@ -1164,7 +1167,9 @@ mod tests {
     }
 
     fn reject(project: &Project, cmd: WireCommand) -> String {
-        validate(&cmd, project).expect_err("command should be rejected").message
+        validate(&cmd, project)
+            .expect_err("command should be rejected")
+            .message
     }
 
     #[test]
@@ -1337,7 +1342,10 @@ mod tests {
                 start: 0.0,
             }),
         );
-        assert!(msg.contains("media clips need a video or audio track"), "{msg}");
+        assert!(
+            msg.contains("media clips need a video or audio track"),
+            "{msg}"
+        );
     }
 
     #[test]
@@ -2010,10 +2018,12 @@ mod tests {
         );
 
         // Omitted fields keep the project's current canvas settings.
-        project.timeline_mut().set_canvas(cutlass_models::CanvasSettings {
-            aspect: CanvasAspect::Square1x1,
-            background: [255, 0, 0],
-        });
+        project
+            .timeline_mut()
+            .set_canvas(cutlass_models::CanvasSettings {
+                aspect: CanvasAspect::Square1x1,
+                background: [255, 0, 0],
+            });
         let edit = lower(
             &project,
             WireCommand::SetCanvas(wire::SetCanvas {

@@ -37,7 +37,9 @@ impl OpenAiCompatProvider {
 
     /// Build from a parsed `[ai]` config section (resolves `api_key_env`).
     pub fn from_config(config: &AiSection) -> Result<Self, ProviderError> {
-        let api_key = config.resolve_api_key().map_err(ProviderError::NotConfigured)?;
+        let api_key = config
+            .resolve_api_key()
+            .map_err(ProviderError::NotConfigured)?;
         Ok(Self::new(&config.base_url, &config.model, api_key))
     }
 

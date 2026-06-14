@@ -43,7 +43,11 @@ fn undo_add_clip_uses_inverse_not_snapshot() {
     assert_eq!(engine.project().timeline().clip_count(), 1);
     assert!(engine.undo());
     assert_eq!(engine.project().timeline().clip_count(), 0);
-    assert_eq!(engine.project().media_count(), 1, "import survives clip undo");
+    assert_eq!(
+        engine.project().media_count(),
+        1,
+        "import survives clip undo"
+    );
 }
 
 #[test]

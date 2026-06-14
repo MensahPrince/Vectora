@@ -17,22 +17,14 @@ fn scrub_session_caches_many_frames_and_reads_back() {
     let source_id = register_source(&cache, &fp);
 
     for pts in 0..60_i64 {
-        cache_frame_sync(
-            &cache,
-            source_id,
-            pts,
-            frame_payload(pts, 4_096),
-        );
+        cache_frame_sync(&cache, source_id, pts, frame_payload(pts, 4_096));
     }
 
     assert_eq!(cache.frame_count(source_id), 60);
     assert_eq!(cache.total_bytes(), 60 * 4_096);
 
     for pts in (0..60).step_by(5) {
-        assert_eq!(
-            cache.get(source_id, pts),
-            Some(frame_payload(pts, 4_096))
-        );
+        assert_eq!(cache.get(source_id, pts), Some(frame_payload(pts, 4_096)));
     }
     assert!(cache.get(source_id, 999).is_none());
 }
@@ -62,10 +54,7 @@ fn warm_restart_restores_indexed_frames() {
     assert_eq!(cache.frame_count(source_id), pts_list.len());
 
     for &pts in &pts_list {
-        assert_eq!(
-            cache.get(source_id, pts),
-            Some(frame_payload(pts, 512))
-        );
+        assert_eq!(cache.get(source_id, pts), Some(frame_payload(pts, 512)));
     }
 }
 
@@ -129,7 +118,10 @@ fn cross_source_eviction_is_global_lru() {
 
     cache_frame_sync(&cache, b, 2, frame_payload(102, 100));
 
-    assert!(!cache.contains(a, 1), "oldest untouched frame should be evicted");
+    assert!(
+        !cache.contains(a, 1),
+        "oldest untouched frame should be evicted"
+    );
     assert!(cache.contains(a, 2));
     assert!(cache.contains(a, 3));
     assert!(cache.contains(b, 1));
@@ -147,30 +139,17 @@ fn two_source_timeline_simulation() {
     let broll_id = register_source(&cache, &broll);
 
     for pts in 0..30 {
-        cache_frame_sync(
-            &cache,
-            interview_id,
-            pts,
-            frame_payload(pts, 2_048),
-        );
+        cache_frame_sync(&cache, interview_id, pts, frame_payload(pts, 2_048));
     }
     for pts in 0..20 {
-        cache_frame_sync(
-            &cache,
-            broll_id,
-            pts * 2,
-            frame_payload(pts * 2, 1_024),
-        );
+        cache_frame_sync(&cache, broll_id, pts * 2, frame_payload(pts * 2, 1_024));
     }
 
     assert_eq!(cache.frame_count(interview_id), 30);
     assert_eq!(cache.frame_count(broll_id), 20);
     assert_eq!(cache.total_bytes(), 30 * 2_048 + 20 * 1_024);
 
-    assert_eq!(
-        cache.get(broll_id, 10),
-        Some(frame_payload(10, 1_024))
-    );
+    assert_eq!(cache.get(broll_id, 10), Some(frame_payload(10, 1_024)));
     assert!(cache.get(interview_id, 29).is_some());
     assert!(cache.get(broll_id, 99).is_none());
 }

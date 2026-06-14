@@ -392,7 +392,9 @@ impl VideoExport {
             scaled
         };
         frame.set_pts(Some(self.frame_index));
-        self.encoder.send_frame(&frame).map_err(EncodeError::Encode)?;
+        self.encoder
+            .send_frame(&frame)
+            .map_err(EncodeError::Encode)?;
         self.frame_index += 1;
 
         drain_encoder(
@@ -567,7 +569,8 @@ mod tests {
         let u = vec![128u8; ((in_w / 2) * (in_h / 2)) as usize];
         let v = vec![128u8; ((in_w / 2) * (in_h / 2)) as usize];
         for _ in 0..8 {
-            sink.push_yuv420p(in_w, in_h, &y, &u, &v).expect("push scaled frame");
+            sink.push_yuv420p(in_w, in_h, &y, &u, &v)
+                .expect("push scaled frame");
         }
         let stats = sink.finish().expect("finish");
         assert_eq!(stats.frames, 8);

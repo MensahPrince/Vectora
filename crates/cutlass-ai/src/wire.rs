@@ -796,9 +796,8 @@ fn spec<T: JsonSchema>(name: &'static str, description: &'static str) -> ToolSpe
     // `WireGenerator` object is required).
     let mut settings = schemars::generate::SchemaSettings::draft2020_12();
     settings.inline_subschemas = true;
-    let parameters =
-        serde_json::to_value(settings.into_generator().into_root_schema_for::<T>())
-            .expect("tool argument schemas are plain data and always serialize");
+    let parameters = serde_json::to_value(settings.into_generator().into_root_schema_for::<T>())
+        .expect("tool argument schemas are plain data and always serialize");
     ToolSpec {
         name,
         description,
@@ -981,15 +980,10 @@ mod tests {
 
     #[test]
     fn from_tool_call_decodes_arguments() {
-        let cmd = WireCommand::from_tool_call(
-            "split_clip",
-            serde_json::json!({ "clip": 7, "at": 12.4 }),
-        )
-        .unwrap();
-        assert_eq!(
-            cmd,
-            WireCommand::SplitClip(SplitClip { clip: 7, at: 12.4 })
-        );
+        let cmd =
+            WireCommand::from_tool_call("split_clip", serde_json::json!({ "clip": 7, "at": 12.4 }))
+                .unwrap();
+        assert_eq!(cmd, WireCommand::SplitClip(SplitClip { clip: 7, at: 12.4 }));
         assert_eq!(cmd.tool_name(), "split_clip");
     }
 
@@ -999,11 +993,9 @@ mod tests {
         assert!(err.contains("unknown tool 'save_project'"));
         assert!(err.contains("add_clip"));
 
-        let err = WireCommand::from_tool_call(
-            "trim_clip",
-            serde_json::json!({ "clip": "not-a-number" }),
-        )
-        .unwrap_err();
+        let err =
+            WireCommand::from_tool_call("trim_clip", serde_json::json!({ "clip": "not-a-number" }))
+                .unwrap_err();
         assert!(err.contains("invalid arguments for trim_clip"));
     }
 
@@ -1022,7 +1014,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("invalid arguments for add_generated"), "{err}");
-        assert!(err.contains("{\"type\": \"text\", \"content\": \"Hello\"}"), "{err}");
+        assert!(
+            err.contains("{\"type\": \"text\", \"content\": \"Hello\"}"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1111,7 +1106,11 @@ mod tests {
         let specs = tool_specs();
         assert_eq!(specs.len(), 36);
         for spec in &specs {
-            assert!(!spec.description.is_empty(), "{} missing description", spec.name);
+            assert!(
+                !spec.description.is_empty(),
+                "{} missing description",
+                spec.name
+            );
             assert_eq!(
                 spec.parameters.get("type").and_then(|t| t.as_str()),
                 Some("object"),

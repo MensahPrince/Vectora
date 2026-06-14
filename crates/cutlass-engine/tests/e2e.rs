@@ -20,10 +20,8 @@ fn assert_mp4_playable(path: &Path, min_frames: u64) {
         "export empty: {}",
         path.display()
     );
-    let mut dec =
-        Decoder::open_with(path, DecodeOptions::default().hw_accel(HwAccel::None)).unwrap_or_else(
-            |e| panic!("open export {}: {e}", path.display()),
-        );
+    let mut dec = Decoder::open_with(path, DecodeOptions::default().hw_accel(HwAccel::None))
+        .unwrap_or_else(|e| panic!("open export {}: {e}", path.display()));
     let dur = dec.duration().expect("duration");
     assert!(dur > Duration::ZERO);
     let frame = dec
@@ -142,7 +140,10 @@ fn e2e_image_still_import_preview_save_reopen_export() {
         (media.full_range(), media.is_image, media.duration.value)
     };
     assert!(is_image, "png imports as a still");
-    assert_eq!(duration_ticks, 5_000, "default 5s placement at 1000/1 ticks");
+    assert_eq!(
+        duration_ticks, 5_000,
+        "default 5s placement at 1000/1 ticks"
+    );
 
     let track = add_track(&mut engine, TrackKind::Video, "V1");
     add_media_clip(&mut engine, track, media_id, source, rt(0));
@@ -153,7 +154,10 @@ fn e2e_image_still_import_preview_save_reopen_export() {
     let frame = engine.get_frame(rt(60)).expect("mid-still preview");
     assert_eq!((frame.width, frame.height), (1920, 1080));
     assert!(
-        frame.bytes.chunks_exact(4).any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0),
+        frame
+            .bytes
+            .chunks_exact(4)
+            .any(|p| p[0] != 0 || p[1] != 0 || p[2] != 0),
         "still renders visible pixels"
     );
 

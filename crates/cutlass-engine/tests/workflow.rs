@@ -46,10 +46,7 @@ fn edit_session_via_commands() {
     };
 
     let tail = match engine
-        .apply(Command::Edit(EditCommand::SplitClip {
-            clip,
-            at: rt(24),
-        }))
+        .apply(Command::Edit(EditCommand::SplitClip { clip, at: rt(24) }))
         .expect("split")
     {
         ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
@@ -112,7 +109,10 @@ fn failed_command_does_not_mutate_project() {
 
     assert!(format!("{err}").contains("unknown media"));
     assert_eq!(engine.project().timeline().clip_count(), 0);
-    assert!(engine.can_undo(), "add-track remains undoable after failed add-clip");
+    assert!(
+        engine.can_undo(),
+        "add-track remains undoable after failed add-clip"
+    );
 }
 
 #[test]

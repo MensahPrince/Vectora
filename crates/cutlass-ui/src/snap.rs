@@ -171,8 +171,7 @@ pub fn resolve_clip_drag(
         }
         // The snap pulled us into a conflict the raw position doesn't have —
         // prefer landing free without the magnet over forcing a new lane.
-        if snap.has_snap && snapped != desired && span_is_free(&track, desired, duration, exclude)
-        {
+        if snap.has_snap && snapped != desired && span_is_free(&track, desired, duration, exclude) {
             return ClipDragResolution {
                 valid: true,
                 is_new_lane: false,
@@ -362,11 +361,7 @@ fn resolve_insertion(track: &crate::Track, exclude: Option<&str>, desired: i32) 
     let commit_tick = if index < spans.len() {
         closed(spans[index].0, spans[index].0)
     } else {
-        spans
-            .iter()
-            .map(|(s, e)| closed(*e, *s))
-            .max()
-            .unwrap_or(0)
+        spans.iter().map(|(s, e)| closed(*e, *s)).max().unwrap_or(0)
     };
 
     Insertion {
@@ -762,7 +757,11 @@ mod tests {
     /// Rows (top-first): 0 = V2 video, 1 = V1 video, 2 = A1 audio.
     fn sample_sequence() -> Sequence {
         sequence(vec![
-            track("2", TrackKind::Video, vec![clip("2", 0, 80), clip("3", 200, 60)]),
+            track(
+                "2",
+                TrackKind::Video,
+                vec![clip("2", 0, 80), clip("3", 200, 60)],
+            ),
             track("1", TrackKind::Video, vec![clip("1", 10, 100)]),
             track("9", TrackKind::Audio, vec![]),
         ])
@@ -1102,7 +1101,11 @@ mod tests {
         // Tail room of 2 caps the end at 102, but clip "B" at 105 is a magnet
         // candidate within threshold — the clamp wins and the guide hides.
         let seq = sequence(vec![
-            track("1", TrackKind::Video, vec![clip_with_rooms("A", 0, 100, 0, 2)]),
+            track(
+                "1",
+                TrackKind::Video,
+                vec![clip_with_rooms("A", 0, 100, 0, 2)],
+            ),
             track("2", TrackKind::Video, vec![clip("B", 105, 50)]),
         ]);
         let r = resolve_clip_trim(&seq, "1", "A", false, 4, 0, 5, false, false);
@@ -1186,10 +1189,7 @@ mod tests {
         let seq = sequence(vec![track(
             "1",
             TrackKind::Video,
-            vec![
-                clip_with_rooms("A", 0, 50, 0, 1_000_000),
-                clip("B", 50, 30),
-            ],
+            vec![clip_with_rooms("A", 0, 50, 0, 1_000_000), clip("B", 50, 30)],
         )]);
         let free = resolve_clip_trim(&seq, "1", "A", false, 80, 0, 0, false, false);
         assert_eq!(free.new_duration, 50);

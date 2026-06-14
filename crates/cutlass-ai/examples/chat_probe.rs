@@ -13,15 +13,18 @@ use cutlass_ai::provider::{ChatProvider, ChatRequest, Message};
 use cutlass_ai::providers::OpenAiCompatProvider;
 
 fn main() {
-    let prompt = std::env::args().nth(1).unwrap_or_else(|| {
-        "Reply with one sentence: what kind of assistant are you?".to_string()
-    });
+    let prompt = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "Reply with one sentence: what kind of assistant are you?".to_string());
 
     let path = default_config_path();
     let section = match load_ai_config(&path) {
         Ok(Some(section)) => section,
         Ok(None) => {
-            eprintln!("no [ai] section in {}; see cutlass-ai/src/config.rs", path.display());
+            eprintln!(
+                "no [ai] section in {}; see cutlass-ai/src/config.rs",
+                path.display()
+            );
             std::process::exit(1);
         }
         Err(e) => {

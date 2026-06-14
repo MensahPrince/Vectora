@@ -60,10 +60,9 @@ pub mod validate;
 pub mod wire;
 
 pub use agent::{
-    run_prompt, ActionLogEntry, AgentConfig, AgentEvent, EngineBridge, PromptOutcome,
-    PromptStatus,
+    ActionLogEntry, AgentConfig, AgentEvent, EngineBridge, PromptOutcome, PromptStatus, run_prompt,
 };
-pub use describe::{summarize, EditorContext, ProjectSummary};
+pub use describe::{EditorContext, ProjectSummary, summarize};
 pub use provider::Message;
-pub use validate::{validate, Rejection};
-pub use wire::{tool_specs, ToolSpec, WireCommand, TOOL_SCHEMA_VERSION};
+pub use validate::{Rejection, validate};
+pub use wire::{TOOL_SCHEMA_VERSION, ToolSpec, WireCommand, tool_specs};

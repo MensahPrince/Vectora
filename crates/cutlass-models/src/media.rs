@@ -132,14 +132,7 @@ mod tests {
 
     #[test]
     fn new_wires_all_fields() {
-        let media = MediaSource::new(
-            "/media/clip.mp4",
-            3840,
-            2160,
-            R30,
-            1_800,
-            false,
-        );
+        let media = MediaSource::new("/media/clip.mp4", 3840, 2160, R30, 1_800, false);
 
         assert_eq!(media.path, PathBuf::from("/media/clip.mp4"));
         assert_eq!(media.width, 3840);
@@ -181,14 +174,7 @@ mod tests {
 
     #[test]
     fn new_duration_carries_frame_rate() {
-        let ntsc = MediaSource::new(
-            "ntsc.mp4",
-            1920,
-            1080,
-            Rational::FPS_23_976,
-            2_400,
-            true,
-        );
+        let ntsc = MediaSource::new("ntsc.mp4", 1920, 1080, Rational::FPS_23_976, 2_400, true);
         assert_eq!(ntsc.frame_rate, Rational::FPS_23_976);
         assert_eq!(ntsc.duration.rate, Rational::FPS_23_976);
         assert_eq!(ntsc.duration.value, 2_400);
@@ -205,10 +191,7 @@ mod tests {
     #[test]
     fn full_range_spans_entire_source() {
         let media = sample("clip.mp4", 500);
-        assert_eq!(
-            media.full_range(),
-            TimeRange::at_rate(0, 500, R24)
-        );
+        assert_eq!(media.full_range(), TimeRange::at_rate(0, 500, R24));
     }
 
     #[test]
@@ -235,7 +218,10 @@ mod tests {
     fn path_returns_borrowed_path() {
         let media = sample("/vault/footage/take_01.mov", 100);
         assert_eq!(media.path(), Path::new("/vault/footage/take_01.mov"));
-        assert_eq!(media.path().file_name().and_then(|s| s.to_str()), Some("take_01.mov"));
+        assert_eq!(
+            media.path().file_name().and_then(|s| s.to_str()),
+            Some("take_01.mov")
+        );
     }
 
     // --- Clone / Eq / Debug -----------------------------------------------
@@ -292,8 +278,7 @@ mod tests {
         assert_eq!(media.frame_rate, STILL_TICK_RATE);
         assert_eq!(media.duration.value, STILL_DEFAULT_DURATION_TICKS);
         // 5000 ticks at 1000/1 is exactly 5 seconds.
-        let seconds =
-            media.duration.value as f64 * media.duration.rate.seconds_per_frame();
+        let seconds = media.duration.value as f64 * media.duration.rate.seconds_per_frame();
         assert_eq!(seconds, 5.0);
         assert!(!media.is_audio_only());
     }

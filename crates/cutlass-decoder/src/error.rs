@@ -20,9 +20,7 @@ pub enum DecodeError {
 
 impl DecodeError {
     pub fn unsupported(what: impl Into<String>) -> Self {
-        DecodeError::Unsupported {
-            what: what.into(),
-        }
+        DecodeError::Unsupported { what: what.into() }
     }
 }
 

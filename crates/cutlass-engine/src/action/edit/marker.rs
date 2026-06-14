@@ -44,7 +44,10 @@ pub struct RemoveMarkerAction {
 }
 
 impl EditAction for RemoveMarkerAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let removed = ctx
             .project
             .timeline_mut()
@@ -60,7 +63,10 @@ struct RestoreMarkerAction {
 }
 
 impl EditAction for RestoreMarkerAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let id = ctx.project.timeline_mut().add_marker(self.marker)?;
         Ok(Box::new(RemoveMarkerAction { marker: id }))
     }
@@ -72,7 +78,10 @@ struct ReplaceMarkerAction {
 }
 
 impl EditAction for ReplaceMarkerAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let id = self.before.id;
         let timeline = ctx.project.timeline_mut();
         let current = timeline

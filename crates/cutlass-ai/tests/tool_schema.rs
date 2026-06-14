@@ -41,8 +41,9 @@ fn tool_schema_matches_snapshot() {
     let stored = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!(
             "missing tool-schema snapshot at {} ({e}); \
-             run with BLESS_TOOL_SCHEMA=1 to create it"
-        , path.display())
+             run with BLESS_TOOL_SCHEMA=1 to create it",
+            path.display()
+        )
     });
     let stored: serde_json::Value = serde_json::from_str(&stored).unwrap();
 

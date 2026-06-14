@@ -60,7 +60,10 @@ pub fn slot_for(dir: &Path, source: Option<&Path>) -> PathBuf {
 }
 
 fn meta_path(slot: &Path) -> PathBuf {
-    let mut name = slot.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let mut name = slot
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
     name.push(".meta.json");
     slot.with_file_name(name)
 }

@@ -30,8 +30,7 @@ fn probe_matches_decoder_metadata() {
 
     if let Some(duration) = dec.duration() {
         let micros = duration.as_micros() as u64;
-        let expected =
-            cutlass_probe::duration_ticks_from_micros(probed.frame_rate, micros);
+        let expected = cutlass_probe::duration_ticks_from_micros(probed.frame_rate, micros);
         assert_eq!(probed.duration_ticks, expected);
     }
 }

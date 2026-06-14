@@ -159,7 +159,10 @@ fn legacy_rgba_yuv_roundtrip_1080p_solid() {
     let yuv = legacy_rgba_to_yuv420p(&rgba, w, h);
     let rgb = yuv_to_rgb_at(&yuv.y, &yuv.u, &yuv.v, w, 960, 540);
     for (got, want) in rgb.iter().zip([169u8, 164, 166]) {
-        assert!((i16::from(*got) - i16::from(want)).abs() <= 2, "got {got} want {want}");
+        assert!(
+            (i16::from(*got) - i16::from(want)).abs() <= 2,
+            "got {got} want {want}"
+        );
     }
 }
 

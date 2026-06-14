@@ -70,7 +70,12 @@ fn background_color_fills_uncovered_canvas() {
 
     // Zero layers = the bare canvas, all background.
     let empty = compositor.composite(&gpu, &config, &[]).expect("composite");
-    assert!(empty.bytes.chunks_exact(4).all(|p| p == [10, 120, 250, 255]));
+    assert!(
+        empty
+            .bytes
+            .chunks_exact(4)
+            .all(|p| p == [10, 120, 250, 255])
+    );
 }
 
 #[test]
@@ -139,7 +144,11 @@ fn uv_rect_crops_and_mirrors_sampled_content() {
     for y in 0..8u32 {
         for x in 0..8u32 {
             let i = ((y * 8 + x) * 4) as usize;
-            let color = if x < 4 { [255, 0, 0, 255] } else { [0, 0, 255, 255] };
+            let color = if x < 4 {
+                [255, 0, 0, 255]
+            } else {
+                [0, 0, 255, 255]
+            };
             bytes[i..i + 4].copy_from_slice(&color);
         }
     }
@@ -154,8 +163,16 @@ fn uv_rect_crops_and_mirrors_sampled_content() {
             &[CompositeLayer::rgba(bytes.clone(), 8, 8, full).with_uv([0.5, 0.0, 1.0, 1.0])],
         )
         .expect("composite");
-    assert_eq!(pixel(&cropped, 1, 4)[2], 255, "left of canvas shows cropped blue");
-    assert_eq!(pixel(&cropped, 6, 4)[2], 255, "right of canvas shows cropped blue");
+    assert_eq!(
+        pixel(&cropped, 1, 4)[2],
+        255,
+        "left of canvas shows cropped blue"
+    );
+    assert_eq!(
+        pixel(&cropped, 6, 4)[2],
+        255,
+        "right of canvas shows cropped blue"
+    );
 
     // Horizontal mirror: red lands on the right, blue on the left.
     let flipped = compositor
@@ -195,8 +212,16 @@ fn placed_solid_covers_only_its_rect() {
         .expect("composite");
 
     assert_eq!(pixel(&image, 16, 16), [255, 0, 0, 255], "inside the rect");
-    assert_eq!(pixel(&image, 9, 9), [255, 0, 0, 255], "near top-left corner");
-    assert_eq!(pixel(&image, 48, 48), [0, 0, 0, 255], "outside is canvas black");
+    assert_eq!(
+        pixel(&image, 9, 9),
+        [255, 0, 0, 255],
+        "near top-left corner"
+    );
+    assert_eq!(
+        pixel(&image, 48, 48),
+        [0, 0, 0, 255],
+        "outside is canvas black"
+    );
     assert_eq!(pixel(&image, 32, 16), [0, 0, 0, 255], "right of the rect");
 }
 
@@ -226,10 +251,26 @@ fn rotated_quad_lands_rotated() {
         )
         .expect("composite");
 
-    assert_eq!(pixel(&image, 32, 12), [0, 255, 0, 255], "on the vertical strip");
-    assert_eq!(pixel(&image, 32, 52), [0, 255, 0, 255], "on the vertical strip");
-    assert_eq!(pixel(&image, 12, 32), [0, 0, 0, 255], "horizontal extent gone");
-    assert_eq!(pixel(&image, 52, 32), [0, 0, 0, 255], "horizontal extent gone");
+    assert_eq!(
+        pixel(&image, 32, 12),
+        [0, 255, 0, 255],
+        "on the vertical strip"
+    );
+    assert_eq!(
+        pixel(&image, 32, 52),
+        [0, 255, 0, 255],
+        "on the vertical strip"
+    );
+    assert_eq!(
+        pixel(&image, 12, 32),
+        [0, 0, 0, 255],
+        "horizontal extent gone"
+    );
+    assert_eq!(
+        pixel(&image, 52, 32),
+        [0, 0, 0, 255],
+        "horizontal extent gone"
+    );
 }
 
 #[test]
@@ -308,9 +349,7 @@ fn empty_layers_yields_opaque_black() {
     };
     let mut compositor = Compositor::new(&gpu).expect("compositor");
     let config = CompositorConfig::new(8, 8);
-    let image = compositor
-        .composite(&gpu, &config, &[])
-        .expect("composite");
+    let image = compositor.composite(&gpu, &config, &[]).expect("composite");
 
     // The canvas clears to opaque black: placed layers may leave parts of it
     // uncovered, and preview/export define the background as black.

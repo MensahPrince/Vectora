@@ -21,7 +21,9 @@ fn open_export(path: &Path) -> Decoder {
 
 fn assert_export_duration_near(path: &Path, frames: u64, fps: i32) {
     let dec = open_export(path);
-    let dur = dec.duration().expect("exported file should report duration");
+    let dur = dec
+        .duration()
+        .expect("exported file should report duration");
     let expected_ms = (frames as f64 / f64::from(fps)) * 1000.0;
     let actual_ms = dur.as_millis() as f64;
     assert!(
@@ -139,12 +141,7 @@ fn export_text_clip_renders_visible_pixels() {
     // canvas yields bright luma pixels; a dropped generator would stay black.
     let (dir, mut engine) = temp_engine();
     let track = add_track(&mut engine, TrackKind::Text, "T1");
-    add_generated(
-        &mut engine,
-        track,
-        Generator::text("HELLO"),
-        tr(0, 24),
-    );
+    add_generated(&mut engine, track, Generator::text("HELLO"), tr(0, 24));
 
     let out = dir.path().join("text_export.mp4");
     let stats = export_to(&mut engine, &out);
@@ -157,7 +154,10 @@ fn export_text_clip_renders_visible_pixels() {
         .expect("decoded frame");
     // Limited-range black is Y≈16; rasterized white text pushes luma high.
     let bright = frame.planes[0].data.iter().filter(|&&y| y > 120).count();
-    assert!(bright > 0, "exported text frame had no bright pixels (text dropped?)");
+    assert!(
+        bright > 0,
+        "exported text frame had no bright pixels (text dropped?)"
+    );
 }
 
 // --- media ----------------------------------------------------------------

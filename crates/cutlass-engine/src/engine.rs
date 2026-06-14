@@ -368,7 +368,10 @@ impl Engine {
     }
 
     pub fn undo(&mut self) -> bool {
-        debug_assert!(!self.history.in_group(), "undo inside an open history group");
+        debug_assert!(
+            !self.history.in_group(),
+            "undo inside an open history group"
+        );
         let Some(action) = self.history.pop_undo() else {
             return false;
         };
@@ -387,7 +390,10 @@ impl Engine {
     }
 
     pub fn redo(&mut self) -> bool {
-        debug_assert!(!self.history.in_group(), "redo inside an open history group");
+        debug_assert!(
+            !self.history.in_group(),
+            "redo inside an open history group"
+        );
         let Some(action) = self.history.pop_redo() else {
             return false;
         };

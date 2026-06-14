@@ -11,7 +11,10 @@ pub struct RestoreTransitionsAction {
 }
 
 impl EditAction for RestoreTransitionsAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let current = ctx.project.transitions_snapshot();
         ctx.project.restore_transitions(self.snapshot);
         Ok(Box::new(RestoreTransitionsAction { snapshot: current }))

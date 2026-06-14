@@ -105,7 +105,9 @@ fn rgba_from_rgba8(frame: &DecodedFrame) -> Result<RgbaFrame, EngineError> {
 /// Tight-packed YUV420P (Y, then U, then V) for the frame cache.
 pub fn pack_yuv420p(frame: &DecodedFrame) -> Result<Vec<u8>, EngineError> {
     if frame.format != PixelFormat::Yuv420p {
-        return Err(EngineError::Preview("expected YUV420P for cache pack".into()));
+        return Err(EngineError::Preview(
+            "expected YUV420P for cache pack".into(),
+        ));
     }
     let w = frame.width as usize;
     let h = frame.height as usize;

@@ -14,8 +14,6 @@ pub enum ProbeError {
 
 impl ProbeError {
     pub fn unsupported(what: impl Into<String>) -> Self {
-        ProbeError::Unsupported {
-            what: what.into(),
-        }
+        ProbeError::Unsupported { what: what.into() }
     }
 }

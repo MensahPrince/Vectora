@@ -6,12 +6,12 @@
 
 use std::path::{Path, PathBuf};
 
+use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use cutlass_commands::{Command, EditCommand, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
 use cutlass_models::{
     ClipParam, Easing, Generator, ParamValue, Rational, RationalTime, TimeRange, TrackKind,
 };
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 fn assets_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets")
@@ -169,11 +169,7 @@ fn bench_get_frame_media(c: &mut Criterion) {
         return;
     };
     let (_dir, mut engine) = engine_with_media(&path, 120);
-    let media = engine
-        .project()
-        .media_iter()
-        .next()
-        .expect("media");
+    let media = engine.project().media_iter().next().expect("media");
     let bytes = (media.width as u64) * (media.height as u64) * 4;
 
     let mut group = c.benchmark_group("preview/get_frame");

@@ -5,9 +5,7 @@
 
 pub mod diskcache;
 
-pub use diskcache::{
-    CacheSpec, DiskCacheError, FrameCache, SourceFingerprint, SourceId,
-};
+pub use diskcache::{CacheSpec, DiskCacheError, FrameCache, SourceFingerprint, SourceId};
 
 use tracing::info;
 

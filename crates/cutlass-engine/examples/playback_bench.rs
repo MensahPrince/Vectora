@@ -140,7 +140,11 @@ fn bench_engine(path: &PathBuf, seconds: u64) {
             .get_frame(RationalTime::new(tick, tl_rate))
             .expect("frame");
     });
-    println!("  -> realtime budget {:.1}ms/frame: {}", 1000.0 / TL_FPS as f64, verdict(&cold));
+    println!(
+        "  -> realtime budget {:.1}ms/frame: {}",
+        1000.0 / TL_FPS as f64,
+        verdict(&cold)
+    );
 
     // Give the async cache writer a moment to land the cold pass's frames.
     engine.cache().sync();
@@ -150,7 +154,11 @@ fn bench_engine(path: &PathBuf, seconds: u64) {
             .get_frame(RationalTime::new(tick, tl_rate))
             .expect("frame");
     });
-    println!("  -> realtime budget {:.1}ms/frame: {}", 1000.0 / TL_FPS as f64, verdict(&warm));
+    println!(
+        "  -> realtime budget {:.1}ms/frame: {}",
+        1000.0 / TL_FPS as f64,
+        verdict(&warm)
+    );
 }
 
 fn verdict(stats: &Stats) -> &'static str {

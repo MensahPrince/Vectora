@@ -165,10 +165,8 @@ impl ExportAudioMixer {
             let reader = match &mut span.reader {
                 Some(reader) => reader,
                 None => {
-                    let reader =
-                        AudioReader::open(&span.path, EXPORT_AUDIO_RATE).map_err(|err| {
-                            audio_err("open audio source", &span.path, err)
-                        })?;
+                    let reader = AudioReader::open(&span.path, EXPORT_AUDIO_RATE)
+                        .map_err(|err| audio_err("open audio source", &span.path, err))?;
                     span.reader.insert(reader)
                 }
             };
@@ -306,8 +304,8 @@ fn ticks_to_samples(value: i64, num: i32, den: i32) -> i64 {
     if num <= 0 || den <= 0 {
         return 0;
     }
-    let frames = i128::from(value) * i128::from(den) * i128::from(EXPORT_AUDIO_RATE)
-        / i128::from(num);
+    let frames =
+        i128::from(value) * i128::from(den) * i128::from(EXPORT_AUDIO_RATE) / i128::from(num);
     frames.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
@@ -385,7 +383,10 @@ mod tests {
         assert_eq!(mixer.spans.len(), 1);
         let span = &mixer.spans[0];
         assert!(span.retimed, "constant speed change flags a retime");
-        assert!(span.source_frames > 0, "the source window length is carried");
+        assert!(
+            span.source_frames > 0,
+            "the source window length is carried"
+        );
         assert_eq!(span.pitch_factor, 1.0, "pitch is locked by default");
 
         // Reverse alone (1×) is also audible and retimed.

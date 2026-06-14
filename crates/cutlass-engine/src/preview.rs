@@ -2,8 +2,8 @@
 
 use std::time::Instant;
 
-use cutlass_compositor::{Compositor, CompositorConfig, GpuContext, Yuv420pImage};
 use cutlass_cache::FrameCache;
+use cutlass_compositor::{Compositor, CompositorConfig, GpuContext, Yuv420pImage};
 use cutlass_models::{ClipId, ClipTransform, Generator, ModelError, Project, RationalTime};
 use tracing::debug;
 
@@ -90,7 +90,18 @@ pub fn prefetch_frame(
     color_convert: ColorConvertPath,
 ) -> Result<(), EngineError> {
     let config = composite_canvas_config(project);
-    resolve_layers(project, Some(cache), pool, raster, time, 0.0, &config, color_convert, None, None)?;
+    resolve_layers(
+        project,
+        Some(cache),
+        pool,
+        raster,
+        time,
+        0.0,
+        &config,
+        color_convert,
+        None,
+        None,
+    )?;
     Ok(())
 }
 

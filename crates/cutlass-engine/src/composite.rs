@@ -13,7 +13,7 @@ use tracing::debug;
 use crate::ColorConvertPath;
 use crate::decoder_pool::DecoderPool;
 use crate::error::EngineError;
-use crate::frame::{decoded_to_yuv_layer, legacy_decoded_to_rgba, RgbaFrame};
+use crate::frame::{RgbaFrame, decoded_to_yuv_layer, legacy_decoded_to_rgba};
 use crate::generator_raster::GeneratorRaster;
 
 const DEFAULT_WIDTH: u32 = 1920;
@@ -79,8 +79,7 @@ pub fn composite_canvas_size(project: &Project) -> (u32, u32) {
 /// config here so the two can never disagree on what the canvas looks like.
 pub fn composite_canvas_config(project: &Project) -> CompositorConfig {
     let (width, height) = composite_canvas_size(project);
-    CompositorConfig::new(width, height)
-        .with_background(project.timeline().canvas().background)
+    CompositorConfig::new(width, height).with_background(project.timeline().canvas().background)
 }
 
 /// Canvas placement for content of `content_w × content_h` under a clip
@@ -157,10 +156,7 @@ pub fn cropped_layer_placement(
 
 /// The anchor pivot in canvas pixels for a placed layer — the point scale and
 /// rotation gestures pivot about, and what `ClipTransform::position` places.
-pub fn anchor_canvas_position(
-    transform: &ClipTransform,
-    placement: &LayerPlacement,
-) -> [f32; 2] {
+pub fn anchor_canvas_position(transform: &ClipTransform, placement: &LayerPlacement) -> [f32; 2] {
     let offset = [
         (transform.anchor_point[0] - 0.5) * placement.size[0],
         (transform.anchor_point[1] - 0.5) * placement.size[1],
@@ -190,10 +186,7 @@ pub fn reposition_anchor(
         delta[0] * cos + delta[1] * sin,
         -delta[0] * sin + delta[1] * cos,
     ];
-    let anchor_point = [
-        0.5 - to_center[0] / size[0],
-        0.5 - to_center[1] / size[1],
-    ];
+    let anchor_point = [0.5 - to_center[0] / size[0], 0.5 - to_center[1] / size[1]];
     let position = [
         (anchor_canvas[0] - cw * 0.5) / cw,
         (anchor_canvas[1] - ch * 0.5) / ch,
@@ -220,10 +213,7 @@ pub fn position_preserving_center(
         center[1] - (to_center[0] * sin + to_center[1] * cos),
     ];
     let (cw, ch) = (canvas.width as f32, canvas.height as f32);
-    [
-        (anchor[0] - cw * 0.5) / cw,
-        (anchor[1] - ch * 0.5) / ch,
-    ]
+    [(anchor[0] - cw * 0.5) / cw, (anchor[1] - ch * 0.5) / ch]
 }
 
 /// The compositor UV rect sampling a clip's kept region: the crop window,
@@ -388,11 +378,13 @@ fn transition_window<'a>(
         let progress = ((time.value - start) as f32 / transition.duration as f32).clamp(0.0, 1.0);
         // Hold each side's edge frame where the window spills past its range.
         let from_sample = RationalTime::new(
-            time.value.clamp(left.timeline.start.value, left.timeline.end_tick() - 1),
+            time.value
+                .clamp(left.timeline.start.value, left.timeline.end_tick() - 1),
             rate,
         );
         let to_sample = RationalTime::new(
-            time.value.clamp(right.timeline.start.value, right.timeline.end_tick() - 1),
+            time.value
+                .clamp(right.timeline.start.value, right.timeline.end_tick() - 1),
             rate,
         );
         return Some(ResolvedTransition {
@@ -499,7 +491,9 @@ fn resolve_clip_layer(
                 Generator::SolidColor { rgba } => {
                     // Solids have no texture to sample: crop shrinks the
                     // quad, flips are invisible.
-                    Ok(Some(CompositeLayer::solid(*rgba, placement).with_effects(effects)))
+                    Ok(Some(
+                        CompositeLayer::solid(*rgba, placement).with_effects(effects),
+                    ))
                 }
                 Generator::Text { .. } | Generator::Shape { .. } => {
                     match raster.raster(generator, canvas.width, canvas.height) {
@@ -701,7 +695,10 @@ mod tests {
 
         // Rotated layers resample off-grid regardless; they keep the
         // continuous (unsnapped) placement.
-        let rotated = ClipTransform { rotation: 30.0, ..t };
+        let rotated = ClipTransform {
+            rotation: 30.0,
+            ..t
+        };
         let p = layer_placement(&rotated, 1920, 1080, &CANVAS);
         assert_eq!(p.center, [960.0 + 0.1234 * 1920.0, 540.0 - 0.0567 * 1080.0]);
     }
@@ -792,7 +789,12 @@ mod tests {
             ..ClipTransform::IDENTITY
         };
         let p = layer_placement(&t, 1920, 1080, &CANVAS);
-        assert!((p.center[0] - center[0]).abs() < 1e-3, "{:?} vs {:?}", p.center, center);
+        assert!(
+            (p.center[0] - center[0]).abs() < 1e-3,
+            "{:?} vs {:?}",
+            p.center,
+            center
+        );
         assert!((p.center[1] - center[1]).abs() < 1e-3);
         let a = anchor_canvas_position(&t, &p);
         assert!((a[0] - anchor[0]).abs() < 1e-3);
@@ -804,7 +806,12 @@ mod tests {
         // Keep the center half horizontally of 1920×1080 content: the kept
         // region is 960×1080 (portrait-ish), so the fit is height-limited
         // on the 1920×1080 canvas — no stretch, aspect preserved.
-        let crop = CropRect { x: 0.25, y: 0.0, w: 0.5, h: 1.0 };
+        let crop = CropRect {
+            x: 0.25,
+            y: 0.0,
+            w: 0.5,
+            h: 1.0,
+        };
         let p = cropped_layer_placement(&ClipTransform::IDENTITY, 1920, 1080, &crop, &CANVAS);
         assert_eq!(p.center, [960.0, 540.0]);
         assert_eq!(p.size, [960.0, 1080.0]);
@@ -817,17 +824,28 @@ mod tests {
             &CropRect::FULL,
             &CANVAS,
         );
-        assert_eq!(full, layer_placement(&ClipTransform::IDENTITY, 1920, 1080, &CANVAS));
+        assert_eq!(
+            full,
+            layer_placement(&ClipTransform::IDENTITY, 1920, 1080, &CANVAS)
+        );
     }
 
     #[test]
     fn content_uv_crops_and_mirrors() {
-        let crop = CropRect { x: 0.1, y: 0.2, w: 0.5, h: 0.25 };
+        let crop = CropRect {
+            x: 0.1,
+            y: 0.2,
+            w: 0.5,
+            h: 0.25,
+        };
         assert_eq!(content_uv(&crop, false, false), [0.1, 0.2, 0.6, 0.45]);
         // Flips reverse the sampled axis, keeping the same window.
         assert_eq!(content_uv(&crop, true, false), [0.6, 0.2, 0.1, 0.45]);
         assert_eq!(content_uv(&crop, false, true), [0.1, 0.45, 0.6, 0.2]);
-        assert_eq!(content_uv(&CropRect::FULL, true, true), [1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(
+            content_uv(&CropRect::FULL, true, true),
+            [1.0, 1.0, 0.0, 0.0]
+        );
     }
 
     #[test]
@@ -837,9 +855,18 @@ mod tests {
         let mut project = Project::new("t", rate);
         let track = project.add_track(TrackKind::Text, "T1");
         let clip = project
-            .add_generated(track, Generator::text("Hi"), TimeRange::at_rate(0, 24, rate))
+            .add_generated(
+                track,
+                Generator::text("Hi"),
+                TimeRange::at_rate(0, 24, rate),
+            )
             .unwrap();
-        let crop = CropRect { x: 0.0, y: 0.25, w: 1.0, h: 0.5 };
+        let crop = CropRect {
+            x: 0.0,
+            y: 0.25,
+            w: 1.0,
+            h: 0.5,
+        };
         project.set_clip_crop(clip, crop, true, false).unwrap();
 
         let mut pool = DecoderPool::new();
@@ -873,7 +900,11 @@ mod tests {
         let mut project = Project::new("t", rate);
         let track = project.add_track(TrackKind::Text, "T1");
         let clip = project
-            .add_generated(track, Generator::text("Hi"), TimeRange::at_rate(0, 24, rate))
+            .add_generated(
+                track,
+                Generator::text("Hi"),
+                TimeRange::at_rate(0, 24, rate),
+            )
             .unwrap();
         project.add_effect(clip, "vignette").unwrap();
         // amount is slot 0 of vignette.
@@ -910,7 +941,11 @@ mod tests {
         let mut project = Project::new("t", rate);
         let track = project.add_track(TrackKind::Adjustment, "FX");
         let clip = project
-            .add_generated(track, Generator::Adjustment, TimeRange::at_rate(0, 24, rate))
+            .add_generated(
+                track,
+                Generator::Adjustment,
+                TimeRange::at_rate(0, 24, rate),
+            )
             .unwrap();
         project.add_effect(clip, "vignette").unwrap();
 
@@ -948,14 +983,18 @@ mod tests {
         let left = project
             .add_generated(
                 track,
-                Generator::SolidColor { rgba: [255, 0, 0, 255] },
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
                 TimeRange::at_rate(0, 24, rate),
             )
             .unwrap();
         let _right = project
             .add_generated(
                 track,
-                Generator::SolidColor { rgba: [0, 0, 255, 255] },
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
                 TimeRange::at_rate(24, 24, rate),
             )
             .unwrap();
@@ -985,7 +1024,11 @@ mod tests {
         let mid = resolve(24, &mut pool, &mut raster);
         assert_eq!(mid.len(), 1);
         match &mid[0].content {
-            LayerContent::Transition { transition_id, progress, .. } => {
+            LayerContent::Transition {
+                transition_id,
+                progress,
+                ..
+            } => {
                 assert_eq!(transition_id, "crossfade");
                 assert!((*progress - 0.5).abs() < 1e-4, "progress {progress}");
             }
@@ -1004,7 +1047,11 @@ mod tests {
         let mut project = Project::new("t", rate);
         let track = project.add_track(TrackKind::Text, "T1");
         project
-            .add_generated(track, Generator::text("Hi"), TimeRange::at_rate(0, 24, rate))
+            .add_generated(
+                track,
+                Generator::text("Hi"),
+                TimeRange::at_rate(0, 24, rate),
+            )
             .unwrap();
 
         let mut pool = DecoderPool::new();
@@ -1071,17 +1118,31 @@ mod tests {
         let clip = project
             .add_generated(
                 track,
-                Generator::SolidColor { rgba: [255, 0, 0, 255] },
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
                 // Clip starts at tick 12, not 0 — sampling must be clip-relative.
                 TimeRange::at_rate(12, 48, rate),
             )
             .unwrap();
         // Opacity fades 0 → 1 over the first 24 clip ticks.
         project
-            .set_param_keyframe(clip, ClipParam::Opacity, RT::new(12, rate), ParamValue::Scalar(0.0), Easing::Linear)
+            .set_param_keyframe(
+                clip,
+                ClipParam::Opacity,
+                RT::new(12, rate),
+                ParamValue::Scalar(0.0),
+                Easing::Linear,
+            )
             .unwrap();
         project
-            .set_param_keyframe(clip, ClipParam::Opacity, RT::new(36, rate), ParamValue::Scalar(1.0), Easing::Linear)
+            .set_param_keyframe(
+                clip,
+                ClipParam::Opacity,
+                RT::new(36, rate),
+                ParamValue::Scalar(1.0),
+                Easing::Linear,
+            )
             .unwrap();
 
         let mut pool = DecoderPool::new();
@@ -1116,8 +1177,8 @@ mod tests {
     }
 
     fn png_asset() -> Option<std::path::PathBuf> {
-        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/texture.png");
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/texture.png");
         path.exists().then_some(path)
     }
 
@@ -1163,7 +1224,10 @@ mod tests {
 
         // Same Arc on a later tick: decoded once, reused per frame.
         let later = resolve(&mut pool, &mut raster, 119);
-        assert!(std::sync::Arc::ptr_eq(rgba_layer(&first[0]), rgba_layer(&later[0])));
+        assert!(std::sync::Arc::ptr_eq(
+            rgba_layer(&first[0]),
+            rgba_layer(&later[0])
+        ));
 
         // Past the clip: gap, no layers.
         assert!(resolve(&mut pool, &mut raster, 120).is_empty());

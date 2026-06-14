@@ -30,14 +30,38 @@ const SLIDE_FS: &str = include_str!("../shaders/transition_slide.wgsl");
 /// The starter set (M4). Ids are drift-checked against the `cutlass-models`
 /// transition catalog from the engine.
 const BLUEPRINTS: &[TransitionBlueprint] = &[
-    TransitionBlueprint { id: "crossfade", fragment: CROSSFADE_FS },
-    TransitionBlueprint { id: "dip_to_black", fragment: DIP_TO_BLACK_FS },
-    TransitionBlueprint { id: "dip_to_white", fragment: DIP_TO_WHITE_FS },
-    TransitionBlueprint { id: "wipe_left", fragment: WIPE_LEFT_FS },
-    TransitionBlueprint { id: "wipe_right", fragment: WIPE_RIGHT_FS },
-    TransitionBlueprint { id: "wipe_up", fragment: WIPE_UP_FS },
-    TransitionBlueprint { id: "wipe_down", fragment: WIPE_DOWN_FS },
-    TransitionBlueprint { id: "slide", fragment: SLIDE_FS },
+    TransitionBlueprint {
+        id: "crossfade",
+        fragment: CROSSFADE_FS,
+    },
+    TransitionBlueprint {
+        id: "dip_to_black",
+        fragment: DIP_TO_BLACK_FS,
+    },
+    TransitionBlueprint {
+        id: "dip_to_white",
+        fragment: DIP_TO_WHITE_FS,
+    },
+    TransitionBlueprint {
+        id: "wipe_left",
+        fragment: WIPE_LEFT_FS,
+    },
+    TransitionBlueprint {
+        id: "wipe_right",
+        fragment: WIPE_RIGHT_FS,
+    },
+    TransitionBlueprint {
+        id: "wipe_up",
+        fragment: WIPE_UP_FS,
+    },
+    TransitionBlueprint {
+        id: "wipe_down",
+        fragment: WIPE_DOWN_FS,
+    },
+    TransitionBlueprint {
+        id: "slide",
+        fragment: SLIDE_FS,
+    },
 ];
 
 /// Canonical ids for every transition the compositor can render.

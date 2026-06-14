@@ -22,17 +22,26 @@ pub fn execute(
         .track_of(clip)
         .ok_or(ModelError::UnknownClip(clip))?;
     let removed = ctx.project.ripple_delete(clip)?;
-    Ok(Box::new(RestoreRippleAction { track, clip: removed }))
+    Ok(Box::new(RestoreRippleAction {
+        track,
+        clip: removed,
+    }))
 }
 
 impl EditAction for RippleDeleteAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         execute(ctx, self.clip).map(|inv| inv)
     }
 }
 
 impl EditAction for RestoreRippleAction {
-    fn apply(self: Box<Self>, ctx: &mut ApplyContext<'_>) -> Result<Box<dyn EditAction>, EngineError> {
+    fn apply(
+        self: Box<Self>,
+        ctx: &mut ApplyContext<'_>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let gap_start = self.clip.timeline.start;
         let gap = self.clip.timeline.duration;
         let track = ctx

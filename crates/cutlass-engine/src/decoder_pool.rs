@@ -50,10 +50,7 @@ impl DecoderPool {
         media_id: MediaId,
         path: &Path,
     ) -> Result<(&mut Decoder, &KeyframeIndex), EngineError> {
-        let stale = self
-            .entries
-            .get(&media_id)
-            .is_none_or(|e| e.path != path);
+        let stale = self.entries.get(&media_id).is_none_or(|e| e.path != path);
 
         if stale {
             let decoder = Decoder::open_with(path, self.options)?;
@@ -80,10 +77,7 @@ impl DecoderPool {
         media_id: MediaId,
         path: &Path,
     ) -> Result<(Arc<Vec<u8>>, u32, u32), EngineError> {
-        let stale = self
-            .stills
-            .get(&media_id)
-            .is_none_or(|e| e.path != path);
+        let stale = self.stills.get(&media_id).is_none_or(|e| e.path != path);
 
         if stale {
             let image = cutlass_decoder::decode_image(path, STILL_MAX_DIM, STILL_MAX_DIM)?;

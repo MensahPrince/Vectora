@@ -68,8 +68,9 @@ pub fn audio_peaks_per_second(
         return Err(DecodeError::unsupported("invalid waveform resolution"));
     }
 
-    let (coarse, sample_rate, chunk) =
-        decode_coarse_peaks(path, &|rate| ((f64::from(rate) / per_second).round() as usize).max(1))?;
+    let (coarse, sample_rate, chunk) = decode_coarse_peaks(path, &|rate| {
+        ((f64::from(rate) / per_second).round() as usize).max(1)
+    })?;
     if coarse.is_empty() {
         return Err(DecodeError::unsupported("audio stream has no samples"));
     }
@@ -118,7 +119,9 @@ fn decode_coarse_peaks(
 
     let rate = decoder.rate();
     if rate == 0 {
-        return Err(DecodeError::unsupported("audio stream reports zero sample rate"));
+        return Err(DecodeError::unsupported(
+            "audio stream reports zero sample rate",
+        ));
     }
     let layout = if decoder.channel_layout().channels() == 0 {
         ChannelLayout::default(i32::from(decoder.channels()))
@@ -182,7 +185,11 @@ fn decode_coarse_peaks(
 
     // Drain whatever swresample still buffers.
     loop {
-        let mut mono = Audio::new(Sample::F32(SampleType::Packed), COARSE_CHUNK, ChannelLayout::MONO);
+        let mut mono = Audio::new(
+            Sample::F32(SampleType::Packed),
+            COARSE_CHUNK,
+            ChannelLayout::MONO,
+        );
         match resampler.flush(&mut mono) {
             Ok(_) if mono.samples() > 0 => peaks.push_frame(&mono),
             _ => break,
@@ -298,12 +305,18 @@ mod tests {
             return;
         };
         let peaks = audio_peaks_per_second(&path, 100.0, 1_000_000).expect("peaks");
-        assert!((peaks.per_second - 100.0).abs() < 1.0, "realized rate ≈ requested");
+        assert!(
+            (peaks.per_second - 100.0).abs() < 1.0,
+            "realized rate ≈ requested"
+        );
         assert!(peaks.peaks.iter().all(|p| (0.0..=1.0).contains(p)));
         assert!(peaks.peaks.iter().any(|&p| p > 0.0));
         // Sanity: count implies a plausible duration (between 1s and 1h).
         let duration_s = peaks.peaks.len() as f64 / peaks.per_second;
-        assert!(duration_s > 1.0 && duration_s < 3600.0, "duration {duration_s}");
+        assert!(
+            duration_s > 1.0 && duration_s < 3600.0,
+            "duration {duration_s}"
+        );
     }
 
     #[test]
