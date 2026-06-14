@@ -180,8 +180,10 @@ pub fn build_proxy_with(
 
     let enc_tb = fps.invert();
 
-    let codec = find_h264_encoder(config.hardware)
+    let chosen = find_h264_encoder(config.hardware)
         .ok_or_else(|| EncodeError::unsupported("no H.264 encoder available"))?;
+    let codec = chosen.codec;
+    let enc_fmt = chosen.pixel;
     let use_crf = codec.name() == "libx264";
 
     let mut octx = format::output(output).map_err(EncodeError::Open)?;
@@ -194,7 +196,7 @@ pub fn build_proxy_with(
 
     enc.set_width(dst_w);
     enc.set_height(dst_h);
-    enc.set_format(Pixel::YUV420P);
+    enc.set_format(enc_fmt);
     enc.set_color_range(ffmpeg_next::color::Range::MPEG);
     enc.set_frame_rate(Some(fps));
     enc.set_time_base(enc_tb);
@@ -258,6 +260,7 @@ pub fn build_proxy_with(
             &mut decoder,
             &mut scaler,
             (dst_w, dst_h),
+            enc_fmt,
             &mut encoder,
             &mut octx,
             ost_index,
@@ -276,6 +279,7 @@ pub fn build_proxy_with(
         &mut decoder,
         &mut scaler,
         (dst_w, dst_h),
+        enc_fmt,
         &mut encoder,
         &mut octx,
         ost_index,
@@ -303,6 +307,7 @@ fn drain_decoder(
     decoder: &mut VideoDecoder,
     scaler: &mut Option<scaling::Context>,
     dst: (u32, u32),
+    dst_fmt: Pixel,
     encoder: &mut VideoEncoder,
     octx: &mut Output,
     ost_index: usize,
@@ -331,7 +336,7 @@ fn drain_decoder(
                             src.format(),
                             src.width(),
                             src.height(),
-                            Pixel::YUV420P,
+                            dst_fmt,
                             dst.0,
                             dst.1,
                             scaling::Flags::BILINEAR,

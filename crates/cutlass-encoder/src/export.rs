@@ -102,6 +102,9 @@ pub struct VideoExport {
     /// Keyed by input size so a mid-stream change rebuilds it.
     yuv_scaler: Option<(u32, u32, scaling::Context)>,
     rgba: VideoFrame,
+    /// Pixel format the chosen encoder consumes (YUV420P, or NV12 for encoders
+    /// like Windows Media Foundation). Frames are converted to it on the way in.
+    enc_fmt: Pixel,
     ost_index: usize,
     enc_tb: Rational,
     ost_tb: Rational,
@@ -268,8 +271,10 @@ impl VideoExport {
         let fps = Rational::new(config.frame_rate_num, config.frame_rate_den);
         let enc_tb = fps.invert();
 
-        let codec = find_h264_encoder(config.hardware)
+        let chosen = find_h264_encoder(config.hardware)
             .ok_or_else(|| EncodeError::unsupported("no H.264 encoder available"))?;
+        let codec = chosen.codec;
+        let enc_fmt = chosen.pixel;
         let use_crf = codec.name() == "libx264";
 
         let mut octx = format::output(output).map_err(EncodeError::Open)?;
@@ -281,7 +286,7 @@ impl VideoExport {
             .map_err(EncodeError::Open)?;
         enc.set_width(width);
         enc.set_height(height);
-        enc.set_format(Pixel::YUV420P);
+        enc.set_format(enc_fmt);
         enc.set_color_range(ffmpeg_next::color::Range::MPEG);
         enc.set_frame_rate(Some(fps));
         enc.set_time_base(enc_tb);
@@ -322,7 +327,7 @@ impl VideoExport {
             Pixel::RGBA,
             width,
             height,
-            Pixel::YUV420P,
+            enc_fmt,
             width,
             height,
             scaling::Flags::BILINEAR,
@@ -337,6 +342,7 @@ impl VideoExport {
             scaler,
             yuv_scaler: None,
             rgba,
+            enc_fmt,
             ost_index,
             enc_tb,
             ost_tb,
@@ -383,7 +389,13 @@ impl VideoExport {
         let mut yuv = VideoFrame::new(Pixel::YUV420P, width, height);
         fill_yuv420p_frame(&mut yuv, width, height, y, u, v)?;
 
-        let mut frame = if width == self.width && height == self.height {
+        // Fast path only when the frame is already exactly what the encoder
+        // wants: matching dimensions *and* a YUV420P encoder. Otherwise swscale
+        // resizes and/or converts to the encoder's format (e.g. YUV420P→NV12).
+        let mut frame = if width == self.width
+            && height == self.height
+            && self.enc_fmt == Pixel::YUV420P
+        {
             yuv
         } else {
             let scaler = self.yuv_scaler_for(width, height)?;
@@ -421,7 +433,7 @@ impl VideoExport {
                 Pixel::YUV420P,
                 src_w,
                 src_h,
-                Pixel::YUV420P,
+                self.enc_fmt,
                 self.width,
                 self.height,
                 scaling::Flags::LANCZOS,
