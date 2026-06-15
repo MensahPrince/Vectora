@@ -291,6 +291,7 @@ impl Engine {
             ApplyOutcome::Saved => self.saved_revision = self.revision,
             // Relink dirties the session: the repaired path needs saving.
             ApplyOutcome::Imported { .. }
+            | ApplyOutcome::RemovedMedia { .. }
             | ApplyOutcome::Edited(_)
             | ApplyOutcome::Relinked { .. } => self.revision += 1,
             // Export is handled by the early return above.

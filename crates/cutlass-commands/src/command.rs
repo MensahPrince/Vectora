@@ -15,6 +15,12 @@ use cutlass_models::{
 pub enum ProjectCommand {
     /// Register a file in the media pool.
     Import { path: PathBuf },
+    /// Drop a source from the media pool (delete from the Library bin).
+    /// Rejected while any clip still references it — callers that want to
+    /// delete used media remove those clips first (one history group). The
+    /// inverse re-inserts the source with its original id, so undo restores
+    /// it and any clips removed alongside it reattach.
+    RemoveMedia { media: MediaId },
     /// Write the current project to a `.cutlass` file.
     Save { path: PathBuf },
     /// Replace the session from a project file; every media path must exist.

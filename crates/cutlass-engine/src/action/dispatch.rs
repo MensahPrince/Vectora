@@ -1,6 +1,7 @@
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 
 use super::edit::add_track::RemoveTrackAction;
+use super::edit::remove_media::RemoveMediaAction;
 use super::edit::restore_transitions::RestoreTransitionsAction;
 use super::edit::{self, remove_clip::RemoveClipAction};
 use super::project::{self, import};
@@ -40,6 +41,7 @@ fn finalize_structural(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApplyOutcome {
     Imported { media: cutlass_models::MediaId },
+    RemovedMedia { media: cutlass_models::MediaId },
     Saved,
     Opened,
     Loaded,
@@ -66,6 +68,10 @@ fn dispatch_project(
         ProjectCommand::Import { path } => {
             let (media, inverse) = import::execute(ctx, &path)?;
             Ok((ApplyOutcome::Imported { media }, inverse))
+        }
+        ProjectCommand::RemoveMedia { media } => {
+            let inverse = Box::new(RemoveMediaAction { media }).apply(ctx)?;
+            Ok((ApplyOutcome::RemovedMedia { media }, Some(inverse)))
         }
         ProjectCommand::Save { path } => {
             project::save::execute(ctx, path)?;
