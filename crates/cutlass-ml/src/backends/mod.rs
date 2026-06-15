@@ -7,5 +7,9 @@
 //! runtime and cloud adapters land as added backends behind opt-in features.
 
 pub mod stub;
+#[cfg(feature = "whisper")]
+pub mod whisper;
 
 pub use stub::StubTranscriber;
+#[cfg(feature = "whisper")]
+pub use whisper::WhisperTranscriber;

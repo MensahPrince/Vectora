@@ -28,6 +28,10 @@ pub mod models;
 pub mod transcribe;
 
 pub use backends::StubTranscriber;
+#[cfg(feature = "whisper")]
+pub use backends::WhisperTranscriber;
 pub use config::{MlSection, TranscribeProvider, load_ml_config};
-pub use models::{ModelCache, ModelCacheError, ModelSpec, models_dir, verify_file};
+pub use models::{
+    ModelCache, ModelCacheError, ModelSpec, WHISPER_MODELS, models_dir, verify_file, whisper_model,
+};
 pub use transcribe::{Segment, Transcribe, TranscribeError, TranscribeOptions, Transcript, Word};

@@ -7,12 +7,19 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Opt-in local transcription via whisper.cpp (whisper-rs). Off by default so
+# the editor build and CI never pull the C/C++ + cmake toolchain; enable with
+# `--features whisper` to build the WhisperTranscriber backend.
+whisper = ["dep:whisper-rs"]
+
 [dependencies]
 serde = { workspace = true }
 sha2 = "0.10"
 thiserror = { workspace = true }
 toml = "0.8"
 ureq = "2"
+whisper-rs = { version = "0.16", optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
