@@ -21,7 +21,10 @@ use cutlass_decoder::{AUDIO_CHANNELS, AudioReader, detect_beats as detect_beats_
 const ANALYSIS_RATE: u32 = 22_050;
 
 /// Detect a media clip's beats and store them. Returns a clip-snapshot inverse.
-pub fn detect(ctx: &mut ApplyContext<'_>, clip: ClipId) -> Result<Box<dyn EditAction>, EngineError> {
+pub fn detect(
+    ctx: &mut ApplyContext<'_>,
+    clip: ClipId,
+) -> Result<Box<dyn EditAction>, EngineError> {
     let beats = analyze(ctx.project, clip)?;
     commit(ctx, clip, beats)
 }
@@ -51,7 +54,9 @@ fn commit(
 /// positions as source ticks at the media frame rate. Rejects generated clips
 /// and media without audio (nothing to analyze).
 fn analyze(project: &Project, clip_id: ClipId) -> Result<Vec<i64>, EngineError> {
-    let clip = project.clip(clip_id).ok_or(ModelError::UnknownClip(clip_id))?;
+    let clip = project
+        .clip(clip_id)
+        .ok_or(ModelError::UnknownClip(clip_id))?;
     let media_id = clip
         .media()
         .ok_or_else(|| ModelError::InvalidParam("beat detection requires a media clip".into()))?;
@@ -72,7 +77,11 @@ fn analyze(project: &Project, clip_id: ClipId) -> Result<Vec<i64>, EngineError> 
     }
     let mono = read_mono(media.path(), src_start, src_frames)?;
     let seconds = detect_beats_dsp(&mono, ANALYSIS_RATE);
-    Ok(beats_to_source_ticks(&seconds, source.start.value, source.start.rate))
+    Ok(beats_to_source_ticks(
+        &seconds,
+        source.start.value,
+        source.start.rate,
+    ))
 }
 
 /// Map detected beat seconds (from the window start) to source ticks at the
@@ -117,8 +126,8 @@ fn ticks_to_samples(value: i64, fps: Rational) -> i64 {
     if fps.num <= 0 || fps.den <= 0 {
         return 0;
     }
-    let frames = i128::from(value) * i128::from(fps.den) * i128::from(ANALYSIS_RATE)
-        / i128::from(fps.num);
+    let frames =
+        i128::from(value) * i128::from(fps.den) * i128::from(ANALYSIS_RATE) / i128::from(fps.num);
     frames.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
@@ -143,7 +152,10 @@ mod tests {
     #[test]
     fn ticks_to_samples_is_exact_for_integer_rates() {
         // 24 ticks (1 s at 24 fps) = ANALYSIS_RATE frames.
-        assert_eq!(ticks_to_samples(24, Rational::FPS_24), i64::from(ANALYSIS_RATE));
+        assert_eq!(
+            ticks_to_samples(24, Rational::FPS_24),
+            i64::from(ANALYSIS_RATE)
+        );
         assert_eq!(ticks_to_samples(0, Rational::FPS_24), 0);
     }
 }

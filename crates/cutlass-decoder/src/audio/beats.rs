@@ -326,7 +326,10 @@ mod tests {
         let beats = detect_beats(&tone, rate);
         // Either no beats, or at most a weak grid — the key invariant is the
         // onset envelope is near-flat so no strong false tempo dominates.
-        assert!(beats.len() < 200, "a pure tone should not read as dense beats");
+        assert!(
+            beats.len() < 200,
+            "a pure tone should not read as dense beats"
+        );
     }
 
     #[test]

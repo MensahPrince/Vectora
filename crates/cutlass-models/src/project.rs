@@ -971,11 +971,7 @@ impl Project {
     /// Phase 5), returning the previous flag for the inverse. The mixers run
     /// the clip's audio through RNNoise when set. Rejected on generated clips
     /// (no source audio to clean).
-    pub fn set_clip_denoise(
-        &mut self,
-        clip_id: ClipId,
-        denoise: bool,
-    ) -> Result<bool, ModelError> {
+    pub fn set_clip_denoise(&mut self, clip_id: ClipId, denoise: bool) -> Result<bool, ModelError> {
         let clip = self
             .timeline
             .clip_mut(clip_id)
@@ -1102,7 +1098,10 @@ impl Project {
         let source = clip
             .source_range()
             .ok_or_else(|| ModelError::InvalidParam("beats require a media-backed clip".into()))?;
-        let (lo, hi) = (source.start.value, source.start.value + source.duration.value);
+        let (lo, hi) = (
+            source.start.value,
+            source.start.value + source.duration.value,
+        );
         let mut beats: Vec<i64> = beats
             .into_iter()
             .filter(|&b| (lo..hi).contains(&b))

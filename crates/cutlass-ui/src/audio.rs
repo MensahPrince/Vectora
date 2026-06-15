@@ -1379,7 +1379,11 @@ mod tests {
             RATE,
             &mut inside,
         );
-        assert_eq!(rendered.len(), 1, "the denoised buffer is rendered + cached");
+        assert_eq!(
+            rendered.len(),
+            1,
+            "the denoised buffer is rendered + cached"
+        );
         assert!(
             inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),
             "clamped to [-1, 1]"

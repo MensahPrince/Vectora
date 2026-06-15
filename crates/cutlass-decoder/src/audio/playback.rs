@@ -557,7 +557,11 @@ mod tests {
         // Seek straight to it with a fresh reader (drives the index path).
         let mut seeked = AudioReader::open(&path, RATE).expect("open");
         seeked.seek_to_frame(block_at).expect("seek");
-        assert_eq!(seeked.position(), Some(block_at), "index seek lands exactly");
+        assert_eq!(
+            seeked.position(),
+            Some(block_at),
+            "index seek lands exactly"
+        );
         let mut block = vec![0f32; 256 * CHANNELS];
         let n = seeked.read(&mut block).expect("read");
         assert_eq!(n, 256);

@@ -230,10 +230,17 @@ mod tests {
     #[test]
     fn all_silence_is_one_span() {
         let rate = 16_000;
-        let spans = detect_silences(&vec![0.0; rate as usize * 2], rate, &SilenceSettings::default());
+        let spans = detect_silences(
+            &vec![0.0; rate as usize * 2],
+            rate,
+            &SilenceSettings::default(),
+        );
         assert_eq!(spans.len(), 1);
         let (a, b) = spans[0];
-        assert!(a > 0.0 && b < 2.0 && b > a, "padded whole-clip span: {a}..{b}");
+        assert!(
+            a > 0.0 && b < 2.0 && b > a,
+            "padded whole-clip span: {a}..{b}"
+        );
     }
 
     #[test]

@@ -317,7 +317,12 @@ fn clip_to_slint(
         effects: project_effects(clip),
         // Beat markers (M8 Phase 6) as absolute sequence ticks, already
         // filtered to the clip's current window by the model helper.
-        beats: model(clip.beat_timeline_ticks().into_iter().map(clamp_i32).collect()),
+        beats: model(
+            clip.beat_timeline_ticks()
+                .into_iter()
+                .map(clamp_i32)
+                .collect(),
+        ),
     }
 }
 
