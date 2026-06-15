@@ -182,6 +182,14 @@ export global InspectorBackend {
     // Clear a clip's detected beat markers (M8 Phase 6). One undoable edit.
     callback clear-beats(clip-id: string);
 
+    // Remove the silences from a media clip (CapCut AutoCut, M9 Phase 1): the
+    // worker decodes the clip's audio, finds the pauses, and ripple-deletes
+    // each one on the clip's track so the remaining speech closes up (later
+    // clips slide left). One undoable edit. The inspector only offers it on
+    // forward (non-retimed) media clips with sound; the engine rejects the
+    // rest, so a rejection here is a stale-projection race.
+    callback remove-silences(clip-id: string);
+
     // Set a visual clip's crop window + mirroring (CapCut crop, M1):
     // normalized inset fractions measured in from each content edge
     // (0,0,0,0 ⇔ uncropped) plus flip flags. main.rs converts insets to the

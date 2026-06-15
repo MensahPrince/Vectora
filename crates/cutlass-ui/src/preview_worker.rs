@@ -189,6 +189,13 @@ enum WorkerMsg {
     ClearBeats {
         clip: String,
     },
+    /// Remove the silences from a media clip (CapCut AutoCut, M9 Phase 1): the
+    /// worker decodes the clip's audio, finds the pauses, and ripple-deletes
+    /// each one on the clip's track so the remaining speech closes up. One
+    /// undoable history entry.
+    RemoveSilences {
+        clip: String,
+    },
     /// Set a visual clip's crop window + mirroring (CapCut crop, M1): the
     /// normalized kept-region rect plus flip flags. One undoable history
     /// entry; the engine rejects audio-lane clips and degenerate rects.
@@ -726,6 +733,11 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::DetectBeats { clip });
     }
 
+    /// Remove the silences from `clip` (CapCut AutoCut, M9 Phase 1).
+    pub fn remove_silences(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::RemoveSilences { clip });
+    }
+
     /// Clear `clip`'s detected beat markers (M8 Phase 6).
     pub fn clear_beats(&self, clip: String) {
         let _ = self.tx.send(WorkerMsg::ClearBeats { clip });
@@ -1189,6 +1201,7 @@ fn worker_loop(
             WorkerMsg::DuckUnderVoice { clip } => duck_under_voice_and_publish(engine, &clip, &ui),
             WorkerMsg::DetectBeats { clip } => detect_beats_and_publish(engine, &clip, &ui),
             WorkerMsg::ClearBeats { clip } => clear_beats_and_publish(engine, &clip, &ui),
+            WorkerMsg::RemoveSilences { clip } => remove_silences_and_publish(engine, &clip, &ui),
             WorkerMsg::SetClipCrop {
                 clip,
                 crop,
@@ -2902,6 +2915,40 @@ fn duck_under_voice_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
         }
         Ok(other) => error!(%music_id, "unexpected duck-under-voice outcome: {other:?}"),
         Err(e) => error!(%music_id, "duck under voice failed: {e}"),
+    }
+}
+
+/// Broadcast-sane AutoCut defaults, kept in lockstep with the agent tool's
+/// `remove_silences` defaults (`cutlass-ai`'s `validate.rs`): a -40 dB linear
+/// gate, half-second shortest pause, and 80 ms of speech padding around each
+/// cut so word onsets/offsets aren't clipped.
+const AUTOCUT_THRESHOLD: f32 = 0.01;
+const AUTOCUT_MIN_SILENCE_S: f32 = 0.5;
+const AUTOCUT_PADDING_S: f32 = 0.08;
+
+/// Remove the silences from a media clip (CapCut AutoCut, M9 Phase 1): the
+/// engine decodes the clip's audio, finds the pauses, and ripple-deletes each
+/// one on the clip's track so the remaining speech closes up (later clips slide
+/// left). One undoable history entry. A rejection (retimed / generated / no
+/// audio) just logs — the inspector only offers the button on forward media
+/// clips with sound, so it would be a stale-projection race.
+fn remove_silences_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "remove-silences ignored: unparsable clip id");
+        return;
+    };
+    match engine.apply(Command::Edit(EditCommand::RemoveSilences {
+        clip: clip_id,
+        threshold: AUTOCUT_THRESHOLD,
+        min_silence: AUTOCUT_MIN_SILENCE_S,
+        padding: AUTOCUT_PADDING_S,
+    })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::ShiftedTrack(_))) => {
+            info!(%clip_id, "removed silences");
+            publish_projection(engine, ui);
+        }
+        Ok(other) => error!(%clip_id, "unexpected remove-silences outcome: {other:?}"),
+        Err(e) => error!(%clip_id, "remove silences failed: {e}"),
     }
 }
 

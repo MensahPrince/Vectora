@@ -586,6 +586,21 @@ component AudioMixInspector inherits VerticalLayout {
             font-size: AppStore.theme.typography.label.size;
         }
     }
+
+    // AutoCut / silence removal (M9 Phase 1): decode this clip's audio, find
+    // the pauses, and ripple-delete them on the track in one undoable edit so
+    // the speech closes up. Hidden on retimed clips — the engine rejects them
+    // (the seconds→tick mapping is linear only at 1×); speed-label is "" only
+    // for a forward 1× clip.
+    if root.model.speed-label == "": HorizontalLayout {
+        alignment: LayoutAlignment.start;
+        SubtleButton {
+            label: "Remove silences";
+            clicked => {
+                InspectorBackend.remove-silences(root.model.id);
+            }
+        }
+    }
 }
 
 // CapCut-style property sheet for visual clips that aren't text (video,

@@ -1540,6 +1540,11 @@ fn main() -> Result<(), slint::PlatformError> {
         .on_clear_beats(move |clip_id| {
             clear_beats_handle.clear_beats(clip_id.to_string());
         });
+    let remove_silences_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_remove_silences(move |clip_id| {
+            remove_silences_handle.remove_silences(clip_id.to_string());
+        });
     let set_crop_handle = preview_worker.handle();
     app.global::<InspectorBackend>().on_set_clip_crop(
         move |clip_id, left, top, right, bottom, flip_h, flip_v| {
