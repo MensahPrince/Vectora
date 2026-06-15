@@ -2158,7 +2158,9 @@ fn remove_media_and_publish(engine: &mut Engine, media: &str, force: bool, ui: &
     }
 
     if !force {
-        match engine.apply(Command::Project(ProjectCommand::RemoveMedia { media: media_id })) {
+        match engine.apply(Command::Project(ProjectCommand::RemoveMedia {
+            media: media_id,
+        })) {
             Ok(ApplyOutcome::RemovedMedia { media }) => {
                 info!(?media, "removed media from pool");
                 crate::thumbnails::forget(media.raw());
@@ -2197,8 +2199,9 @@ fn remove_media_and_publish(engine: &mut Engine, media: &str, force: bool, ui: &
             return;
         }
     }
-    if let Err(e) = engine.apply(Command::Project(ProjectCommand::RemoveMedia { media: media_id }))
-    {
+    if let Err(e) = engine.apply(Command::Project(ProjectCommand::RemoveMedia {
+        media: media_id,
+    })) {
         error!(%media_id, "remove media failed after clearing clips: {e}");
         engine.rollback_group();
         publish_projection(engine, ui);

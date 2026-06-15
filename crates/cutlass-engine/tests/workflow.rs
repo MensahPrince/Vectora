@@ -195,7 +195,9 @@ fn force_delete_media_cascade_undoes_as_one_step() {
         .apply(Command::Edit(EditCommand::RemoveClip { clip }))
         .expect("remove clip");
     engine
-        .apply(Command::Project(ProjectCommand::RemoveMedia { media: media_id }))
+        .apply(Command::Project(ProjectCommand::RemoveMedia {
+            media: media_id,
+        }))
         .expect("remove media");
     engine.commit_group();
 

@@ -992,10 +992,20 @@ mod tests {
         let track = project.add_track(TrackKind::Video, "V1");
         let src = TimeRange::at_rate(0, 24, EngineRational::FPS_24);
         project
-            .add_clip(track, used, src, RationalTime::new(0, EngineRational::FPS_24))
+            .add_clip(
+                track,
+                used,
+                src,
+                RationalTime::new(0, EngineRational::FPS_24),
+            )
             .expect("first clip");
         project
-            .add_clip(track, used, src, RationalTime::new(24, EngineRational::FPS_24))
+            .add_clip(
+                track,
+                used,
+                src,
+                RationalTime::new(24, EngineRational::FPS_24),
+            )
             .expect("second clip");
 
         let projected = project_to_slint(&project, &HashMap::new(), &HashSet::new());
