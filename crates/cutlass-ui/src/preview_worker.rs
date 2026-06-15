@@ -17,13 +17,11 @@ use cutlass_models::{
 };
 use tracing::{debug, error, info, warn};
 
-use slint::{ModelRc, VecModel};
-
 use crate::agent::{AgentCreated, AgentPlanStep};
 use crate::audio::{AudioHandle, AudioSnapshot, AudioSpan};
 use crate::strips::StripHandle;
 use crate::thumbnails::{ThumbKind, ThumbnailHandle};
-use crate::{EditorStore, ExportBackend, PreviewStore, TranscriptLine, TranscriptStore, TranscriptWord};
+use crate::{EditorStore, ExportBackend, PreviewStore};
 
 /// Everything a mutation publishes to: the Slint view model and the audio
 /// mixer's timeline snapshot. One value threaded through the worker so the
@@ -31,7 +29,6 @@ use crate::{EditorStore, ExportBackend, PreviewStore, TranscriptLine, Transcript
 struct UiSink {
     editor: slint::Weak<EditorStore<'static>>,
     export: slint::Weak<ExportBackend<'static>>,
-    transcript: slint::Weak<TranscriptStore<'static>>,
     audio: AudioHandle,
 }
 
@@ -191,32 +188,6 @@ enum WorkerMsg {
     /// Clear a clip's detected beat markers (M8 Phase 6). One undoable entry.
     ClearBeats {
         clip: String,
-    },
-    /// Remove the silences from a media clip (CapCut AutoCut, M9 Phase 1): the
-    /// worker decodes the clip's audio, finds the pauses, and ripple-deletes
-    /// each one on the clip's track so the remaining speech closes up. One
-    /// undoable history entry.
-    RemoveSilences {
-        clip: String,
-    },
-    /// Auto-caption a media clip (M9 Phase 4): the worker decodes the clip's
-    /// speech, transcribes it, and adds the words as subtitle text clips on a
-    /// fresh lane in one undoable history entry.
-    GenerateCaptions {
-        clip: String,
-    },
-    /// Transcribe a media clip for the transcript panel (M9 Phase 3): the worker
-    /// decodes + transcribes the clip and publishes its word-timed transcript to
-    /// the TranscriptStore. No project mutation.
-    TranscribeClip {
-        clip: String,
-    },
-    /// Ripple-delete a set of timeline tick `ranges` from `track` (M9 Phase 3):
-    /// the words struck out in the transcript lower to these spans. One undoable
-    /// history entry.
-    DeleteTranscriptRanges {
-        track: String,
-        ranges: Vec<(i64, i64)>,
     },
     /// Set a visual clip's crop window + mirroring (CapCut crop, M1): the
     /// normalized kept-region rect plus flip flags. One undoable history
@@ -755,28 +726,6 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::DetectBeats { clip });
     }
 
-    /// Remove the silences from `clip` (CapCut AutoCut, M9 Phase 1).
-    pub fn remove_silences(&self, clip: String) {
-        let _ = self.tx.send(WorkerMsg::RemoveSilences { clip });
-    }
-
-    /// Auto-caption `clip` (M9 Phase 4).
-    pub fn generate_captions(&self, clip: String) {
-        let _ = self.tx.send(WorkerMsg::GenerateCaptions { clip });
-    }
-
-    /// Transcribe `clip` for the transcript panel (M9 Phase 3).
-    pub fn transcribe_clip(&self, clip: String) {
-        let _ = self.tx.send(WorkerMsg::TranscribeClip { clip });
-    }
-
-    /// Ripple-delete `ranges` (timeline ticks) from `track` (M9 Phase 3).
-    pub fn delete_transcript_ranges(&self, track: String, ranges: Vec<(i64, i64)>) {
-        let _ = self
-            .tx
-            .send(WorkerMsg::DeleteTranscriptRanges { track, ranges });
-    }
-
     /// Clear `clip`'s detected beat markers (M8 Phase 6).
     pub fn clear_beats(&self, clip: String) {
         let _ = self.tx.send(WorkerMsg::ClearBeats { clip });
@@ -982,13 +931,11 @@ pub struct PreviewWorker {
 
 impl PreviewWorker {
     /// Spawns a dedicated thread that owns the [`Engine`] (required: decoders are not `Send`).
-    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         config: EngineConfig,
         preview_weak: slint::Weak<PreviewStore<'static>>,
         editor_weak: slint::Weak<EditorStore<'static>>,
         export_weak: slint::Weak<ExportBackend<'static>>,
-        transcript_weak: slint::Weak<TranscriptStore<'static>>,
         thumbs: ThumbnailHandle,
         strips: StripHandle,
         audio: AudioHandle,
@@ -1004,7 +951,6 @@ impl PreviewWorker {
                     preview_weak,
                     editor_weak,
                     export_weak,
-                    transcript_weak,
                     thumbs,
                     strips,
                     audio,
@@ -1042,7 +988,6 @@ fn worker_main(
     preview_weak: slint::Weak<PreviewStore<'static>>,
     editor_weak: slint::Weak<EditorStore<'static>>,
     export_weak: slint::Weak<ExportBackend<'static>>,
-    transcript_weak: slint::Weak<TranscriptStore<'static>>,
     thumbs: ThumbnailHandle,
     strips: StripHandle,
     audio: AudioHandle,
@@ -1074,7 +1019,6 @@ fn worker_main(
     let ui = UiSink {
         editor: editor_weak,
         export: export_weak,
-        transcript: transcript_weak,
         audio,
     };
     publish_projection(&mut engine, &ui);
@@ -1245,14 +1189,6 @@ fn worker_loop(
             WorkerMsg::DuckUnderVoice { clip } => duck_under_voice_and_publish(engine, &clip, &ui),
             WorkerMsg::DetectBeats { clip } => detect_beats_and_publish(engine, &clip, &ui),
             WorkerMsg::ClearBeats { clip } => clear_beats_and_publish(engine, &clip, &ui),
-            WorkerMsg::RemoveSilences { clip } => remove_silences_and_publish(engine, &clip, &ui),
-            WorkerMsg::GenerateCaptions { clip } => {
-                generate_captions_and_publish(engine, &clip, &ui)
-            }
-            WorkerMsg::TranscribeClip { clip } => transcribe_and_publish(engine, &clip, &ui),
-            WorkerMsg::DeleteTranscriptRanges { track, ranges } => {
-                delete_transcript_ranges_and_publish(engine, &track, &ranges, &ui)
-            }
             WorkerMsg::SetClipCrop {
                 clip,
                 crop,
@@ -2967,390 +2903,6 @@ fn duck_under_voice_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
         Ok(other) => error!(%music_id, "unexpected duck-under-voice outcome: {other:?}"),
         Err(e) => error!(%music_id, "duck under voice failed: {e}"),
     }
-}
-
-/// Broadcast-sane AutoCut defaults, kept in lockstep with the agent tool's
-/// `remove_silences` defaults (`cutlass-ai`'s `validate.rs`): a -40 dB linear
-/// gate, half-second shortest pause, and 80 ms of speech padding around each
-/// cut so word onsets/offsets aren't clipped.
-const AUTOCUT_THRESHOLD: f32 = 0.01;
-const AUTOCUT_MIN_SILENCE_S: f32 = 0.5;
-const AUTOCUT_PADDING_S: f32 = 0.08;
-
-/// Remove the silences from a media clip (CapCut AutoCut, M9 Phase 1): the
-/// engine decodes the clip's audio, finds the pauses, and ripple-deletes each
-/// one on the clip's track so the remaining speech closes up (later clips slide
-/// left). One undoable history entry. A rejection (retimed / generated / no
-/// audio) just logs — the inspector only offers the button on forward media
-/// clips with sound, so it would be a stale-projection race.
-fn remove_silences_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
-    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
-        error!(clip, "remove-silences ignored: unparsable clip id");
-        return;
-    };
-    match engine.apply(Command::Edit(EditCommand::RemoveSilences {
-        clip: clip_id,
-        threshold: AUTOCUT_THRESHOLD,
-        min_silence: AUTOCUT_MIN_SILENCE_S,
-        padding: AUTOCUT_PADDING_S,
-    })) {
-        Ok(ApplyOutcome::Edited(EditOutcome::ShiftedTrack(_))) => {
-            info!(%clip_id, "removed silences");
-            publish_projection(engine, ui);
-        }
-        Ok(other) => error!(%clip_id, "unexpected remove-silences outcome: {other:?}"),
-        Err(e) => error!(%clip_id, "remove silences failed: {e}"),
-    }
-}
-
-/// Auto-caption a media clip (M9 Phase 4): decode its speech, transcribe it,
-/// and add the words as subtitle text clips on a fresh lane — one undoable
-/// history entry. Transcription runs here on the worker thread (slow); the
-/// local model builds lazily on first use (downloading if needed), so the
-/// first caption can take a while. A rejection (no backend, generated /
-/// retimed / silent clip) just logs — the inspector only offers the button on
-/// forward media clips, so it would be a stale-projection race. Off-thread
-/// progress + cancellation ride a follow-up (see `docs/ai-media-roadmap.md`).
-fn generate_captions_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
-    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
-        error!(clip, "generate-captions ignored: unparsable clip id");
-        return;
-    };
-    if !engine.has_transcriber() {
-        match build_transcriber() {
-            Some(transcriber) => engine.set_transcriber(transcriber),
-            None => {
-                error!(
-                    "captions unavailable: no transcription backend (configure a cloud provider \
-                     in ~/.cutlass/config.toml, or rebuild with --features whisper)"
-                );
-                return;
-            }
-        }
-    }
-    let cancel = AtomicBool::new(false);
-    match engine.generate_captions(
-        clip_id,
-        cutlass_ml::TranscribeOptions::default(),
-        cutlass_ml::CaptionLayout::default(),
-        &cancel,
-        &mut |_| {},
-    ) {
-        Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(track))) => {
-            info!(%clip_id, %track, "generated captions");
-            publish_projection(engine, ui);
-        }
-        Ok(other) => error!(%clip_id, "unexpected generate-captions outcome: {other:?}"),
-        Err(e) => error!(%clip_id, "generate captions failed: {e}"),
-    }
-}
-
-/// Transcribe a media clip and publish its word-timed transcript to the
-/// TranscriptStore (M9 Phase 3). Lazily builds the whisper backend on first use
-/// (downloading the configured model), runs synchronously on this thread (so
-/// the UI shows "Transcribing…" meanwhile), and never mutates the project. The
-/// panel set `running` before sending; every exit path clears it.
-fn transcribe_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
-    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
-        error!(clip, "transcribe ignored: unparsable clip id");
-        publish_transcript_status(ui, "Could not read the selected clip.");
-        return;
-    };
-    if !engine.has_transcriber() {
-        match build_transcriber() {
-            Some(transcriber) => engine.set_transcriber(transcriber),
-            None => {
-                publish_transcript_status(
-                    ui,
-                    "No transcription backend. Configure a cloud provider in \
-                     ~/.cutlass/config.toml ([ml] transcribe_provider = \"cloud\"), \
-                     or rebuild with --features whisper for local transcription.",
-                );
-                return;
-            }
-        }
-    }
-    // The clip's timeline span + fps anchor the word → tick mapping (the same
-    // linear map captions use; retimed clips are rejected by the engine).
-    let Some((clip_start, clip_end)) = engine
-        .project()
-        .clip(clip_id)
-        .map(|c| (c.timeline.start.value, c.timeline.end_tick()))
-    else {
-        publish_transcript_status(ui, "The selected clip is gone.");
-        return;
-    };
-    let fps = engine.project().timeline().frame_rate;
-    let clip_raw = clip_id.raw().to_string();
-    let track_id = engine
-        .project()
-        .timeline()
-        .track_of(clip_id)
-        .map(|t| t.raw().to_string())
-        .unwrap_or_default();
-
-    let cancel = AtomicBool::new(false);
-    match engine.transcribe_clip(
-        clip_id,
-        cutlass_ml::TranscribeOptions::default(),
-        &cancel,
-        &mut |_| {},
-    ) {
-        Ok(transcript) => {
-            let words = flatten_words(&transcript, clip_start, clip_end, fps);
-            let status = if words.is_empty() {
-                "No speech found in this clip.".to_string()
-            } else {
-                String::new()
-            };
-            info!(%clip_id, words = words.len(), "transcribed clip");
-            publish_transcript(ui, words, clip_raw, track_id, status);
-        }
-        Err(e) => {
-            error!(%clip_id, "transcribe failed: {e}");
-            publish_transcript_status(ui, &format!("Transcription failed: {e}"));
-        }
-    }
-}
-
-/// Ripple-delete the transcript's struck-out word spans from `track` (M9 Phase
-/// 3). One undoable history entry; the on-screen reflow is applied UI-side.
-fn delete_transcript_ranges_and_publish(
-    engine: &mut Engine,
-    track: &str,
-    ranges: &[(i64, i64)],
-    ui: &UiSink,
-) {
-    let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
-        error!(track, "transcript delete ignored: unparsable track id");
-        return;
-    };
-    if ranges.is_empty() {
-        return;
-    }
-    match engine.ripple_delete_ranges(track_id, ranges) {
-        Ok(_) => {
-            info!(%track_id, cuts = ranges.len(), "deleted transcript ranges");
-            publish_projection(engine, ui);
-        }
-        Err(e) => error!(%track_id, "transcript delete failed: {e}"),
-    }
-}
-
-/// Send-able word payload: the `!Send` Slint `TranscriptWord` is built inside
-/// the event-loop closure, so the worker hands plain data across the boundary.
-struct WordData {
-    text: String,
-    index: i32,
-    start_tick: i32,
-    end_tick: i32,
-}
-
-/// Flatten a transcript's segments to a flat, indexed word list mapped to
-/// absolute timeline ticks. Words with no timing fall back to their segment's
-/// span; a segment with no words at all becomes one entry of its text.
-fn flatten_words(
-    transcript: &cutlass_ml::Transcript,
-    clip_start: i64,
-    clip_end: i64,
-    fps: Rational,
-) -> Vec<WordData> {
-    if fps.num <= 0 || fps.den <= 0 || clip_end <= clip_start {
-        return Vec::new();
-    }
-    let fps_f = f64::from(fps.num) / f64::from(fps.den);
-    let to_tick =
-        |secs: f64| ((clip_start as f64 + secs * fps_f).round() as i64).clamp(clip_start, clip_end);
-    let mut out = Vec::new();
-    let push = |text: &str, start: f64, end: f64, out: &mut Vec<WordData>| {
-        let text = text.trim();
-        if text.is_empty() {
-            return;
-        }
-        let a = to_tick(start);
-        let b = to_tick(end).max(a);
-        out.push(WordData {
-            text: text.to_string(),
-            index: out.len() as i32,
-            start_tick: a as i32,
-            end_tick: b as i32,
-        });
-    };
-    for seg in &transcript.segments {
-        if seg.words.is_empty() {
-            push(&seg.text, seg.start, seg.end, &mut out);
-        } else {
-            for w in &seg.words {
-                push(&w.text, w.start, w.end, &mut out);
-            }
-        }
-    }
-    out
-}
-
-/// Greedy-pack words into panel-width lines (Slint has no flow layout, so each
-/// line is a row of chips). The budget is in characters, tuned to the dock
-/// width; words are never split.
-fn pack_lines(words: Vec<WordData>) -> Vec<Vec<WordData>> {
-    const LINE_CHAR_BUDGET: usize = 34;
-    let mut lines: Vec<Vec<WordData>> = Vec::new();
-    let mut cur: Vec<WordData> = Vec::new();
-    let mut len = 0usize;
-    for w in words {
-        let wl = w.text.chars().count();
-        if !cur.is_empty() && len + 1 + wl > LINE_CHAR_BUDGET {
-            lines.push(std::mem::take(&mut cur));
-            len = 0;
-        }
-        if !cur.is_empty() {
-            len += 1; // the space between words
-        }
-        len += wl;
-        cur.push(w);
-    }
-    if !cur.is_empty() {
-        lines.push(cur);
-    }
-    lines
-}
-
-/// Publish a fresh transcript to the store (event loop; builds the `!Send`
-/// Slint models there). Clears the selection and the running flag.
-fn publish_transcript(
-    ui: &UiSink,
-    words: Vec<WordData>,
-    clip_id: String,
-    track_id: String,
-    status: String,
-) {
-    let count = words.len() as i32;
-    let lines = pack_lines(words);
-    let weak = ui.transcript.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        let Some(store) = weak.upgrade() else {
-            return;
-        };
-        let line_models: Vec<TranscriptLine> = lines
-            .into_iter()
-            .map(|wl| {
-                let words: Vec<TranscriptWord> = wl
-                    .into_iter()
-                    .map(|w| TranscriptWord {
-                        text: w.text.into(),
-                        index: w.index,
-                        start_tick: w.start_tick,
-                        end_tick: w.end_tick,
-                        deleted: false,
-                    })
-                    .collect();
-                TranscriptLine {
-                    words: ModelRc::new(VecModel::from(words)),
-                }
-            })
-            .collect();
-        store.set_lines(ModelRc::new(VecModel::from(line_models)));
-        store.set_word_count(count);
-        store.set_clip_id(clip_id.into());
-        store.set_track_id(track_id.into());
-        store.set_status(status.into());
-        store.set_running(false);
-        store.set_sel_start(-1);
-        store.set_sel_end(-1);
-    });
-}
-
-/// Report a transcript status (error / "no backend") without touching the
-/// existing lines, and clear the running flag.
-fn publish_transcript_status(ui: &UiSink, status: &str) {
-    let status = status.to_string();
-    let weak = ui.transcript.clone();
-    let _ = slint::invoke_from_event_loop(move || {
-        if let Some(store) = weak.upgrade() {
-            store.set_status(status.into());
-            store.set_running(false);
-        }
-    });
-}
-
-/// Build the transcription backend from the `[ml]` config. Cloud is pure HTTP
-/// and always available; local whisper needs the `whisper` feature, so a lean
-/// build with the default `transcribe_provider = "local"` has no backend.
-fn build_transcriber() -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
-    use cutlass_ml::TranscribeProvider;
-
-    let cfg = cutlass_ml::load_ml_config(&cutlass_ml::config::default_config_path())
-        .unwrap_or_else(|e| {
-            warn!("ml config unreadable ({e}); using defaults");
-            None
-        })
-        .unwrap_or_default();
-
-    match cfg.transcribe_provider {
-        TranscribeProvider::Cloud => match cutlass_ml::CloudTranscriber::from_config(&cfg) {
-            Ok(transcriber) => {
-                info!("using cloud transcription provider");
-                Some(Arc::new(transcriber) as Arc<dyn cutlass_ml::Transcribe + Send + Sync>)
-            }
-            Err(e) => {
-                error!("cloud transcription unavailable: {e}");
-                None
-            }
-        },
-        TranscribeProvider::Local => build_local_transcriber(&cfg),
-    }
-}
-
-/// Build the local whisper.cpp backend from the `[ml]` config, downloading the
-/// model on first use. Present only with the `whisper` feature.
-#[cfg(feature = "whisper")]
-fn build_local_transcriber(
-    cfg: &cutlass_ml::MlSection,
-) -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
-    use cutlass_ml::{ModelCache, WhisperTranscriber, models_dir, whisper_model};
-
-    let spec = whisper_model(&cfg.transcribe_model).or_else(|| {
-        warn!(model = %cfg.transcribe_model, "unknown whisper model; falling back to base.en");
-        whisper_model("base.en")
-    })?;
-    info!(model = spec.name, "fetching whisper model (first run downloads it)");
-    let cancel = AtomicBool::new(false);
-    let path = ModelCache::new(models_dir())
-        .ensure(&spec, &cancel, &mut |_| {})
-        .inspect_err(|e| error!("whisper model unavailable: {e}"))
-        .ok()?;
-    WhisperTranscriber::from_model_path(&path)
-        .inspect_err(|e| error!("whisper model failed to load: {e}"))
-        .ok()
-        .map(|t| Arc::new(t) as Arc<dyn cutlass_ml::Transcribe + Send + Sync>)
-}
-
-/// Lean build (no `whisper` feature): only the cloud provider can transcribe,
-/// so a `transcribe_provider = "local"` config has no backend.
-#[cfg(not(feature = "whisper"))]
-fn build_local_transcriber(
-    _cfg: &cutlass_ml::MlSection,
-) -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
-    warn!(
-        "local transcription needs the `whisper` feature; set [ml] transcribe_provider = \"cloud\" \
-         in ~/.cutlass/config.toml, or rebuild with --features whisper"
-    );
-    None
-}
-
-/// Whether any transcription backend can be built from the current config —
-/// drives the Transcript panel's availability without building one (which would
-/// download a model). Local whisper is available whenever the `whisper` feature
-/// is compiled in; otherwise only a configured cloud provider works.
-pub fn transcribe_available() -> bool {
-    if cfg!(feature = "whisper") {
-        return true;
-    }
-    matches!(
-        cutlass_ml::load_ml_config(&cutlass_ml::config::default_config_path()),
-        Ok(Some(cfg))
-            if cfg.transcribe_provider == cutlass_ml::TranscribeProvider::Cloud
-                && cutlass_ml::CloudTranscriber::from_config(&cfg).is_ok()
-    )
 }
 
 /// Detect beat markers on a media clip (CapCut "Beat", M8 Phase 6): the engine

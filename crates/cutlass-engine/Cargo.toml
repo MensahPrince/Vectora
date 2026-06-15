@@ -11,7 +11,6 @@ cutlass-commands = { path = "../cutlass-commands" }
 cutlass-compositor = { path = "../cutlass-compositor" }
 cutlass-decoder = { path = "../cutlass-decoder" }
 cutlass-encoder = { path = "../cutlass-encoder" }
-cutlass-ml = { path = "../cutlass-ml" }
 cutlass-models = { path = "../cutlass-models" }
 cutlass-probe = { path = "../cutlass-probe" }
 pollster.workspace = true

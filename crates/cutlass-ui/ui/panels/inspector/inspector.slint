@@ -586,21 +586,6 @@ component AudioMixInspector inherits VerticalLayout {
             font-size: AppStore.theme.typography.label.size;
         }
     }
-
-    // AutoCut / silence removal (M9 Phase 1): decode this clip's audio, find
-    // the pauses, and ripple-delete them on the track in one undoable edit so
-    // the speech closes up. Hidden on retimed clips — the engine rejects them
-    // (the seconds→tick mapping is linear only at 1×); speed-label is "" only
-    // for a forward 1× clip.
-    if root.model.speed-label == "": HorizontalLayout {
-        alignment: LayoutAlignment.start;
-        SubtleButton {
-            label: "Remove silences";
-            clicked => {
-                InspectorBackend.remove-silences(root.model.id);
-            }
-        }
-    }
 }
 
 // CapCut-style property sheet for visual clips that aren't text (video,
@@ -732,72 +717,17 @@ component VisualClipInspector inherits VerticalLayout {
     }
 }
 
-// Auto-captions (M9 Phase 4): the "Speech to text" tab. Transcribe the clip's
-// speech and lay the words down as subtitle-styled text clips on a new lane —
-// captions are just text clips, so they edit like any title afterward. Offered
-// only on forward (1×) media clips with sound; transcription itself needs a
-// local model, so the standard build reports it when the worker can't.
-component SpeechToTextTab inherits CutlassScrollView {
-    in property <Clip> model;
-
-    private property <bool> captionable: model.media-id != "" && model.speed-label == "";
-
-    vertical-stretch: 1;
-    viewport-width: root.width;
-    viewport-height: content.preferred-height;
-    show-horizontal-scrollbar: false;
-
-    content := VerticalLayout {
-        width: max(0px, root.width - AppStore.theme.scrollbar.size);
-        spacing: AppStore.theme.metrics.spacing.md;
-        alignment: LayoutAlignment.start;
-        padding: AppStore.theme.metrics.spacing.lg;
-
-        Text {
-            width: 100%;
-            wrap: TextWrap.word-wrap;
-            text: "Transcribe this clip's speech into captions. They're added as editable text clips on a new track, so you can restyle, move, or delete any line afterward.";
-            color: AppStore.theme.text.muted;
-            font-size: AppStore.theme.typography.label.size;
-        }
-
-        if root.captionable: HorizontalLayout {
-            alignment: LayoutAlignment.start;
-            SubtleButton {
-                label: "Generate captions";
-                clicked => {
-                    InspectorBackend.generate-captions(root.model.id);
-                }
-            }
-        }
-
-        if !root.captionable: Text {
-            width: 100%;
-            wrap: TextWrap.word-wrap;
-            text: "Captioning needs a media clip at normal speed.";
-            color: AppStore.theme.text.muted;
-            font-size: AppStore.theme.typography.label.size;
-        }
-    }
-}
-
 component AudioClipInspector inherits VerticalLayout {
     in property <Clip> model;
-
-    private property <int> selected-tab: 0;
 
     spacing: AppStore.theme.metrics.spacing.none;
 
     InspectorTabHeader {
         tabs: ["Audio", "Speech to text"];
-        selected: root.selected-tab;
-        interactive: true;
-        select(i) => {
-            root.selected-tab = i;
-        }
+        selected: 0;
     }
 
-    if root.selected-tab == 0: body-scroll := CutlassScrollView {
+    body-scroll := CutlassScrollView {
         vertical-stretch: 1;
         viewport-width: root.width;
         viewport-height: content.preferred-height;
@@ -837,10 +767,6 @@ component AudioClipInspector inherits VerticalLayout {
                 model: root.model;
             }
         }
-    }
-
-    if root.selected-tab == 1: SpeechToTextTab {
-        model: root.model;
     }
 }
 

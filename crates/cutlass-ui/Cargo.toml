@@ -9,19 +9,11 @@ description = "Cutlass desktop editor UI (Slint)"
 name = "cutlass-ui"
 path = "src/main.rs"
 
-[features]
-# Opt-in local transcription for auto-captions: forwards to cutlass-ml's
-# whisper.cpp backend (pulls the C/C++ + cmake toolchain). Off by default so
-# the standard editor build stays lean; the captions affordance reports that
-# transcription is unavailable until the app is built with `--features whisper`.
-whisper = ["cutlass-ml/whisper"]
-
 [dependencies]
 cutlass-ai = { path = "../cutlass-ai" }
 cutlass-compositor = { path = "../cutlass-compositor" }
 cutlass-decoder = { path = "../cutlass-decoder" }
 cutlass-engine = { path = "../cutlass-engine" }
-cutlass-ml = { path = "../cutlass-ml" }
 cutlass-models = { path = "../cutlass-models" }
 cutlass-commands = { path = "../cutlass-commands" }
 crossbeam-channel = "0.5.15"

@@ -1,7 +1,7 @@
 //! Command dispatch: undoable timeline edits and session project commands.
 
 mod dispatch;
-pub(crate) mod edit;
+mod edit;
 pub(crate) mod project;
 
 pub use dispatch::{ApplyOutcome, dispatch};

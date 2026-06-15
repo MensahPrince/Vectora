@@ -263,28 +263,6 @@ pub enum EditCommand {
     /// Clear a clip's detected beat markers (M8 Phase 6). The inverse restores
     /// them.
     ClearBeats { clip: ClipId },
-    /// Remove the silences from a media clip (CapCut AutoCut, M9 Phase 1): the
-    /// engine decodes the clip's audio, detects pauses (`threshold` is the
-    /// linear RMS gate, `min_silence` the shortest pause worth cutting in
-    /// seconds, `padding` the audio kept on each side so a cut never clips a
-    /// word), and ripple-deletes each silent span on the clip's track so the
-    /// remaining speech closes up. Rejected on generated clips, media without
-    /// audio, and retimed clips. The whole pass is one undo entry restoring
-    /// every clip and shift.
-    RemoveSilences {
-        clip: ClipId,
-        threshold: f32,
-        min_silence: f32,
-        padding: f32,
-    },
-    /// Auto-caption a media clip (M9 Phase 4): the engine decodes the clip's
-    /// speech, transcribes it, and adds the words as subtitle-styled text clips
-    /// on a fresh "Captions" lane in one undoable entry. Captions are ordinary
-    /// text clips, so they move, restyle, and delete like any title afterward.
-    /// Rejected on generated, retimed, and audio-less clips. Handled directly by
-    /// `Engine::apply` (it needs the injected transcribe backend), not the
-    /// stateless dispatch.
-    CaptionClip { clip: ClipId },
     /// Drop a named, colored marker on the timeline ruler at `at` (M1
     /// markers). `color: None` cycles the fixed palette. The inverse
     /// removes it.

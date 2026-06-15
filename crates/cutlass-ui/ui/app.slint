@@ -5,7 +5,6 @@ import {
 } from "components/index.slint";
 import {
     AgentPanel,
-    TranscriptPanel,
     InspectorPanel,
     LibraryPanel,
     PreviewPanel,
@@ -13,7 +12,6 @@ import {
 } from "panels/index.slint";
 import {
     AgentStore,
-    TranscriptStore,
     AppStore,
     EditorStore,
     PreviewStore,
@@ -46,9 +44,6 @@ export { AppState }from "state.slint";
 export {
     AgentStore,
     AgentEntry,
-    TranscriptStore,
-    TranscriptWord,
-    TranscriptLine,
     EditorStore,
     RecentProject,
     TimelineStore,
@@ -110,7 +105,6 @@ export component AppWindow inherits Window {
     in-out property <length> left-pane-width: 350px;
     in-out property <length> right-pane-width: 350px;
     in-out property <length> agent-pane-width: 350px;
-    in-out property <length> transcript-pane-width: 350px;
     in-out property <length> timeline-height: 400px;
 
     // Native menu bar — on macOS Slint renders this through muda as the
@@ -516,16 +510,6 @@ export component AppWindow inherits Window {
 
                     InspectorPanel {
                         width: root.right-pane-width;
-                        vertical-stretch: 1;
-                    }
-
-                    if AppState.transcript-panel-open: HSplitGripTrail {
-                        pane-width <=> root.transcript-pane-width;
-                        vertical-stretch: 1;
-                    }
-
-                    if AppState.transcript-panel-open: TranscriptPanel {
-                        width: root.transcript-pane-width;
                         vertical-stretch: 1;
                     }
 

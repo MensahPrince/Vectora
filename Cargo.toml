@@ -8,7 +8,6 @@ members = [
     "crates/cutlass-encoder",
     "crates/cutlass-compositor",
     "crates/cutlass-engine",
-    "crates/cutlass-ml",
     "crates/cutlass-models",
     "crates/cutlass-probe",
     "crates/cutlass-ui",

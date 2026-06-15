@@ -36,10 +36,7 @@ use serde::{Deserialize, Serialize};
 /// 15: shape generators gain optional width/height.
 /// 16: optional `anchor_x`/`anchor_y` on `set_clip_transform`.
 /// 17: M8 beat detection (`detect_beats`).
-/// 18: M8 noise reduction (`set_denoise`).
-/// 19: M9 silence removal / AutoCut (`remove_silences`).
-/// 20: M9 auto captions (`caption_clip`).
-pub const TOOL_SCHEMA_VERSION: u32 = 20;
+pub const TOOL_SCHEMA_VERSION: u32 = 18;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -480,42 +477,6 @@ pub struct DetectBeats {
     pub clip: u64,
 }
 
-/// Remove the silences from a media clip (CapCut AutoCut). The editor decodes
-/// the clip's audio, finds the pauses, and ripple-deletes each one so the
-/// remaining speech closes up — the cut shifts later clips on the same track
-/// left. Target a media-backed clip with sound. Not valid for generated clips
-/// or retimed clips (speed change / reverse / ramp).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct RemoveSilences {
-    /// Id of the media clip to cut.
-    pub clip: u64,
-    /// Shortest pause worth cutting, in seconds — gaps shorter than this (the
-    /// breaths between words) are kept. Defaults to 0.5.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub min_pause: Option<f64>,
-    /// Audio kept on each side of a cut, in seconds, so a cut never clips a
-    /// word's start or end. Defaults to 0.08.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub padding: Option<f64>,
-    /// Loudness at or below which audio counts as silent, 0.0–1.0 (linear,
-    /// roughly -40 dB at the 0.01 default). Raise it to cut quiet mumbling
-    /// too; lower it to keep more.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub threshold: Option<f64>,
-}
-
-/// Auto-caption a media clip (CapCut "Auto captions"). The editor decodes the
-/// clip's speech, transcribes it, and adds the words as subtitle-styled text
-/// clips on a fresh "Captions" lane — captions are ordinary text clips, so the
-/// user can restyle, move, and delete them like any title afterward. Target a
-/// media-backed clip with sound. Not valid for generated clips or retimed clips
-/// (speed change / reverse / ramp).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct CaptionClip {
-    /// Id of the media clip to caption.
-    pub clip: u64,
-}
-
 /// Split a clip at a timeline position into two abutting clips.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SplitClip {
@@ -754,8 +715,6 @@ pub enum WireCommand {
     SetDenoise(SetDenoise),
     Duck(Duck),
     DetectBeats(DetectBeats),
-    RemoveSilences(RemoveSilences),
-    CaptionClip(CaptionClip),
     SplitClip(SplitClip),
     TrimClip(TrimClip),
     MoveClip(MoveClip),
@@ -830,8 +789,6 @@ impl WireCommand {
                 a.music.iter_mut().for_each(clip);
             }
             WireCommand::DetectBeats(a) => clip(&mut a.clip),
-            WireCommand::RemoveSilences(a) => clip(&mut a.clip),
-            WireCommand::CaptionClip(a) => clip(&mut a.clip),
             WireCommand::SplitClip(a) => clip(&mut a.clip),
             WireCommand::TrimClip(a) => clip(&mut a.clip),
             WireCommand::MoveClip(a) => {
@@ -998,10 +955,6 @@ tools! {
         "Duck music clips under voice/narration clips (sidechain): measures speech-band loudness on the voice clips and writes volume keyframes that dip the music while the voice talks, recovering in the gaps. amount 0..1 sets how far it dips (default ~0.66). Pass audio-lane clip ids for both lists. The result is ordinary, editable volume automation.";
     "detect_beats" => DetectBeats(DetectBeats),
         "Detect beat positions on a media clip's audio (onset/tempo analysis) and store them as beat markers the timeline magnet snaps clip edges to — use this to set up beat-synced cuts. Target a media-backed clip with sound (for a video clip, its linked audio companion). Not valid for generated clips.";
-    "remove_silences" => RemoveSilences(RemoveSilences),
-        "Cut the silences out of a media clip (AutoCut): finds the pauses in its audio and ripple-deletes each one so the remaining speech closes up (later clips on the track slide left). Optional min_pause (shortest gap to cut, default 0.5s), padding (audio kept around speech, default 0.08s), and threshold (0..1 loudness gate, default 0.01). Target a media-backed clip with sound. Not valid for generated or retimed clips.";
-    "caption_clip" => CaptionClip(CaptionClip),
-        "Auto-caption a media clip (auto captions): transcribes its speech and adds the words as subtitle-styled text clips on a fresh 'Captions' lane. Captions are ordinary text clips afterward, so they can be restyled, moved, or deleted like any title. Target a media-backed clip with sound. Not valid for generated or retimed clips. Requires a transcription backend to be configured.";
     "split_clip" => SplitClip(SplitClip),
         "Split a clip at a timeline position (seconds) into two abutting clips.";
     "trim_clip" => TrimClip(TrimClip),
@@ -1187,7 +1140,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 40);
+        assert_eq!(specs.len(), 38);
         for spec in &specs {
             assert!(
                 !spec.description.is_empty(),

@@ -201,7 +201,7 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 | Text animations (in/loop/out) | ❌ | M7 |
 | Text templates (preset animated titles) | ❌ | M7 (local preset packs) |
 | Stickers (animated overlays) | placeholder | M7 (local packs: Lottie/APNG/WebP) |
-| Auto captions (styled subtitle track) | ✅ as text clips (M9); styled caption-group track is M7 | **M9** |
+| Auto captions (styled subtitle track) | ❌ | **M9** |
 | Project templates / community templates | ❌ | non-goal (cloud ecosystem) |
 
 ### Audio
@@ -224,9 +224,9 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 | CapCut feature | Cutlass today | v1 plan |
 | --- | --- | --- |
 | **Prompt-to-edit agent** (our identity; CapCut has no real equivalent) | ✅ (M3 foundation: chat panel, sandbox + atomic replay, dry-run preview, one undo per prompt) | vocabulary grows every milestone |
-| Auto captions + translation | ✅ captions (M9, whisper local, as text clips); translation cloud later | M9 (whisper local; cloud later) |
-| Transcript-based editing (edit video by editing text) | ✅ (M9, delete words → ripple-cut) | M9 — flagship |
-| AutoCut / silence removal | ✅ (M9, energy-based, local) | M9 (energy-based, local) |
+| Auto captions + translation | ❌ | M9 (whisper local; cloud later) |
+| Transcript-based editing (edit video by editing text) | ❌ | M9 — flagship |
+| AutoCut / silence removal | ❌ | M9 (energy-based, local) |
 | Text-to-speech | ❌ | M9 (local TTS; cloud voices later) |
 | Background removal (no green screen) | ❌ | M9 (video matting, local ONNX) |
 | AI upscaling / enhance | ❌ | post-v1 |
@@ -680,27 +680,22 @@ Goal: the CapCut AI features people use daily — local-first, provider-
 abstracted. Depends on: M3 (agent + providers), M6 (matte plumbing),
 M7 (caption track), M8 (beat markers).
 
-- [x] **`cutlass-ml` crate**: local inference runtimes behind traits —
-      whisper.cpp transcribe shipped (feature-gated), with the model cache
-      (`~/.cutlass/models/` + checksums) and `[ml]` config + provider seam;
-      ONNX matting and a local TTS runtime still to come on the same shape.
-- [x] **Auto captions**: transcribe a clip's audio → readable cues → ordinary
-      subtitle-styled text clips on a fresh "Captions" lane (captions *are*
-      text clips, like CapCut), one undoable group; a "Generate captions"
-      inspector control and a `caption_clip` agent tool drive it. (A styled
-      caption-group identity for batch restyle / SRT export lands with M7 — see
-      `ai-media-roadmap.md`.)
-- [x] **Transcript-based editing (flagship)**: a Transcript panel where
-      selecting/deleting words ripple-cuts the underlying clip (whisper word
-      stamps → timeline ticks, the delete lowered through a shared
-      `ripple_cut` primitive as one undoable cut; the panel reflows in place).
-      This + the M3 agent is the "AI-first" identity. (Transient transcript +
-      a transcript agent tool are follow-ups — see `ai-media-roadmap.md`.)
-- [x] **Silence removal / AutoCut**: energy-based silence detection
-      (`detect_silences`, local DSP) → ripple-deleted on the clip's track
-      as one undoable history group; a "Remove silences" inspector button
-      and a `remove_silences` agent tool drive it. (Dry-run preview review
-      surface + tuning controls are a follow-up — see `ai-media-roadmap.md`.)
+- [ ] **`cutlass-ml` crate**: local inference runtimes behind traits —
+      whisper.cpp (transcribe), ONNX Runtime (matting), a local TTS
+      (Piper/Kokoro-class). Models downloaded on demand to
+      `~/.cutlass/models/` with checksums; every capability also has a
+      provider seam for cloud later.
+- [ ] **Auto captions**: transcribe audio lanes → styled cues on the M7
+      caption track; word-level timestamps; edit text in the inspector;
+      caption style presets. Translation rides cloud providers later.
+- [ ] **Transcript-based editing (flagship)**: transcript panel where
+      selecting/deleting words ripple-cuts the underlying clips (text ↔
+      time mapping from whisper word stamps, edits emitted as ordinary
+      ripple commands → undoable). This + the M3 agent is the "AI-first"
+      identity, shipped.
+- [ ] **Silence removal / AutoCut**: energy-based silence detection →
+      proposed cut list rendered as a preview (dry-run UI from M3) →
+      one-click apply as a single history group.
 - [ ] **Text-to-speech**: text clip / script → voiceover audio clip,
       local voices; provider seam for premium cloud voices.
 - [ ] **Background removal**: video matting (RVM/MODNet-class ONNX) →

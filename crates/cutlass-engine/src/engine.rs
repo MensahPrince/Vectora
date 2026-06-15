@@ -1,16 +1,13 @@
 //! Session-scoped editing runtime.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use cutlass_cache::FrameCache;
-use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
+use cutlass_commands::{Command, ProjectCommand};
 use cutlass_compositor::{Compositor, GpuContext};
-use cutlass_ml::{CaptionLayout, Transcribe, TranscribeOptions, Transcript};
 use cutlass_models::Project;
 
-use cutlass_models::{ClipId, ClipTransform, Generator, RationalTime, TimeRange, TrackId, TrackKind};
+use cutlass_models::{ClipId, ClipTransform, RationalTime};
 
 use crate::action::{ApplyContext, ApplyOutcome, History, dispatch};
 use crate::decoder_pool::DecoderPool;
@@ -86,12 +83,6 @@ pub struct Engine {
     /// The revision last written to (or read from) disk; together with
     /// `revision` this is the dirty flag (see [`is_dirty`](Self::is_dirty)).
     saved_revision: u64,
-    /// Runtime-injected speech-to-text backend for auto-captions (M9 Phase 4).
-    /// `None` until a caller wires one (the UI from `[ml]` config, tests a
-    /// stub) — the crate stays free of any model runtime, so the lean build
-    /// never pulls whisper.cpp. Shared (`Arc`) so a worker can hold it while
-    /// the engine moves between jobs.
-    transcriber: Option<Arc<dyn Transcribe + Send + Sync>>,
 }
 
 impl Engine {
@@ -114,7 +105,6 @@ impl Engine {
             generator_override: None,
             revision: 0,
             saved_revision: 0,
-            transcriber: None,
         })
     }
 
@@ -137,7 +127,6 @@ impl Engine {
             generator_override: None,
             revision: 0,
             saved_revision: 0,
-            transcriber: None,
         })
     }
 
@@ -284,19 +273,6 @@ impl Engine {
             return Ok(ApplyOutcome::Exported { stats });
         }
 
-        // Captioning needs the injected transcribe backend (and decodes the
-        // clip itself), so it can't go through the stateless dispatch. Route it
-        // to the dedicated path with the same defaults the UI button uses.
-        if let Command::Edit(EditCommand::CaptionClip { clip }) = command {
-            return self.generate_captions(
-                clip,
-                TranscribeOptions::default(),
-                CaptionLayout::default(),
-                &AtomicBool::new(false),
-                &mut |_| {},
-            );
-        }
-
         let mut ctx = ApplyContext {
             project: &mut self.project,
             cache: &self.cache,
@@ -325,166 +301,6 @@ impl Engine {
             self.history.record_do(inverse);
         }
         Ok(outcome)
-    }
-
-    /// Inject the speech-to-text backend used by [`generate_captions`]. Called
-    /// once at startup by the UI (built from `[ml]` config) or by a test with a
-    /// stub; replaces any previously set backend.
-    pub fn set_transcriber(&mut self, transcriber: Arc<dyn Transcribe + Send + Sync>) {
-        self.transcriber = Some(transcriber);
-    }
-
-    /// Whether a transcribe backend is wired (so the UI can gate the captions
-    /// affordance instead of offering a button that always errors).
-    pub fn has_transcriber(&self) -> bool {
-        self.transcriber.is_some()
-    }
-
-    /// Transcribe a media clip's speech (M9 Phase 3, transcript editing). Decode
-    /// the clip's source window, run the injected backend, and return the
-    /// word-timed transcript — times are seconds from the clip's window start,
-    /// which the transcript panel maps to timeline ticks the same linear way
-    /// captions do.
-    ///
-    /// Read-only: no project mutation, no history (the edits the user makes
-    /// *from* the transcript go through [`delete_clip_ranges`]). Slow (the
-    /// transcribe call can run for seconds): callers run it off the UI thread,
-    /// passing `cancel`/`on_progress` to abort and report. Errors when no backend
-    /// is set, the clip is generated / retimed / silent, or the backend fails.
-    pub fn transcribe_clip(
-        &self,
-        clip: ClipId,
-        options: TranscribeOptions,
-        cancel: &AtomicBool,
-        on_progress: &mut dyn FnMut(f32),
-    ) -> Result<Transcript, EngineError> {
-        let transcriber = self
-            .transcriber
-            .clone()
-            .ok_or_else(|| EngineError::Transcribe("no transcription backend configured".into()))?;
-        let target = self
-            .project
-            .clip(clip)
-            .ok_or(cutlass_models::ModelError::UnknownClip(clip))?;
-        if target.is_retimed() {
-            return Err(EngineError::Transcribe(
-                "transcript editing does not yet support retimed clips".into(),
-            ));
-        }
-        let mono = crate::clip_audio::decode_clip_mono(&self.project, clip)?;
-        let transcript = transcriber.transcribe(
-            &mono,
-            crate::clip_audio::ANALYSIS_RATE,
-            &options,
-            cancel,
-            on_progress,
-        )?;
-        Ok(transcript)
-    }
-
-    /// Ripple-delete a set of absolute timeline tick `ranges` from `track` as
-    /// one undoable entry (M9 Phase 3, transcript editing): the words the user
-    /// struck out lower to the timeline spans they occupy, and removing them
-    /// closes the gap so the surviving speech plays back-to-back. Resolves the
-    /// affected clips by position (via [`ripple_cut`](crate::action::edit::ripple_cut)),
-    /// so repeated deletes work after the region has split into several clips.
-    /// An empty `ranges` is a no-op that still records a (trivially oscillating)
-    /// undo entry.
-    pub fn ripple_delete_ranges(
-        &mut self,
-        track: TrackId,
-        ranges: &[(i64, i64)],
-    ) -> Result<ApplyOutcome, EngineError> {
-        let fps = self.project.timeline().frame_rate;
-        let mut ctx = ApplyContext {
-            project: &mut self.project,
-            cache: &self.cache,
-            project_path: &mut self.project_path,
-            history: &mut self.history,
-        };
-        let inverse = crate::action::edit::ripple_cut::cut_ranges(&mut ctx, track, fps, ranges)?;
-        self.history.record_do(inverse);
-        self.revision += 1;
-        Ok(ApplyOutcome::Edited(EditOutcome::ShiftedTrack(track)))
-    }
-
-    /// Auto-caption a media clip (M9 Phase 4): decode its speech, transcribe it
-    /// with the injected backend, and add the words as subtitle-styled text
-    /// clips on a fresh "Captions" lane — one undoable history entry. Captions
-    /// are ordinary text clips, so they edit, restyle, move, and delete like any
-    /// title afterward.
-    ///
-    /// Slow (the transcribe call can run for seconds): callers run it off the UI
-    /// thread, passing `cancel`/`on_progress` to abort and report. Errors when
-    /// no backend is set, the clip is generated / retimed / silent, or the
-    /// backend fails; on any error nothing is added.
-    pub fn generate_captions(
-        &mut self,
-        clip: ClipId,
-        options: TranscribeOptions,
-        layout: CaptionLayout,
-        cancel: &AtomicBool,
-        on_progress: &mut dyn FnMut(f32),
-    ) -> Result<ApplyOutcome, EngineError> {
-        let transcriber = self
-            .transcriber
-            .clone()
-            .ok_or_else(|| EngineError::Transcribe("no transcription backend configured".into()))?;
-
-        // Decode + transcribe + map against an immutable view, then mutate.
-        let placements = crate::caption::plan(
-            &self.project,
-            clip,
-            transcriber.as_ref(),
-            &options,
-            &layout,
-            cancel,
-            on_progress,
-        )?;
-        if placements.is_empty() {
-            return Err(EngineError::Transcribe("no speech detected to caption".into()));
-        }
-
-        // All the inserts (the new lane + every cue) collapse into one undo.
-        self.begin_group();
-        match self.insert_captions(placements) {
-            Ok(track) => {
-                self.commit_group();
-                Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(track)))
-            }
-            Err(e) => {
-                self.rollback_group();
-                Err(e)
-            }
-        }
-    }
-
-    /// Add a fresh text lane and place every caption clip on it. Caller owns the
-    /// history group; a partial failure rolls back through it.
-    fn insert_captions(
-        &mut self,
-        placements: Vec<(Generator, TimeRange)>,
-    ) -> Result<TrackId, EngineError> {
-        let track = match self.apply(Command::Edit(EditCommand::AddTrack {
-            kind: TrackKind::Text,
-            name: "Captions".into(),
-            index: None,
-        }))? {
-            ApplyOutcome::Edited(EditOutcome::CreatedTrack(id)) => id,
-            other => {
-                return Err(EngineError::Transcribe(format!(
-                    "captions: unexpected add-track outcome: {other:?}"
-                )));
-            }
-        };
-        for (generator, timeline) in placements {
-            self.apply(Command::Edit(EditCommand::AddGenerated {
-                track,
-                generator,
-                timeline,
-            }))?;
-        }
-        Ok(track)
     }
 
     /// Warm decoders and the frame cache for `time` without compositing —
