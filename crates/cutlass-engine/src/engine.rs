@@ -284,6 +284,19 @@ impl Engine {
             return Ok(ApplyOutcome::Exported { stats });
         }
 
+        // Captioning needs the injected transcribe backend (and decodes the
+        // clip itself), so it can't go through the stateless dispatch. Route it
+        // to the dedicated path with the same defaults the UI button uses.
+        if let Command::Edit(EditCommand::CaptionClip { clip }) = command {
+            return self.generate_captions(
+                clip,
+                TranscribeOptions::default(),
+                CaptionLayout::default(),
+                &AtomicBool::new(false),
+                &mut |_| {},
+            );
+        }
+
         let mut ctx = ApplyContext {
             project: &mut self.project,
             cache: &self.cache,

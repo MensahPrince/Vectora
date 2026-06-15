@@ -156,6 +156,63 @@ fn captions_land_as_text_clips_on_a_fresh_lane_and_undo_cleanly() {
 }
 
 #[test]
+fn caption_clip_command_routes_through_apply() {
+    // The agent reaches captioning via the CaptionClip edit command, which
+    // Engine::apply special-cases onto generate_captions with default options.
+    let Some(audio) = audio_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    engine.set_transcriber(Arc::new(two_cue_stub()));
+
+    let media_id = import_asset(&mut engine, &audio);
+    let rate = engine.project().media(media_id).expect("media").frame_rate;
+    let a1 = match engine
+        .apply(cutlass_engine::Command::Edit(
+            cutlass_engine::EditCommand::AddTrack {
+                kind: TrackKind::Audio,
+                name: "A1".into(),
+                index: None,
+            },
+        ))
+        .unwrap()
+    {
+        ApplyOutcome::Edited(EditOutcome::CreatedTrack(id)) => id,
+        other => panic!("expected CreatedTrack, got {other:?}"),
+    };
+    let clip = match engine
+        .apply(cutlass_engine::Command::Edit(
+            cutlass_engine::EditCommand::AddClip {
+                track: a1,
+                media: media_id,
+                source: TimeRange::at_rate(0, 2 * rate.num as i64, rate),
+                start: cutlass_models::RationalTime::new(0, Rational::FPS_24),
+            },
+        ))
+        .unwrap()
+    {
+        ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+
+    let tracks_before = engine.project().timeline().order().len();
+    let outcome = engine
+        .apply(cutlass_engine::Command::Edit(
+            cutlass_engine::EditCommand::CaptionClip { clip },
+        ))
+        .expect("captions generated");
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Edited(EditOutcome::CreatedTrack(_))
+    ));
+    assert_eq!(engine.project().timeline().order().len(), tracks_before + 1);
+
+    // One undo entry, same as the direct path.
+    assert!(engine.undo());
+    assert_eq!(engine.project().timeline().order().len(), tracks_before);
+}
+
+#[test]
 fn captions_without_a_backend_error() {
     let (_dir, mut engine) = temp_engine();
     let cancel = AtomicBool::new(false);

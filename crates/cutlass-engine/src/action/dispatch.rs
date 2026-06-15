@@ -452,6 +452,9 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::CaptionClip { .. } => Err(EngineError::Transcribe(
+            "captions are handled by Engine::apply, not dispatch".into(),
+        )),
         EditCommand::AddMarker { at, name, color } => {
             let (id, inverse) = edit::marker::add(ctx, at, name, color)?;
             Ok((
