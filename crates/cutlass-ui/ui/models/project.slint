@@ -398,6 +398,10 @@ export struct Media {
     is-image: bool,
     // Source length as "MM:SS" (or "H:MM:SS"), for the tile badge.
     duration-label: string,
+    // How many timeline clips currently reference this source. Drives the
+    // delete flow: 0 removes straight away, > 0 raises the "used by N clips"
+    // confirmation before cascading the clip removals.
+    usage-count: int,
     // Poster frame (video) or rendered waveform (audio). Generated off-thread
     // after import; empty until ready (see src/thumbnails.rs).
     thumbnail: image,

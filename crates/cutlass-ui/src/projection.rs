@@ -59,7 +59,8 @@ pub fn project_to_slint(
 
     let id = project.id.raw().to_string();
 
-    let pool = media_pool(project, missing_media);
+    let usage = media_usage_counts(project);
+    let pool = media_pool(project, missing_media, &usage);
     // Audio-only subset for the library's Audio > Local section — projected
     // here because Slint's `for` can't filter a model. `Media` clones are
     // cheap (the thumbnail is a refcounted image handle).
@@ -95,15 +96,41 @@ pub fn project_to_slint(
     }
 }
 
+/// Count, per pool entry, how many timeline clips reference it — in one pass
+/// over every clip (O(clips), not O(media × clips)). Drives the library tile's
+/// delete confirmation; only media-backed clips carry a `MediaId`.
+fn media_usage_counts(project: &EngineProject) -> HashMap<u64, i32> {
+    let mut counts: HashMap<u64, i32> = HashMap::new();
+    for track in project.timeline().tracks_ordered() {
+        for clip in track.clips() {
+            if let Some(media) = clip.media() {
+                *counts.entry(media.raw()).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
+}
+
 /// The media pool as Library bin entries, ordered by id (the engine's pool is a
 /// hash map, so a stable sort keeps tile order from jumping between imports).
-fn media_pool(project: &EngineProject, missing_media: &HashSet<u64>) -> Vec<Media> {
+fn media_pool(
+    project: &EngineProject,
+    missing_media: &HashSet<u64>,
+    usage: &HashMap<u64, i32>,
+) -> Vec<Media> {
     let tl_rate = project.timeline().frame_rate;
     let mut sources: Vec<&MediaSource> = project.media_iter().collect();
     sources.sort_by_key(|media| media.id.raw());
     sources
         .into_iter()
-        .map(|media| media_to_slint(media, tl_rate, missing_media.contains(&media.id.raw())))
+        .map(|media| {
+            media_to_slint(
+                media,
+                tl_rate,
+                missing_media.contains(&media.id.raw()),
+                usage.get(&media.id.raw()).copied().unwrap_or(0),
+            )
+        })
         .collect()
 }
 
@@ -111,6 +138,7 @@ fn media_to_slint(
     media: &MediaSource,
     tl_rate: cutlass_models::Rational,
     is_missing: bool,
+    usage_count: i32,
 ) -> Media {
     Media {
         id: media.id.raw().to_string().into(),
@@ -124,6 +152,7 @@ fn media_to_slint(
         is_audio: media.is_audio_only(),
         is_image: media.is_image,
         duration_label: duration_label(media.duration).into(),
+        usage_count,
         // Generated asynchronously after import; until then the tile shows
         // its placeholder card (see src/thumbnails.rs).
         thumbnail: crate::thumbnails::thumbnail_for(media.id.raw()).unwrap_or_default(),
@@ -934,6 +963,52 @@ mod tests {
             "/tmp/b.mp4",
             "dialog shows where the file used to be"
         );
+    }
+
+    #[test]
+    fn media_pool_reports_clip_usage_counts() {
+        use cutlass_models::{MediaSource, RationalTime, TimeRange, TrackKind};
+        use slint::Model;
+
+        let mut project = EngineProject::new("test", EngineRational::FPS_24);
+        let used = project.add_media(MediaSource::new(
+            "/tmp/used.mp4",
+            1920,
+            1080,
+            EngineRational::FPS_24,
+            48,
+            true,
+        ));
+        let unused = project.add_media(MediaSource::new(
+            "/tmp/unused.mp4",
+            1920,
+            1080,
+            EngineRational::FPS_24,
+            48,
+            true,
+        ));
+
+        // Two abutting clips reference `used`; `unused` is referenced by none.
+        let track = project.add_track(TrackKind::Video, "V1");
+        let src = TimeRange::at_rate(0, 24, EngineRational::FPS_24);
+        project
+            .add_clip(track, used, src, RationalTime::new(0, EngineRational::FPS_24))
+            .expect("first clip");
+        project
+            .add_clip(track, used, src, RationalTime::new(24, EngineRational::FPS_24))
+            .expect("second clip");
+
+        let projected = project_to_slint(&project, &HashMap::new(), &HashSet::new());
+        let media = &projected.media;
+        assert_eq!(media.row_count(), 2);
+        let by_id = |id: &str| {
+            (0..media.row_count())
+                .map(|r| media.row_data(r).unwrap())
+                .find(|m| m.id.as_str() == id)
+                .expect("media row")
+        };
+        assert_eq!(by_id(&used.raw().to_string()).usage_count, 2);
+        assert_eq!(by_id(&unused.raw().to_string()).usage_count, 0);
     }
 
     #[test]
