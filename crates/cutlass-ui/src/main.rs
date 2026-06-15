@@ -551,9 +551,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // Transcript-based editing (M9 Phase 3): the panel transcribes the selected
     // clip and deletes word ranges, both via the preview worker. Transcription
-    // needs a backend (the whisper feature); the lean build shows a hint.
+    // needs a backend — the local whisper feature or a configured cloud
+    // provider; without either the panel shows a hint.
     let transcript_store = app.global::<TranscriptStore>();
-    transcript_store.set_available(cfg!(feature = "whisper"));
+    transcript_store.set_available(preview_worker::transcribe_available());
 
     let transcribe_handle = preview_worker.handle();
     let transcribe_app = app.as_weak();

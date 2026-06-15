@@ -3021,7 +3021,8 @@ fn generate_captions_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
             Some(transcriber) => engine.set_transcriber(transcriber),
             None => {
                 error!(
-                    "captions unavailable: no transcription backend (rebuild with --features whisper)"
+                    "captions unavailable: no transcription backend (configure a cloud provider \
+                     in ~/.cutlass/config.toml, or rebuild with --features whisper)"
                 );
                 return;
             }
@@ -3061,7 +3062,9 @@ fn transcribe_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
             None => {
                 publish_transcript_status(
                     ui,
-                    "No transcription backend (rebuild with --features whisper).",
+                    "No transcription backend. Configure a cloud provider in \
+                     ~/.cutlass/config.toml ([ml] transcribe_provider = \"cloud\"), \
+                     or rebuild with --features whisper for local transcription.",
                 );
                 return;
             }
@@ -3269,12 +3272,11 @@ fn publish_transcript_status(ui: &UiSink, status: &str) {
     });
 }
 
-/// Build the local transcription backend from the `[ml]` config, downloading
-/// the model on first use. Present only with the `whisper` feature; the lean
-/// build has no backend, so captions report unavailable.
-#[cfg(feature = "whisper")]
+/// Build the transcription backend from the `[ml]` config. Cloud is pure HTTP
+/// and always available; local whisper needs the `whisper` feature, so a lean
+/// build with the default `transcribe_provider = "local"` has no backend.
 fn build_transcriber() -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
-    use cutlass_ml::{ModelCache, TranscribeProvider, WhisperTranscriber, models_dir, whisper_model};
+    use cutlass_ml::TranscribeProvider;
 
     let cfg = cutlass_ml::load_ml_config(&cutlass_ml::config::default_config_path())
         .unwrap_or_else(|e| {
@@ -3282,10 +3284,30 @@ fn build_transcriber() -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> 
             None
         })
         .unwrap_or_default();
-    if cfg.transcribe_provider != TranscribeProvider::Local {
-        warn!("cloud transcription is not wired yet; set transcribe_provider = \"local\"");
-        return None;
+
+    match cfg.transcribe_provider {
+        TranscribeProvider::Cloud => match cutlass_ml::CloudTranscriber::from_config(&cfg) {
+            Ok(transcriber) => {
+                info!("using cloud transcription provider");
+                Some(Arc::new(transcriber) as Arc<dyn cutlass_ml::Transcribe + Send + Sync>)
+            }
+            Err(e) => {
+                error!("cloud transcription unavailable: {e}");
+                None
+            }
+        },
+        TranscribeProvider::Local => build_local_transcriber(&cfg),
     }
+}
+
+/// Build the local whisper.cpp backend from the `[ml]` config, downloading the
+/// model on first use. Present only with the `whisper` feature.
+#[cfg(feature = "whisper")]
+fn build_local_transcriber(
+    cfg: &cutlass_ml::MlSection,
+) -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
+    use cutlass_ml::{ModelCache, WhisperTranscriber, models_dir, whisper_model};
+
     let spec = whisper_model(&cfg.transcribe_model).or_else(|| {
         warn!(model = %cfg.transcribe_model, "unknown whisper model; falling back to base.en");
         whisper_model("base.en")
@@ -3302,9 +3324,33 @@ fn build_transcriber() -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> 
         .map(|t| Arc::new(t) as Arc<dyn cutlass_ml::Transcribe + Send + Sync>)
 }
 
+/// Lean build (no `whisper` feature): only the cloud provider can transcribe,
+/// so a `transcribe_provider = "local"` config has no backend.
 #[cfg(not(feature = "whisper"))]
-fn build_transcriber() -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
+fn build_local_transcriber(
+    _cfg: &cutlass_ml::MlSection,
+) -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
+    warn!(
+        "local transcription needs the `whisper` feature; set [ml] transcribe_provider = \"cloud\" \
+         in ~/.cutlass/config.toml, or rebuild with --features whisper"
+    );
     None
+}
+
+/// Whether any transcription backend can be built from the current config —
+/// drives the Transcript panel's availability without building one (which would
+/// download a model). Local whisper is available whenever the `whisper` feature
+/// is compiled in; otherwise only a configured cloud provider works.
+pub fn transcribe_available() -> bool {
+    if cfg!(feature = "whisper") {
+        return true;
+    }
+    matches!(
+        cutlass_ml::load_ml_config(&cutlass_ml::config::default_config_path()),
+        Ok(Some(cfg))
+            if cfg.transcribe_provider == cutlass_ml::TranscribeProvider::Cloud
+                && cutlass_ml::CloudTranscriber::from_config(&cfg).is_ok()
+    )
 }
 
 /// Detect beat markers on a media clip (CapCut "Beat", M8 Phase 6): the engine

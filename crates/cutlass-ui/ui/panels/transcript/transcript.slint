@@ -110,7 +110,7 @@ export component TranscriptPanel inherits PanelBase {
             spacing: AppStore.theme.metrics.spacing.sm;
 
             if !TranscriptStore.available: CutlassText {
-                text: "Transcription isn't available in this build. Rebuild with --features whisper to enable speech-to-text.";
+                text: "Transcription isn't available. Configure a cloud provider in ~/.cutlass/config.toml ([ml] transcribe_provider = \"cloud\"), or rebuild with --features whisper for local speech-to-text.";
                 wrap: word-wrap;
                 style: AppStore.theme.typography.caption;
                 foreground: AppStore.theme.text.muted;
