@@ -159,7 +159,11 @@ fn get_frame_places_transformed_solid() {
             frame.bytes[i + 3],
         ]
     };
-    assert_eq!(pixel(w / 4, h / 4), [200, 40, 10, 255], "inside placed quad");
+    assert_eq!(
+        pixel(w / 4, h / 4),
+        [200, 40, 10, 255],
+        "inside placed quad"
+    );
     assert_eq!(pixel(10, 10), [200, 40, 10, 255], "top-left corner covered");
     assert_eq!(
         pixel(3 * w / 4, 3 * h / 4),

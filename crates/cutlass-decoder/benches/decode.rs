@@ -82,8 +82,9 @@ fn bench_decode(c: &mut Criterion) {
     // Software decode: exactly what the preview DecoderPool forces today
     // (`DecodeOptions::default().hw_accel(HwAccel::None)`).
     {
-        let mut decoder = Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::None))
-            .expect("open software decoder");
+        let mut decoder =
+            Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::None))
+                .expect("open software decoder");
         let info = decoder.info();
         eprintln!(
             "decode bench: {} — {}x{} @ {:?} fps, software ({})",
@@ -101,8 +102,9 @@ fn bench_decode(c: &mut Criterion) {
     // Hardware decode (Auto → VideoToolbox on macOS). Skip the case when the
     // platform falls back to software so the label never lies.
     {
-        let mut decoder = Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::Auto))
-            .expect("open hardware decoder");
+        let mut decoder =
+            Decoder::open_with(&path, DecodeOptions::default().hw_accel(HwAccel::Auto))
+                .expect("open hardware decoder");
         let active = decoder.info().hw_accel;
         if active.uses_hardware() {
             eprintln!("decode bench: hardware backend active = {}", active.name());

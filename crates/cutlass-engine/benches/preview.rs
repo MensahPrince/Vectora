@@ -250,7 +250,9 @@ fn bench_playback_media(c: &mut Criterion) {
             for _ in 0..iters {
                 let tick = next % total;
                 next += 1;
-                let _ = engine.get_frame(RationalTime::new(tick, rate)).expect("frame");
+                let _ = engine
+                    .get_frame(RationalTime::new(tick, rate))
+                    .expect("frame");
             }
             start.elapsed()
         });
@@ -289,7 +291,9 @@ fn bench_playback_prefetch(c: &mut Criterion) {
             for _ in 0..iters {
                 let tick = next % total;
                 next += 1;
-                let _ = engine.get_frame(RationalTime::new(tick, rate)).expect("frame");
+                let _ = engine
+                    .get_frame(RationalTime::new(tick, rate))
+                    .expect("frame");
                 for ahead in 1..=READ_AHEAD {
                     let t = (tick + ahead).min(total - 1);
                     let _ = engine.prefetch(RationalTime::new(t, rate));

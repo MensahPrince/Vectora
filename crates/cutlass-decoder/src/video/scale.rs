@@ -24,7 +24,9 @@ pub fn scale_yuv420p(
     dst_h: u32,
 ) -> Result<DecodedFrame, DecodeError> {
     if frame.format != PixelFormat::Yuv420p {
-        return Err(DecodeError::unsupported("scale_yuv420p requires YUV420P input"));
+        return Err(DecodeError::unsupported(
+            "scale_yuv420p requires YUV420P input",
+        ));
     }
     if frame.width == dst_w && frame.height == dst_h {
         return Ok(frame.clone());
