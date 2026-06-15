@@ -23,6 +23,7 @@
 //!   lean; heavy native backends sit behind opt-in features.
 
 pub mod backends;
+pub mod captions;
 pub mod config;
 pub mod models;
 pub mod transcribe;
@@ -30,6 +31,7 @@ pub mod transcribe;
 pub use backends::StubTranscriber;
 #[cfg(feature = "whisper")]
 pub use backends::WhisperTranscriber;
+pub use captions::{CaptionCue, CaptionLayout, plan_captions};
 pub use config::{MlSection, TranscribeProvider, load_ml_config};
 pub use models::{
     ModelCache, ModelCacheError, ModelSpec, WHISPER_MODELS, models_dir, verify_file, whisper_model,
