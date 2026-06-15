@@ -693,9 +693,11 @@ M7 (caption track), M8 (beat markers).
       time mapping from whisper word stamps, edits emitted as ordinary
       ripple commands → undoable). This + the M3 agent is the "AI-first"
       identity, shipped.
-- [ ] **Silence removal / AutoCut**: energy-based silence detection →
-      proposed cut list rendered as a preview (dry-run UI from M3) →
-      one-click apply as a single history group.
+- [x] **Silence removal / AutoCut**: energy-based silence detection
+      (`detect_silences`, local DSP) → ripple-deleted on the clip's track
+      as one undoable history group; a "Remove silences" inspector button
+      and a `remove_silences` agent tool drive it. (Dry-run preview review
+      surface + tuning controls are a follow-up — see `ai-media-roadmap.md`.)
 - [ ] **Text-to-speech**: text clip / script → voiceover audio clip,
       local voices; provider seam for premium cloud voices.
 - [ ] **Background removal**: video matting (RVM/MODNet-class ONNX) →

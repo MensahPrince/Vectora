@@ -105,6 +105,21 @@ and export agree on every one, and each edit is a single undo.
   FFmpeg's estimated PTS, killing the tens-of-ms MP3 seek error noted in the
   previous alpha. MP4/AAC was already sample-accurate.
 
+### Silence removal / AutoCut (M9 Phase 1)
+
+- **Cut the silences in one move.** A new energy-based silence detector
+  (`detect_silences`, pure DSP next to beat detection / ducking) finds the
+  pauses in a clip's audio; the engine maps them to timeline ticks and
+  ripple-deletes each span so the remaining speech closes up. The whole pass
+  is a single undoable history entry — one undo restores every clip and
+  shift. Rejected on generated, silent, and retimed clips.
+- **In the inspector.** A **"Remove silences"** button in the audio clip
+  inspector runs it on the selected clip (broadcast-sane defaults: -40 dB
+  gate, 0.5 s minimum pause, 80 ms padding). Hidden on retimed clips.
+- **From a prompt.** A `remove_silences` agent tool (optional `min_pause` /
+  `padding` / `threshold`) lowers to the same command, so "cut the silences
+  out of the interview" just works. Tool schema → v19.
+
 ## [alpha-0.4.0] — 2026-06-15
 
 The **Windows & performance alpha**: Windows joins macOS and Linux with

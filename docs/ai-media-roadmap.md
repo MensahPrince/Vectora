@@ -69,33 +69,39 @@ Needs no model and no gated dependency: it's pure DSP in `cutlass-decoder`
 (next to beat detection / ducking, the M8 precedent — **not** `cutlass-ml`,
 which is for model-backed inference) plus the existing ripple commands.
 
-- [ ] **Silence DSP** (`cutlass-decoder/src/audio/silence.rs`):
+- [x] **Silence DSP** (`cutlass-decoder/src/audio/silence.rs`):
       `detect_silences(mono, sample_rate, &SilenceSettings) -> Vec<(f64, f64)>`
       returns silent spans in seconds. A control-rate (≈100 Hz, the ducking
       hop) broadband RMS envelope marks hops below `threshold`; contiguous
       below-threshold runs longer than `min_silence` become spans, each shrunk
       inward by `keep_padding` so word onsets/offsets aren't clipped. Pure,
       unit-tested on synthetic tone-burst / silence signals.
-- [ ] **Cut planner** (engine, pure): silence spans (decoded per media clip,
-      mapped seconds → timeline ticks through the clip's live window and
-      speed) → a list of timeline ranges to ripple-delete on the clip's track,
-      merging spans that abut across the clip boundary, clamping to the
-      selection, and dropping spans that would leave a sub-frame remainder.
-      Linked A/V ripple together so pairs stay aligned. Unit-tested as a pure
-      planner (no decode).
-- [ ] **`RemoveSilences` command + engine action**: decode the target clips,
+- [x] **Cut planner** (engine, pure): silence spans (decoded per media clip,
+      mapped seconds → timeline ticks through the clip's live window) → a list
+      of timeline ranges to ripple-delete on the clip's track, merging spans
+      that abut after frame-rounding and clamping each to the clip's own
+      `[start, end)`. Unit-tested as a pure planner (no decode).
+- [x] **`RemoveSilences` command + engine action**: decode the target clip,
       run the planner, and apply the cut ranges as split + ripple-delete on the
-      magnet track in one `CompoundAction` (one undo restores every clip and
-      shift). Rejected on generated clips and media without audio. Mirrors the
-      `DuckLanes` "analysis writes ordinary edits" shape.
-- [ ] **Agent tool**: `remove_silences` (clip ids + optional `threshold` /
-      `min_silence` / `padding`) lowers to `RemoveSilences` — "cut the silences
-      out of the interview" from a prompt. Wire DTO + validation + action-log
-      phrasing + schema snapshot bump + eval.
-- [ ] **UI**: an "AutoCut / Remove silences" control in the clip audio
-      inspector that runs the analysis and shows the proposed cuts in the M3
-      dry-run action list; one click applies them as a single history group.
-      Threshold / min-pause / padding controls with broadcast-sane defaults.
+      clip's track in one undoable entry. The inverse is a single track-clips
+      snapshot (`SetTrackClipsAction`) rather than a composition of the
+      primitives' inverses — composing those re-mints clip ids on redo and
+      strands the chained ripple-delete; the snapshot restores the exact clips
+      (ids included) and oscillates cleanly. Rejected on generated clips, media
+      without audio, and retimed clips (the seconds → tick map is linear only
+      at 1×). Mirrors the `DuckLanes` "analysis writes ordinary edits" shape.
+      *Deferred to a follow-up: linked A/V ripple-together and a whole-timeline
+      magnet ripple (today the cut ripples the target clip's own track).*
+- [x] **Agent tool**: `remove_silences` (clip id + optional `min_pause` /
+      `padding` / `threshold`) lowers to `RemoveSilences` — "cut the silences
+      out of the interview" from a prompt. Wire DTO + validation (rejects
+      generated / silent / retimed with named reasons) + action-log phrasing +
+      schema snapshot bump (v19) + dry-run & rejection evals.
+- [x] **UI**: a **"Remove silences"** button in the audio clip inspector runs
+      it on the selected clip as one undoable history entry, with broadcast-sane
+      defaults (-40 dB gate, 0.5 s minimum pause, 80 ms padding) and hidden on
+      retimed clips. *Deferred to a follow-up: the M3 dry-run review surface
+      for the proposed cuts and threshold / min-pause / padding controls.*
 
 ## Phase 2 — `cutlass-ml` crate + transcribe foundation
 
