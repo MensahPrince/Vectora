@@ -105,14 +105,32 @@ which is for model-backed inference) plus the existing ripple commands.
 
 ## Phase 2 — `cutlass-ml` crate + transcribe foundation
 
-- [ ] **`cutlass-ml` crate scaffold**: workspace member, off the default build
-      like a future `cutlass-py`; inference traits (`Transcribe` first) with a
-      local whisper.cpp-backed implementation and a model-download/cache helper
-      (`~/.cutlass/models/`, checksummed). Provider seam for cloud transcribe.
-- [ ] **Word-level transcription**: audio lane → segments + word timestamps,
-      the substrate both captions (Phase 4) and transcript editing (Phase 3)
-      consume. Off-thread, progress-reported through the established handle
-      pattern.
+- [x] **`cutlass-ml` crate scaffold**: a workspace member kept off
+      `default-members` (like the planned `cutlass-py`), so the editor build
+      stays lean. The `Transcribe` trait is the provider seam (blocking,
+      sample-domain `&[f32]` in, plain data out — the M8 DSP convention), with
+      `Transcript` / `Segment` / `Word` result types (word timing,
+      serde-serializable), `TranscribeOptions`, distinct `TranscribeError`
+      kinds, and a deterministic `StubTranscriber` so downstream consumers test
+      without a model on disk.
+- [x] **Model download/cache helper** (`cutlass-ml/src/models.rs`):
+      `ModelCache::ensure` resolves a `ModelSpec` under `~/.cutlass/models/`,
+      streaming the download to a `.part` sidecar, hashing as it goes, and
+      renaming into place only after the SHA-256 matches; a present, valid file
+      short-circuits with no network. Pure verify/resolve unit-test offline.
+- [x] **`[ml]` config table** (`cutlass-ml/src/config.rs`): mirrors `[ai]` in
+      `~/.cutlass/config.toml` — pick the local whisper model or route to a
+      cloud provider. Local-first: an absent/empty table yields a usable local
+      configuration; cloud credentials resolve from the environment.
+- [ ] **Local whisper.cpp backend** (feature-gated): a `Transcribe` impl over
+      `whisper-rs` (the C/C++ build dependency stays opt-in, off the default
+      build), plus the real model registry (URLs + checksums) the cache
+      consumes. *Deferred — the native dependency lands on its own.*
+- [ ] **Word-level transcription** (engine + worker): audio lane → decode at
+      16 kHz mono → `Transcribe` → segments + word timestamps mapped to source
+      ticks, the substrate both captions (Phase 4) and transcript editing
+      (Phase 3) consume. Off-thread, progress-reported through the established
+      handle pattern.
 
 ## Phase 3 — Transcript-based editing (flagship) — needs Phase 2
 

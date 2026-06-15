@@ -120,6 +120,22 @@ and export agree on every one, and each edit is a single undo.
   `padding` / `threshold`) lowers to the same command, so "cut the silences
   out of the interview" just works. Tool schema → v19.
 
+### `cutlass-ml` foundation (M9 Phase 2)
+
+- **New inference crate.** `cutlass-ml` opens the local-first, provider-
+  abstracted home for model-backed media tools. The `Transcribe` trait is the
+  seam (blocking, sample-domain `&[f32]` in, plain data out — the same shape
+  as the audio DSP), with `Transcript` / `Segment` / `Word` result types
+  carrying word-level timing, and a deterministic `StubTranscriber` so the
+  features that consume transcripts can be built and tested without a model on
+  disk. The crate is off the default build (like the planned `cutlass-py`).
+- **Models are data, fetched on demand.** A model cache resolves and downloads
+  weights under `~/.cutlass/models/`, streaming to a `.part` sidecar and
+  verifying a SHA-256 before installing atomically — a present, valid file
+  costs no network. An `[ml]` config table (mirroring `[ai]`) picks the local
+  whisper model or routes to a cloud provider. (The whisper.cpp backend and
+  word-level transcription land next.)
+
 ## [alpha-0.4.0] — 2026-06-15
 
 The **Windows & performance alpha**: Windows joins macOS and Linux with
