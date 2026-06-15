@@ -199,6 +199,22 @@ export component TitleBar inherits Rectangle {
         VerticalLayout {
             alignment: center;
 
+            // Transcript-based editing dock toggle (M9 Phase 3).
+            SubtleButton {
+                label: AppState.transcript-panel-open ? "Hide Transcript" : "Transcript";
+                clicked => {
+                    AppState.transcript-panel-open = !AppState.transcript-panel-open;
+                }
+            }
+        }
+
+        Rectangle {
+            width: AppStore.theme.metrics.spacing.sm;
+        }
+
+        VerticalLayout {
+            alignment: center;
+
             // AI assistant dock toggle (ai-agent roadmap Phase 4).
             SubtleButton {
                 label: AppState.agent-panel-open ? "Hide Assistant" : "Assistant";

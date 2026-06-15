@@ -1,0 +1,88 @@
+// Transcript-based editing state (M9 Phase 3). The lines are written by the
+// preview worker (src/preview_worker.rs) via the event loop after a transcribe;
+// the panel reads them, tracks a word-range selection, and fires the callbacks
+// below, which main.rs forwards to the worker (and applies the on-screen
+// reflow). Editing the text edits the video: deleting a run of words ripple-cuts
+// their timeline span out of the clip.
+
+// One transcribed word. `index` is its position in the clip's flat word list
+// (the selection works in these indices); `start-tick`/`end-tick` are absolute
+// timeline ticks (for click-to-seek and the delete mapping); `deleted` strikes
+// a word the user has already cut.
+export struct TranscriptWord {
+    text: string,
+    index: int,
+    start-tick: int,
+    end-tick: int,
+    deleted: bool,
+}
+
+// A wrapped line of words (the worker greedy-packs words into panel-width
+// lines, since Slint has no flow layout). Rendering is lines stacked vertically,
+// each a row of word chips.
+export struct TranscriptLine {
+    words: [TranscriptWord],
+}
+
+export global TranscriptStore {
+    in-out property <[TranscriptLine]> lines: [];
+    // Total words across all lines; 0 ⇔ no transcript yet.
+    in-out property <int> word-count: 0;
+
+    // True from a transcribe request until the transcript arrives or fails;
+    // gates the button and shows a spinner-ish status.
+    in-out property <bool> running: false;
+    // Quiet status / error line under the header (download progress, "no
+    // speech found", a backend error).
+    in-out property <string> status: "";
+
+    // False on a lean build with no transcription backend — the panel shows a
+    // hint instead of a button that always fails. Set by the worker.
+    in-out property <bool> available: true;
+
+    // The transcribed clip's track (raw id), needed to lower a delete to a
+    // ripple-cut on the right lane. Set by the worker alongside the lines.
+    in-out property <string> track-id: "";
+
+    // Selected word range, as inclusive global indices into the flat word list.
+    // -1 ⇔ nothing selected. The selection always spans non-deleted words.
+    in-out property <int> sel-start: -1;
+    in-out property <int> sel-end: -1;
+
+    // True when at least one word is selected.
+    public pure function has-selection() -> bool {
+        self.sel-start >= 0 && self.sel-end >= 0;
+    }
+
+    // Whether word `i` falls inside the current selection.
+    public pure function selected(i: int) -> bool {
+        self.has-selection()
+            && i >= min(self.sel-start, self.sel-end)
+            && i <= max(self.sel-start, self.sel-end);
+    }
+
+    public function clear-selection() {
+        self.sel-start = -1;
+        self.sel-end = -1;
+    }
+
+    // Click a word: anchor a fresh single-word selection.
+    public function select-word(i: int) {
+        self.sel-start = i;
+        self.sel-end = i;
+    }
+
+    // Shift-click a word: extend from the existing anchor (or start one).
+    public function extend-to(i: int) {
+        if (self.sel-start < 0) {
+            self.sel-start = i;
+        }
+        self.sel-end = i;
+    }
+
+    // → main.rs → preview worker. `transcribe` runs on the selected clip;
+    // `delete-selection` ripple-cuts the inclusive word-index range (main.rs
+    // maps indices → ticks and reflows the lines).
+    callback transcribe(clip-id: string);
+    callback delete-selection(from-index: int, to-index: int);
+}
