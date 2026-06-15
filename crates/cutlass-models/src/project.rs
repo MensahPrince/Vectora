@@ -704,6 +704,10 @@ impl Project {
         // The effect chain copies to both halves (same as crop): each half is
         // an independent clip that keeps the full chain.
         new_clip.effects = clip.effects.clone();
+        // Beat markers are stored in source time, so both halves keep the full
+        // list — each clip's `beat_timeline_ticks` shows only the beats inside
+        // its own (now-divided) source window.
+        new_clip.beats = clip.beats.clone();
 
         let track_id = self
             .timeline
@@ -963,6 +967,27 @@ impl Project {
         Ok(())
     }
 
+    /// Toggle noise reduction on a media clip (CapCut "Reduce noise", M8
+    /// Phase 5), returning the previous flag for the inverse. The mixers run
+    /// the clip's audio through RNNoise when set. Rejected on generated clips
+    /// (no source audio to clean).
+    pub fn set_clip_denoise(
+        &mut self,
+        clip_id: ClipId,
+        denoise: bool,
+    ) -> Result<bool, ModelError> {
+        let clip = self
+            .timeline
+            .clip_mut(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        if clip.source_range().is_none() {
+            return Err(ModelError::InvalidParam(
+                "noise reduction requires a media-backed clip".into(),
+            ));
+        }
+        Ok(std::mem::replace(&mut clip.denoise, denoise))
+    }
+
     /// Set a media clip's audio mix (CapCut volume + fades): `volume` is
     /// `Some` to set a flat gain (`0` mutes, `1` unchanged, up to
     /// [`crate::MAX_CLIP_VOLUME`]× boost), overwriting any M8 envelope
@@ -1057,6 +1082,39 @@ impl Project {
         clip.flip_h = flip_h;
         clip.flip_v = flip_v;
         Ok(())
+    }
+
+    /// Replace a clip's detected beat markers (M8 Phase 6), returning the
+    /// previous list for the inverse. Beats are source ticks at the media
+    /// frame rate; this only stores what detection (or a clear) produced —
+    /// the engine owns the analysis. Media clips only (generated content has
+    /// no audio to analyze). Stored sorted + de-duplicated and clamped to the
+    /// source window so a stale list can't snap to phantom positions.
+    pub fn set_clip_beats(
+        &mut self,
+        clip_id: ClipId,
+        beats: Vec<i64>,
+    ) -> Result<Vec<i64>, ModelError> {
+        let clip = self
+            .timeline
+            .clip(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        let source = clip
+            .source_range()
+            .ok_or_else(|| ModelError::InvalidParam("beats require a media-backed clip".into()))?;
+        let (lo, hi) = (source.start.value, source.start.value + source.duration.value);
+        let mut beats: Vec<i64> = beats
+            .into_iter()
+            .filter(|&b| (lo..hi).contains(&b))
+            .collect();
+        beats.sort_unstable();
+        beats.dedup();
+
+        let clip = self
+            .timeline
+            .clip_mut(clip_id)
+            .expect("clip existence checked above");
+        Ok(std::mem::replace(&mut clip.beats, beats))
     }
 
     /// Move a clip to `to_track` at `new_start`, preserving duration and source.
@@ -1830,6 +1888,41 @@ mod tests {
     }
 
     #[test]
+    fn set_clip_denoise_toggles_and_returns_the_previous_flag() {
+        let (mut project, media_id, track) = project_with_media(500);
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+        assert!(!project.clip(clip).unwrap().denoise, "off by default");
+
+        // Turning it on returns the old value (false); turning it off again
+        // returns true — the engine uses this for the undo inverse.
+        assert!(!project.set_clip_denoise(clip, true).unwrap());
+        assert!(project.clip(clip).unwrap().denoise);
+        assert!(project.set_clip_denoise(clip, false).unwrap());
+        assert!(!project.clip(clip).unwrap().denoise);
+    }
+
+    #[test]
+    fn set_clip_denoise_rejects_generated_clips() {
+        let mut project = Project::new("p", R24);
+        let track = project.add_track(TrackKind::Sticker, "T1");
+        let clip = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 0, 255],
+                },
+                tr(0, 10),
+            )
+            .unwrap();
+        assert!(
+            project.set_clip_denoise(clip, true).is_err(),
+            "no audio to clean"
+        );
+    }
+
+    #[test]
     fn set_clip_speed_curve_rederives_duration_from_average() {
         let (mut project, media_id, track) = project_with_media(500);
         let clip = project
@@ -1959,6 +2052,63 @@ mod tests {
         let c = project.clip(clip).unwrap();
         assert_eq!(c.timeline, tr(0, 100));
         assert_eq!(c.speed, Rational::new(1, 1));
+    }
+
+    // --- set_clip_beats (M8 Phase 6) -----------------------------------------
+
+    #[test]
+    fn set_clip_beats_sorts_dedups_clamps_and_returns_previous() {
+        let (mut project, media_id, track) = project_with_media(500);
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+
+        // Out-of-window (>=100), duplicate, and unsorted input is normalized.
+        let prev = project
+            .set_clip_beats(clip, vec![60, 10, 10, 200, 30])
+            .unwrap();
+        assert!(prev.is_empty(), "no beats before the first detect");
+        assert_eq!(project.clip(clip).unwrap().beats, vec![10, 30, 60]);
+
+        // Replacing returns the old list (the inverse snapshot).
+        let prev = project.set_clip_beats(clip, vec![5]).unwrap();
+        assert_eq!(prev, vec![10, 30, 60]);
+        assert_eq!(project.clip(clip).unwrap().beats, vec![5]);
+    }
+
+    #[test]
+    fn set_clip_beats_rejects_generated_clips() {
+        let mut project = Project::new("test", R24);
+        let track = project.add_track(TrackKind::Text, "T");
+        let clip = project
+            .add_generated(track, Generator::text("hi"), tr(0, 48))
+            .unwrap();
+        assert!(matches!(
+            project.set_clip_beats(clip, vec![1, 2]),
+            Err(ModelError::InvalidParam(_))
+        ));
+    }
+
+    #[test]
+    fn split_keeps_beats_on_both_halves() {
+        let (mut project, media_id, track) = project_with_media(500);
+        let clip = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+        project.set_clip_beats(clip, vec![10, 60, 90]).unwrap();
+
+        let right = project.split_clip(clip, rt(50)).unwrap();
+        // Both halves keep the full source-tick list; each shows only the
+        // beats inside its own window via `beat_timeline_ticks`.
+        assert_eq!(project.clip(clip).unwrap().beats, vec![10, 60, 90]);
+        assert_eq!(project.clip(right).unwrap().beats, vec![10, 60, 90]);
+        // Left window [0,50): only the beat at 10 maps in.
+        assert_eq!(project.clip(clip).unwrap().beat_timeline_ticks(), vec![10]);
+        // Right window [50,100) at timeline [50,100): beats 60, 90 map in.
+        assert_eq!(
+            project.clip(right).unwrap().beat_timeline_ticks(),
+            vec![60, 90]
+        );
     }
 
     // --- set_clip_audio (M1) -------------------------------------------------

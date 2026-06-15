@@ -832,6 +832,58 @@ fn set_clip_audio_rejects_generated_clips_and_long_fades() {
 }
 
 #[test]
+fn set_clip_denoise_undo_redo_roundtrip() {
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = common::add_track(&mut engine, TrackKind::Audio, "A1");
+    let clip_id = created(
+        engine
+            .apply(Command::Edit(EditCommand::AddClip {
+                track,
+                media: media_id,
+                source: tr(0, 48),
+                start: rt(0),
+            }))
+            .expect("add"),
+    );
+    let denoise = |engine: &cutlass_engine::Engine| engine.project().clip(clip_id).unwrap().denoise;
+    assert!(!denoise(&engine), "off by default");
+
+    engine
+        .apply(Command::Edit(EditCommand::SetClipDenoise {
+            clip: clip_id,
+            denoise: true,
+        }))
+        .expect("enable denoise");
+    assert!(denoise(&engine));
+
+    assert!(engine.undo());
+    assert!(!denoise(&engine), "undo clears the flag");
+    assert!(engine.redo());
+    assert!(denoise(&engine), "redo restores it");
+}
+
+#[test]
+fn set_clip_denoise_rejects_generated_clips() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+    let before = engine.project().clip(clip_id).unwrap().clone();
+
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetClipDenoise {
+                clip: clip_id,
+                denoise: true,
+            }))
+            .is_err()
+    );
+    assert_eq!(engine.project().clip(clip_id).unwrap(), &before);
+}
+
+#[test]
 fn set_clip_crop_undo_redo_roundtrip() {
     let (_dir, mut engine) = temp_engine();
     let clip_id = text_clip(&mut engine);

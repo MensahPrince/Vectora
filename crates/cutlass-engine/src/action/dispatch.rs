@@ -227,6 +227,13 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::SetClipDenoise { clip, denoise } => {
+            let inverse = edit::set_denoise::set_denoise(ctx, clip, denoise)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
         EditCommand::AddEffect { clip, effect_id } => {
             let inverse = edit::set_effect::add_effect(ctx, clip, &effect_id)?;
             Ok((
@@ -411,6 +418,20 @@ fn dispatch_edit(
         } => {
             let (clip, inverse) =
                 edit::duck::duck(ctx, &voice, &music, threshold, amount, attack, release)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::DetectBeats { clip } => {
+            let inverse = edit::detect_beats::detect(ctx, clip)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::ClearBeats { clip } => {
+            let inverse = edit::detect_beats::clear(ctx, clip)?;
             Ok((
                 ApplyOutcome::Edited(EditOutcome::Updated(clip)),
                 Some(inverse),

@@ -3,6 +3,7 @@
 pub mod add_clip;
 pub mod add_generated;
 pub mod add_track;
+pub mod detect_beats;
 pub mod duck;
 pub mod insert_clip;
 pub mod insert_media;
@@ -18,6 +19,7 @@ pub mod ripple_insert;
 pub mod set_audio;
 pub mod set_canvas;
 pub mod set_crop;
+pub mod set_denoise;
 pub mod set_effect;
 pub mod set_generator;
 pub mod set_param;

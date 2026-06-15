@@ -159,6 +159,11 @@ pub enum EditCommand {
         fade_in: RationalTime,
         fade_out: RationalTime,
     },
+    /// Toggle noise reduction on a media clip (CapCut "Reduce noise", M8
+    /// Phase 5): both audio mixers run the clip's audio through RNNoise to
+    /// suppress steady background noise. Rejected on generated clips. The
+    /// inverse restores the previous flag.
+    SetClipDenoise { clip: ClipId, denoise: bool },
     /// Append a GPU effect (M4) to a visual clip's chain. `effect_id` must
     /// exist in the effect catalog. The inverse removes it (clip snapshot).
     AddEffect { clip: ClipId, effect_id: String },
@@ -249,6 +254,15 @@ pub enum EditCommand {
         attack: f32,
         release: f32,
     },
+    /// Detect beat positions on a media clip (CapCut "Beat", M8 Phase 6): the
+    /// engine decodes the clip's audio, runs onset/tempo analysis, and stores
+    /// the beat grid (source ticks) on the clip for the timeline magnet to snap
+    /// to. Rejected on generated clips and media without audio. The inverse
+    /// restores the clip's previous beats.
+    DetectBeats { clip: ClipId },
+    /// Clear a clip's detected beat markers (M8 Phase 6). The inverse restores
+    /// them.
+    ClearBeats { clip: ClipId },
     /// Drop a named, colored marker on the timeline ruler at `at` (M1
     /// markers). `color: None` cycles the fixed palette. The inverse
     /// removes it.

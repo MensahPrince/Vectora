@@ -940,6 +940,14 @@ pub struct Clip {
     /// linear gain ramp `volume` → 0. Absent from saves while 0.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fade_out: i64,
+    /// Noise reduction (CapCut "Reduce noise", M8 Phase 5): run this clip's
+    /// audio through RNNoise to suppress steady background noise (hiss, hum,
+    /// room tone) while keeping speech. Both audio mixers render the cleaned
+    /// signal and serve it 1:1; meaningful for clips on audio lanes, ignored
+    /// elsewhere. `false` (and absent from saves) when off, so old files load
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub denoise: bool,
     /// Normalized crop window into the content (CapCut crop, M1): only the
     /// kept region renders, aspect-fit and transformed like the full frame
     /// was. Meaningful on visual clips; full-frame (and absent from saves)
@@ -961,6 +969,15 @@ pub struct Clip {
     /// unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<EffectInstance>,
+    /// Detected beat positions (CapCut "Beat" markers, M8 Phase 6): source
+    /// ticks at the media frame rate, sorted ascending. `DetectBeats` fills
+    /// them from onset analysis; the timeline magnet snaps clip edges to them.
+    /// Stored in *source* time so they ride the content — trims and splits
+    /// keep exactly the beats inside each half's window visible (see
+    /// [`Clip::beat_timeline_ticks`]). Meaningful on media clips; empty (and
+    /// absent from saves) until detected, so old files load unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub beats: Vec<i64>,
 }
 
 /// Upper bound for [`Clip::volume`] (CapCut's 1000% ceiling).
@@ -1087,10 +1104,12 @@ impl Clip {
             volume: default_volume(),
             fade_in: 0,
             fade_out: 0,
+            denoise: false,
             crop: CropRect::FULL,
             flip_h: false,
             flip_v: false,
             effects: Vec::new(),
+            beats: Vec::new(),
         }
     }
 
@@ -1109,10 +1128,12 @@ impl Clip {
             volume: default_volume(),
             fade_in: 0,
             fade_out: 0,
+            denoise: false,
             crop: CropRect::FULL,
             flip_h: false,
             flip_v: false,
             effects: Vec::new(),
+            beats: Vec::new(),
         }
     }
 
@@ -1139,6 +1160,46 @@ impl Clip {
     /// elsewhere — so the mixers keep it and sample per sample-frame.
     pub fn is_silent(&self) -> bool {
         matches!(self.volume.constant(), Some(v) if v <= 0.0)
+    }
+
+    /// True iff the clip carries detected beat markers (M8 Phase 6).
+    pub fn has_beats(&self) -> bool {
+        !self.beats.is_empty()
+    }
+
+    /// Absolute timeline ticks (at the clip's timeline rate) for every detected
+    /// beat that falls within the clip's visible source window. Beats are stored
+    /// in source time, so this maps each through the clip's geometry: the
+    /// fraction of the source window a beat sits at becomes the same fraction of
+    /// the timeline span (exact for constant speed — the source window maps
+    /// linearly onto the span — and a close approximation for speed ramps).
+    /// `reversed` mirrors the window. Out-of-window beats (left behind by a
+    /// trim/split) are skipped. Pure; `O(beats)`.
+    pub fn beat_timeline_ticks(&self) -> Vec<i64> {
+        let Some(source) = self.source_range() else {
+            return Vec::new();
+        };
+        let dur = source.duration.value;
+        if dur <= 0 || self.beats.is_empty() {
+            return Vec::new();
+        }
+        let first = source.start.value;
+        let last = first + dur; // exclusive
+        let tl_start = self.timeline.start.value;
+        let tl_dur = self.timeline.duration.value;
+        let mut out = Vec::with_capacity(self.beats.len());
+        for &b in &self.beats {
+            if b < first || b >= last {
+                continue;
+            }
+            let mut frac = (b - first) as f64 / dur as f64;
+            if self.reversed {
+                frac = 1.0 - frac;
+            }
+            out.push(tl_start + (frac * tl_dur as f64).round() as i64);
+        }
+        out.sort_unstable();
+        out
     }
 
     /// True iff the clip plays at anything but forward 1× — the audio mixers
@@ -1520,6 +1581,56 @@ mod tests {
         let a = Clip::generated(Generator::Adjustment, timeline);
         let b = Clip::generated(Generator::Adjustment, timeline);
         assert_ne!(a.id, b.id);
+    }
+
+    // --- beats (M8 Phase 6) -----------------------------------------------
+
+    #[test]
+    fn beat_timeline_ticks_map_proportionally_within_window() {
+        // Source window [0, 100) at 24fps maps onto a [10, 60) timeline span
+        // (50 ticks): a beat at source 50 (half-way) lands at 10 + 25 = 35.
+        let mut clip = media_clip(MediaId::from_raw(1), tr(0, 100, R24), tr(10, 50, R24));
+        clip.beats = vec![0, 50, 99];
+        assert_eq!(clip.beat_timeline_ticks(), vec![10, 35, 60]);
+    }
+
+    #[test]
+    fn beat_timeline_ticks_skip_out_of_window_beats() {
+        // Window [40, 80): beats before/after it (left by a trim/split) drop.
+        let mut clip = media_clip(MediaId::from_raw(1), tr(40, 40, R24), tr(0, 40, R24));
+        clip.beats = vec![10, 40, 60, 80, 100];
+        assert_eq!(clip.beat_timeline_ticks(), vec![0, 20]);
+    }
+
+    #[test]
+    fn beat_timeline_ticks_mirror_when_reversed() {
+        // Reversed: a beat near the source window end appears near clip start.
+        let mut clip = media_clip(MediaId::from_raw(1), tr(0, 100, R24), tr(0, 100, R24));
+        clip.reversed = true;
+        clip.beats = vec![25, 75];
+        assert_eq!(clip.beat_timeline_ticks(), vec![25, 75]);
+        clip.beats = vec![10];
+        assert_eq!(clip.beat_timeline_ticks(), vec![90]);
+    }
+
+    #[test]
+    fn beats_serialize_only_when_present() {
+        let clip = media_clip(MediaId::from_raw(1), tr(0, 100, R24), tr(0, 100, R24));
+        let json = serde_json::to_value(&clip).unwrap();
+        assert!(
+            json.get("beats").is_none(),
+            "beat-free clips serialize without the field"
+        );
+        // Pre-beats files (no key) deserialize to an empty list.
+        let back: Clip = serde_json::from_value(json).unwrap();
+        assert!(!back.has_beats());
+
+        let mut beaten = clip.clone();
+        beaten.beats = vec![10, 20, 30];
+        let json = serde_json::to_value(&beaten).unwrap();
+        assert_eq!(json["beats"], serde_json::json!([10, 20, 30]));
+        let round: Clip = serde_json::from_value(json).unwrap();
+        assert_eq!(round.beats, vec![10, 20, 30]);
     }
 
     // --- accessors --------------------------------------------------------
