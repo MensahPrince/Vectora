@@ -23,12 +23,15 @@ M7 (caption track), and M8 (beat markers). As of `alpha-0.4.0`:
 - **M6 ❌ not started** — no mask/matte input in the compositor yet, so
   **background removal** (which feeds an alpha matte into the M6 pipeline) is
   *gated* and lands after M6.
-- **M7 ❌ not started** — no styled caption track to render cues into, so
-  **auto captions** are *gated* and land after M7.
+- **M7 ❌ not started** — no styled caption *track* yet, but **auto captions
+  shipped anyway** (Phase 4): captions land as ordinary text clips on a fresh
+  lane (the way CapCut treats them), so they didn't need to wait on M7. M7 now
+  only adds the *nice-to-haves* on top — a soft caption-group identity for
+  batch restyle / SRT export.
 
 So the order is **unblocked-first**: silence removal (no model, no gated dep)
 ships first, then the model-backed transcribe foundation and the features that
-ride it, and the two gated features land when their substrate (M6/M7) exists.
+ride it (captions included), and background removal lands when M6 exists.
 
 ## Architecture invariants (apply to every phase)
 
@@ -130,11 +133,13 @@ which is for model-backed inference) plus the existing ripple commands.
       toolchain never touches the default build or CI. The real model registry
       (tiny.en / base.en / small.en, official HF URLs + SHA-256s) lives in
       `models.rs` and feeds the cache.
-- [ ] **Word-level transcription** (engine + worker): audio lane → decode at
-      16 kHz mono → `Transcribe` → segments + word timestamps mapped to source
-      ticks, the substrate both captions (Phase 4) and transcript editing
-      (Phase 3) consume. Off-thread, progress-reported through the established
-      handle pattern.
+- [x] **Word-level transcription** (engine): the engine decodes a clip's audio
+      to 16 kHz mono, runs `Transcribe`, and maps segment/word stamps to
+      timeline ticks — landed via the caption path (`caption.rs`), with an
+      injected backend on `Engine` and a `generate_captions` entry point. The
+      transcript-panel *consumption* of this substrate is still Phase 3; the
+      caption worker runs it synchronously off the UI thread for now (no
+      progress bar / cancellation surfaced yet).
 
 ## Phase 3 — Transcript-based editing (flagship) — needs Phase 2
 
@@ -143,12 +148,35 @@ which is for model-backed inference) plus the existing ripple commands.
       underlying clips (one undoable history group), so editing the text edits
       the video. This + the M3 agent is the "AI-first" identity shipped.
 
-## Phase 4 — Auto captions — **gated on M7 (caption track)**
+## Phase 4 — Auto captions — **shipped** (captions *are* text clips)
 
-- [ ] Transcribe audio lanes → styled cues on the M7 caption track; word-level
-      timing; edit text in the inspector; caption style presets. Translation
-      rides cloud providers later. *Blocked until M7 lands the styled subtitle
-      lane to render cues into.*
+Re-scoped off its M7 gate: a caption is just a text clip that starts at the
+cue's time (the way CapCut treats them — you can drag a caption onto the same
+track as a hand-made title), so captioning ships now on the existing
+`Generator::Text` + `TrackKind::Text` primitives instead of waiting on a
+bespoke subtitle lane.
+
+- [x] **Cue planner** (`cutlass-ml/src/captions.rs`, pure): word-timed speech →
+      readable caption lines respecting a character budget, max duration,
+      inter-word pauses, and sentence boundaries; falls back to one cue per
+      segment when word timing is absent. No engine/timeline types — unit-tested
+      on synthetic transcripts.
+- [x] **Engine path** (`cutlass-engine/src/caption.rs` + `generate_captions`):
+      decode → transcribe → plan cues → emit subtitle-styled `Generator::Text`
+      clips on a fresh **"Captions"** lane, all in one undoable history group
+      (`rollback_group` on partial failure). Rejected on generated, retimed, and
+      audio-less clips.
+- [x] **Inspector** : a "Speech to text" tab with a **"Generate captions"**
+      button; the worker lazily builds the whisper backend on first use
+      (downloading the configured model), runs off the UI thread, and publishes
+      the result. Behind the opt-in `whisper` feature.
+- [x] **Agent tool**: `caption_clip` → a new `CaptionClip` command that
+      `Engine::apply` routes to the caption path; full M3 checklist (wire +
+      validate + action-log + schema v20 + eval).
+- [ ] **Deferred to M7**: a soft caption-group identity (a tag shared by the
+      cues from one run) for batch restyle and SRT/VTT export; caption style
+      presets; translation via cloud providers. Until then captions are
+      independent, individually-editable text clips.
 
 ## Phase 5 — Text-to-speech — needs a `cutlass-ml` TTS runtime
 
@@ -180,5 +208,5 @@ which is for model-backed inference) plus the existing ripple commands.
 
 Import an interview → auto captions → delete filler words in the transcript →
 TTS an intro line → "make the music duck under speech" — all local, all
-undoable. (Captions and background removal land with M7 and M6 respectively;
-silence removal, transcript editing, and TTS do not wait on them.)
+undoable. (Captions shipped as text clips ahead of M7; background removal lands
+with M6; silence removal, transcript editing, and TTS do not wait on them.)

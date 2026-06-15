@@ -141,6 +141,32 @@ and export agree on every one, and each edit is a single undo.
   registry (tiny/base/small `.en`, official Hugging Face builds verified by
   SHA-256) feeds the cache. (Engine/worker wiring lands next.)
 
+### Auto captions (M9 Phase 4)
+
+- **Captions are just text clips.** Auto-captioning a clip decodes its speech,
+  transcribes it through the injected `Transcribe` backend, and adds the words
+  as subtitle-styled text clips on a fresh **"Captions"** lane — ordinary
+  `Generator::Text` clips, so they restyle, move, retime, and delete like any
+  title afterward (matching how CapCut treats captions). The whole pass is a
+  single undoable history entry: one undo removes the lane and every cue.
+- **Readable cue lines, not raw words.** A pure cue planner (`cutlass-ml`)
+  packs word-timed speech into lines that respect a character budget, a max
+  duration, inter-word pauses, and sentence boundaries, falling back to one cue
+  per segment when word timing is absent — so cues read like subtitles instead
+  of a word-per-clip stutter.
+- **In the inspector.** A **"Speech to text"** tab in the audio clip inspector
+  carries a **"Generate captions"** button; the UI worker lazily builds the
+  whisper backend on first use (downloading the configured model if needed)
+  behind the opt-in `whisper` feature, runs off the UI thread, and publishes
+  the result. Rejected on generated, retimed, and audio-less clips.
+- **From a prompt.** A `caption_clip` agent tool lowers to a new `CaptionClip`
+  command that `Engine::apply` routes to the same caption path, so "add
+  captions to the interview" just works. Tool schema → v20.
+- **Deferred.** Captions run synchronously on the worker for now (no progress
+  bar / off-thread cancellation surfaced in the UI yet), and a soft
+  caption-group identity for batch restyle/export is left for M7's caption
+  track work — captions land as independent text clips until then.
+
 ## [alpha-0.4.0] — 2026-06-15
 
 The **Windows & performance alpha**: Windows joins macOS and Linux with
