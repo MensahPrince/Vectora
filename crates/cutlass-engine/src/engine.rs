@@ -382,6 +382,32 @@ impl Engine {
         Ok(transcript)
     }
 
+    /// Ripple-delete a set of absolute timeline tick `ranges` from `track` as
+    /// one undoable entry (M9 Phase 3, transcript editing): the words the user
+    /// struck out lower to the timeline spans they occupy, and removing them
+    /// closes the gap so the surviving speech plays back-to-back. Resolves the
+    /// affected clips by position (via [`ripple_cut`](crate::action::edit::ripple_cut)),
+    /// so repeated deletes work after the region has split into several clips.
+    /// An empty `ranges` is a no-op that still records a (trivially oscillating)
+    /// undo entry.
+    pub fn ripple_delete_ranges(
+        &mut self,
+        track: TrackId,
+        ranges: &[(i64, i64)],
+    ) -> Result<ApplyOutcome, EngineError> {
+        let fps = self.project.timeline().frame_rate;
+        let mut ctx = ApplyContext {
+            project: &mut self.project,
+            cache: &self.cache,
+            project_path: &mut self.project_path,
+            history: &mut self.history,
+        };
+        let inverse = crate::action::edit::ripple_cut::cut_ranges(&mut ctx, track, fps, ranges)?;
+        self.history.record_do(inverse);
+        self.revision += 1;
+        Ok(ApplyOutcome::Edited(EditOutcome::ShiftedTrack(track)))
+    }
+
     /// Auto-caption a media clip (M9 Phase 4): decode its speech, transcribe it
     /// with the injected backend, and add the words as subtitle-styled text
     /// clips on a fresh "Captions" lane — one undoable history entry. Captions

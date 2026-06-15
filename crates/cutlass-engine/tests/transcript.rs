@@ -102,6 +102,48 @@ fn transcribe_clip_returns_word_timed_text() {
 }
 
 #[test]
+fn ripple_delete_ranges_cuts_through_history_and_undoes() {
+    // The durable transcript edit, on a generated clip so it needs no audio:
+    // deleting words lowers to ripple_delete_ranges on the clip's track.
+    use cutlass_models::Generator;
+    let (_dir, mut engine) = temp_engine();
+    let track = common::add_track(&mut engine, TrackKind::Adjustment, "FX");
+    let clip = common::add_generated(&mut engine, track, Generator::Adjustment, common::tr(0, 48));
+    // A downstream neighbour to observe the ripple close-up.
+    let d = common::add_generated(&mut engine, track, Generator::Adjustment, common::tr(48, 24));
+    let before = engine.project().timeline().clip_count();
+
+    engine.ripple_delete_ranges(track, &[(12, 24)]).expect("cut");
+
+    // C shrank to [0,12), its tail split off, and D rippled left by 12.
+    assert_eq!(
+        engine.project().clip(clip).unwrap().timeline,
+        common::tr(0, 12)
+    );
+    assert_eq!(engine.project().clip(d).unwrap().start().value, 36);
+    assert!(engine.can_undo());
+
+    // One undo restores the original layout (clip ids included).
+    assert!(engine.undo());
+    assert_eq!(
+        engine.project().clip(clip).unwrap().timeline,
+        common::tr(0, 48)
+    );
+    assert_eq!(
+        engine.project().clip(d).unwrap().timeline,
+        common::tr(48, 24)
+    );
+    assert_eq!(engine.project().timeline().clip_count(), before);
+
+    // And redo re-applies the cut.
+    assert!(engine.redo());
+    assert_eq!(
+        engine.project().clip(clip).unwrap().timeline,
+        common::tr(0, 12)
+    );
+}
+
+#[test]
 fn transcribe_without_a_backend_errors() {
     let (_dir, engine) = temp_engine();
     let cancel = AtomicBool::new(false);
