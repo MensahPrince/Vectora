@@ -192,7 +192,7 @@ fn compensate_output_latency(output: &mut [f32], l_out: usize) {
 /// Decode `src_frames` of interleaved stereo from `path` starting at output
 /// frame `src_start_frame` (at `out_rate`), zero-padding a short tail or a
 /// lead gap, and reversing the frame order when `reversed`.
-fn read_source_window(
+pub(crate) fn read_source_window(
     path: &Path,
     out_rate: u32,
     src_start_frame: i64,

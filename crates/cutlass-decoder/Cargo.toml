@@ -8,6 +8,8 @@ description = "Cutlass video demux + decode"
 [dependencies]
 ffmpeg-next.workspace = true
 signalsmith-stretch.workspace = true
+nnnoiseless.workspace = true
+rustfft.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

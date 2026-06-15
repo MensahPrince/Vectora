@@ -11,7 +11,7 @@
 //! through small forward gaps instead of paying a container seek + decoder
 //! flush — the same philosophy as the video path's `frame_at`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ffmpeg_next::error::EAGAIN;
 use ffmpeg_next::format::{self, context::Input};
@@ -23,6 +23,7 @@ use ffmpeg_next::util::frame::audio::Audio;
 use ffmpeg_next::{Error as FfmpegError, Rational, codec, packet::Packet};
 use tracing::debug;
 
+use crate::audio::mp3_index::Mp3SeekIndex;
 use crate::error::DecodeError;
 use crate::video::ensure_ffmpeg_init;
 
@@ -51,6 +52,17 @@ pub struct AudioReader {
     /// or `None` before the first decode establishes the PTS anchor.
     position: Option<i64>,
     resampler_flushed: bool,
+    /// Source path, kept so the MP3 seek index can be built lazily on the
+    /// first hard seek (it re-opens the file for a decode-free demux pass).
+    path: PathBuf,
+    /// True when the best audio stream is MP3 — the only codec that needs the
+    /// byte-exact seek index (everything else has an exact container table).
+    is_mp3: bool,
+    /// Frame-exact MP3 seek index, built lazily. `tried` distinguishes "not
+    /// built yet" from "build failed, fall back to PTS seeks" so a failed
+    /// build is not retried on every seek.
+    mp3_index: Option<Mp3SeekIndex>,
+    mp3_index_tried: bool,
 }
 
 impl AudioReader {
@@ -73,6 +85,7 @@ impl AudioReader {
             .ok_or_else(|| DecodeError::unsupported("no audio stream found"))?;
         let stream_index = stream.index();
         let time_base = stream.time_base();
+        let is_mp3 = stream.parameters().id() == codec::Id::MP3;
 
         let mut decoder = codec::Context::from_parameters(stream.parameters())
             .map_err(DecodeError::Open)?
@@ -116,6 +129,10 @@ impl AudioReader {
             pending_cursor: 0,
             position: None,
             resampler_flushed: false,
+            path: path.to_path_buf(),
+            is_mp3,
+            mp3_index: None,
+            mp3_index_tried: false,
         })
     }
 
@@ -144,6 +161,14 @@ impl AudioReader {
                 return self.discard_until(target);
             }
             _ => {}
+        }
+
+        // MP3 has no container sample table, so the high-level timestamp seek
+        // below lands tens of ms off (bitrate-estimated byte offset + an
+        // estimated PTS anchor). When a frame-exact index is available, seek by
+        // byte to a real frame boundary and anchor from the index instead.
+        if self.is_mp3 && self.index_seek(target)? {
+            return Ok(());
         }
 
         // µs = frames / out_rate, floored — the container snaps backward.
@@ -179,6 +204,83 @@ impl AudioReader {
         self.position = None;
 
         self.discard_until(target)
+    }
+
+    /// Frame-exact MP3 seek via the byte index. Returns `Ok(true)` when it
+    /// positioned the reader, `Ok(false)` to fall back to the PTS seek (no
+    /// index could be built, the conversion is degenerate, or the byte seek was
+    /// rejected by the demuxer).
+    ///
+    /// Unlike the PTS path, the position anchor comes from the *index* (a known
+    /// frame boundary), never the decoder's re-estimated post-seek PTS — that
+    /// is what makes the landing exact. A short pre-roll before the target
+    /// covers the MP3 bit-reservoir carry-in and swresample priming, the same
+    /// discard-and-warm-up the PTS path relies on.
+    fn index_seek(&mut self, target: i64) -> Result<bool, DecodeError> {
+        if !self.mp3_index_tried {
+            self.mp3_index_tried = true;
+            match Mp3SeekIndex::build(&self.path) {
+                Ok(index) => self.mp3_index = Some(index),
+                Err(e) => debug!(error = %e, "mp3 seek index unavailable; using pts seek"),
+            }
+        }
+        let Some(index) = self.mp3_index.as_ref() else {
+            return Ok(false);
+        };
+
+        let tb_num = i128::from(self.time_base.numerator());
+        let tb_den = i128::from(self.time_base.denominator());
+        let out_rate = i128::from(self.out_rate);
+        if tb_num <= 0 || tb_den <= 0 {
+            return Ok(false);
+        }
+
+        // out frame → stream PTS (seconds = target / out_rate; pts = sec / tb).
+        let target_pts = (i128::from(target) * tb_den / (out_rate * tb_num)) as i64;
+        // ≈ 0.25s of pre-roll, expressed in stream `time_base` ticks.
+        let preroll_pts = (tb_den / (4 * tb_num)).max(1) as i64;
+        let entry = index.entry_at_or_before((target_pts - preroll_pts).max(0));
+
+        // Byte seek to the recorded frame boundary. `AVSEEK_FLAG_BYTE` makes
+        // the timestamp a file offset; the demuxer resyncs at exactly that
+        // frame because the offset came from its own packet position.
+        let rc = unsafe {
+            ffmpeg_next::ffi::av_seek_frame(
+                self.input.as_mut_ptr(),
+                self.stream_index as i32,
+                entry.byte,
+                ffmpeg_next::ffi::AVSEEK_FLAG_BYTE,
+            )
+        };
+        if rc < 0 {
+            debug!(byte = entry.byte, "mp3 byte seek rejected; using pts seek");
+            return Ok(false);
+        }
+
+        self.decoder.flush();
+        // swresample keeps cross-call state; recreate so a stale tail never
+        // bleeds into the post-seek stream (mirrors the PTS path).
+        self.resampler = resampling::Context::get(
+            self.decoder.format(),
+            self.in_layout,
+            self.decoder.rate(),
+            Sample::F32(SampleType::Packed),
+            ChannelLayout::STEREO,
+            self.out_rate,
+        )
+        .map_err(DecodeError::Decode)?;
+        self.demuxer_done = false;
+        self.resampler_flushed = false;
+        self.pending.clear();
+        self.pending_cursor = 0;
+
+        // Anchor from the index frame's PTS (back to out frames), so decode
+        // re-anchoring is skipped and the discard walk lands exactly on target.
+        let anchor = (i128::from(entry.pts) * out_rate * tb_num / tb_den).max(0) as i64;
+        self.position = Some(anchor);
+
+        self.discard_until(target)?;
+        Ok(true)
     }
 
     /// Fill `out` (interleaved stereo, `out.len() / 2` frames) from the
@@ -425,6 +527,48 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0f32, f32::max);
         assert!(max_err < 0.05, "seeked audio diverged: max err {max_err}");
+    }
+
+    #[test]
+    fn mp3_index_seek_matches_sequential_read_content() {
+        // The MP3 fix (M8 Phase 8): the byte-exact seek index lands a mid-file
+        // seek on the same content a sequential read reaches, where the old
+        // bitrate-estimated PTS seek drifted tens of ms (a near full-scale
+        // error against the reference block). Decode warm-up + resampler phase
+        // after a seek aren't bit-exact for a lossy codec, so demand aligned,
+        // not identical.
+        let Some(path) = audio_asset() else {
+            return;
+        };
+        // Read 2s sequentially, remember a block near the end.
+        let mut seq = AudioReader::open(&path, RATE).expect("open");
+        let total = RATE as usize * 2;
+        let mut all = vec![0f32; total * CHANNELS];
+        let mut filled = 0;
+        while filled < total {
+            let n = seq.read(&mut all[filled * CHANNELS..]).expect("read");
+            if n == 0 {
+                return; // asset shorter than 2s: nothing to compare
+            }
+            filled += n;
+        }
+        let block_at = (total - 256) as i64;
+
+        // Seek straight to it with a fresh reader (drives the index path).
+        let mut seeked = AudioReader::open(&path, RATE).expect("open");
+        seeked.seek_to_frame(block_at).expect("seek");
+        assert_eq!(seeked.position(), Some(block_at), "index seek lands exactly");
+        let mut block = vec![0f32; 256 * CHANNELS];
+        let n = seeked.read(&mut block).expect("read");
+        assert_eq!(n, 256);
+
+        let expected = &all[(block_at as usize) * CHANNELS..];
+        let max_err = block
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(max_err < 0.1, "mp3 index seek diverged: max err {max_err}");
     }
 
     #[test]

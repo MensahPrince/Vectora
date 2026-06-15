@@ -5,10 +5,15 @@
 //! enough for a static waveform image. Playback decode (clocked, seekable)
 //! lives in [`playback`].
 
+pub mod beats;
+mod denoise;
 pub mod ducking;
+mod mp3_index;
 mod playback;
 mod stretch;
 
+pub use beats::{detect_beats, onset_envelope};
+pub use denoise::{denoise_interleaved, render_denoised};
 pub use ducking::{CONTROL_HZ, DuckSettings, duck_gain, reduce_curve, speech_band_energy};
 pub use playback::{AudioReader, CHANNELS as AUDIO_CHANNELS};
 pub use stretch::{render_stretched, render_stretched_curve};
