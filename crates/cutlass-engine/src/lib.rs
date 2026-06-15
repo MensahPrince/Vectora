@@ -2,6 +2,7 @@
 
 mod action;
 mod caption;
+mod clip_audio;
 mod composite;
 mod decoder_pool;
 mod engine;

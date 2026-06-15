@@ -3,8 +3,9 @@
 //! "Cut the silences out of this": decode a clip's audio, find the pauses
 //! ([`cutlass_decoder::detect_silences`]), and ripple-delete each silent span
 //! so the remaining speech closes up. Like the ducking and beat passes the DSP
-//! is pure and lives in the decoder; this module owns the decode, the
-//! seconds → timeline-tick mapping, and the structural edit.
+//! is pure and lives in the decoder, and the decode is shared
+//! ([`crate::clip_audio`]); this module owns the seconds → timeline-tick mapping
+//! and the structural edit.
 //!
 //! The forward cut reuses the [`split_clip`] and [`ripple_delete`] primitives
 //! (so source-window trimming and the gap-close stay correct), but the inverse
@@ -20,17 +21,13 @@
 //! ripples the target clip's own track — linked A/V companions and a
 //! whole-timeline magnet ripple ride a follow-up.
 
-use cutlass_decoder::{AUDIO_CHANNELS, AudioReader, SilenceSettings, detect_silences};
+use cutlass_decoder::{SilenceSettings, detect_silences};
 use cutlass_models::{Clip, ClipId, ModelError, Project, Rational, RationalTime, TrackId};
 
 use crate::action::edit::{ripple_delete, split_clip};
 use crate::action::{ApplyContext, EditAction};
+use crate::clip_audio::{self, ANALYSIS_RATE};
 use crate::error::EngineError;
-
-/// Decode rate for silence analysis. Silence detection only needs broadband
-/// level over time, so 16 kHz mono (matching the ducking sidechain) is ample
-/// and decodes far less than the export rate.
-const ANALYSIS_RATE: u32 = 16_000;
 
 /// Detect a clip's silent spans and ripple-delete them. Returns the clip's
 /// track (for the edit outcome) and a snapshot inverse restoring the track's
@@ -203,7 +200,7 @@ impl EditAction for SetTrackClipsAction {
     }
 }
 
-/// Decode the clip's source window at [`ANALYSIS_RATE`] and run silence
+/// Decode the clip's source window at the analysis rate and run silence
 /// detection, returning silent spans in seconds from the window start. Rejects
 /// generated clips and media without audio.
 fn detect_clip_silences(
@@ -211,62 +208,8 @@ fn detect_clip_silences(
     clip_id: ClipId,
     settings: SilenceSettings,
 ) -> Result<Vec<(f64, f64)>, EngineError> {
-    let clip = project
-        .clip(clip_id)
-        .ok_or(ModelError::UnknownClip(clip_id))?;
-    let media_id = clip
-        .media()
-        .ok_or_else(|| ModelError::InvalidParam("AutoCut requires a media clip".into()))?;
-    let media = project
-        .media(media_id)
-        .ok_or(ModelError::UnknownMedia(media_id))?;
-    if !media.has_audio {
-        return Err(ModelError::InvalidParam("clip media has no audio to analyze".into()).into());
-    }
-    let source = clip
-        .source_range()
-        .ok_or_else(|| ModelError::InvalidParam("AutoCut requires a media clip".into()))?;
-    let src_start = ticks_to_samples(source.start.value, source.start.rate);
-    let src_frames = ticks_to_samples(source.duration.value, source.start.rate);
-    if src_frames <= 0 {
-        return Ok(Vec::new());
-    }
-    let mono = read_mono(media.path(), src_start, src_frames)?;
+    let mono = clip_audio::decode_clip_mono(project, clip_id)?;
     Ok(detect_silences(&mono, ANALYSIS_RATE, &settings))
-}
-
-/// Read `frames` output frames from `src_start` of `path` at the analysis
-/// rate, downmixed to mono. Streams in blocks so memory stays bounded.
-fn read_mono(path: &std::path::Path, src_start: i64, frames: i64) -> Result<Vec<f32>, EngineError> {
-    const BLOCK: usize = 16_384;
-    let mut reader = AudioReader::open(path, ANALYSIS_RATE)?;
-    reader.seek_to_frame(src_start)?;
-    let mut mono = Vec::with_capacity(frames as usize);
-    let mut buf = vec![0.0f32; BLOCK * AUDIO_CHANNELS];
-    let mut remaining = frames as usize;
-    while remaining > 0 {
-        let want = remaining.min(BLOCK);
-        let got = reader.read(&mut buf[..want * AUDIO_CHANNELS])?;
-        if got == 0 {
-            break;
-        }
-        for f in 0..got {
-            mono.push((buf[f * AUDIO_CHANNELS] + buf[f * AUDIO_CHANNELS + 1]) * 0.5);
-        }
-        remaining -= got;
-    }
-    Ok(mono)
-}
-
-/// `value` ticks at `fps` → output frames at [`ANALYSIS_RATE`] (exact i128,
-/// floored).
-fn ticks_to_samples(value: i64, fps: Rational) -> i64 {
-    if fps.num <= 0 || fps.den <= 0 {
-        return 0;
-    }
-    let frames =
-        i128::from(value) * i128::from(fps.den) * i128::from(ANALYSIS_RATE) / i128::from(fps.num);
-    frames.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
 }
 
 #[cfg(test)]
