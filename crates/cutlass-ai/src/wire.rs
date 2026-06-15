@@ -35,7 +35,8 @@ use serde::{Deserialize, Serialize};
 /// 14: M8 sidechain ducking (`duck`).
 /// 15: shape generators gain optional width/height.
 /// 16: optional `anchor_x`/`anchor_y` on `set_clip_transform`.
-pub const TOOL_SCHEMA_VERSION: u32 = 16;
+/// 17: M8 beat detection (`detect_beats`).
+pub const TOOL_SCHEMA_VERSION: u32 = 18;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -423,6 +424,20 @@ pub struct SetClipAudio {
     pub fade_out: Option<f64>,
 }
 
+/// Turn noise reduction on or off for a media clip (CapCut "Reduce noise").
+/// Runs the clip's audio through a speech-preserving denoiser that suppresses
+/// steady background noise — fan hum, hiss, air-conditioning, room tone — while
+/// keeping voice. Best on clips with a constant background drone. Audio lives
+/// on audio-lane clips; for a video clip, target its linked audio companion.
+/// Not valid for generated clips.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetDenoise {
+    /// The media clip to clean.
+    pub clip: u64,
+    /// True turns noise reduction on, false off.
+    pub denoise: bool,
+}
+
 /// Duck the music clips under the voice clips (CapCut sidechain ducking). The
 /// editor measures how loud the voice clips are in the speech band and writes
 /// volume keyframes that dip the music while the voice talks, recovering in
@@ -449,6 +464,17 @@ pub struct Duck {
     /// 0.32.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub release: Option<f64>,
+}
+
+/// Detect beat positions on a media clip's audio (CapCut "Beat" markers). The
+/// editor runs onset/tempo analysis and drops a beat grid the timeline magnet
+/// snaps clip edges to — the substrate for beat-synced cutting. Target a
+/// media-backed clip with sound (for a video clip, its linked audio companion
+/// also works).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DetectBeats {
+    /// Id of the media clip to analyze.
+    pub clip: u64,
 }
 
 /// Split a clip at a timeline position into two abutting clips.
@@ -686,7 +712,9 @@ pub enum WireCommand {
     SetSpeedCurve(SetSpeedCurve),
     SetClipPitch(SetClipPitch),
     SetClipAudio(SetClipAudio),
+    SetDenoise(SetDenoise),
     Duck(Duck),
+    DetectBeats(DetectBeats),
     SplitClip(SplitClip),
     TrimClip(TrimClip),
     MoveClip(MoveClip),
@@ -755,10 +783,12 @@ impl WireCommand {
             WireCommand::SetSpeedCurve(a) => clip(&mut a.clip),
             WireCommand::SetClipPitch(a) => clip(&mut a.clip),
             WireCommand::SetClipAudio(a) => clip(&mut a.clip),
+            WireCommand::SetDenoise(a) => clip(&mut a.clip),
             WireCommand::Duck(a) => {
                 a.voice.iter_mut().for_each(&clip);
                 a.music.iter_mut().for_each(clip);
             }
+            WireCommand::DetectBeats(a) => clip(&mut a.clip),
             WireCommand::SplitClip(a) => clip(&mut a.clip),
             WireCommand::TrimClip(a) => clip(&mut a.clip),
             WireCommand::MoveClip(a) => {
@@ -919,8 +949,12 @@ tools! {
         "Lock or unlock a retimed media clip's pitch. preserve_pitch true (default) keeps the original pitch while time-stretching; false lets pitch follow speed (the chipmunk effect when sped up). Only affects a clip that is retimed (speed change, reverse, or ramp). Not valid for generated clips.";
     "set_clip_audio" => SetClipAudio(SetClipAudio),
         "Set an audio-lane clip's volume (0.0 mutes, 1.0 unchanged, 2.0 doubles) and/or fade-in/fade-out durations in seconds. Omitted fields keep their current value. For a video clip, target its linked audio companion clip.";
+    "set_denoise" => SetDenoise(SetDenoise),
+        "Turn noise reduction on or off for a media clip: runs its audio through a speech-preserving denoiser that suppresses steady background noise (hum, hiss, air-conditioning, room tone) while keeping voice. Use on clips with a constant background drone. For a video clip, target its linked audio companion. Not valid for generated clips.";
     "duck" => Duck(Duck),
         "Duck music clips under voice/narration clips (sidechain): measures speech-band loudness on the voice clips and writes volume keyframes that dip the music while the voice talks, recovering in the gaps. amount 0..1 sets how far it dips (default ~0.66). Pass audio-lane clip ids for both lists. The result is ordinary, editable volume automation.";
+    "detect_beats" => DetectBeats(DetectBeats),
+        "Detect beat positions on a media clip's audio (onset/tempo analysis) and store them as beat markers the timeline magnet snaps clip edges to — use this to set up beat-synced cuts. Target a media-backed clip with sound (for a video clip, its linked audio companion). Not valid for generated clips.";
     "split_clip" => SplitClip(SplitClip),
         "Split a clip at a timeline position (seconds) into two abutting clips.";
     "trim_clip" => TrimClip(TrimClip),
@@ -1106,7 +1140,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 36);
+        assert_eq!(specs.len(), 38);
         for spec in &specs {
             assert!(
                 !spec.description.is_empty(),

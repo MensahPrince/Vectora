@@ -1016,6 +1016,32 @@
       }
     },
     {
+      "description": "Turn noise reduction on or off for a media clip: runs its audio through a speech-preserving denoiser that suppresses steady background noise (hum, hiss, air-conditioning, room tone) while keeping voice. Use on clips with a constant background drone. For a video clip, target its linked audio companion. Not valid for generated clips.",
+      "name": "set_denoise",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Turn noise reduction on or off for a media clip (CapCut \"Reduce noise\").\nRuns the clip's audio through a speech-preserving denoiser that suppresses\nsteady background noise — fan hum, hiss, air-conditioning, room tone — while\nkeeping voice. Best on clips with a constant background drone. Audio lives\non audio-lane clips; for a video clip, target its linked audio companion.\nNot valid for generated clips.",
+        "properties": {
+          "clip": {
+            "description": "The media clip to clean.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "denoise": {
+            "description": "True turns noise reduction on, false off.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "clip",
+          "denoise"
+        ],
+        "title": "SetDenoise",
+        "type": "object"
+      }
+    },
+    {
       "description": "Duck music clips under voice/narration clips (sidechain): measures speech-band loudness on the voice clips and writes volume keyframes that dip the music while the voice talks, recovering in the gaps. amount 0..1 sets how far it dips (default ~0.66). Pass audio-lane clip ids for both lists. The result is ordinary, editable volume automation.",
       "name": "duck",
       "parameters": {
@@ -1070,6 +1096,27 @@
           "music"
         ],
         "title": "Duck",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Detect beat positions on a media clip's audio (onset/tempo analysis) and store them as beat markers the timeline magnet snaps clip edges to — use this to set up beat-synced cuts. Target a media-backed clip with sound (for a video clip, its linked audio companion). Not valid for generated clips.",
+      "name": "detect_beats",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Detect beat positions on a media clip's audio (CapCut \"Beat\" markers). The\neditor runs onset/tempo analysis and drops a beat grid the timeline magnet\nsnaps clip edges to — the substrate for beat-synced cutting. Target a\nmedia-backed clip with sound (for a video clip, its linked audio companion\nalso works).",
+        "properties": {
+          "clip": {
+            "description": "Id of the media clip to analyze.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clip"
+        ],
+        "title": "DetectBeats",
         "type": "object"
       }
     },
@@ -1582,5 +1629,5 @@
       }
     }
   ],
-  "version": 16
+  "version": 18
 }

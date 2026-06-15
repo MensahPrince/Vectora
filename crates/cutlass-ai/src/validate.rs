@@ -354,6 +354,50 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 preserve_pitch: args.preserve_pitch,
             }
         }
+        WireCommand::SetDenoise(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            if clip.is_generated() {
+                return Err(Rejection::new(format!(
+                    "clip {} is a generated clip; set_denoise only works on media \
+                     clips (footage with a source file)",
+                    args.clip
+                )));
+            }
+            // Denoise acts on sound, which rides audio-lane clips: a video-lane
+            // target would be a silent no-op, so steer to the clip that sounds
+            // (same rule as set_clip_audio).
+            let timeline = project.timeline();
+            let on_audio_lane = timeline
+                .track_of(clip.id)
+                .and_then(|id| timeline.track(id))
+                .is_some_and(|t| t.kind == TrackKind::Audio);
+            if !on_audio_lane {
+                let companion = clip.link.and_then(|link| {
+                    timeline
+                        .tracks_ordered()
+                        .filter(|t| t.kind == TrackKind::Audio)
+                        .flat_map(|t| t.clips())
+                        .find(|c| c.link == Some(link))
+                        .map(|c| c.id.raw())
+                });
+                return Err(Rejection::new(match companion {
+                    Some(id) => format!(
+                        "clip {} is not on an audio lane; its audio plays through \
+                         linked clip {id} — call set_denoise on clip {id} instead",
+                        args.clip
+                    ),
+                    None => format!(
+                        "clip {} is not on an audio lane and has no linked audio \
+                         companion; there is nothing audible to clean",
+                        args.clip
+                    ),
+                }));
+            }
+            EditCommand::SetClipDenoise {
+                clip: clip.id,
+                denoise: args.denoise,
+            }
+        }
         WireCommand::SetClipAudio(args) => {
             let clip = clip_ref(project, args.clip)?;
             if clip.is_generated() {
@@ -599,6 +643,17 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 attack: attack as f32,
                 release: release as f32,
             }
+        }
+        WireCommand::DetectBeats(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            if clip.is_generated() {
+                return Err(Rejection::new(format!(
+                    "clip {} is a generated clip; detect_beats only works on media \
+                     clips (footage with a source file)",
+                    args.clip
+                )));
+            }
+            EditCommand::DetectBeats { clip: clip.id }
         }
         WireCommand::AddMarker(args) => {
             require_non_negative(args.at, "at")?;
@@ -1751,6 +1806,87 @@ mod tests {
             }),
         );
         assert!(msg.contains("between 0"), "{msg}");
+    }
+
+    #[test]
+    fn detect_beats_lowers_and_rejects_generated() {
+        let (project, _, _, _, clip, title) = fixture();
+
+        let edit = lower(
+            &project,
+            WireCommand::DetectBeats(wire::DetectBeats { clip }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::DetectBeats {
+                clip: ClipId::from_raw(clip),
+            }
+        );
+
+        // A generated clip has no footage to analyze.
+        let msg = reject(
+            &project,
+            WireCommand::DetectBeats(wire::DetectBeats { clip: title }),
+        );
+        assert!(msg.contains("generated clip"), "{msg}");
+    }
+
+    #[test]
+    fn set_denoise_lowers_steers_and_rejects_generated() {
+        let (mut project, media, _, _, video_clip, title) = fixture();
+        // An audio lane carrying the linked companion of the video clip.
+        let lane = project.add_track(TrackKind::Audio, "A1");
+        let audio_clip = project
+            .add_clip(
+                lane,
+                cutlass_models::MediaId::from_raw(media),
+                TimeRange::at_rate(0, 240, R24),
+                RationalTime::new(0, R24),
+            )
+            .unwrap();
+        let link = cutlass_models::LinkId::next();
+        for id in [ClipId::from_raw(video_clip), audio_clip] {
+            project.timeline_mut().clip_mut(id).unwrap().link = Some(link);
+        }
+
+        // An audio-lane target lowers straight through.
+        let edit = lower(
+            &project,
+            WireCommand::SetDenoise(wire::SetDenoise {
+                clip: audio_clip.raw(),
+                denoise: true,
+            }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::SetClipDenoise {
+                clip: audio_clip,
+                denoise: true,
+            }
+        );
+
+        // A video-lane target is steered to its linked audio companion.
+        let msg = reject(
+            &project,
+            WireCommand::SetDenoise(wire::SetDenoise {
+                clip: video_clip,
+                denoise: true,
+            }),
+        );
+        assert!(
+            msg.contains(&format!("linked clip {}", audio_clip.raw())),
+            "{msg}"
+        );
+
+        // A generated clip has no footage to clean.
+        let msg = reject(
+            &project,
+            WireCommand::SetDenoise(wire::SetDenoise {
+                clip: title,
+                denoise: true,
+            }),
+        );
+        assert!(msg.contains("generated clip"), "{msg}");
     }
 
     #[test]
