@@ -23,7 +23,9 @@
 //!   lean; heavy native backends sit behind opt-in features.
 
 pub mod backends;
+pub mod models;
 pub mod transcribe;
 
 pub use backends::StubTranscriber;
+pub use models::{ModelCache, ModelCacheError, ModelSpec, models_dir, verify_file};
 pub use transcribe::{Segment, Transcribe, TranscribeError, TranscribeOptions, Transcript, Word};

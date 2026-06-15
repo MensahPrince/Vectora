@@ -9,7 +9,10 @@ repository.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+sha2 = "0.10"
 thiserror = { workspace = true }
+ureq = "2"
 
 [dev-dependencies]
 serde_json = { workspace = true }
+tempfile = "3"
