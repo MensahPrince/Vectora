@@ -2,6 +2,119 @@
 
 ## [Unreleased]
 
+## [alpha-0.4.0] — 2026-06-15
+
+The **Windows & performance alpha**: Windows joins macOS and Linux with
+real double-click installers (both x64 and arm64), preview gets
+dramatically faster on high-resolution footage, and the library learns
+to delete media — referenced sources cascade their clips away in a
+single undo.
+
+### Windows support
+
+- **Real installers, not just portable archives.** A new Inno Setup
+  build packages `cutlass-ui.exe` + the bundled FFmpeg DLLs + licenses
+  into a single `Setup.exe` (Program Files install, Start-menu shortcut,
+  uninstaller, optional desktop icon); the portable `.zip` still ships
+  alongside it. Both Windows and macOS now build **native artifacts for
+  each architecture** in CI — Windows x86_64 + arm64, macOS Apple Silicon
+  + Intel.
+- **Native Windows window frame.** The macOS custom-title-bar approach is
+  generalized to Windows: keep the OS-drawn frame (native resize, Aero
+  snap, drop shadow, rounded corners) and only suppress the caption so
+  the custom Slint title bar shows through (`WM_NCCALCSIZE` reclaims the
+  caption strip, `WM_NCHITTEST` re-adds the top resize band). Linux/BSD,
+  which have no "frame minus titlebar" mode, stay fully frameless.
+- **Export fixed on stock Windows FFmpeg.** LGPL FFmpeg builds ship no
+  libx264, so the old fallback could pick a hardware-surface-only encoder
+  (e.g. `h264_d3d12va`) that rejects the pipeline's software frames and
+  surfaced as "failed to open media". Encoder selection is now
+  format-aware: prefer software libx264/libopenh264, otherwise fall back
+  to a CPU-frame-capable hardware encoder (Media Foundation, then
+  NVENC/AMF/QSV) and feed it NV12 — a surface-only encoder is never handed
+  to the software pipeline.
+
+### Faster preview
+
+- **Preview runs at a 720p cap, end-to-end.** A decode miss now
+  downscales the native frame to the preview height *before* it enters
+  the cache, so the frame cache, GPU upload, composite, canvas, and UI
+  readback all shrink with it (~9× fewer bytes versus 4K). Decode still
+  runs at native resolution and **export is untouched** (full source, no
+  cache); `import_media` registers each source's cache spec at the scaled
+  dims, so flipping the cap auto-drops the stale on-disk index.
+- **Playback stutter fixed.** Frames are now cached under the requested
+  `target_ticks`, not the decoded frame's PTS — which rarely matched on
+  off-grid rates (e.g. 60.03 fps), so every revisit missed and the
+  read-ahead prefetch turned each miss into a backward seek (~3 fps and an
+  `mmco: unref short failure` flood). Same key on both sides means
+  prefetch warms exactly what the render reads: the render+prefetch path
+  drops from **~325 ms to ~2.7 ms per frame (3 → 365 fps)**, guarded by a
+  new `playback_prefetch` bench.
+- **No more per-frame GPU texture churn.** The preview hot path allocated
+  three ~12 MB upload textures per 4K frame and issued two queue submits.
+  Upload textures now live in a pool (bucketed by format/size, reused
+  across frames) and the canvas→buffer copy folds into the render encoder
+  for a single submit. Warm 4K `get_frame` on an M5 Pro: 4K24 17.4 → 8.3 ms
+  mean, 4K60 p95 28.1 → 9.8 ms — well under the 20 ms / 50 fps budget.
+- New `scale_yuv420p` swscale helper in `cutlass-decoder` (AREA
+  resampling, PTS preserved) backs the downscale; identity and invalid
+  target sizes short-circuit.
+
+### Library: media management
+
+- **Remove media from a project.** Right-click a library tile →
+  *Remove from project*. Unused sources delete immediately; a source still
+  used by clips raises a confirm dialog that removes the referencing clips
+  **and** the source as one undoable cascade — emptied lanes are pruned and
+  the source's cached thumbnail is evicted.
+- New undoable `RemoveMedia` command (the inverse of media insert). The
+  model rejects removing a referenced source unless its clips are removed
+  in the same history group, so a stray delete can never orphan a clip.
+- Library tiles show a per-source **clip usage count**, computed in one
+  pass over the timeline — the delete flow reads it to decide whether to
+  drop a source straight away or confirm the cascade first.
+
+### UI
+
+- Library panel restyle: a darker surface palette, line-duotone tab icons
+  (media / audio / text / stickers / effects / transitions), and larger
+  tabs with a scroll view for overflow.
+
+### Downloads
+
+| Platform | Artifact |
+| --- | --- |
+| Windows (x64 / arm64) | `Cutlass-*-windows-*-Setup.exe` — run the installer; or the portable `Cutlass-*-windows-*.zip` |
+| macOS (Apple Silicon / Intel) | `Cutlass-*-macos-arm64.zip` / `Cutlass-*-macos-x86_64.zip` — unzip, drag `Cutlass.app` to Applications. **First launch:** right-click → Open (not notarized). See `INSTALL-macos.txt`. |
+| Linux (x86_64) | `Cutlass-*-linux-x86_64.tar.gz` — extract and run `./cutlass-ui`; requires FFmpeg |
+
+### Using the AI agent
+
+The agent needs an LLM endpoint — none is bundled. Point
+`~/.cutlass/config.toml` at any OpenAI-compatible server, local or cloud:
+
+```toml
+[ai]
+base_url = "http://localhost:11434/v1"   # e.g. Ollama
+model = "qwen2.5:14b"
+# api_key = "sk-..."                     # for cloud endpoints
+```
+
+### Known limitations
+
+- **Retimed clips are silent** — audio on speed ≠ 1× clips mutes until
+  varispeed lands (M8).
+- **Crop is numeric-only** — no draggable crop-handles mode in the
+  preview yet.
+- **Agent quality tracks the model you give it** — small local models
+  may tool-call poorly; dry-run mode previews every plan before it
+  touches the timeline.
+- **Alpha stability** — crashes and UI polish gaps are expected; please
+  file issues.
+- **MP3 seek accuracy** — mid-stream seeks on MP3 can be tens of ms off;
+  MP4/AAC is sample-accurate.
+
 ## [alpha-0.3.0] — 2026-06-14
 
 The **effects alpha**: the GPU effect engine, transitions, adjustment
@@ -381,6 +494,7 @@ cargo run --release -p cutlass-ui
 
 See [README.md](README.md) for prerequisites and the `cutlass-app` CLI smoke test.
 
+[alpha-0.4.0]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.4.0
 [alpha-0.3.0]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.3.0
 [alpha-0.2.0]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.2.0
 [alpha-0.1.0]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.1.0
