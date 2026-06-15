@@ -558,6 +558,7 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
         ),
         WireCommand::DetectBeats(a) => format!("detected beats on clip {}", a.clip),
         WireCommand::RemoveSilences(a) => format!("removed the silences from clip {}", a.clip),
+        WireCommand::CaptionClip(a) => format!("captioned clip {}", a.clip),
         WireCommand::SetClipAudio(a) => {
             let mut parts = Vec::new();
             if let Some(v) = a.volume {

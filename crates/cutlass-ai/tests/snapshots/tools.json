@@ -1166,6 +1166,27 @@
       }
     },
     {
+      "description": "Auto-caption a media clip (auto captions): transcribes its speech and adds the words as subtitle-styled text clips on a fresh 'Captions' lane. Captions are ordinary text clips afterward, so they can be restyled, moved, or deleted like any title. Target a media-backed clip with sound. Not valid for generated or retimed clips. Requires a transcription backend to be configured.",
+      "name": "caption_clip",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Auto-caption a media clip (CapCut \"Auto captions\"). The editor decodes the\nclip's speech, transcribes it, and adds the words as subtitle-styled text\nclips on a fresh \"Captions\" lane — captions are ordinary text clips, so the\nuser can restyle, move, and delete them like any title afterward. Target a\nmedia-backed clip with sound. Not valid for generated clips or retimed clips\n(speed change / reverse / ramp).",
+        "properties": {
+          "clip": {
+            "description": "Id of the media clip to caption.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clip"
+        ],
+        "title": "CaptionClip",
+        "type": "object"
+      }
+    },
+    {
       "description": "Split a clip at a timeline position (seconds) into two abutting clips.",
       "name": "split_clip",
       "parameters": {
@@ -1674,5 +1695,5 @@
       }
     }
   ],
-  "version": 19
+  "version": 20
 }

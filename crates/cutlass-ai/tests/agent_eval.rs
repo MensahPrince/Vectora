@@ -620,6 +620,114 @@ fn remove_silences_on_a_silent_clip_is_rejected() {
     assert!(rejection.contains("no audio"), "{rejection}");
 }
 
+#[test]
+fn add_captions_to_the_clip() {
+    // "add captions to the interview" lowers to caption_clip on the selected
+    // media clip. Run dry so the eval exercises wire → validate → plan without
+    // a transcribe backend or decoding a source file; the engine-side caption
+    // generation is covered by the cutlass-engine captions tests.
+    let (mut host, _, _, clip) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "caption_clip",
+            serde_json::json!({ "clip": clip }),
+        )]),
+        text_turn("Planned auto captions for the clip."),
+    ]);
+
+    let context = EditorContext {
+        selected_clips: vec![clip],
+        ..Default::default()
+    };
+    let config = AgentConfig {
+        dry_run: true,
+        ..Default::default()
+    };
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &context,
+        "add captions to the clip",
+        &config,
+    );
+
+    assert_eq!(outcome.status, PromptStatus::DryRun);
+    assert_eq!(outcome.actions.len(), 1);
+    assert_eq!(
+        outcome.actions[0].command,
+        WireCommand::CaptionClip(cutlass_ai::wire::CaptionClip { clip })
+    );
+    assert_eq!(
+        outcome.actions[0].description,
+        format!("captioned clip {clip}")
+    );
+
+    // Nothing applied: untouched timeline, no history.
+    assert_eq!(host.engine.project().timeline().clip_count(), 1);
+    assert!(!host.engine.undo());
+}
+
+#[test]
+fn caption_clip_on_a_silent_clip_is_rejected() {
+    // A clip whose media has no audio can't be captioned; the rejection names
+    // the clip and the reason so the model can course-correct.
+    let mut project = Project::new("eval-silent", R24);
+    let broll = project.add_media(MediaSource::new(
+        "/tmp/broll.mp4",
+        1920,
+        1080,
+        R24,
+        60 * 24,
+        false,
+    ));
+    let track = project.add_track(TrackKind::Video, "V1");
+    let clip = project
+        .add_clip(
+            track,
+            broll,
+            TimeRange::at_rate(0, 240, R24),
+            RationalTime::new(0, R24),
+        )
+        .unwrap()
+        .raw();
+    let mut host = EngineHost::new(project);
+
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "caption_clip",
+            serde_json::json!({ "clip": clip }),
+        )]),
+        text_turn("That clip has no audio to caption."),
+    ]);
+
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "caption the b-roll",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert!(outcome.actions.is_empty(), "nothing applied");
+    assert!(!host.engine.undo(), "a rejected tool records no history");
+
+    let requests = provider.requests();
+    let rejection = requests
+        .iter()
+        .flat_map(|msgs| msgs.iter())
+        .find_map(|m| match m {
+            Message::ToolResult { content, .. } if content.contains("rejected") => {
+                Some(content.as_str())
+            }
+            _ => None,
+        })
+        .expect("a rejection tool result");
+    assert!(rejection.contains("no audio"), "{rejection}");
+}
+
 /// A model simulator: creates a text track, reads the new track's id out
 /// of the tool result (the way a real model does), then places the title
 /// on it. Static scripts can't thread runtime ids; this can.

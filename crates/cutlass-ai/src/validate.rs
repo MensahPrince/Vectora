@@ -713,6 +713,39 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 padding: padding as f32,
             }
         }
+        WireCommand::CaptionClip(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            let Some(media_id) = clip.media() else {
+                return Err(Rejection::new(format!(
+                    "clip {} is a generated clip; caption_clip only works on media \
+                     clips (footage with a source file)",
+                    args.clip
+                )));
+            };
+            if clip.is_retimed() {
+                return Err(Rejection::new(format!(
+                    "clip {} is retimed; auto captions do not yet support speed-changed, \
+                     reversed, or ramped clips",
+                    args.clip
+                )));
+            }
+            match project.media(media_id) {
+                Some(media) if media.has_audio => {}
+                Some(_) => {
+                    return Err(Rejection::new(format!(
+                        "clip {}'s media has no audio to transcribe for captions",
+                        args.clip
+                    )));
+                }
+                None => {
+                    return Err(Rejection::new(format!(
+                        "clip {} references missing media",
+                        args.clip
+                    )));
+                }
+            }
+            EditCommand::CaptionClip { clip: clip.id }
+        }
         WireCommand::AddMarker(args) => {
             require_non_negative(args.at, "at")?;
             let at = timeline_time(project, args.at, "at")?;
