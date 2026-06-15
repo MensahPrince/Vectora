@@ -75,11 +75,45 @@ pub fn composite_canvas_size(project: &Project) -> (u32, u32) {
 }
 
 /// The full compositor canvas for a project: derived size plus the
-/// project's background color. Preview and export both build their pass
-/// config here so the two can never disagree on what the canvas looks like.
+/// project's background color. Export builds its pass config here; preview
+/// goes through [`preview_canvas_config`], which may scale this down.
 pub fn composite_canvas_config(project: &Project) -> CompositorConfig {
     let (width, height) = composite_canvas_size(project);
     CompositorConfig::new(width, height).with_background(project.timeline().canvas().background)
+}
+
+/// Preview compositor canvas: [`composite_canvas_config`] optionally scaled
+/// down so the longer edge fits `max_dim` (aspect preserved, even dims).
+///
+/// Preview can trade a softer image for a much cheaper frame: the GPU
+/// composites a smaller render target, the RGBA readback shrinks
+/// quadratically, and the UI uploads fewer pixels. Decode and the YUV frame
+/// cache are untouched — they key on source PTS, not canvas size — so a cap
+/// never re-decodes or fragments the cache. Export ignores this and always
+/// composites at full size so the encode keeps the footage's resolution.
+///
+/// `None` (or `0`) means no cap: identical to [`composite_canvas_config`].
+pub fn preview_canvas_config(project: &Project, max_dim: Option<u32>) -> CompositorConfig {
+    let (width, height) = composite_canvas_size(project);
+    let (width, height) = scale_within_max_dim(width, height, max_dim);
+    CompositorConfig::new(width, height).with_background(project.timeline().canvas().background)
+}
+
+/// Scale `width × height` down so its longer edge is at most `max_dim`,
+/// preserving aspect ratio and forcing even dimensions. Sizes already within
+/// the cap (or no cap) pass through unchanged; the result never goes below 2.
+fn scale_within_max_dim(width: u32, height: u32, max_dim: Option<u32>) -> (u32, u32) {
+    let Some(cap) = max_dim.filter(|c| *c > 0) else {
+        return (width, height);
+    };
+    let longest = width.max(height);
+    if longest <= cap {
+        return (width, height);
+    }
+    let scale = f64::from(cap) / f64::from(longest);
+    let w = ((f64::from(width) * scale).round() as u32).max(2);
+    let h = ((f64::from(height) * scale).round() as u32).max(2);
+    (to_even(w), to_even(h))
 }
 
 /// Canvas placement for content of `content_w × content_h` under a clip
@@ -642,6 +676,36 @@ mod tests {
     fn composite_canvas_size_defaults_without_media() {
         let project = Project::new("test", Rational::FPS_24);
         assert_eq!(composite_canvas_size(&project), (1920, 1080));
+    }
+
+    #[test]
+    fn scale_within_max_dim_no_cap_is_identity() {
+        assert_eq!(scale_within_max_dim(3840, 2160, None), (3840, 2160));
+        assert_eq!(scale_within_max_dim(3840, 2160, Some(0)), (3840, 2160));
+    }
+
+    #[test]
+    fn scale_within_max_dim_passes_through_when_within_cap() {
+        assert_eq!(scale_within_max_dim(1920, 1080, Some(1920)), (1920, 1080));
+        assert_eq!(scale_within_max_dim(1280, 720, Some(1920)), (1280, 720));
+    }
+
+    #[test]
+    fn scale_within_max_dim_scales_landscape_4k_to_1080p() {
+        assert_eq!(scale_within_max_dim(3840, 2160, Some(1920)), (1920, 1080));
+    }
+
+    #[test]
+    fn scale_within_max_dim_caps_longer_edge_for_portrait() {
+        // Longer edge (height) drops to the cap; width follows, aspect kept.
+        assert_eq!(scale_within_max_dim(2160, 3840, Some(1920)), (1080, 1920));
+    }
+
+    #[test]
+    fn scale_within_max_dim_forces_even_dimensions() {
+        let (w, h) = scale_within_max_dim(1999, 1001, Some(1000));
+        assert_eq!(h, 502);
+        assert!(w.is_multiple_of(2) && h.is_multiple_of(2), "got {w}x{h}");
     }
 
     fn rgba_layer(layer: &CompositeLayer) -> &std::sync::Arc<Vec<u8>> {

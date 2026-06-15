@@ -8,7 +8,7 @@ use cutlass_models::{ClipId, ClipTransform, Generator, ModelError, Project, Rati
 use tracing::debug;
 
 use crate::ColorConvertPath;
-use crate::composite::{composite_canvas_config, resolve_layers};
+use crate::composite::{composite_canvas_config, preview_canvas_config, resolve_layers};
 use crate::decoder_pool::DecoderPool;
 use crate::error::EngineError;
 use crate::frame::RgbaFrame;
@@ -24,6 +24,7 @@ pub fn get_frame(
     compositor: &mut Compositor,
     time: RationalTime,
     color_convert: ColorConvertPath,
+    preview_max_dim: Option<u32>,
     override_transform: Option<(ClipId, ClipTransform)>,
     override_generator: Option<(ClipId, &Generator)>,
 ) -> Result<RgbaFrame, EngineError> {
@@ -36,7 +37,7 @@ pub fn get_frame(
         .into());
     }
 
-    let config = composite_canvas_config(project);
+    let config = preview_canvas_config(project, preview_max_dim);
 
     // Stage timings (playback roadmap Phase 2): resolve covers decode or
     // cache read; composite covers GPU submit + RGBA readback.
@@ -88,8 +89,9 @@ pub fn prefetch_frame(
     raster: &mut GeneratorRaster,
     time: RationalTime,
     color_convert: ColorConvertPath,
+    preview_max_dim: Option<u32>,
 ) -> Result<(), EngineError> {
-    let config = composite_canvas_config(project);
+    let config = preview_canvas_config(project, preview_max_dim);
     resolve_layers(
         project,
         Some(cache),

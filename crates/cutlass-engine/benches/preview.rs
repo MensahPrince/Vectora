@@ -5,6 +5,7 @@
 //!   `CUTLASS_BENCH_ASSET=local-assets/assets/foo.mp4 cargo bench -p cutlass-engine --bench preview`
 
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use cutlass_commands::{Command, EditCommand, ProjectCommand};
@@ -87,11 +88,20 @@ fn engine_with_solid_clip(frames: i64) -> (tempfile::TempDir, Engine, cutlass_mo
 }
 
 fn engine_with_media(path: &Path, source_frames: i64) -> (tempfile::TempDir, Engine) {
+    engine_with_media_cap(path, source_frames, None)
+}
+
+fn engine_with_media_cap(
+    path: &Path,
+    source_frames: i64,
+    preview_max_dim: Option<u32>,
+) -> (tempfile::TempDir, Engine) {
     let dir = tempfile::tempdir().expect("tempdir");
     let config = EngineConfig {
         cache_dir: dir.path().join("cache"),
         cache_budget_bytes: 512 * 1024 * 1024,
         undo_limit: 8,
+        preview_max_dim,
         ..Default::default()
     };
     let mut engine = Engine::new(config).expect("engine");
@@ -115,12 +125,16 @@ fn engine_with_media(path: &Path, source_frames: i64) -> (tempfile::TempDir, Eng
         ApplyOutcome::Edited(cutlass_commands::EditOutcome::CreatedTrack(id)) => id,
         o => panic!("{o:?}"),
     };
+    // The source window is expressed at the media's own frame rate (which may
+    // not be 24); the timeline start stays at the timeline rate.
+    let media_rate = engine.project().media(media).expect("media").frame_rate;
+    let tl_rate = engine.project().timeline().frame_rate;
     engine
         .apply(Command::Edit(EditCommand::AddClip {
             track,
             media,
-            source: tr(0, source_frames),
-            start: rt(0),
+            source: TimeRange::at_rate(0, source_frames, media_rate),
+            start: RationalTime::new(0, tl_rate),
         }))
         .expect("clip");
     (dir, engine)
@@ -170,9 +184,11 @@ fn bench_get_frame_media(c: &mut Criterion) {
         );
         return;
     };
-    let (_dir, mut engine) = engine_with_media(&path, 120);
+    let (_dir, engine) = engine_with_media(&path, 120);
     let media = engine.project().media_iter().next().expect("media");
     let bytes = (media.width as u64) * (media.height as u64) * 4;
+    let rate = engine.project().timeline().frame_rate;
+    let at0 = RationalTime::new(0, rate);
 
     let mut group = c.benchmark_group("preview/get_frame");
     group.throughput(Throughput::Bytes(bytes));
@@ -181,18 +197,77 @@ fn bench_get_frame_media(c: &mut Criterion) {
     group.bench_function("media_cold_tick0", |b| {
         b.iter(|| {
             let (_d, mut e) = engine_with_media(&path, 120);
-            e.get_frame(rt(0)).expect("frame")
+            e.get_frame(at0).expect("frame")
         });
     });
 
     // Warm cache: same timeline tick, repeated decode skipped via disk cache.
-    engine.get_frame(rt(0)).expect("prime");
-    group.bench_function("media_warm_tick0", |b| {
-        b.iter(|| engine.get_frame(rt(0)).expect("frame"));
-    });
+    // Isolates unpack + GPU upload + composite + RGBA readback — the part a
+    // preview-resolution cap actually shrinks (no decode, no cache write).
+    for (label, cap) in [("warm_full", None), ("warm_cap1080", Some(1920u32))] {
+        let (_d, mut e) = engine_with_media_cap(&path, 120, cap);
+        let r = e.project().timeline().frame_rate;
+        let prime = RationalTime::new(0, r);
+        e.get_frame(prime).expect("prime");
+        group.bench_function(format!("media_{label}"), |b| {
+            b.iter(|| e.get_frame(prime).expect("frame"));
+        });
+    }
 
     group.finish();
 }
 
-criterion_group!(benches, bench_get_frame_solid, bench_get_frame_media);
+/// Sequential playback: sweep consecutive timeline ticks, each a cache miss,
+/// the way pressing play does (decode → pack/cache-write → GPU composite →
+/// RGBA readback per frame). This is the number that decides whether playback
+/// keeps cadence: `elem/s` reads as the sustainable preview FPS. With a clip
+/// span far larger than the cache budget, revisited ticks have long since been
+/// evicted, so every frame stays a real miss.
+fn bench_playback_media(c: &mut Criterion) {
+    let Some(path) = bench_asset() else {
+        eprintln!("playback bench: no asset, skipping");
+        return;
+    };
+    // A long source span so the sweep never lives entirely inside the cache.
+    let span = 600;
+
+    let mut group = c.benchmark_group("preview/playback");
+    group.throughput(Throughput::Elements(1));
+    group.sample_size(10);
+
+    // Full footage resolution (today's behavior) vs a 1080p-class preview cap.
+    // Same decode + cache work either way; only the composite render target,
+    // RGBA readback, and (in the app) UI upload shrink under the cap.
+    for (label, cap) in [("full", None), ("cap1080", Some(1920u32))] {
+        let (_dir, mut engine) = engine_with_media_cap(&path, span, cap);
+        let media = engine.project().media_iter().next().expect("media");
+        let (sw, sh) = (media.width, media.height);
+        let rate = engine.project().timeline().frame_rate;
+        let total = engine.project().timeline().duration().value.max(1);
+        // Report the resolution the preview actually composites at.
+        let frame = engine.get_frame(RationalTime::new(0, rate)).expect("frame");
+        let (pw, ph) = (frame.width, frame.height);
+
+        let mut next: i64 = 0;
+        group.bench_function(format!("media_{sw}x{sh}_{label}_{pw}x{ph}"), |b| {
+            b.iter_custom(|iters| {
+                let start = Instant::now();
+                for _ in 0..iters {
+                    let tick = next % total;
+                    next += 1;
+                    let _ = engine.get_frame(RationalTime::new(tick, rate)).expect("frame");
+                }
+                start.elapsed()
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_get_frame_solid,
+    bench_get_frame_media,
+    bench_playback_media
+);
 criterion_main!(benches);

@@ -1344,6 +1344,7 @@ dependencies = [
 name = "cutlass-decoder"
 version = "0.3.0-alpha.0"
 dependencies = [
+ "criterion",
  "ffmpeg-next",
  "signalsmith-stretch",
  "tempfile",
