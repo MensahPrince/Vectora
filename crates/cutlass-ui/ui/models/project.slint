@@ -189,6 +189,10 @@ export struct Clip {
     volume: float,
     fade-in-s: float,
     fade-out-s: float,
+    // Noise reduction (CapCut "Reduce noise", M8 Phase 5): true ⇒ the mixers
+    // run this clip's audio through RNNoise. Meaningful on audio-lane clips;
+    // toggled via `InspectorBackend.set-denoise` on the worker.
+    denoise: bool,
     // Text / title generator content. Empty on non-text clips.
     text-content: string,
     // Full visual treatment for text/title clips (font, color, stroke, …).
@@ -295,6 +299,12 @@ export struct Clip {
     // Visual effect chain (M4), in order. The index of each entry is what
     // remove-effect / set-effect-param address. Empty ⇔ no effects.
     effects: [EffectView],
+    // Detected beat positions (CapCut "Beat", M8 Phase 6) as ABSOLUTE
+    // sequence ticks, in order — only the beats inside the clip's current
+    // window. The timeline draws a dot per beat and the magnet snaps clip
+    // edges to them. Empty ⇔ no beats detected. Filled by
+    // `EditCommand::DetectBeats` on the worker.
+    beats: [int],
 }
 
 // Drives lane ordering, drag targeting (same-kind blocks), and which

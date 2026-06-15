@@ -51,11 +51,15 @@ struct Span {
     /// Fade ramp lengths in output sample frames, anchored at the span edges.
     fade_in: i64,
     fade_out: i64,
-    /// Opened on first overlap, dropped with the mixer. Unused for retimed
-    /// spans, which serve from `rendered` instead.
+    /// Noise reduction (M8 Phase 5): render the span's audio through RNNoise
+    /// and serve the cleaned buffer (`rendered`), like a retime. Stacks with a
+    /// retime (denoise rides on top of the stretched buffer).
+    denoise: bool,
+    /// Opened on first overlap, dropped with the mixer. Unused for rendered
+    /// spans (retimed and/or denoised), which serve from `rendered` instead.
     reader: Option<AudioReader>,
-    /// Time-stretched buffer for a retimed span, rendered fail-loud on first
-    /// overlap (interleaved stereo, `out_frames * CHANNELS` long).
+    /// Rendered buffer for a retimed and/or denoised span, produced fail-loud
+    /// on first overlap (interleaved stereo, `out_frames * CHANNELS` long).
     rendered: Option<Vec<f32>>,
     /// Source ran out before the span's out-point: the rest pads as silence.
     exhausted: bool,
@@ -125,6 +129,7 @@ impl ExportAudioMixer {
                         .map_ticks(|tick| ticks_to_samples(tick, fps.num, fps.den)),
                     fade_in: ticks_to_samples(clip.fade_in, fps.num, fps.den),
                     fade_out: ticks_to_samples(clip.fade_out, fps.num, fps.den),
+                    denoise: clip.denoise,
                     reader: None,
                     rendered: None,
                     exhausted: false,
@@ -155,10 +160,11 @@ impl ExportAudioMixer {
             let s = span.start.max(pos);
             let e = span.end.min(block_end);
 
-            // Retimed clips (M8 Phase 3): mix from the time-stretched buffer,
-            // rendered fail-loud on first overlap and served 1:1.
-            if span.retimed {
-                mix_retimed_span(span, pos, s, e, out)?;
+            // Rendered clips — retimed (M8 Phase 3) and/or denoised (M8 Phase
+            // 5): mix from the buffer rendered fail-loud on first overlap and
+            // served 1:1.
+            if span.retimed || span.denoise {
+                mix_rendered_span(span, pos, s, e, out)?;
                 continue;
             }
 
@@ -233,21 +239,14 @@ impl ExportAudioMixer {
     }
 }
 
-/// Mix the overlap `[s, e)` of a retimed span (M8 Phase 3) from its
-/// time-stretched buffer, rendering it fail-loud on first overlap. Volume
-/// envelope and fades ride on top exactly like the 1× path.
-fn mix_retimed_span(
-    span: &mut Span,
-    pos: i64,
-    s: i64,
-    e: i64,
-    out: &mut [f32],
-) -> Result<(), EngineError> {
-    if span.rendered.is_none() {
-        // A ramp (M2) renders variable-rate, following the curve's normalized
-        // integral; a constant-rate retime takes the uniform path. Identical
-        // inputs to the preview mixer, so what you hear is what you ship.
-        let buf = match &span.speed_curve {
+/// Render a span's full buffer (interleaved stereo) at the export rate. A
+/// retime (M8 Phase 3) time-stretches — variable-rate for a ramp (M2), uniform
+/// otherwise; a pure denoise (M8 Phase 5) reads the window 1:1. Denoise rides
+/// on top of whichever, so the same inputs the preview mixer uses produce the
+/// same buffer — what you hear is what you ship.
+fn render_span(span: &Span) -> Result<Vec<f32>, EngineError> {
+    let mut buf = if span.retimed {
+        match &span.speed_curve {
             Some(curve) => cutlass_decoder::render_stretched_curve(
                 &span.path,
                 EXPORT_AUDIO_RATE,
@@ -268,8 +267,38 @@ fn mix_retimed_span(
                 span.pitch_factor,
             ),
         }
-        .map_err(|err| audio_err("render varispeed audio", &span.path, err))?;
-        span.rendered = Some(buf);
+        .map_err(|err| audio_err("render varispeed audio", &span.path, err))?
+    } else {
+        // Denoise-only: read the window 1:1 and clean it.
+        cutlass_decoder::render_denoised(
+            &span.path,
+            EXPORT_AUDIO_RATE,
+            span.source_start,
+            span.end - span.start,
+            span.end - span.start,
+            span.reversed,
+        )
+        .map_err(|err| audio_err("render denoised audio", &span.path, err))?
+    };
+    // Denoise stacks on top of a retime's stretched buffer.
+    if span.denoise && span.retimed {
+        cutlass_decoder::denoise_interleaved(&mut buf);
+    }
+    Ok(buf)
+}
+
+/// Mix the overlap `[s, e)` of a rendered span — retimed (M8 Phase 3) and/or
+/// denoised (M8 Phase 5) — from its buffer, rendering it fail-loud on first
+/// overlap. Volume envelope and fades ride on top exactly like the 1× path.
+fn mix_rendered_span(
+    span: &mut Span,
+    pos: i64,
+    s: i64,
+    e: i64,
+    out: &mut [f32],
+) -> Result<(), EngineError> {
+    if span.rendered.is_none() {
+        span.rendered = Some(render_span(span)?);
     }
     let buf = span.rendered.as_ref().expect("rendered above");
     let total_frames = (buf.len() / AUDIO_CHANNELS) as i64;
@@ -393,6 +422,19 @@ mod tests {
         let (project, _clip) = audio_clip_project(Rational::new(1, 1), true);
         let mixer = ExportAudioMixer::for_project(&project).expect("reversed clip is audible");
         assert!(mixer.spans[0].retimed && mixer.spans[0].reversed);
+    }
+
+    #[test]
+    fn denoised_clip_carries_a_rendered_non_retimed_span() {
+        // A 1× clip with noise reduction on is audible and serves from a
+        // rendered buffer, but is not a retime (M8 Phase 5).
+        let (mut project, clip) = audio_clip_project(Rational::new(1, 1), false);
+        project.set_clip_denoise(clip, true).unwrap();
+        let mixer = ExportAudioMixer::for_project(&project).expect("denoised clip is audible");
+        assert_eq!(mixer.spans.len(), 1);
+        let span = &mixer.spans[0];
+        assert!(span.denoise, "the span carries the denoise flag");
+        assert!(!span.retimed, "1× denoise is not a retime");
     }
 
     #[test]

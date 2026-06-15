@@ -135,6 +135,14 @@ enum WorkerMsg {
         clip: String,
         preserve: bool,
     },
+    /// Toggle noise reduction on a media clip (CapCut "Reduce noise", M8
+    /// Phase 5): `true` runs the clip's audio through RNNoise in both mixers.
+    /// Routed to the clip's audio-lane link partners when a video half is
+    /// targeted; one undoable history entry.
+    SetDenoise {
+        clip: String,
+        denoise: bool,
+    },
     /// Set (or clear) a media clip's speed ramp (CapCut speed curves, M2):
     /// `curve` is the normalized rate curve, `None` clears it. The engine
     /// re-derives the timeline duration from the ramp's average; one undoable
@@ -168,6 +176,17 @@ enum WorkerMsg {
     /// its volume under them, written as ordinary M8 volume keyframes. One
     /// undoable history entry.
     DuckUnderVoice {
+        clip: String,
+    },
+    /// Detect beat markers on a media clip (CapCut "Beat", M8 Phase 6): the
+    /// worker decodes the clip's audio, runs onset/tempo analysis, and stores
+    /// the beat grid on the clip so the timeline magnet can snap to it. One
+    /// undoable history entry.
+    DetectBeats {
+        clip: String,
+    },
+    /// Clear a clip's detected beat markers (M8 Phase 6). One undoable entry.
+    ClearBeats {
         clip: String,
     },
     /// Set a visual clip's crop window + mirroring (CapCut crop, M1): the
@@ -655,6 +674,10 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::SetClipPitch { clip, preserve });
     }
 
+    pub fn set_denoise(&self, clip: String, denoise: bool) {
+        let _ = self.tx.send(WorkerMsg::SetDenoise { clip, denoise });
+    }
+
     /// Resolve a speed-ramp preset name (CapCut speed curves, M2) and dispatch
     /// the edit. `""` / `"none"` / `"normal"` clears the ramp; an unknown name
     /// is dropped with a warning so a stray UI string can't apply garbage.
@@ -696,6 +719,16 @@ impl WorkerHandle {
     /// Duck `clip` (a music clip) under the voice-tagged lanes (M8 Phase 4).
     pub fn duck_under_voice(&self, clip: String) {
         let _ = self.tx.send(WorkerMsg::DuckUnderVoice { clip });
+    }
+
+    /// Detect beat markers on `clip` (CapCut "Beat", M8 Phase 6).
+    pub fn detect_beats(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::DetectBeats { clip });
+    }
+
+    /// Clear `clip`'s detected beat markers (M8 Phase 6).
+    pub fn clear_beats(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::ClearBeats { clip });
     }
 
     /// Set only the fades, preserving the clip's gain (constant or a
@@ -1138,6 +1171,9 @@ fn worker_loop(
             WorkerMsg::SetClipPitch { clip, preserve } => {
                 set_clip_pitch_and_publish(engine, &clip, preserve, *linkage, &ui)
             }
+            WorkerMsg::SetDenoise { clip, denoise } => {
+                set_denoise_and_publish(engine, &clip, denoise, *linkage, &ui)
+            }
             WorkerMsg::SetSpeedCurve { clip, curve } => {
                 set_speed_curve_and_publish(engine, &clip, &curve, *linkage, &ui)
             }
@@ -1151,6 +1187,8 @@ fn worker_loop(
                 fade_out_s,
             } => set_clip_audio_and_publish(engine, &clip, volume, fade_in_s, fade_out_s, &ui),
             WorkerMsg::DuckUnderVoice { clip } => duck_under_voice_and_publish(engine, &clip, &ui),
+            WorkerMsg::DetectBeats { clip } => detect_beats_and_publish(engine, &clip, &ui),
+            WorkerMsg::ClearBeats { clip } => clear_beats_and_publish(engine, &clip, &ui),
             WorkerMsg::SetClipCrop {
                 clip,
                 crop,
@@ -2633,6 +2671,44 @@ fn set_clip_pitch_and_publish(
     publish_projection(engine, ui);
 }
 
+/// Toggle noise reduction on a media clip (CapCut "Reduce noise", M8 Phase 5).
+/// With linkage on, the whole link group follows so selecting a video half
+/// still cleans its audio companion — one undoable history group. The
+/// republish re-snapshots the mixer, which renders the cleaned signal.
+fn set_denoise_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    denoise: bool,
+    linkage: bool,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-denoise ignored: unparsable clip id");
+        return;
+    };
+    let targets = if linkage {
+        link_group_ids(engine, clip_id)
+    } else {
+        vec![clip_id]
+    };
+
+    engine.begin_group();
+    for target in &targets {
+        if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipDenoise {
+            clip: *target,
+            denoise,
+        })) {
+            error!(clip_id = %target, "set denoise failed: {e}");
+            engine.rollback_group();
+            publish_projection(engine, ui);
+            return;
+        }
+    }
+    engine.commit_group();
+    info!(%clip_id, denoise, clips = targets.len(), "set denoise");
+    publish_projection(engine, ui);
+}
+
 /// Set (or clear) a media clip's speed ramp (CapCut speed curves, M2). Like
 /// constant-speed retiming the engine re-derives each clip's timeline
 /// duration from the ramp average, so with linkage on every link partner
@@ -2826,6 +2902,43 @@ fn duck_under_voice_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
         }
         Ok(other) => error!(%music_id, "unexpected duck-under-voice outcome: {other:?}"),
         Err(e) => error!(%music_id, "duck under voice failed: {e}"),
+    }
+}
+
+/// Detect beat markers on a media clip (CapCut "Beat", M8 Phase 6): the engine
+/// decodes the clip's audio, runs onset/tempo analysis, and stores the beat
+/// grid (source ticks) so the timeline magnet can snap clip edges to it. One
+/// undoable history entry. A rejection (generated clip / no audio) just logs —
+/// the inspector only offers the button on media clips with sound, so it would
+/// be a stale-projection race.
+fn detect_beats_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "detect-beats ignored: unparsable clip id");
+        return;
+    };
+    match engine.apply(Command::Edit(EditCommand::DetectBeats { clip: clip_id })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::Updated(_))) => {
+            info!(%clip_id, "detected beats");
+            publish_projection(engine, ui);
+        }
+        Ok(other) => error!(%clip_id, "unexpected detect-beats outcome: {other:?}"),
+        Err(e) => error!(%clip_id, "detect beats failed: {e}"),
+    }
+}
+
+/// Clear a clip's detected beat markers (M8 Phase 6). One undoable entry.
+fn clear_beats_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "clear-beats ignored: unparsable clip id");
+        return;
+    };
+    match engine.apply(Command::Edit(EditCommand::ClearBeats { clip: clip_id })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::Updated(_))) => {
+            info!(%clip_id, "cleared beats");
+            publish_projection(engine, ui);
+        }
+        Ok(other) => error!(%clip_id, "unexpected clear-beats outcome: {other:?}"),
+        Err(e) => error!(%clip_id, "clear beats failed: {e}"),
     }
 }
 
@@ -4935,6 +5048,7 @@ fn audio_snapshot(engine: &Engine) -> AudioSnapshot {
                 volume: clip.volume.clone(),
                 fade_in_ticks: clip.fade_in,
                 fade_out_ticks: clip.fade_out,
+                denoise: clip.denoise,
             });
         }
     }

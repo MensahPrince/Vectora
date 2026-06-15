@@ -68,6 +68,13 @@ pub fn compute_drag_snap(
             let e = s.saturating_add(clip.source_range.duration.value);
             consider(s);
             consider(e);
+            // Beat markers (M8 Phase 6): the magnet pulls clip edges onto the
+            // music's beats, already published as absolute sequence ticks.
+            for beat_idx in 0..clip.beats.row_count() {
+                if let Some(beat) = clip.beats.row_data(beat_idx) {
+                    consider(beat);
+                }
+            }
         }
     }
 
@@ -795,6 +802,29 @@ mod tests {
         let r = compute_drag_snap(&seq, "1", "1", 3, 100, 0, 0);
         assert!(!r.has_snap);
         assert_eq!(r.snapped_start_value, 3);
+    }
+
+    #[test]
+    fn snaps_to_beat_marker() {
+        // An audio lane whose clip carries beat markers at ticks 100 and 200.
+        let mut beaten = clip("a", 0, 300);
+        beaten.beats = ModelRc::from(Rc::new(VecModel::from(vec![100i32, 200])));
+        let seq = sequence(vec![
+            track("1", TrackKind::Video, vec![clip("1", 0, 50)]),
+            track("9", TrackKind::Audio, vec![beaten]),
+        ]);
+        // Drag the video clip's leading edge to 197 — within 5 of beat 200.
+        let r = compute_drag_snap(&seq, "1", "1", 197, 50, 5, 0);
+        assert!(r.has_snap);
+        assert_eq!(r.snapped_start_value, 200);
+        assert_eq!(r.snap_line_tick, 200);
+
+        // Trailing edge snaps too: a clip of duration 50 dragged so its end
+        // lands near beat 100 snaps the end to 100 (start 50).
+        let r = compute_drag_snap(&seq, "1", "1", 48, 50, 5, 0);
+        assert!(r.has_snap);
+        assert_eq!(r.snapped_start_value, 50);
+        assert_eq!(r.snap_line_tick, 100);
     }
 
     // --- resolve_clip_drag --------------------------------------------------

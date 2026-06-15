@@ -498,8 +498,20 @@ fn main() -> Result<(), slint::PlatformError> {
     // Playhead moves (ruler scrub, frame-step keys, Home/End) become preview
     // frame requests; the worker coalesces a burst to the newest tick.
     let frame_handle = preview_worker.handle();
+    let scrub_audio = audio_system.handle();
+    let scrub_weak = app.as_weak();
     editor.on_on_playhead_changed(move |tick| {
         frame_handle.request_frame(i64::from(tick));
+        // Scrub audio (M8 Phase 7): a manual playhead move while paused plays a
+        // short burst of the sound under the playhead. During playback the
+        // master clock drives the playhead, so suppress scrub there — the
+        // mixer is already producing that audio.
+        let playing = scrub_weak
+            .upgrade()
+            .is_some_and(|app| app.global::<TimelineStore>().get_playing());
+        if !playing {
+            scrub_audio.scrub(i64::from(tick));
+        }
     });
 
     let drop_handle = preview_worker.handle();
@@ -1483,6 +1495,11 @@ fn main() -> Result<(), slint::PlatformError> {
         .on_set_clip_pitch(move |clip_id, preserve| {
             set_pitch_handle.set_clip_pitch(clip_id.to_string(), preserve);
         });
+    let set_denoise_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_denoise(move |clip_id, denoise| {
+            set_denoise_handle.set_denoise(clip_id.to_string(), denoise);
+        });
     let set_curve_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
         .on_set_speed_curve(move |clip_id, preset| {
@@ -1512,6 +1529,16 @@ fn main() -> Result<(), slint::PlatformError> {
     app.global::<InspectorBackend>()
         .on_duck_under_voice(move |clip_id| {
             duck_handle.duck_under_voice(clip_id.to_string());
+        });
+    let detect_beats_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_detect_beats(move |clip_id| {
+            detect_beats_handle.detect_beats(clip_id.to_string());
+        });
+    let clear_beats_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_clear_beats(move |clip_id| {
+            clear_beats_handle.clear_beats(clip_id.to_string());
         });
     let set_crop_handle = preview_worker.handle();
     app.global::<InspectorBackend>().on_set_clip_crop(

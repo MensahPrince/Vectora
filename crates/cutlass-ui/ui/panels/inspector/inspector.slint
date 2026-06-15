@@ -514,6 +514,39 @@ component AudioMixInspector inherits VerticalLayout {
         }
     }
 
+    // Noise reduction (CapCut "Reduce noise", M8 Phase 5): a single undoable
+    // toggle. The mixers render the clip's audio through RNNoise and cache the
+    // result, so the change is audible within a buffer block of the republish.
+    HorizontalLayout {
+        spacing: AppStore.theme.metrics.spacing.md;
+        height: 28px;
+        vertical-stretch: 0;
+
+        LabelCell {
+            label: "Reduce noise";
+        }
+
+        Rectangle {
+            width: 14px;
+            height: 14px;
+            y: (parent.height - self.height) / 2;
+            border-radius: 3px;
+            border-width: 1px;
+            border-color: root.model.denoise ? AppStore.theme.accent.primary : #ffffff2f;
+            background: root.model.denoise ? AppStore.theme.accent.primary : #ffffff14;
+
+            TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    InspectorBackend.set-denoise(root.model.id, !root.model.denoise);
+                    AppState.refocus-shortcuts();
+                }
+            }
+        }
+
+        Rectangle { horizontal-stretch: 1; }
+    }
+
     // Sidechain ducking (M8 Phase 4): dip this music under the voice lanes.
     // Shown only when another audio lane is tagged as a voice source (the
     // track header "V"); the worker resolves which voice clips overlap and
@@ -525,6 +558,32 @@ component AudioMixInspector inherits VerticalLayout {
             clicked => {
                 InspectorBackend.duck-under-voice(root.model.id);
             }
+        }
+    }
+
+    // Beat detection (CapCut "Beat", M8 Phase 6): analyze this clip's audio
+    // and drop a beat grid the timeline magnet snaps clip edges to. Re-running
+    // re-detects; "Clear" drops the markers. Both are single undoable edits.
+    HorizontalLayout {
+        alignment: LayoutAlignment.start;
+        spacing: AppStore.theme.metrics.spacing.sm;
+        SubtleButton {
+            label: root.model.beats.length > 0 ? "Re-detect beats" : "Detect beats";
+            clicked => {
+                InspectorBackend.detect-beats(root.model.id);
+            }
+        }
+        if root.model.beats.length > 0: SubtleButton {
+            label: "Clear";
+            clicked => {
+                InspectorBackend.clear-beats(root.model.id);
+            }
+        }
+        if root.model.beats.length > 0: Text {
+            vertical-alignment: TextVerticalAlignment.center;
+            text: root.model.beats.length + " beats";
+            color: AppStore.theme.text.muted;
+            font-size: AppStore.theme.typography.label.size;
         }
     }
 }

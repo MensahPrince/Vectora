@@ -39,6 +39,12 @@ const BLOCK_FRAMES: usize = 1024;
 /// Blocks in flight device-ward. 6 × 21ms ≈ 128ms of buffered audio — also
 /// the worst-case latency for a mid-playback edit to become audible.
 const BLOCK_CAPACITY: usize = 6;
+/// Blocks one scrub gesture emits before the mixer goes idle (M8 Phase 7).
+/// 4 × 21ms ≈ 85ms — long enough to *hear* the content under the playhead,
+/// short enough that the next drag step retriggers a fresh burst (CapCut's
+/// scrub-audio feel). Each step bumps the epoch, so the callback drops the
+/// previous burst's tail and the newest position wins.
+const SCRUB_BURST_BLOCKS: usize = 4;
 
 // ---------------------------------------------------------------------------
 // Snapshot: what the timeline sounds like (worker → mixer)
@@ -76,6 +82,10 @@ pub struct AudioSpan {
     /// Fade ramp lengths, sequence ticks at the snapshot's fps.
     pub fade_in_ticks: i64,
     pub fade_out_ticks: i64,
+    /// Noise reduction (M8 Phase 5): render the span's audio through RNNoise
+    /// and serve the cleaned buffer 1:1, like a retime. Stacks with a retime
+    /// (denoise rides on top of the stretched buffer).
+    pub denoise: bool,
 }
 
 /// Every unmuted audio clip on the timeline + the sequence rate.
@@ -93,6 +103,13 @@ enum AudioMsg {
         epoch: u64,
     },
     Pause,
+    /// Emit one short audio burst from `tick` (M8 Phase 7 scrub audio), then
+    /// idle. `epoch` (assigned UI-side) supersedes any earlier play/scrub
+    /// burst so only the newest scrub position is heard.
+    Scrub {
+        tick: i64,
+        epoch: u64,
+    },
 }
 
 /// One mixed block on its way to the device.
@@ -107,13 +124,19 @@ struct AudioBlock {
 // ---------------------------------------------------------------------------
 
 struct AudioShared {
-    /// Bumped by every play/seek; the callback discards stale-tagged blocks.
+    /// Bumped by every play/seek/scrub; the callback discards stale-tagged
+    /// blocks (the lock-free flush).
     epoch: AtomicU64,
     /// Timeline tick at the current epoch's origin.
     anchor_tick: AtomicI64,
     /// Device frames of the current epoch consumed by the callback.
     frames_played: AtomicU64,
     playing: AtomicBool,
+    /// Scrub-audio gate (M8 Phase 7): the callback plays queued bursts while
+    /// set, but — unlike `playing` — never advances `frames_played`, so a
+    /// scrub burst is heard without moving the master clock (the playhead is
+    /// driven by the drag, not the audio).
+    scrubbing: AtomicBool,
     underruns: AtomicU64,
 }
 
@@ -141,6 +164,7 @@ impl AudioHandle {
         let epoch = self.shared.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.shared.anchor_tick.store(tick, Ordering::Release);
         self.shared.frames_played.store(0, Ordering::Release);
+        self.shared.scrubbing.store(false, Ordering::Release);
         self.shared.playing.store(true, Ordering::Release);
         if let Some(tx) = &self.tx {
             let _ = tx.send(AudioMsg::Play { tick, epoch });
@@ -149,8 +173,26 @@ impl AudioHandle {
 
     pub fn pause(&self) {
         self.shared.playing.store(false, Ordering::Release);
+        self.shared.scrubbing.store(false, Ordering::Release);
         if let Some(tx) = &self.tx {
             let _ = tx.send(AudioMsg::Pause);
+        }
+    }
+
+    /// Play a short audio burst from `tick` (M8 Phase 7): the UI calls this as
+    /// the playhead is dragged while paused, so the user hears the content
+    /// under the playhead. Bumps the epoch so the burst supersedes the prior
+    /// one; never touches the master clock (a scrub must not move the
+    /// playhead, the drag already does). No-op without an output device.
+    pub fn scrub(&self, tick: i64) {
+        if self.tx.is_none() {
+            return;
+        }
+        let epoch = self.shared.epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shared.playing.store(false, Ordering::Release);
+        self.shared.scrubbing.store(true, Ordering::Release);
+        if let Some(tx) = &self.tx {
+            let _ = tx.send(AudioMsg::Scrub { tick, epoch });
         }
     }
 
@@ -268,6 +310,7 @@ impl AudioShared {
             anchor_tick: AtomicI64::new(0),
             frames_played: AtomicU64::new(0),
             playing: AtomicBool::new(false),
+            scrubbing: AtomicBool::new(false),
             underruns: AtomicU64::new(0),
         }
     }
@@ -297,7 +340,11 @@ impl CallbackSink {
     /// stale block is dropped (acceptable for a desktop editor's callback).
     fn fill(&mut self, out: &mut [f32], device_channels: usize, shared: &AudioShared) {
         out.fill(0.0);
-        if !shared.playing.load(Ordering::Acquire) {
+        let playing = shared.playing.load(Ordering::Acquire);
+        // Scrub bursts play through the same ring (M8 Phase 7) but don't drive
+        // the clock — only real playback advances `frames_played`.
+        let scrubbing = !playing && shared.scrubbing.load(Ordering::Acquire);
+        if !playing && !scrubbing {
             self.current = None;
             return;
         }
@@ -343,13 +390,17 @@ impl CallbackSink {
             filled += take;
         }
 
-        if filled > 0 {
-            shared
-                .frames_played
-                .fetch_add(filled as u64, Ordering::AcqRel);
-        }
-        if filled < want_frames {
-            shared.underruns.fetch_add(1, Ordering::AcqRel);
+        // Only real playback owns the clock; a scrub burst draining to silence
+        // is expected, not an underrun.
+        if playing {
+            if filled > 0 {
+                shared
+                    .frames_played
+                    .fetch_add(filled as u64, Ordering::AcqRel);
+            }
+            if filled < want_frames {
+                shared.underruns.fetch_add(1, Ordering::AcqRel);
+            }
         }
     }
 }
@@ -370,7 +421,11 @@ struct ResolvedSpan {
     fade_out_frames: i64,
     /// Speed ramp (M2): drives the variable-rate render when present.
     speed_curve: Option<Param<f32>>,
-    /// Varispeed render identity for a retimed span; `None` ⇒ read 1:1.
+    /// Retimed (varispeed): time-stretch the source window. A render key may
+    /// also exist without this — a denoise-only span renders 1:1 (M8 Phase 5).
+    retimed: bool,
+    /// Render identity for a span that must be rendered once + served 1:1
+    /// (retimed and/or denoised); `None` ⇒ stream the source 1:1.
     render: Option<RenderKey>,
 }
 
@@ -391,6 +446,10 @@ struct RenderKey {
     /// Speed-ramp identity (M2): the curve's keyframes flattened to a hashable
     /// form so editing the ramp re-renders. Empty for a constant-rate retime.
     curve: Vec<CurveKeyframe>,
+    /// Noise reduction (M8 Phase 5): part of the cache identity so toggling it
+    /// re-renders, and so a denoised + a clean copy of the same window don't
+    /// collide.
+    denoise: bool,
 }
 
 /// One speed-ramp keyframe as a hashable tuple — `(tick, value bits, easing
@@ -439,6 +498,9 @@ fn mixer_loop(
     let mut rendered: HashMap<RenderKey, Arc<Vec<f32>>> = HashMap::new();
     let mut epoch = 0u64;
     let mut playing = false;
+    // Scrub-burst state (M8 Phase 7): how many burst blocks remain to emit
+    // before the mixer idles. Reset on each `Scrub`, zeroed by play/pause.
+    let mut scrub_blocks_left = 0usize;
     // Timeline device-frame position the next block mixes from.
     let mut write_frame = 0i64;
     let mut last_underruns = 0u64;
@@ -455,9 +517,19 @@ fn mixer_loop(
                         AudioMsg::Play { tick, epoch: e } => {
                             epoch = e;
                             playing = true;
+                            scrub_blocks_left = 0;
                             write_frame = ticks_to_frames(tick, fps, sample_rate);
                         }
-                        AudioMsg::Pause => playing = false,
+                        AudioMsg::Pause => {
+                            playing = false;
+                            scrub_blocks_left = 0;
+                        }
+                        AudioMsg::Scrub { tick, epoch: e } => {
+                            epoch = e;
+                            playing = false;
+                            scrub_blocks_left = SCRUB_BURST_BLOCKS;
+                            write_frame = ticks_to_frames(tick, fps, sample_rate);
+                        }
                     }
                     latest = msg_rx.try_recv().ok();
                 }
@@ -486,13 +558,18 @@ fn mixer_loop(
             failed_opens.clear();
         }
 
-        if !playing {
+        // Idle unless playing or mid-scrub-burst.
+        if !playing && scrub_blocks_left == 0 {
             continue;
         }
 
         // Fill whatever room the device side has left, but never starve the
-        // message queue: a pending play/seek/snapshot outranks the next block.
+        // message queue: a pending play/seek/scrub/snapshot outranks the next
+        // block. A scrub burst stops after its fixed block count (then idles).
         while !block_tx.is_full() && msg_rx.is_empty() {
+            if !playing && scrub_blocks_left == 0 {
+                break;
+            }
             let mut samples = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
             mix_block(
                 &spans,
@@ -507,6 +584,9 @@ fn mixer_loop(
                 return; // device side gone
             }
             write_frame += BLOCK_FRAMES as i64;
+            if !playing {
+                scrub_blocks_left -= 1;
+            }
         }
 
         let underruns = shared.underruns.load(Ordering::Acquire);
@@ -538,10 +618,11 @@ fn mix_block(
         let s = span.start_frame.max(pos);
         let e = span.end_frame.min(block_end);
 
-        // Retimed clips (M8 Phase 3) play their time-stretched buffer 1:1
-        // instead of reading the source at native rate.
+        // Rendered spans — retimed (M8 Phase 3) and/or denoised (M8 Phase 5) —
+        // play a buffer rendered once and served 1:1 instead of reading the
+        // source at native rate.
         if let Some(key) = &span.render {
-            mix_retimed_span(
+            mix_rendered_span(
                 span,
                 key,
                 rendered,
@@ -628,11 +709,61 @@ fn mix_block(
     }
 }
 
-/// Mix the overlap `[s, e)` of a retimed span (M8 Phase 3) by serving its
-/// time-stretched buffer 1:1. The buffer is rendered + cached on first touch;
-/// the volume envelope and fades ride on top exactly like the 1× path.
+/// Render a span's full buffer (interleaved stereo). Retimed spans (M8 Phase 3)
+/// time-stretch — variable-rate for a ramp (M2), uniform otherwise; a pure
+/// denoise span (M8 Phase 5) reads the window 1:1. Denoise then rides on top of
+/// whichever, so a clip can be both sped up and cleaned.
+fn render_span(
+    span: &ResolvedSpan,
+    key: &RenderKey,
+    sample_rate: u32,
+) -> Result<Vec<f32>, cutlass_decoder::DecodeError> {
+    let mut buf = if span.retimed {
+        match &span.speed_curve {
+            Some(curve) => cutlass_decoder::render_stretched_curve(
+                &span.path,
+                sample_rate,
+                key.source_start_frame,
+                key.source_frames,
+                key.out_frames,
+                key.reversed,
+                f32::from_bits(key.pitch_bits),
+                |p| cutlass_models::speed_curve_source_fraction(curve, p),
+            )?,
+            None => cutlass_decoder::render_stretched(
+                &span.path,
+                sample_rate,
+                key.source_start_frame,
+                key.source_frames,
+                key.out_frames,
+                key.reversed,
+                f32::from_bits(key.pitch_bits),
+            )?,
+        }
+    } else {
+        // Denoise-only: read the window 1:1 and clean it.
+        cutlass_decoder::render_denoised(
+            &span.path,
+            sample_rate,
+            key.source_start_frame,
+            key.source_frames,
+            key.out_frames,
+            key.reversed,
+        )?
+    };
+    // Denoise stacks on top of a retime's stretched buffer.
+    if key.denoise && span.retimed {
+        cutlass_decoder::denoise_interleaved(&mut buf);
+    }
+    Ok(buf)
+}
+
+/// Mix the overlap `[s, e)` of a rendered span — retimed (M8 Phase 3) and/or
+/// denoised (M8 Phase 5) — by serving its rendered buffer 1:1. The buffer is
+/// rendered + cached on first touch; the volume envelope and fades ride on top
+/// exactly like the 1× path.
 #[allow(clippy::too_many_arguments)]
-fn mix_retimed_span(
+fn mix_rendered_span(
     span: &ResolvedSpan,
     key: &RenderKey,
     rendered: &mut HashMap<RenderKey, Arc<Vec<f32>>>,
@@ -649,38 +780,14 @@ fn mix_retimed_span(
             if failed_opens.contains_key(&span.path) {
                 return;
             }
-            // A ramp (M2) renders with a variable rate that follows the curve's
-            // normalized integral; a constant-rate retime takes the uniform
-            // path. Both resolve to one cached buffer served 1:1.
-            let result = match &span.speed_curve {
-                Some(curve) => cutlass_decoder::render_stretched_curve(
-                    &span.path,
-                    sample_rate,
-                    key.source_start_frame,
-                    key.source_frames,
-                    key.out_frames,
-                    key.reversed,
-                    f32::from_bits(key.pitch_bits),
-                    |p| cutlass_models::speed_curve_source_fraction(curve, p),
-                ),
-                None => cutlass_decoder::render_stretched(
-                    &span.path,
-                    sample_rate,
-                    key.source_start_frame,
-                    key.source_frames,
-                    key.out_frames,
-                    key.reversed,
-                    f32::from_bits(key.pitch_bits),
-                ),
-            };
-            match result {
+            match render_span(span, key, sample_rate) {
                 Ok(buf) => {
                     let buf = Arc::new(buf);
                     rendered.insert(key.clone(), Arc::clone(&buf));
                     buf
                 }
                 Err(err) => {
-                    warn!(path = %span.path.display(), "varispeed render failed: {err}");
+                    warn!(path = %span.path.display(), "audio render failed: {err}");
                     failed_opens.insert(span.path.clone(), ());
                     return;
                 }
@@ -725,14 +832,23 @@ fn resolve_spans(snapshot: &AudioSnapshot, sample_rate: u32) -> Vec<ResolvedSpan
             let end_frame = ticks_to_frames(span.end_tick, snapshot.fps, sample_rate);
             let source_start_frame =
                 ticks_to_frames(span.source_start, span.source_rate, sample_rate);
-            let render = span.retimed.then(|| RenderKey {
+            // A span renders-once-and-caches when retimed (varispeed) and/or
+            // denoised (M8 Phase 5). A pure denoise reads the window 1:1, so
+            // its source length is just the span length.
+            let needs_render = span.retimed || span.denoise;
+            let render = needs_render.then(|| RenderKey {
                 path: span.path.clone(),
                 source_start_frame,
-                source_frames: ticks_to_frames(span.source_duration, span.source_rate, sample_rate),
+                source_frames: if span.retimed {
+                    ticks_to_frames(span.source_duration, span.source_rate, sample_rate)
+                } else {
+                    end_frame - start_frame
+                },
                 out_frames: end_frame - start_frame,
                 reversed: span.reversed,
                 pitch_bits: span.pitch_factor.to_bits(),
                 curve: curve_key(span.speed_curve.as_ref()),
+                denoise: span.denoise,
             });
             ResolvedSpan {
                 path: span.path.clone(),
@@ -749,6 +865,7 @@ fn resolve_spans(snapshot: &AudioSnapshot, sample_rate: u32) -> Vec<ResolvedSpan
                 // The ramp's keyframe ticks are normalized (0..=SPEED_CURVE_SCALE),
                 // independent of fps, so it rides through unmapped.
                 speed_curve: span.speed_curve.clone(),
+                retimed: span.retimed,
                 render,
             }
         })
@@ -822,6 +939,7 @@ mod tests {
                 },
                 fade_in_ticks: 0,
                 fade_out_ticks: 0,
+                denoise: false,
             }],
         };
         let spans = resolve_spans(&snapshot, 48_000);
@@ -864,6 +982,89 @@ mod tests {
         // 1.5s of consumed audio = 36 ticks at 24fps.
         handle.shared.frames_played.store(72_000, Ordering::Release);
         assert_eq!(handle.current_tick(24, 1), 136);
+    }
+
+    #[test]
+    fn scrub_burst_plays_without_advancing_the_clock() {
+        // A scrub-tagged block is audible through the callback, but a scrub
+        // never advances `frames_played` (the drag drives the playhead, not
+        // the audio clock) — M8 Phase 7.
+        let shared = AudioShared::new();
+        shared.scrubbing.store(true, Ordering::Release);
+        let (tx, rx) = bounded::<AudioBlock>(BLOCK_CAPACITY);
+        tx.send(AudioBlock {
+            epoch: 0, // matches the fresh AudioShared epoch
+            samples: vec![0.5; BLOCK_FRAMES * AUDIO_CHANNELS],
+        })
+        .unwrap();
+
+        let mut sink = CallbackSink::new(rx);
+        let mut out = vec![0f32; 256 * 2];
+        sink.fill(&mut out, 2, &shared);
+        assert!(out.iter().any(|&s| s != 0.0), "scrub burst is audible");
+        assert_eq!(
+            shared.frames_played.load(Ordering::Acquire),
+            0,
+            "a scrub burst must not move the master clock"
+        );
+    }
+
+    #[test]
+    fn mixer_thread_emits_a_finite_scrub_burst_then_idles() {
+        let Some(path) = audio_asset() else {
+            return;
+        };
+        const RATE: u32 = 48_000;
+        let shared = Arc::new(AudioShared::new());
+        let (msg_tx, msg_rx) = unbounded::<AudioMsg>();
+        let (block_tx, block_rx) = bounded::<AudioBlock>(BLOCK_CAPACITY);
+        let mixer_shared = Arc::clone(&shared);
+        let mixer = std::thread::spawn(move || mixer_loop(msg_rx, block_tx, mixer_shared, RATE));
+
+        // A clip over the scrub position so the burst carries real audio.
+        msg_tx
+            .send(AudioMsg::Snapshot(AudioSnapshot {
+                fps: (24, 1),
+                spans: vec![AudioSpan {
+                    path,
+                    start_tick: 0,
+                    end_tick: 48,
+                    source_start: 0,
+                    source_rate: (24, 1),
+                    source_duration: 0,
+                    retimed: false,
+                    reversed: false,
+                    pitch_factor: 1.0,
+                    speed_curve: None,
+                    volume: Param::Constant(1.0),
+                    fade_in_ticks: 0,
+                    fade_out_ticks: 0,
+                    denoise: false,
+                }],
+            }))
+            .unwrap();
+        msg_tx.send(AudioMsg::Scrub { tick: 0, epoch: 7 }).unwrap();
+
+        // Exactly SCRUB_BURST_BLOCKS blocks, all tagged with the scrub epoch.
+        let mut heard = false;
+        for _ in 0..SCRUB_BURST_BLOCKS {
+            let block = block_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("scrub burst produces");
+            assert_eq!(block.epoch, 7);
+            heard |= block.samples.iter().any(|&s| s != 0.0);
+        }
+        assert!(heard, "scrub burst is audible over the clip");
+
+        // Then the mixer idles: no further blocks without a new message.
+        assert!(
+            block_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the burst is finite — the mixer stops producing after it"
+        );
+
+        drop(msg_tx);
+        while block_rx.try_recv().is_ok() {}
+        mixer.join().expect("mixer thread exits cleanly");
     }
 
     #[test]
@@ -922,6 +1123,7 @@ mod tests {
                 volume: Param::Constant(1.0),
                 fade_in_ticks: 0,
                 fade_out_ticks: 0,
+                denoise: false,
             }],
         };
         let spans = resolve_spans(&snapshot, RATE);
@@ -1003,6 +1205,7 @@ mod tests {
                 volume: Param::Constant(volume),
                 fade_in_ticks,
                 fade_out_ticks: 0,
+                denoise: false,
             }],
         };
         // Mix the same block at full and half volume: every sample halves.
@@ -1094,6 +1297,7 @@ mod tests {
                 volume: Param::Constant(1.0),
                 fade_in_ticks: 0,
                 fade_out_ticks: 0,
+                denoise: false,
             }],
         };
         let spans = resolve_spans(&snapshot, RATE);
@@ -1121,6 +1325,61 @@ mod tests {
             "the stretched buffer is rendered + cached"
         );
         assert!(inside.iter().any(|&s| s != 0.0), "retimed audio plays");
+        assert!(
+            inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),
+            "clamped to [-1, 1]"
+        );
+    }
+
+    #[test]
+    fn mixer_denoises_a_non_retimed_span() {
+        let Some(path) = audio_asset() else {
+            return;
+        };
+        const RATE: u32 = 48_000;
+        // A 1× clip with noise reduction on: the mixer renders + caches a
+        // cleaned buffer and serves it 1:1 (M8 Phase 5), not a retime.
+        let snapshot = AudioSnapshot {
+            fps: (24, 1),
+            spans: vec![AudioSpan {
+                path,
+                start_tick: 0,
+                end_tick: 24,
+                source_start: 0,
+                source_rate: (24, 1),
+                source_duration: 0,
+                retimed: false,
+                reversed: false,
+                pitch_factor: 1.0,
+                speed_curve: None,
+                volume: Param::Constant(1.0),
+                fade_in_ticks: 0,
+                fade_out_ticks: 0,
+                denoise: true,
+            }],
+        };
+        let spans = resolve_spans(&snapshot, RATE);
+        let key = spans[0]
+            .render
+            .as_ref()
+            .expect("a denoised span carries a render key");
+        assert!(!spans[0].retimed, "denoise-only is not a retime");
+        assert!(key.denoise, "the render identity carries the denoise flag");
+
+        let mut readers = HashMap::new();
+        let mut failed = HashMap::new();
+        let mut rendered = HashMap::new();
+        let mut inside = vec![0f32; BLOCK_FRAMES * AUDIO_CHANNELS];
+        mix_block(
+            &spans,
+            &mut readers,
+            &mut failed,
+            &mut rendered,
+            4 * BLOCK_FRAMES as i64,
+            RATE,
+            &mut inside,
+        );
+        assert_eq!(rendered.len(), 1, "the denoised buffer is rendered + cached");
         assert!(
             inside.iter().all(|&s| (-1.0..=1.0).contains(&s)),
             "clamped to [-1, 1]"
@@ -1166,6 +1425,7 @@ mod tests {
                 volume: Param::Constant(1.0),
                 fade_in_ticks: 0,
                 fade_out_ticks: 0,
+                denoise: false,
             }],
         };
         let spans = resolve_spans(&snapshot, RATE);
@@ -1237,6 +1497,7 @@ mod tests {
                     volume: Param::Constant(1.0),
                     fade_in_ticks: 0,
                     fade_out_ticks: 0,
+                    denoise: false,
                 }],
             }))
             .unwrap();

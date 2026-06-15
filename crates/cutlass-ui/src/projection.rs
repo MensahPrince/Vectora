@@ -267,6 +267,7 @@ fn clip_to_slint(
         fade_in_s: time_to_seconds(EngineTime::new(clip.fade_in, clip.timeline.start.rate)) as f32,
         fade_out_s: time_to_seconds(EngineTime::new(clip.fade_out, clip.timeline.start.rate))
             as f32,
+        denoise: clip.denoise,
         text_content: text_content.into(),
         text_style: clip_text_style(clip),
         generator_kind: generator_kind.into(),
@@ -314,6 +315,9 @@ fn clip_to_slint(
         has_volume_envelope: clip.has_volume_envelope(),
         volume_path: volume_path(clip).into(),
         effects: project_effects(clip),
+        // Beat markers (M8 Phase 6) as absolute sequence ticks, already
+        // filtered to the clip's current window by the model helper.
+        beats: model(clip.beat_timeline_ticks().into_iter().map(clamp_i32).collect()),
     }
 }
 

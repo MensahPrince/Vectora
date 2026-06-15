@@ -225,6 +225,25 @@ export component ClipView inherits Rectangle {
         }
     }
 
+    // Beat markers (CapCut "Beat", M8 Phase 6): a slim tick per detected beat
+    // along the clip's bottom edge. The model publishes only the beats inside
+    // this clip's current window as absolute sequence ticks, so the same
+    // tick→x mapping as the keyframe dots places them. Shown on any clip that
+    // carries beats (audio lanes, or video clips with detected beats).
+    if root.model.beats.length > 0 && root.width > 24px: Rectangle {
+        width: 100%;
+        height: 100%;
+        opacity: root.dimmed ? 0.4 : 0.95;
+        for beat in root.model.beats: Rectangle {
+            x: (beat - root.model.timeline-start.value) * root.zoom * 1px - self.width / 2;
+            y: parent.height - self.height - 1px;
+            width: 2px;
+            height: 8px;
+            border-radius: 1px;
+            background: #ffd34d;
+        }
+    }
+
     // Audio fade ramps: a darkening triangle over each attenuated corner with
     // a bright edge line. Driven by the projected fade-*-s (or the live drag
     // width); drawn before the labels so the badges stay legible.
