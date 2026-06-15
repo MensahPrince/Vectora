@@ -190,6 +190,15 @@ export global InspectorBackend {
     // rest, so a rejection here is a stale-projection race.
     callback remove-silences(clip-id: string);
 
+    // Auto-caption a media clip (M9 Phase 4): the worker decodes the clip's
+    // speech, transcribes it, and adds the words as subtitle-styled text clips
+    // on a fresh "Captions" lane in one undoable edit. Captions are ordinary
+    // text clips afterward, so they move, restyle, and delete like any title.
+    // Slow (transcription runs on the worker thread) and needs a local model —
+    // the standard build reports it's unavailable until built with the whisper
+    // feature.
+    callback generate-captions(clip-id: string);
+
     // Set a visual clip's crop window + mirroring (CapCut crop, M1):
     // normalized inset fractions measured in from each content edge
     // (0,0,0,0 ⇔ uncropped) plus flip flags. main.rs converts insets to the

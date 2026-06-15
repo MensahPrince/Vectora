@@ -1545,6 +1545,11 @@ fn main() -> Result<(), slint::PlatformError> {
         .on_remove_silences(move |clip_id| {
             remove_silences_handle.remove_silences(clip_id.to_string());
         });
+    let generate_captions_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_generate_captions(move |clip_id| {
+            generate_captions_handle.generate_captions(clip_id.to_string());
+        });
     let set_crop_handle = preview_worker.handle();
     app.global::<InspectorBackend>().on_set_clip_crop(
         move |clip_id, left, top, right, bottom, flip_h, flip_v| {

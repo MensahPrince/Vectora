@@ -196,6 +196,12 @@ enum WorkerMsg {
     RemoveSilences {
         clip: String,
     },
+    /// Auto-caption a media clip (M9 Phase 4): the worker decodes the clip's
+    /// speech, transcribes it, and adds the words as subtitle text clips on a
+    /// fresh lane in one undoable history entry.
+    GenerateCaptions {
+        clip: String,
+    },
     /// Set a visual clip's crop window + mirroring (CapCut crop, M1): the
     /// normalized kept-region rect plus flip flags. One undoable history
     /// entry; the engine rejects audio-lane clips and degenerate rects.
@@ -738,6 +744,11 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::RemoveSilences { clip });
     }
 
+    /// Auto-caption `clip` (M9 Phase 4).
+    pub fn generate_captions(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::GenerateCaptions { clip });
+    }
+
     /// Clear `clip`'s detected beat markers (M8 Phase 6).
     pub fn clear_beats(&self, clip: String) {
         let _ = self.tx.send(WorkerMsg::ClearBeats { clip });
@@ -1202,6 +1213,9 @@ fn worker_loop(
             WorkerMsg::DetectBeats { clip } => detect_beats_and_publish(engine, &clip, &ui),
             WorkerMsg::ClearBeats { clip } => clear_beats_and_publish(engine, &clip, &ui),
             WorkerMsg::RemoveSilences { clip } => remove_silences_and_publish(engine, &clip, &ui),
+            WorkerMsg::GenerateCaptions { clip } => {
+                generate_captions_and_publish(engine, &clip, &ui)
+            }
             WorkerMsg::SetClipCrop {
                 clip,
                 crop,
@@ -2950,6 +2964,85 @@ fn remove_silences_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
         Ok(other) => error!(%clip_id, "unexpected remove-silences outcome: {other:?}"),
         Err(e) => error!(%clip_id, "remove silences failed: {e}"),
     }
+}
+
+/// Auto-caption a media clip (M9 Phase 4): decode its speech, transcribe it,
+/// and add the words as subtitle text clips on a fresh lane — one undoable
+/// history entry. Transcription runs here on the worker thread (slow); the
+/// local model builds lazily on first use (downloading if needed), so the
+/// first caption can take a while. A rejection (no backend, generated /
+/// retimed / silent clip) just logs — the inspector only offers the button on
+/// forward media clips, so it would be a stale-projection race. Off-thread
+/// progress + cancellation ride a follow-up (see `docs/ai-media-roadmap.md`).
+fn generate_captions_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "generate-captions ignored: unparsable clip id");
+        return;
+    };
+    if !engine.has_transcriber() {
+        match build_transcriber() {
+            Some(transcriber) => engine.set_transcriber(transcriber),
+            None => {
+                error!(
+                    "captions unavailable: no transcription backend (rebuild with --features whisper)"
+                );
+                return;
+            }
+        }
+    }
+    let cancel = AtomicBool::new(false);
+    match engine.generate_captions(
+        clip_id,
+        cutlass_ml::TranscribeOptions::default(),
+        cutlass_ml::CaptionLayout::default(),
+        &cancel,
+        &mut |_| {},
+    ) {
+        Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(track))) => {
+            info!(%clip_id, %track, "generated captions");
+            publish_projection(engine, ui);
+        }
+        Ok(other) => error!(%clip_id, "unexpected generate-captions outcome: {other:?}"),
+        Err(e) => error!(%clip_id, "generate captions failed: {e}"),
+    }
+}
+
+/// Build the local transcription backend from the `[ml]` config, downloading
+/// the model on first use. Present only with the `whisper` feature; the lean
+/// build has no backend, so captions report unavailable.
+#[cfg(feature = "whisper")]
+fn build_transcriber() -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
+    use cutlass_ml::{ModelCache, TranscribeProvider, WhisperTranscriber, models_dir, whisper_model};
+
+    let cfg = cutlass_ml::load_ml_config(&cutlass_ml::config::default_config_path())
+        .unwrap_or_else(|e| {
+            warn!("ml config unreadable ({e}); using defaults");
+            None
+        })
+        .unwrap_or_default();
+    if cfg.transcribe_provider != TranscribeProvider::Local {
+        warn!("cloud transcription is not wired yet; set transcribe_provider = \"local\"");
+        return None;
+    }
+    let spec = whisper_model(&cfg.transcribe_model).or_else(|| {
+        warn!(model = %cfg.transcribe_model, "unknown whisper model; falling back to base.en");
+        whisper_model("base.en")
+    })?;
+    info!(model = spec.name, "fetching whisper model (first run downloads it)");
+    let cancel = AtomicBool::new(false);
+    let path = ModelCache::new(models_dir())
+        .ensure(&spec, &cancel, &mut |_| {})
+        .inspect_err(|e| error!("whisper model unavailable: {e}"))
+        .ok()?;
+    WhisperTranscriber::from_model_path(&path)
+        .inspect_err(|e| error!("whisper model failed to load: {e}"))
+        .ok()
+        .map(|t| Arc::new(t) as Arc<dyn cutlass_ml::Transcribe + Send + Sync>)
+}
+
+#[cfg(not(feature = "whisper"))]
+fn build_transcriber() -> Option<Arc<dyn cutlass_ml::Transcribe + Send + Sync>> {
+    None
 }
 
 /// Detect beat markers on a media clip (CapCut "Beat", M8 Phase 6): the engine
