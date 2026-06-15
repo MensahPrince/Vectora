@@ -46,6 +46,46 @@ pub struct ModelSpec {
     pub size: u64,
 }
 
+/// Tiny English whisper model (~75 MB): fastest, lowest accuracy.
+pub const WHISPER_TINY_EN: ModelSpec = ModelSpec {
+    name: "tiny.en",
+    file: "ggml-tiny.en.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin",
+    sha256: "921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f",
+    size: 77_704_715,
+};
+
+/// Base English whisper model (~142 MB): the default — a good speed/accuracy
+/// balance and the `[ml] transcribe_model` default.
+pub const WHISPER_BASE_EN: ModelSpec = ModelSpec {
+    name: "base.en",
+    file: "ggml-base.en.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
+    sha256: "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
+    size: 147_964_211,
+};
+
+/// Small English whisper model (~466 MB): slower, higher accuracy.
+pub const WHISPER_SMALL_EN: ModelSpec = ModelSpec {
+    name: "small.en",
+    file: "ggml-small.en.bin",
+    url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.en.bin",
+    sha256: "c6138d6d58ecc8322097e0f987c32f1be8bb0a18532a3f88f734d1bbf9c41e5d",
+    size: 487_614_201,
+};
+
+/// Known whisper.cpp ggml models, smallest first. The official
+/// `ggerganov/whisper.cpp` builds on Hugging Face; checksums are the git-LFS
+/// OIDs (authoritative SHA-256s), so [`ModelCache::ensure`] verifies a real
+/// download against a real hash.
+pub const WHISPER_MODELS: &[ModelSpec] = &[WHISPER_TINY_EN, WHISPER_BASE_EN, WHISPER_SMALL_EN];
+
+/// Look up a whisper model by its `[ml]` `transcribe_model` name (e.g.
+/// `"base.en"`).
+pub fn whisper_model(name: &str) -> Option<ModelSpec> {
+    WHISPER_MODELS.iter().copied().find(|m| m.name == name)
+}
+
 /// Model-cache failures, kept distinct so the UI can tell a checksum mismatch
 /// (re-download) from a network error (retry later) from a cancel.
 #[derive(Debug, thiserror::Error)]
@@ -272,6 +312,28 @@ mod tests {
             Some(&1.0),
             "no network, immediate completion"
         );
+    }
+
+    #[test]
+    fn whisper_registry_lookup_and_integrity() {
+        assert_eq!(whisper_model("base.en"), Some(WHISPER_BASE_EN));
+        assert_eq!(whisper_model("tiny.en"), Some(WHISPER_TINY_EN));
+        assert!(whisper_model("does-not-exist").is_none());
+        for m in WHISPER_MODELS {
+            assert_eq!(m.sha256.len(), 64, "{}: sha256 is 64 hex chars", m.name);
+            assert!(
+                m.sha256.chars().all(|c| c.is_ascii_hexdigit()),
+                "{}: sha256 is hex",
+                m.name
+            );
+            assert!(
+                m.url
+                    .starts_with("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-"),
+                "{}: official HF url",
+                m.name
+            );
+            assert!(m.size > 0, "{}: known size", m.name);
+        }
     }
 
     #[test]
