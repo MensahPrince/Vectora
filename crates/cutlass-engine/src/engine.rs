@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 use cutlass_cache::FrameCache;
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_compositor::{Compositor, GpuContext};
-use cutlass_ml::{CaptionLayout, Transcribe, TranscribeOptions};
+use cutlass_ml::{CaptionLayout, Transcribe, TranscribeOptions, Transcript};
 use cutlass_models::Project;
 
 use cutlass_models::{ClipId, ClipTransform, Generator, RationalTime, TimeRange, TrackId, TrackKind};
@@ -338,6 +338,48 @@ impl Engine {
     /// affordance instead of offering a button that always errors).
     pub fn has_transcriber(&self) -> bool {
         self.transcriber.is_some()
+    }
+
+    /// Transcribe a media clip's speech (M9 Phase 3, transcript editing). Decode
+    /// the clip's source window, run the injected backend, and return the
+    /// word-timed transcript — times are seconds from the clip's window start,
+    /// which the transcript panel maps to timeline ticks the same linear way
+    /// captions do.
+    ///
+    /// Read-only: no project mutation, no history (the edits the user makes
+    /// *from* the transcript go through [`delete_clip_ranges`]). Slow (the
+    /// transcribe call can run for seconds): callers run it off the UI thread,
+    /// passing `cancel`/`on_progress` to abort and report. Errors when no backend
+    /// is set, the clip is generated / retimed / silent, or the backend fails.
+    pub fn transcribe_clip(
+        &self,
+        clip: ClipId,
+        options: TranscribeOptions,
+        cancel: &AtomicBool,
+        on_progress: &mut dyn FnMut(f32),
+    ) -> Result<Transcript, EngineError> {
+        let transcriber = self
+            .transcriber
+            .clone()
+            .ok_or_else(|| EngineError::Transcribe("no transcription backend configured".into()))?;
+        let target = self
+            .project
+            .clip(clip)
+            .ok_or(cutlass_models::ModelError::UnknownClip(clip))?;
+        if target.is_retimed() {
+            return Err(EngineError::Transcribe(
+                "transcript editing does not yet support retimed clips".into(),
+            ));
+        }
+        let mono = crate::clip_audio::decode_clip_mono(&self.project, clip)?;
+        let transcript = transcriber.transcribe(
+            &mono,
+            crate::clip_audio::ANALYSIS_RATE,
+            &options,
+            cancel,
+            on_progress,
+        )?;
+        Ok(transcript)
     }
 
     /// Auto-caption a media clip (M9 Phase 4): decode its speech, transcribe it
