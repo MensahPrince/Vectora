@@ -165,26 +165,76 @@ beat markers all mirror CapCut desktop's audio panel.
 
 ## Phase 5 — Noise reduction
 
-- [ ] rnnoise-class denoise as an audio effect on clips (offline render
-      into the mixer path, cached like a proxy). **Open decision**: rnnoise
-      binding vs ONNX model.
+- [x] **Backend (decided)**: `nnnoiseless` — a pure-Rust port of Xiph's
+      RNNoise, chosen over a C `rnnoise` binding (keeps Cutlass pure Rust and
+      its MIT/Apache posture) and over an ONNX model (no model file / runtime
+      to ship). Lives in `cutlass-decoder` as an *offline per-span render*
+      (`render_denoised` / `denoise_interleaved`) mirroring the varispeed
+      render: the cleaned span is produced once, cached on the span's
+      `RenderKey`, and served 1:1, so preview and export use identical samples.
+      Handles RNNoise's i16-scale convention and its one-frame overlap-add
+      latency (feed a trailing flush frame, drop the fade-in output) so output
+      stays aligned and length-preserving.
+- [x] **Model / command / engine**: `Clip.denoise: bool` (media clips only,
+      serde-skipped when off so old files load unchanged) + `set_clip_denoise`
+      setter (returns the prior flag for the inverse) + `SetClipDenoise` command
+      + engine action with a clip-snapshot undo.
+- [x] **Mixers**: the realtime (`cutlass-ui/src/audio.rs`) and export
+      (`cutlass-engine/src/export_audio.rs`) "render once, cache, serve 1:1"
+      span path — previously varispeed-only — now also covers denoise: a
+      pure-denoise span reads its window 1:1 and runs RNNoise, and denoise
+      stacks on top of a retime's stretched buffer. The render key carries the
+      flag so toggling re-renders; preview and export agree.
+- [x] **Inspector + agent**: a "Reduce noise" toggle in the clip audio
+      inspector (one undoable edit, routed to the audio-lane link partners), and
+      a `set_denoise` agent tool that rejects generated clips and steers a
+      video target to its linked audio companion (like `set_clip_audio`). Wire
+      DTO + validation + action-log phrasing + schema snapshot bump (v18).
 
 ## Phase 6 — Beat detection & snap
 
-- [ ] Onset analysis (local DSP) → beat markers on audio clips; "snap to
-      beats" in the timeline magnet; the substrate for agent/M9 beat-sync.
-      **Open decision**: aubio-style onset detector vs hand-rolled
-      spectral-flux.
+- [x] **Onset DSP (decoder, decided)**: a hand-rolled spectral-flux onset
+      detector (`detect_beats` / `onset_envelope`), chosen over an aubio binding
+      to stay pure Rust — peak-picked spectral flux into beat seconds. Pure,
+      model-free DSP, unit-tested on synthetic input.
+- [x] **Model**: `Clip.beats: Vec<i64>` stored in *source* ticks so beats ride
+      the content through trims/splits, with a `beat_timeline_ticks` helper that
+      maps the clip's live window to absolute sequence ticks. Serde-skipped
+      while empty.
+- [x] **Command / engine**: `DetectBeats` / `ClearBeats` commands + action —
+      decode the clip's window, run onset analysis, map seconds → source ticks,
+      and commit through `set_clip_beats` (sorted, de-duped, clamped to the
+      window) with a clip-snapshot inverse.
+- [x] **Snap**: the timeline magnet snaps clip edges onto a clip's published
+      beat ticks, alongside the existing edge / playhead / marker candidates.
+- [x] **UI**: a slim beat tick per marker drawn along the clip's bottom edge,
+      and a "Detect beats" / "Re-detect" / "Clear" control group with a beat
+      count in the audio inspector.
+- [x] **Agent**: a `detect_beats` tool (rejects generated clips) lowers to
+      `DetectBeats`. Wire DTO + validation + action-log phrasing + schema
+      snapshot bump (v17).
 
 ## Phase 7 — Audio scrub bursts
 
-- [ ] Short audio bursts while dragging the playhead (the reserved
-      `AudioReader` seam from `playback-roadmap.md` Phase 4).
+- [x] Short audio bursts while dragging the playhead (the reserved
+      `AudioReader` seam from `playback-roadmap.md` Phase 4): a `Scrub` message
+      plus a `scrubbing` gate on the realtime mixer emit a fixed, finite burst
+      (~85 ms) from the scrubbed position through the same block ring, bumping
+      the epoch so the newest position wins and the device callback drops the
+      prior burst's tail. The burst is heard without advancing the master clock
+      — the drag drives the playhead, not the audio. The UI calls `scrub` on a
+      manual playhead move while paused; playback suppresses it (the mixer is
+      already producing that sound).
 
 ## Phase 8 — MP3 frame-exact seek index
 
-- [ ] Lazily-built MP3 seek index to kill the known tens-of-ms seek offset
-      (`decoder` debt called out in the v1 roadmap).
+- [x] A lazily-built, byte-exact MP3 seek index (`Mp3SeekIndex`) maps each
+      packet's `(pts, byte_offset)`; `AudioReader::seek_to_frame` on an MP3
+      stream looks up the entry at-or-before the target, byte-seeks
+      (`AVSEEK_FLAG_BYTE`), recreates the resampler, and re-anchors its position
+      from the index rather than FFmpeg's estimated PTS — killing the
+      tens-of-ms MP3 seek offset called out as decoder debt in the v1 roadmap.
+      Built once on first seek and cached on the reader.
 
 ---
 

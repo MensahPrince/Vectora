@@ -167,8 +167,8 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 | Cut / split / trim / ripple | ✅ (incl. magnet-lane ripple trim) | — |
 | Multi-track, linked A/V, magnet | ✅ | — |
 | Keyframes (position/scale/rotation/opacity/volume/effects) | ✅ transform + opacity (volume/effects ride M1/M4 fields) | **M2** — the keystone |
-| Speed: constant, reverse | ✅ (audio mutes until M8 varispeed) | M1 |
-| Speed: curves / velocity ramps | ✅ (presets + velocity-graph editor; audio mutes until M8) | M2 |
+| Speed: constant, reverse | ✅ (pitch-corrected audio, M8 varispeed) | M1 |
+| Speed: curves / velocity ramps | ✅ (presets + velocity-graph editor; audio time-stretches, M8) | M2 |
 | Crop / flip / non-uniform scale | ✅ crop + flip H/V (non-uniform scale open) | M1 |
 | Image (stills) import | ✅ (PNG/JPEG/WebP) | — |
 | Compound clips / nested timelines | ❌ | post-v1 |
@@ -208,16 +208,16 @@ Research base: the CapCut desktop 2025–2026 feature set (editor + AI toolkit).
 
 | CapCut feature | Cutlass today | v1 plan |
 | --- | --- | --- |
-| Clip volume + fades | ✅ constant volume + edge fades (M1) | M8 adds envelopes |
-| Volume keyframes / envelopes | ❌ | M8 (rides M2) |
-| Audio ducking (auto-lower music under speech) | ❌ | M8 |
-| Noise reduction | ❌ | M8 (rnnoise-class, local) |
-| Varispeed audio (pitch-corrected speed) | ❌ (speed ≠1 mutes) | M8 |
-| Beat detection / beat sync markers | ❌ | M8 |
+| Clip volume + fades | ✅ constant volume + edge fades (M1), envelopes (M8) | — |
+| Volume keyframes / envelopes | ✅ (M8, rides M2) | — |
+| Audio ducking (auto-lower music under speech) | ✅ (M8) | — |
+| Noise reduction | ✅ (M8, `nnnoiseless` RNNoise, local) | — |
+| Varispeed audio (pitch-corrected speed) | ✅ (M8; constant, reverse, ramps) | — |
+| Beat detection / beat sync markers | ✅ (M8, spectral-flux onsets + snap) | — |
 | Voice changer / voice FX | ❌ | post-v1 |
 | Audio separation (vocals/music stems) | ❌ | post-v1 |
 | Extract audio from video | ✅ (linked companion clip) | — |
-| Scrub audio bursts | ❌ | M8 |
+| Scrub audio bursts | ✅ (M8) | — |
 
 ### AI
 
@@ -649,27 +649,26 @@ previewed, and exported.
 
 Goal: sound that doesn't need a DAW round-trip.
 
-- [ ] **Volume envelopes**: `volume` as keyframed `Param` flowing into
+- [x] **Volume envelopes**: `volume` as keyframed `Param` flowing into
       both mixers; envelope handles drawn on audio clips (CapCut line +
       points UX).
-- [ ] **Fades**: fade-in/out handles on clip corners (sugar over the
+- [x] **Fades**: fade-in/out handles on clip corners (sugar over the
       envelope evaluation, stored as the M1 fields).
-- [ ] **Varispeed audio**: time-stretch with pitch preservation
-      (`signalsmith-stretch`-class or rubberband) so M1/M2 speed clips
-      finally play sound; pitch-shift toggle (chipmunk mode optional, as
-      CapCut offers).
-- [ ] **Audio ducking**: sidechain — detect speech-band energy on chosen
+- [x] **Varispeed audio**: time-stretch with pitch preservation
+      (`signalsmith-stretch`) so M1/M2 speed clips finally play sound,
+      ramps included; pitch-shift toggle (chipmunk mode, as CapCut offers).
+- [x] **Audio ducking**: sidechain — detect speech-band energy on chosen
       "voice" lanes, auto-keyframe music lanes down (attack/release/
       threshold/amount controls, written as ordinary volume keyframes so
       ducking is inspectable and editable after the fact).
-- [ ] **Noise reduction**: rnnoise-class denoise as an audio effect on
-      clips (offline render into the mixer path, cached).
-- [ ] **Beat detection**: onset analysis (local DSP) → beat markers on
-      audio clips; "snap to beats" in the timeline magnet; the substrate
-      for auto beat-sync edits (agent + M9).
-- [ ] **Audio scrub bursts** while dragging the playhead (the reserved
+- [x] **Noise reduction**: `nnnoiseless` (pure-Rust RNNoise) denoise on
+      clips (offline per-span render into the mixer path, cached).
+- [x] **Beat detection**: spectral-flux onset analysis (local DSP) → beat
+      markers on audio clips; "snap to beats" in the timeline magnet; the
+      substrate for auto beat-sync edits (agent + M9).
+- [x] **Audio scrub bursts** while dragging the playhead (the reserved
       `AudioReader` seam from `playback-roadmap.md` Phase 4).
-- [ ] **MP3 frame-exact seek index** (lazily built) — kills the known
+- [x] **MP3 frame-exact seek index** (lazily built) — kills the known
       tens-of-ms offset debt.
 
 Exit: music ducks under narration, denoised voice, beat-snapped cuts,

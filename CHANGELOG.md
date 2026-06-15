@@ -2,6 +2,109 @@
 
 ## [Unreleased]
 
+The **audio alpha** (M8): sound that doesn't need a DAW round-trip. Clip
+volume becomes a keyframable envelope, fades are corner handles, retimed
+clips finally play (pitch-corrected) — including speed ramps — music ducks
+itself under narration, clips can be denoised and beat-detected, the
+playhead chirps while you scrub, and MP3 seeks land sample-close. Preview
+and export agree on every one, and each edit is a single undo.
+
+### Volume envelopes (M8 Phase 1)
+
+- **Clip volume is now a keyframable envelope.** `Clip.volume` is a
+  `Param<f32>` (the M2 keyframe type), so the gain can ride eased keyframes
+  across a clip, not just sit at a constant. Backward-compatible on disk: a
+  constant still serializes as the bare value (`"volume": 0.8`,
+  byte-identical to pre-M8 saves) and only an animated clip writes the
+  `{"kf":[...]}` form — old projects load unchanged.
+- **Both mixers sample the envelope per sample-frame.** A shared
+  `audio_gain_at` evaluates the envelope and multiplies the fades on top;
+  each mixer rebases the clip-relative tick keyframes into sample frames
+  once per span so the hot per-sample lookup stays an O(log k) compare. The
+  unity fast path (constant 1.0, no fades) still skips the gain loop.
+- **Inspector + on-clip UI.** A keyframe diamond on the Volume row reads the
+  gain at the playhead and adds/removes a point; the slider sculpts the
+  keyframe on an animated clip or sets the flat level on a constant one. The
+  gain curve is drawn over the waveform with a dot per keyframe, and a
+  timeline envelope chip marks an animated clip.
+- **Agent vocabulary.** `volume` joins the agent's keyframe tools so a
+  prompt like "fade the music down under the voice" writes a real envelope.
+
+### Fades as corner handles (M8 Phase 2)
+
+- **Fades preserve automation.** `set_clip_audio`'s volume is now optional:
+  setting a flat level flattens the envelope (the basic slider), while a
+  fade-only edit keeps the gain (constant or keyframed) and just moves the
+  ramps — so "fade the music out" past a keyframed clip no longer wipes it.
+- **Drag the corners.** Grab the top corners of a selected audio clip to set
+  fade-in (left) / fade-out (right) — a darkening triangle with a grab dot
+  per ramp, committed as one envelope-preserving edit on release.
+
+### Varispeed audio (M8 Phase 3)
+
+- **Retimed clips play again.** Both mixers drop the "audio mutes while
+  retimed" rule and render speed ≠ 1× and reversed clips through an offline
+  per-span time-stretch (`signalsmith-stretch`, MIT) that is computed once,
+  cached, and served 1:1 — so preview and export use identical samples and
+  reverse is a buffered flip.
+- **Pitch lock.** `Clip.preserve_pitch` (serde-default true) drives the
+  transpose: pitch-corrected stretch by default, pitch-follows-speed
+  ("chipmunk") when off, via a `set_clip_pitch` command, a "Keep pitch"
+  switch in the Speed inspector (flips the whole A/V link group), and an
+  agent tool.
+- **Speed ramps too.** A time-varying render warps the audio along the same
+  normalized curve the picture uses, so velocity ramps stay in sync and
+  preview matches export.
+
+### Audio ducking (M8 Phase 4)
+
+- **Auto-lower music under speech.** A sidechain analysis band-passes the
+  voice (300–3400 Hz), follows its RMS, and turns it into a
+  threshold/attack/release gain-reduction curve, thinned to the few points a
+  volume envelope needs. The `duck` flow writes the result as **ordinary
+  volume keyframes** on each music clip — dipped onto the clip's own level,
+  not overwritten — so the ducking is inspectable and editable after the
+  fact, and both mixers duck identically with no extra plumbing. One undo.
+- **Two ways in.** A `duck` agent tool ("duck the music under the
+  narration"), and a CapCut-style UI: tag a lane as the voice with a **"V"**
+  toggle in the track header, then hit **"Duck under voice"** in a music
+  clip's audio inspector.
+
+### Noise reduction (M8 Phase 5)
+
+- **One-click denoise.** A "Reduce noise" toggle runs a clip's audio through
+  RNNoise (`nnnoiseless`, a pure-Rust port — no C binding, no model file to
+  ship) to suppress steady background noise (hiss, hum, room tone) while
+  keeping speech. Like varispeed it's an offline per-span render, computed
+  once and cached, so preview and export are bit-identical; denoise also
+  stacks on top of a retimed clip's stretched audio.
+- **Model + agent.** `Clip.denoise` (media clips only, absent from saves
+  when off) with an undoable `SetClipDenoise` command and a `set_denoise`
+  agent tool that steers a video-lane target to its linked audio companion.
+
+### Beat detection & snap (M8 Phase 6)
+
+- **Find the beats.** A local spectral-flux onset detector marks the beats
+  on an audio clip; **"Detect beats" / "Re-detect" / "Clear"** live in the
+  audio inspector and the markers draw as ticks along the clip's bottom edge.
+  Beats are stored in source ticks, so they ride the content through trims
+  and splits.
+- **Snap to them.** The timeline magnet snaps clip edges onto a clip's beat
+  ticks, alongside the existing edge / playhead candidates — the substrate
+  for agent and M9 beat-sync. A `detect_beats` agent tool drives it from a
+  prompt.
+
+### Smaller audio wins
+
+- **Audio scrub bursts (M8 Phase 7).** Dragging the playhead while paused
+  now chirps a short (~85 ms) audio burst from the scrubbed position, so you
+  can hear where you are. The burst never advances the transport — the drag
+  drives the playhead, not the clock — and the newest position always wins.
+- **MP3 frame-exact seek (M8 Phase 8).** A lazily-built, byte-exact MP3 seek
+  index re-anchors each mid-stream seek from the true frame offset instead of
+  FFmpeg's estimated PTS, killing the tens-of-ms MP3 seek error noted in the
+  previous alpha. MP4/AAC was already sample-accurate.
+
 ## [alpha-0.4.0] — 2026-06-15
 
 The **Windows & performance alpha**: Windows joins macOS and Linux with
