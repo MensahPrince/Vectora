@@ -18,8 +18,8 @@ pub use image::{STILL_MAX_DIM, decode_image};
 pub use video::{
     DecodeOptions, DecodedFrame, Decoder, HwAccel, KeyframeIndex, PixelFormat, Plane, SourceInfo,
     ThumbnailImage, attach_hwaccel, duration_to_ticks, ffmpeg_version, hw_accel_from_env,
-    is_hardware_pixel_format, ticks_to_duration, transfer_hw_frame_to_cpu, video_strip,
-    video_thumbnail,
+    is_hardware_pixel_format, scale_yuv420p, ticks_to_duration, transfer_hw_frame_to_cpu,
+    video_strip, video_thumbnail,
 };
 
 use tracing::info;

@@ -4,6 +4,7 @@ mod decoder;
 mod frame;
 mod hwaccel;
 mod keyframe_indexer;
+mod scale;
 mod strip;
 mod thumbnail;
 
@@ -15,6 +16,7 @@ pub use hwaccel::{
     transfer_to_cpu as transfer_hw_frame_to_cpu,
 };
 pub use keyframe_indexer::{KeyframeIndex, duration_to_ticks, ticks_to_duration};
+pub use scale::scale_yuv420p;
 pub use strip::video_strip;
 pub use thumbnail::{ThumbnailImage, video_thumbnail};
 pub(crate) use thumbnail::{decode_first_frame, scale_to_rgba};
