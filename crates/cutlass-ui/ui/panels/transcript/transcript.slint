@@ -89,7 +89,7 @@ export component TranscriptPanel inherits PanelBase {
     // words and their ticks belong to the clip they were transcribed from.
     private property <string> sel-clip: TimelineStore.selected-clip-id;
     changed sel-clip => {
-        if (sel-clip != TranscriptStore.track-id) {
+        if (sel-clip != TranscriptStore.clip-id) {
             TranscriptStore.lines = [];
             TranscriptStore.word-count = 0;
             TranscriptStore.status = "";

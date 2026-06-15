@@ -45,6 +45,61 @@ fn defer_main_thread(f: impl FnOnce() + Send + 'static) {
     slint::Timer::single_shot(std::time::Duration::ZERO, f);
 }
 
+/// Apply the transcript reflow for deleting the word-index range `[from, to]`
+/// (M9 Phase 3) and return the timeline span to cut, or `None` if the selection
+/// holds no live words. Runs on the UI thread (the engine cut happens on the
+/// worker with the same span): the selected words' tick spans union into one
+/// range `[a, b)`; the deleted words are struck in place (parked at `a`) and
+/// every later word shifts left by `b - a`, mirroring the engine's ripple so
+/// the panel reflows without a re-transcribe. Done by rebuilding the line model
+/// in place, preserving the wrapping.
+fn reflow_transcript_delete(store: &TranscriptStore, from: i32, to: i32) -> Option<(i64, i64)> {
+    let lines = store.get_lines();
+    let selected = |w: &TranscriptWord| !w.deleted && w.index >= from && w.index <= to;
+
+    let mut a = i32::MAX;
+    let mut b = i32::MIN;
+    for li in 0..lines.row_count() {
+        let words = lines.row_data(li)?.words;
+        for wi in 0..words.row_count() {
+            let w = words.row_data(wi)?;
+            if selected(&w) {
+                a = a.min(w.start_tick);
+                b = b.max(w.end_tick);
+            }
+        }
+    }
+    if a == i32::MAX || b <= a {
+        return None;
+    }
+    let shift = b - a;
+
+    let new_lines: Vec<TranscriptLine> = (0..lines.row_count())
+        .map(|li| {
+            let words = lines.row_data(li).unwrap().words;
+            let new_words: Vec<TranscriptWord> = (0..words.row_count())
+                .map(|wi| {
+                    let mut w = words.row_data(wi).unwrap();
+                    if selected(&w) {
+                        w.deleted = true;
+                        w.start_tick = a;
+                        w.end_tick = a;
+                    } else if !w.deleted && w.start_tick >= b {
+                        w.start_tick -= shift;
+                        w.end_tick -= shift;
+                    }
+                    w
+                })
+                .collect();
+            TranscriptLine {
+                words: ModelRc::new(VecModel::from(new_words)),
+            }
+        })
+        .collect();
+    store.set_lines(ModelRc::new(VecModel::from(new_lines)));
+    Some((a as i64, b as i64))
+}
+
 /// Map a "Titles & shapes" tile key to the engine generator it creates, with
 /// the default styling for a freshly dropped clip. `None` for an unknown key.
 fn generator_from_key(key: &str) -> Option<cutlass_models::Generator> {
@@ -418,6 +473,7 @@ fn main() -> Result<(), slint::PlatformError> {
         preview_store_weak,
         editor_store_weak,
         app.global::<ExportBackend>().as_weak(),
+        app.global::<TranscriptStore>().as_weak(),
         thumbnail_worker.handle(),
         strip_worker.handle(),
         audio_system.handle(),
@@ -491,6 +547,44 @@ fn main() -> Result<(), slint::PlatformError> {
         agent_session.cancel();
         agent_session.discard_plan();
         agent_session.reset_history();
+    });
+
+    // Transcript-based editing (M9 Phase 3): the panel transcribes the selected
+    // clip and deletes word ranges, both via the preview worker. Transcription
+    // needs a backend (the whisper feature); the lean build shows a hint.
+    let transcript_store = app.global::<TranscriptStore>();
+    transcript_store.set_available(cfg!(feature = "whisper"));
+
+    let transcribe_handle = preview_worker.handle();
+    let transcribe_app = app.as_weak();
+    transcript_store.on_transcribe(move |clip_id| {
+        let Some(app) = transcribe_app.upgrade() else {
+            return;
+        };
+        let store = app.global::<TranscriptStore>();
+        store.set_running(true);
+        store.set_status(SharedString::new());
+        transcribe_handle.transcribe_clip(clip_id.to_string());
+    });
+
+    let delete_handle = preview_worker.handle();
+    let delete_app = app.as_weak();
+    transcript_store.on_delete_selection(move |from, to| {
+        let Some(app) = delete_app.upgrade() else {
+            return;
+        };
+        let store = app.global::<TranscriptStore>();
+        let track = store.get_track_id().to_string();
+        if track.is_empty() {
+            return;
+        }
+        // Reflow the panel and get the span; lower the same span to a ripple-cut
+        // on the worker so the timeline and the transcript stay in lockstep.
+        if let Some((a, b)) = reflow_transcript_delete(&store, from, to) {
+            delete_handle.delete_transcript_ranges(track, vec![(a, b)]);
+        }
+        store.set_sel_start(-1);
+        store.set_sel_end(-1);
     });
 
     let editor = app.global::<EditorStore>();

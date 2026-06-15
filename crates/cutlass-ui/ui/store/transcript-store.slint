@@ -40,6 +40,9 @@ export global TranscriptStore {
     // hint instead of a button that always fails. Set by the worker.
     in-out property <bool> available: true;
 
+    // The transcribed clip (raw id); the panel drops the transcript when the
+    // selection moves to a different clip. Set by the worker with the lines.
+    in-out property <string> clip-id: "";
     // The transcribed clip's track (raw id), needed to lower a delete to a
     // ripple-cut on the right lane. Set by the worker alongside the lines.
     in-out property <string> track-id: "";
