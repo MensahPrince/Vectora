@@ -84,6 +84,16 @@ pub fn import_asset(engine: &mut Engine, path: &Path) -> MediaId {
     }
 }
 
+pub fn remove_media(engine: &mut Engine, media: MediaId) {
+    match engine
+        .apply(Command::Project(ProjectCommand::RemoveMedia { media }))
+        .expect("remove media")
+    {
+        ApplyOutcome::RemovedMedia { media: removed } => assert_eq!(removed, media),
+        other => panic!("expected RemovedMedia, got {other:?}"),
+    }
+}
+
 pub fn created_clip(outcome: ApplyOutcome) -> ClipId {
     match outcome {
         ApplyOutcome::Edited(EditOutcome::Created(id)) => id,

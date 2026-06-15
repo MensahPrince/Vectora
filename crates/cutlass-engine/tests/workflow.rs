@@ -2,7 +2,7 @@
 
 mod common;
 
-use common::{import_asset, rt, small_video_asset, temp_engine, tr};
+use common::{import_asset, remove_media, rt, small_video_asset, temp_engine, tr};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::ApplyOutcome;
 use cutlass_models::TrackKind;
@@ -152,4 +152,98 @@ fn reimport_same_path_returns_existing_media_without_duplicating_pool() {
     assert!(engine.undo());
     assert_eq!(engine.project().media_count(), 0);
     assert!(engine.project().media(first).is_none());
+}
+
+#[test]
+fn remove_unreferenced_media_is_undoable() {
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    assert_eq!(engine.project().media_count(), 1);
+
+    remove_media(&mut engine, media_id);
+    assert_eq!(engine.project().media_count(), 0);
+    assert!(engine.project().media(media_id).is_none());
+    assert!(engine.can_undo());
+
+    // Undo restores the source with its original id so existing clips would
+    // reattach; redo drops it again.
+    assert!(engine.undo());
+    assert_eq!(engine.project().media_count(), 1);
+    assert!(engine.project().media(media_id).is_some());
+
+    assert!(engine.redo());
+    assert_eq!(engine.project().media_count(), 0);
+}
+
+#[test]
+fn force_delete_media_cascade_undoes_as_one_step() {
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = common::add_track(&mut engine, TrackKind::Video, "V1");
+    let clip = common::add_media_clip(&mut engine, track, media_id, tr(0, 48), rt(0));
+
+    // Mirror cutlass-ui's `remove_media_and_publish` force path: delete the
+    // referencing clip and the source as one history group.
+    engine.begin_group();
+    engine
+        .apply(Command::Edit(EditCommand::RemoveClip { clip }))
+        .expect("remove clip");
+    engine
+        .apply(Command::Project(ProjectCommand::RemoveMedia { media: media_id }))
+        .expect("remove media");
+    engine.commit_group();
+
+    assert_eq!(engine.project().media_count(), 0);
+    assert_eq!(engine.project().timeline().clip_count(), 0);
+    assert!(engine.can_undo());
+
+    // One undo restores the source *and* the clip that referenced it.
+    assert!(engine.undo());
+    assert_eq!(engine.project().media_count(), 1);
+    assert!(engine.project().media(media_id).is_some());
+    assert_eq!(engine.project().timeline().clip_count(), 1);
+    assert!(engine.project().clip(clip).is_some());
+
+    // And one redo deletes the lot again.
+    assert!(engine.redo());
+    assert_eq!(engine.project().media_count(), 0);
+    assert_eq!(engine.project().timeline().clip_count(), 0);
+}
+
+#[test]
+fn remove_referenced_media_is_rejected() {
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = common::add_track(&mut engine, TrackKind::Video, "V1");
+    engine
+        .apply(Command::Edit(EditCommand::AddClip {
+            track,
+            media: media_id,
+            source: tr(0, 48),
+            start: rt(0),
+        }))
+        .expect("add clip");
+
+    let err = match engine.apply(Command::Project(ProjectCommand::RemoveMedia {
+        media: media_id,
+    })) {
+        Err(e) => e,
+        Ok(_) => panic!("expected referenced-media rejection"),
+    };
+    assert!(
+        format!("{err}").contains("referenced"),
+        "unexpected error: {err}"
+    );
+    // The rejected command leaves the pool and timeline untouched.
+    assert_eq!(engine.project().media_count(), 1);
+    assert_eq!(engine.project().timeline().clip_count(), 1);
 }
