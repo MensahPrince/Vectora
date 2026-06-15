@@ -655,6 +655,64 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
             }
             EditCommand::DetectBeats { clip: clip.id }
         }
+        WireCommand::RemoveSilences(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            let Some(media_id) = clip.media() else {
+                return Err(Rejection::new(format!(
+                    "clip {} is a generated clip; remove_silences only works on media \
+                     clips (footage with a source file)",
+                    args.clip
+                )));
+            };
+            if clip.is_retimed() {
+                return Err(Rejection::new(format!(
+                    "clip {} is retimed; AutoCut does not yet support speed-changed, \
+                     reversed, or ramped clips",
+                    args.clip
+                )));
+            }
+            match project.media(media_id) {
+                Some(media) if media.has_audio => {}
+                Some(_) => {
+                    return Err(Rejection::new(format!(
+                        "clip {}'s media has no audio to analyze for silences",
+                        args.clip
+                    )));
+                }
+                None => {
+                    return Err(Rejection::new(format!(
+                        "clip {} references missing media",
+                        args.clip
+                    )));
+                }
+            }
+            // Defaults mirror the decoder's broadcast-typical AutoCut; min_pause
+            // and padding are seconds, threshold a linear 0..1 loudness gate.
+            let min_silence = args.min_pause.unwrap_or(0.5);
+            let padding = args.padding.unwrap_or(0.08);
+            if !min_silence.is_finite() || min_silence <= 0.0 {
+                return Err(Rejection::new(
+                    "remove_silences min_pause must be a positive number of seconds".to_string(),
+                ));
+            }
+            if !padding.is_finite() || padding < 0.0 {
+                return Err(Rejection::new(
+                    "remove_silences padding must be a non-negative number of seconds".to_string(),
+                ));
+            }
+            let threshold = args.threshold.unwrap_or(0.01);
+            if !(0.0..=1.0).contains(&threshold) {
+                return Err(Rejection::new(
+                    "remove_silences threshold must be between 0.0 and 1.0".to_string(),
+                ));
+            }
+            EditCommand::RemoveSilences {
+                clip: clip.id,
+                threshold: threshold as f32,
+                min_silence: min_silence as f32,
+                padding: padding as f32,
+            }
+        }
         WireCommand::AddMarker(args) => {
             require_non_negative(args.at, "at")?;
             let at = timeline_time(project, args.at, "at")?;

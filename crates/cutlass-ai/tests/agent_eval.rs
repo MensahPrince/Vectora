@@ -506,6 +506,120 @@ fn dry_run_collects_the_plan_without_touching_the_engine() {
     assert!(!host.engine.undo());
 }
 
+#[test]
+fn cut_the_silences_out_of_the_clip() {
+    // "cut the silences out of the interview" lowers to remove_silences on
+    // the selected media clip. Run dry so the eval exercises the wire →
+    // validate → plan path without decoding a (nonexistent) source file;
+    // the engine-side cut planning is covered by remove_silences unit tests.
+    let (mut host, _, _, clip) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "remove_silences",
+            serde_json::json!({ "clip": clip }),
+        )]),
+        text_turn("Planned an AutoCut of the silences."),
+    ]);
+
+    let context = EditorContext {
+        selected_clips: vec![clip],
+        ..Default::default()
+    };
+    let config = AgentConfig {
+        dry_run: true,
+        ..Default::default()
+    };
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &context,
+        "cut the silences out of the clip",
+        &config,
+    );
+
+    assert_eq!(outcome.status, PromptStatus::DryRun);
+    assert_eq!(outcome.actions.len(), 1);
+    assert_eq!(
+        outcome.actions[0].command,
+        WireCommand::RemoveSilences(cutlass_ai::wire::RemoveSilences {
+            clip,
+            min_pause: None,
+            padding: None,
+            threshold: None,
+        })
+    );
+    assert_eq!(
+        outcome.actions[0].description,
+        format!("removed the silences from clip {clip}")
+    );
+
+    // Nothing applied: untouched timeline, no history.
+    assert_eq!(host.engine.project().timeline().clip_count(), 1);
+    assert!(!host.engine.undo());
+}
+
+#[test]
+fn remove_silences_on_a_silent_clip_is_rejected() {
+    // A clip whose media has no audio can't be AutoCut; the rejection names
+    // the clip and the reason so the model can course-correct.
+    let mut project = Project::new("eval-silent", R24);
+    let broll = project.add_media(MediaSource::new(
+        "/tmp/broll.mp4",
+        1920,
+        1080,
+        R24,
+        60 * 24,
+        false,
+    ));
+    let track = project.add_track(TrackKind::Video, "V1");
+    let clip = project
+        .add_clip(
+            track,
+            broll,
+            TimeRange::at_rate(0, 240, R24),
+            RationalTime::new(0, R24),
+        )
+        .unwrap()
+        .raw();
+    let mut host = EngineHost::new(project);
+
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "remove_silences",
+            serde_json::json!({ "clip": clip }),
+        )]),
+        text_turn("That clip has no audio to cut."),
+    ]);
+
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "cut the silences out of the b-roll",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert!(outcome.actions.is_empty(), "nothing applied");
+    assert!(!host.engine.undo(), "a rejected tool records no history");
+
+    // The rejection went back to the model naming the clip and the cause.
+    let requests = provider.requests();
+    let rejection = requests
+        .iter()
+        .flat_map(|msgs| msgs.iter())
+        .find_map(|m| match m {
+            Message::ToolResult { content, .. } if content.contains("rejected") => {
+                Some(content.as_str())
+            }
+            _ => None,
+        })
+        .expect("a rejection tool result");
+    assert!(rejection.contains("no audio"), "{rejection}");
+}
+
 /// A model simulator: creates a text track, reads the new track's id out
 /// of the tool result (the way a real model does), then places the title
 /// on it. Static scripts can't thread runtime ids; this can.
