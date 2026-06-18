@@ -15,8 +15,8 @@ mod preview;
 pub use action::ApplyOutcome;
 pub use composite::{
     PREVIEW_MAX_HEIGHT, anchor_canvas_position, composite_canvas_config, composite_canvas_size,
-    content_uv, cropped_layer_placement, layer_placement, position_preserving_center,
-    preview_canvas_size, preview_scaled_dims, reposition_anchor,
+    content_uv, cropped_layer_placement, generator_layer_placement, layer_placement,
+    position_preserving_center, preview_canvas_size, preview_scaled_dims, reposition_anchor,
 };
 pub use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 pub use cutlass_encoder::{ExportConfig, ExportStats};

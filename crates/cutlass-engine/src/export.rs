@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use cutlass_compositor::{Compositor, CompositorError, GpuContext};
-use cutlass_decoder::AUDIO_CHANNELS;
+use cutlass_decoder::{AUDIO_CHANNELS, HwAccel};
 use cutlass_encoder::{ExportConfig, ExportStats, VideoExport};
 use cutlass_models::{Project, Rational, RationalTime};
 use tracing::info;
@@ -83,8 +83,29 @@ pub fn export_config_with(
         frame_rate_num: out_rate.num,
         frame_rate_den: out_rate.den,
         quality: settings.quality.unwrap_or(defaults.quality),
+        // Prefer the platform hardware H.264 encoder (VideoToolbox / NVENC /
+        // …): far faster on big 4K timelines. The encoder selection falls back
+        // to software libx264 (CRF `quality`) when no hardware encoder opens,
+        // so this is safe everywhere. Hardware uses bitrate, not CRF, hence the
+        // resolution-aware target below.
+        hardware: true,
+        bitrate: target_bitrate(width, height, out_rate),
         ..defaults
     })
+}
+
+/// Target H.264 bitrate (bits/sec) for the hardware encoder, which — unlike
+/// libx264's constant-quality CRF — needs an explicit rate. Scales with pixels
+/// and frame rate at ~0.15 bits/pixel/frame, the high-quality-upload ballpark
+/// (≈9 Mb/s for 1080p30, ≈37 Mb/s for 4K30, ≈75 Mb/s for 4K60), with a floor
+/// so tiny frames still get a usable rate. Ignored when the encoder falls back
+/// to software CRF.
+fn target_bitrate(width: u32, height: u32, rate: Rational) -> usize {
+    const BITS_PER_PIXEL: f64 = 0.15;
+    const FLOOR: usize = 2_000_000;
+    let fps = f64::from(rate.num) / f64::from(rate.den.max(1));
+    let bits = f64::from(width) * f64::from(height) * fps * BITS_PER_PIXEL;
+    (bits as usize).max(FLOOR)
 }
 
 /// Output dimensions for a resolution preset: exactly `target_h` tall (up
@@ -286,7 +307,10 @@ pub fn export_project_with(
 ) -> Result<ExportStats, EngineError> {
     let gpu = GpuContext::new_headless_blocking().map_err(gpu_err)?;
     let mut compositor = Compositor::new(&gpu).map_err(gpu_err)?;
-    let mut pool = DecoderPool::new();
+    // Hardware decode (probe the platform media engine, fall back to software):
+    // its own pool with no frame cache, so NV12 hardware frames never reach the
+    // preview cache's YUV420P pack path.
+    let mut pool = DecoderPool::with_hw_accel(HwAccel::Auto);
     export_timeline_with(
         project,
         &mut pool,
@@ -345,6 +369,40 @@ mod tests {
         )
         .unwrap();
         assert_eq!((cfg.width, cfg.height), (3840, 2160));
+    }
+
+    #[test]
+    fn export_prefers_hardware_with_resolution_scaled_bitrate() {
+        let project = Project::new("test", Rational::FPS_24);
+        let cfg = export_config_with(
+            &project,
+            ExportSettings {
+                target_height: Some(2160),
+                fps: Some(Rational::FPS_30),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(cfg.hardware);
+        // 4K30 lands near the YouTube high-quality upload ballpark, not the
+        // 12 Mb/s default that would crush a 4K render.
+        assert_eq!(cfg.bitrate, target_bitrate(3840, 2160, Rational::FPS_30));
+        assert!(cfg.bitrate > 30_000_000, "4K30 bitrate too low: {}", cfg.bitrate);
+    }
+
+    #[test]
+    fn target_bitrate_scales_and_floors() {
+        // Scales with pixels and fps.
+        assert!(
+            target_bitrate(3840, 2160, Rational::FPS_60)
+                > target_bitrate(3840, 2160, Rational::FPS_30)
+        );
+        assert!(
+            target_bitrate(3840, 2160, Rational::FPS_30)
+                > target_bitrate(1920, 1080, Rational::FPS_30)
+        );
+        // Tiny frame still gets the floor.
+        assert_eq!(target_bitrate(2, 2, Rational::FPS_24), 2_000_000);
     }
 
     #[test]

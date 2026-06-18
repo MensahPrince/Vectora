@@ -149,8 +149,8 @@ lacks cleanly (`letter-spacing`, `line-height`): **[Tabler](https://tabler.io/ic
 
 - [ ] `x` — placeholder `"×"` — transition remove (`panels/timeline/transition-pill.slint`).
 - [ ] `check` — placeholder `"✓"` — agent dry-run checkbox (`panels/agent/agent.slint`).
-- [ ] `send` — placeholder `"Send"` — agent submit (optional) (`panels/agent/agent.slint`).
-- [ ] `circle-stop` — placeholder `"Stop"` — agent cancel (optional) (`panels/agent/agent.slint`).
+- [x] `send` — `assets/icon/chat/send.svg` — agent submit (`panels/agent/agent.slint`).
+- [x] `circle-stop` — `assets/icon/chat/stop.svg` — agent cancel (`panels/agent/agent.slint`).
 
 ### Fine as text (no icon needed)
 

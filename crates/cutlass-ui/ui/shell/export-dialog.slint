@@ -250,6 +250,13 @@ export component ExportDialog inherits Rectangle {
                     }
                 }
 
+                if ExportBackend.completed: SubtleButton {
+                    label: "Open";
+                    clicked => {
+                        ExportBackend.reveal-output-clicked();
+                    }
+                }
+
                 if ExportBackend.completed || ExportBackend.failed: AccentButton {
                     label: ExportBackend.completed ? "Done" : "Close";
                     clicked => {

@@ -1,5 +1,6 @@
 import {
     Accent,
+    AgentChat,
     Layout,
     Metrics,
     Panel,
@@ -119,6 +120,18 @@ export global DarkBlueTheme {
         },
     };
 
+    private property <AgentChat> agent: {
+        input-bg: self.surface.app-background,
+        user-message-bg: #12161f,
+        plan-bg: #151a26,
+        plan-border: #d4a01745,
+        send-disabled-bg: #2a3142,
+        stop-bg: #eef0f410,
+        stop-bg-hover: #eef0f41c,
+        error: #FF6B6B,
+        preview-toggle-border: #eef0f444,
+    };
+
     out property <Theme> theme: {
         surface: self.surface,
         text: self.text,
@@ -129,5 +142,6 @@ export global DarkBlueTheme {
         panel: self.panel,
         scrollbar: self.scrollbar,
         track-lane: self.track-lane,
+        agent: self.agent,
     };
 }

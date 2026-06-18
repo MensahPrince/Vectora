@@ -257,9 +257,31 @@ export component PreviewPanel inherits PanelBase {
                                         PreviewStore.viewport-pan-x / 1px,
                                         PreviewStore.viewport-pan-y / 1px);
                                     if (viewport.hit.clip-id == "") {
-                                        // Empty canvas or letterbox bar:
-                                        // deselect, CapCut-style.
-                                        TimelineActions.clear-selection();
+                                        // Missed every in-frame layer. A
+                                        // selected clip whose content overflows
+                                        // the frame (e.g. a long title) extends
+                                        // into the letterbox — if the press
+                                        // landed on it out there, grab it to
+                                        // drag instead of deselecting.
+                                        if (TimelineStore.selected-clip-id != ""
+                                            && PreviewBackend.selected-contains(
+                                                EditorStore.project.sequence,
+                                                TimelineStore.selected-clip-id,
+                                                TimelineStore.playhead-tick,
+                                                viewport.press-x,
+                                                viewport.press-y,
+                                                viewport.width / 1px,
+                                                viewport.height / 1px,
+                                                PreviewStore.viewport-zoom,
+                                                PreviewStore.viewport-pan-x / 1px,
+                                                PreviewStore.viewport-pan-y / 1px)) {
+                                            viewport.drag-mode = 1;
+                                            viewport.drag-clip = TimelineStore.selected-clip-id;
+                                        } else {
+                                            // Empty canvas or letterbox bar:
+                                            // deselect, CapCut-style.
+                                            TimelineActions.clear-selection();
+                                        }
                                     } else {
                                         // Same selection path as a timeline
                                         // click, so link groups and the

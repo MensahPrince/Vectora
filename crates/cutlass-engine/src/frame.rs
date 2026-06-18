@@ -54,13 +54,87 @@ pub fn decoded_to_yuv_layer(frame: &DecodedFrame) -> Result<Yuv420pLayer, Engine
                 v.stride as u32,
             ))
         }
+        // Hardware decoders (VideoToolbox / NVDEC) deliver frames as NV12 after
+        // the GPU→CPU transfer; the compositor's YUV pipeline wants planar U/V,
+        // so split the interleaved chroma once here on the way in.
+        PixelFormat::Nv12 => {
+            let y = &frame.planes[0];
+            let (u, v) = deinterleave_nv12(frame)?;
+            let uv_stride = frame.width / 2;
+            Ok(Yuv420pLayer::new(
+                frame.width,
+                frame.height,
+                y.data.clone(),
+                y.stride as u32,
+                u,
+                uv_stride,
+                v,
+                uv_stride,
+            ))
+        }
         PixelFormat::Rgba8 => Err(EngineError::Preview(
             "RGBA source must use legacy CPU path".into(),
         )),
-        PixelFormat::Nv12 => Err(EngineError::Preview(
-            "NV12 preview conversion not implemented yet".into(),
-        )),
     }
+}
+
+/// Split an NV12 frame's interleaved chroma plane into tight planar U and V
+/// (each `width/2 × height/2`). Shared by the GPU YUV path and the CPU
+/// fallback — both want separate chroma planes, but hardware decode hands back
+/// NV12.
+fn deinterleave_nv12(frame: &DecodedFrame) -> Result<(Vec<u8>, Vec<u8>), EngineError> {
+    if frame.format != PixelFormat::Nv12 {
+        return Err(EngineError::Preview("expected NV12 frame".into()));
+    }
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+    if w == 0 || h == 0 || !w.is_multiple_of(2) || !h.is_multiple_of(2) {
+        return Err(EngineError::Preview("invalid NV12 dimensions".into()));
+    }
+    let uv = frame
+        .planes
+        .get(1)
+        .ok_or_else(|| EngineError::Preview("NV12 frame missing chroma plane".into()))?;
+    let uv_w = w / 2;
+    let uv_h = h / 2;
+    let mut u = vec![0u8; uv_w * uv_h];
+    let mut v = vec![0u8; uv_w * uv_h];
+    for row in 0..uv_h {
+        let src = row * uv.stride;
+        if src + 2 * uv_w > uv.data.len() {
+            return Err(EngineError::Preview("NV12 chroma row out of bounds".into()));
+        }
+        let dst = row * uv_w;
+        for col in 0..uv_w {
+            u[dst + col] = uv.data[src + 2 * col];
+            v[dst + col] = uv.data[src + 2 * col + 1];
+        }
+    }
+    Ok((u, v))
+}
+
+/// Repack an NV12 frame as planar YUV420P (tight chroma planes), so the CPU
+/// fallback's YUV→RGBA path can consume hardware-decoded frames too.
+fn nv12_as_yuv420p(frame: &DecodedFrame) -> Result<DecodedFrame, EngineError> {
+    let (u, v) = deinterleave_nv12(frame)?;
+    let uv_w = (frame.width / 2) as usize;
+    Ok(DecodedFrame {
+        width: frame.width,
+        height: frame.height,
+        pts_ticks: frame.pts_ticks,
+        format: PixelFormat::Yuv420p,
+        planes: vec![
+            frame.planes[0].clone(),
+            cutlass_decoder::Plane {
+                data: u,
+                stride: uv_w,
+            },
+            cutlass_decoder::Plane {
+                data: v,
+                stride: uv_w,
+            },
+        ],
+    })
 }
 
 /// Legacy CPU YUV/RGBA conversion.
@@ -78,9 +152,7 @@ fn decoded_to_rgba_inner(frame: &DecodedFrame) -> Result<RgbaFrame, EngineError>
     match frame.format {
         PixelFormat::Rgba8 => rgba_from_rgba8(frame),
         PixelFormat::Yuv420p => yuv420p_to_rgba(frame),
-        PixelFormat::Nv12 => Err(EngineError::Preview(
-            "NV12 preview conversion not implemented yet".into(),
-        )),
+        PixelFormat::Nv12 => yuv420p_to_rgba(&nv12_as_yuv420p(frame)?),
     }
 }
 
@@ -248,5 +320,65 @@ mod tests {
         assert_eq!(rgba.bytes[0], rgba.bytes[1]);
         assert_eq!(rgba.bytes[1], rgba.bytes[2]);
         assert_eq!(rgba.bytes[3], 255);
+    }
+
+    /// NV12: full-res Y plane, then one interleaved U,V,U,V,… chroma plane at
+    /// quarter resolution (the layout VideoToolbox / NVDEC transfer back).
+    fn solid_nv12(width: u32, height: u32, y: u8, u: u8, v: u8) -> DecodedFrame {
+        let w = width as usize;
+        let h = height as usize;
+        let mut uv = Vec::with_capacity((w / 2) * (h / 2) * 2);
+        for _ in 0..(w / 2) * (h / 2) {
+            uv.push(u);
+            uv.push(v);
+        }
+        DecodedFrame {
+            width,
+            height,
+            pts_ticks: 0,
+            format: PixelFormat::Nv12,
+            planes: vec![
+                Plane {
+                    data: vec![y; w * h],
+                    stride: w,
+                },
+                Plane {
+                    data: uv,
+                    stride: w,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn nv12_deinterleaves_to_separate_chroma_planes() {
+        // Distinct U/V so a swapped deinterleave would be caught.
+        let frame = solid_nv12(4, 4, 200, 90, 240);
+        let (u, v) = deinterleave_nv12(&frame).unwrap();
+        assert_eq!(u, vec![90; 4]);
+        assert_eq!(v, vec![240; 4]);
+    }
+
+    #[test]
+    fn nv12_yuv_layer_matches_equivalent_yuv420p() {
+        // An NV12 frame and the YUV420P frame with the same samples must build
+        // the identical GPU layer — hardware decode is transparent downstream.
+        let nv12 = solid_nv12(4, 4, 128, 100, 150);
+        let planar = solid_yuv420p(4, 4, 128, 100, 150);
+        let from_nv12 = decoded_to_yuv_layer(&nv12).unwrap();
+        let from_planar = decoded_to_yuv_layer(&planar).unwrap();
+        assert_eq!(from_nv12.tight_y(), from_planar.tight_y());
+        assert_eq!(from_nv12.tight_u(), from_planar.tight_u());
+        assert_eq!(from_nv12.tight_v(), from_planar.tight_v());
+    }
+
+    #[test]
+    fn nv12_rgba_fallback_matches_equivalent_yuv420p() {
+        let nv12 = solid_nv12(2, 2, 128, 128, 128);
+        let planar = solid_yuv420p(2, 2, 128, 128, 128);
+        assert_eq!(
+            decoded_to_rgba_inner(&nv12).unwrap(),
+            decoded_to_rgba_inner(&planar).unwrap()
+        );
     }
 }

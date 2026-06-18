@@ -11,34 +11,77 @@ import {
     AccentButton,
     SubtleButton,
 } from "../../components/index.slint";
-import { AgentStore, AgentEntry, AppStore, TimelineActions } from "../../store/index.slint";
+import {
+    AgentStore,
+    AgentEntry,
+    AppStore,
+    TimelineActions,
+} from "../../store/index.slint";
+
+// Circular send/stop affordance pinned inside the composer (ChatGPT-style).
+component ComposerAction inherits Rectangle {
+    in property <image> icon;
+    in property <bool> enabled: true;
+    in property <bool> accent: true;
+    callback clicked();
+
+    width: 28px;
+    height: 28px;
+    border-radius: self.width / 2;
+    background: accent
+        ? (enabled ? AppStore.theme.accent.primary : AppStore.theme.agent.send-disabled-bg)
+        : (ta.has-hover && enabled ? AppStore.theme.agent.stop-bg-hover : AppStore.theme.agent.stop-bg);
+    opacity: enabled ? 1.0 : 0.55;
+
+    Image {
+        width: 16px;
+        height: 16px;
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        source: root.icon;
+        image-fit: ImageFit.contain;
+        colorize: accent ? AppStore.theme.accent.on-accent : AppStore.theme.text.primary;
+    }
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: enabled ? MouseCursor.pointer : MouseCursor.default;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
 
 // The prompt composer: multi-line input styled like the inspector's
 // text fields (focus ring in the accent teal). Grows with content up to
-// a cap, then scrolls. Enter sends; Shift+Enter inserts a newline.
+// a cap, then scrolls. Enter sends; Shift+Enter inserts a newline. Send
+// and stop sit inside the field at the bottom-right.
 component PromptInput inherits Rectangle {
     in-out property <string> text;
     in property <bool> enabled: true;
+    in property <bool> running: false;
     callback accepted(text: string);
+    callback stop();
 
     private property <length> pad-y: AppStore.theme.metrics.spacing.sm;
     private property <length> pad-x: AppStore.theme.metrics.spacing.md;
+    private property <length> action-size: 28px;
+    private property <length> action-gap: AppStore.theme.metrics.spacing.sm;
+    private property <length> text-inset-right: action-size + action-gap;
+    private property <length> composer-min-h: action-size + 2 * self.pad-y;
+    private property <length> editor-area-h: max(0px, root.height - 2 * self.pad-y);
+    private property <length> text-block-h: input.preferred-height;
+    private property <bool> scrolls: text-block-h > editor-area-h;
 
-    height: clamp(input.preferred-height + 2 * self.pad-y, 34px, 110px);
+    height: clamp(max(input.preferred-height + 2 * self.pad-y, self.composer-min-h), self.composer-min-h, 110px);
     horizontal-stretch: 1;
     border-radius: AppStore.theme.metrics.radius.md;
-    border-width: input.has-focus ? 1px : 0px;
-    border-color: AppStore.theme.accent.primary;
-    background: input.has-focus ? #202020 : #1a1a1a;
+    background: AppStore.theme.agent.input-bg;
     opacity: enabled ? 1.0 : 0.55;
     clip: true;
     forward-focus: input;
 
     animate background {
-        duration: 120ms;
-        easing: ease-out;
-    }
-    animate border-width {
         duration: 120ms;
         easing: ease-out;
     }
@@ -52,10 +95,10 @@ component PromptInput inherits Rectangle {
 
     if root.text == "" && !input.has-focus: CutlassText {
         x: root.pad-x;
-        width: parent.width - 2 * root.pad-x;
+        width: max(0px, parent.width - root.pad-x - root.pad-x - root.text-inset-right);
         height: parent.height;
         vertical-alignment: center;
-        text: "Describe an edit…  (Enter sends, Shift+Enter for newline)";
+        text: "Describe an edit...";
         style: AppStore.theme.typography.body;
         foreground: AppStore.theme.text.muted;
         overflow: elide;
@@ -63,17 +106,17 @@ component PromptInput inherits Rectangle {
 
     editor-scroll := CutlassScrollView {
         x: root.pad-x;
-        y: root.pad-y;
-        width: max(0px, root.width - 2 * root.pad-x);
-        height: max(0px, root.height - 2 * root.pad-y);
+        y: root.scrolls ? root.pad-y : root.pad-y + (root.editor-area-h - root.text-block-h) / 2;
+        width: max(0px, root.width - 2 * root.pad-x - root.text-inset-right);
+        height: root.scrolls ? root.editor-area-h : root.text-block-h;
         viewport-width: self.width;
         viewport-height: max(self.height, input.preferred-height);
         show-horizontal-scrollbar: false;
-        show-vertical-scrollbar: input.preferred-height > self.height;
+        show-vertical-scrollbar: false;
 
         input := TextInput {
             width: editor-scroll.width;
-            height: max(editor-scroll.height, self.preferred-height);
+            height: root.scrolls ? max(editor-scroll.height, self.preferred-height) : self.preferred-height;
             single-line: false;
             wrap: word-wrap;
             enabled: root.enabled;
@@ -111,6 +154,49 @@ component PromptInput inherits Rectangle {
                 }
                 reject
             }
+
+            cursor-position-changed(cpos) => {
+                if (!root.scrolls) {
+                    return;
+                }
+                if (cpos.y + editor-scroll.viewport-y < 8px) {
+                    editor-scroll.viewport-y = min(0px, max(
+                        editor-scroll.height - self.height,
+                        -cpos.y + 8px,
+                    ));
+                } else if (cpos.y + editor-scroll.viewport-y > editor-scroll.height - 24px) {
+                    editor-scroll.viewport-y = min(0px, max(
+                        editor-scroll.height - self.height,
+                        editor-scroll.height - cpos.y - 24px,
+                    ));
+                }
+            }
+        }
+    }
+
+    if !root.running: ComposerAction {
+        x: root.width - root.pad-x - root.action-size;
+        y: root.scrolls
+            ? root.height - root.pad-y - root.action-size
+            : (root.height - root.action-size) / 2;
+        icon: @image-url("../../../../../assets/icon/chat/send.svg");
+        accent: true;
+        enabled: root.text != "";
+        clicked => {
+            root.accepted(root.text);
+        }
+    }
+
+    if root.running: ComposerAction {
+        x: root.width - root.pad-x - root.action-size;
+        y: root.scrolls
+            ? root.height - root.pad-y - root.action-size
+            : (root.height - root.action-size) / 2;
+        icon: @image-url("../../../../../assets/icon/chat/stop.svg");
+        accent: false;
+        enabled: true;
+        clicked => {
+            root.stop();
         }
     }
 }
@@ -129,7 +215,7 @@ component TranscriptEntry inherits VerticalLayout {
         alignment: end;
 
         Rectangle {
-            background: #303030;
+            background: AppStore.theme.agent.user-message-bg;
             border-radius: AppStore.theme.metrics.radius.md;
             width: min(user-text.preferred-width + 2 * AppStore.theme.metrics.spacing.md, parent.width);
             height: user-text.preferred-height + 2 * AppStore.theme.metrics.spacing.sm;
@@ -202,7 +288,7 @@ component TranscriptEntry inherits VerticalLayout {
         text: entry.text;
         wrap: word-wrap;
         style: AppStore.theme.typography.caption;
-        foreground: #FF6B6B;
+        foreground: AppStore.theme.agent.error;
     }
 }
 
@@ -301,9 +387,9 @@ export component AgentPanel inherits PanelBase {
 
         // The rehearsed plan, waiting on the user (preview-before-apply).
         if AgentStore.plan-pending: Rectangle {
-            background: #1f1f1f;
+            background: AppStore.theme.agent.plan-bg;
             border-width: 1px;
-            border-color: AppStore.theme.accent.primary.with-alpha(0.27);
+            border-color: AppStore.theme.agent.plan-border;
             border-radius: AppStore.theme.metrics.radius.md;
 
             VerticalLayout {
@@ -350,34 +436,14 @@ export component AgentPanel inherits PanelBase {
             padding: AppStore.theme.metrics.spacing.md;
             spacing: AppStore.theme.metrics.spacing.sm;
 
-            HorizontalLayout {
-                spacing: AppStore.theme.metrics.spacing.sm;
-
-                prompt-input := PromptInput {
-                    enabled: !AgentStore.running;
-                    accepted(text) => {
-                        root.submit(text);
-                    }
+            prompt-input := PromptInput {
+                enabled: !AgentStore.running;
+                running: AgentStore.running;
+                accepted(text) => {
+                    root.submit(text);
                 }
-
-                // Pin the action at the bottom edge while the input grows.
-                VerticalLayout {
-                    alignment: end;
-
-                    if !AgentStore.running: AccentButton {
-                        label: "Send";
-                        enabled: prompt-input.text != "";
-                        clicked => {
-                            root.submit(prompt-input.text);
-                        }
-                    }
-
-                    if AgentStore.running: SubtleButton {
-                        label: "Stop";
-                        clicked => {
-                            AgentStore.cancel();
-                        }
-                    }
+                stop => {
+                    AgentStore.cancel();
                 }
             }
 
@@ -402,7 +468,7 @@ export component AgentPanel inherits PanelBase {
                             height: 12px;
                             border-radius: AppStore.theme.metrics.radius.sm;
                             border-width: 1px;
-                            border-color: AgentStore.dry-run ? AppStore.theme.accent.primary : #ffffff44;
+                            border-color: AgentStore.dry-run ? AppStore.theme.accent.primary : AppStore.theme.agent.preview-toggle-border;
                             background: AgentStore.dry-run ? AppStore.theme.accent.primary : transparent;
 
                             if AgentStore.dry-run: CutlassText {

@@ -13,6 +13,8 @@ export global ExportBackend {
     // Flag the running job to stop after the frame in flight. The job
     // confirms by publishing `failed` with a cancellation status.
     callback cancel();
+    // Reveal the finished export in the OS file browser (Finder on macOS).
+    callback reveal-output-clicked();
 
     // Destination shown in the dialog; prefilled by Rust at startup and
     // updated after Browse…. Persists across dialog open/close.

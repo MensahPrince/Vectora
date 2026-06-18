@@ -10,8 +10,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use cosmic_text::{
-    Attrs, Buffer, Color as TextColor, Family, FontSystem, Metrics, Shaping, Style as FontStyle,
-    SwashCache, Weight, Wrap,
+    Attrs, Buffer, Color as TextColor, Family, FontSystem, LayoutRun, Metrics, Shaping,
+    Style as FontStyle, SwashCache, Weight, Wrap,
 };
 use cutlass_models::{Generator, Shape, TextAlignH, TextAlignV, TextStyle};
 use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
@@ -20,6 +20,12 @@ use tiny_skia::{FillRule, Paint, PathBuilder, Pixmap, Rect, Transform};
 /// rasterizer scales every length by `height / REFERENCE_HEIGHT` so a title
 /// looks identical at any output resolution. Matches [`cutlass_models`].
 const REFERENCE_HEIGHT: f32 = 1080.0;
+
+/// Hard cap on a raster buffer edge, matching wgpu's guaranteed
+/// `max_texture_dimension_2d` (the compositor requires the default limits, so
+/// a texture wider/taller than this can't be uploaded). Text that would
+/// overflow past this is still clipped — but that's far beyond any sane title.
+const MAX_RASTER_DIM: u32 = 8192;
 
 /// Enumerate installed font family names (deduped, sorted) for the text
 /// inspector's font picker. Scanning the system font directories is slow
@@ -126,6 +132,11 @@ fn shape_key(shape: Shape) -> ShapeKey {
 struct CachedRaster {
     bytes: Arc<Vec<u8>>,
     content: (u32, u32),
+    /// Pixel dimensions of `bytes`. Canvas-sized for shapes/solids; for text it
+    /// can grow past the canvas to hold content that overflows the frame, so
+    /// the excess can be revealed by moving/scaling the clip instead of being
+    /// clipped away at raster time.
+    size: (u32, u32),
 }
 
 /// Rasterizes text and shape generators, caching results. Owned by the engine
@@ -157,6 +168,11 @@ impl GeneratorRaster {
     /// Returns `None` for generators that have no raster representation yet
     /// (sticker/effect/filter/adjustment) or for a zero-size canvas — callers
     /// skip those layers, as before.
+    /// Just the raster bytes (canvas-sized for shapes/solids; for text the
+    /// buffer may be larger — use [`raster_layer`](Self::raster_layer) when the
+    /// dimensions matter). Kept for tests and callers that only blit at a known
+    /// size.
+    #[allow(dead_code)]
     pub fn raster(
         &mut self,
         generator: &Generator,
@@ -164,6 +180,21 @@ impl GeneratorRaster {
         height: u32,
     ) -> Option<Arc<Vec<u8>>> {
         self.entry(generator, width, height).map(|e| e.bytes)
+    }
+
+    /// Like [`raster`](Self::raster) but also reports the raster buffer's pixel
+    /// dimensions. A text generator may grow these past the canvas to hold
+    /// content that overflows the frame; the compositor places the buffer at
+    /// these dims, 1:1 with canvas pixels, so the overflow extends beyond the
+    /// frame instead of being clipped during rasterization.
+    pub fn raster_layer(
+        &mut self,
+        generator: &Generator,
+        width: u32,
+        height: u32,
+    ) -> Option<(Arc<Vec<u8>>, u32, u32)> {
+        self.entry(generator, width, height)
+            .map(|e| (e.bytes, e.size.0, e.size.1))
     }
 
     /// Tight size (canvas px) of the content a generator actually draws on a
@@ -220,7 +251,7 @@ impl GeneratorRaster {
             return Some(hit);
         }
 
-        let bytes = match generator {
+        let (bytes, bw, bh) = match generator {
             Generator::Text { content, style } => self.raster_text(content, style, width, height),
             Generator::Shape {
                 shape,
@@ -231,7 +262,8 @@ impl GeneratorRaster {
             _ => unreachable!("filtered above"),
         };
         let entry = CachedRaster {
-            content: alpha_bbox_size(&bytes, width),
+            content: alpha_bbox_size(&bytes, bw),
+            size: (bw, bh),
             bytes: Arc::new(bytes),
         };
         self.insert(key, entry.clone());
@@ -258,37 +290,39 @@ impl GeneratorRaster {
         style: &TextStyle,
         width: u32,
         height: u32,
-    ) -> Vec<u8> {
-        let mut out = vec![0u8; (width as usize) * (height as usize) * 4];
-
+    ) -> (Vec<u8>, u32, u32) {
         // The string actually shaped: the casing transform is applied up front
         // so cosmic-text measures the displayed glyphs.
         let shaped = style.case.apply(content);
         if shaped.trim().is_empty() {
-            return out;
+            return (vec![0u8; (width as usize) * (height as usize) * 4], width, height);
         }
 
-        let w = width as usize;
-        let h = height as usize;
         let scale = height as f32 / REFERENCE_HEIGHT;
         let font_size = (style.size * scale).max(4.0);
         let line_height = (font_size * style.line_spacing.max(0.1)).max(font_size);
         let letter_spacing = style.letter_spacing * scale;
 
-        // Coverage of the glyph/underline shapes (canvas-sized, 0..=255). Built
-        // once, then reused as the source for the fill, stroke (dilated) and
-        // shadow (blurred) passes so they stay perfectly registered.
-        let coverage = self.text_coverage(
+        // Coverage of the glyph/underline shapes (0..=255), plus the buffer
+        // size it was drawn into — which grows past the canvas when the text
+        // overflows the frame. Built once, then reused as the source for the
+        // fill, stroke (dilated) and shadow (blurred) passes so they stay
+        // perfectly registered.
+        let (coverage, bw, bh) = self.text_coverage(
             &shaped,
             style,
+            scale,
             font_size,
             line_height,
             letter_spacing,
             width,
             height,
         );
+        let w = bw as usize;
+        let h = bh as usize;
+        let mut out = vec![0u8; w * h * 4];
         let Some(bbox) = coverage_bbox(&coverage, w) else {
-            return out;
+            return (out, bw, bh);
         };
 
         // Background card sits behind everything, hugging the text block.
@@ -326,28 +360,30 @@ impl GeneratorRaster {
         // Fill on top.
         composite_mask(&mut out, w, h, &coverage, style.fill, 0, 0);
 
-        out
+        (out, bw, bh)
     }
 
     /// Lay out `text` and accumulate its glyph (and underline) alpha coverage
-    /// into a canvas-sized 0..=255 mask. Centering, alignment, letter spacing
-    /// and underline are all resolved here; effect passes only reshape this
-    /// mask.
+    /// into a 0..=255 mask, returning the mask and the buffer size it was drawn
+    /// into. Centering, alignment, letter spacing and underline are resolved
+    /// here against the *canvas* (so a centered title stays centered); the
+    /// buffer then grows symmetrically past the canvas to hold whatever
+    /// overflows the frame. Keeping the buffer concentric with the canvas lets
+    /// every transform/anchor/hit-test that assumes a canvas-centered raster
+    /// keep working — the buffer just got bigger. Effect passes only reshape
+    /// this mask.
     #[allow(clippy::too_many_arguments)]
     fn text_coverage(
         &mut self,
         text: &str,
         style: &TextStyle,
+        scale: f32,
         font_size: f32,
         line_height: f32,
         letter_spacing: f32,
         width: u32,
         height: u32,
-    ) -> Vec<u8> {
-        let w = width as usize;
-        let h = height as usize;
-        let mut mask = vec![0u8; w * h];
-
+    ) -> (Vec<u8>, u32, u32) {
         let font_system = self.font_system.get_or_insert_with(FontSystem::new);
         let swash = &mut self.swash_cache;
 
@@ -368,21 +404,22 @@ impl GeneratorRaster {
         // the edge; it also serves as the left/right alignment margin below.
         let margin = width as f32 * 0.05;
         if style.wrap {
-            // Wrap the title inside the canvas width.
+            // Wrap the title inside the canvas width; height is unbounded so
+            // every line lays out — a tall block grows past the frame instead
+            // of being cut off.
             let wrap_w = (width as f32 - 2.0 * margin).max(1.0);
-            buffer.set_size(font_system, Some(wrap_w), Some(height as f32));
+            buffer.set_size(font_system, Some(wrap_w), None);
         } else {
             // No wrap: lay the text on a single line (explicit newlines still
-            // break) that may overflow the canvas edges, where it's clipped to
-            // the frame — `Wrap::None` plus an unbounded layout width so
-            // cosmic-text never inserts soft breaks.
+            // break) — `Wrap::None` plus an unbounded layout size so
+            // cosmic-text never inserts soft breaks and never drops lines.
             buffer.set_wrap(font_system, Wrap::None);
-            buffer.set_size(font_system, None, Some(height as f32));
+            buffer.set_size(font_system, None, None);
         }
         buffer.set_text(font_system, text, &attrs, Shaping::Advanced);
         buffer.shape_until_scroll(font_system, false);
 
-        // Block height (for vertical alignment).
+        // Block height (for vertical alignment), across every laid-out line.
         let text_h = buffer
             .layout_runs()
             .fold(0.0_f32, |m, run| m.max(run.line_top + run.line_height));
@@ -393,58 +430,183 @@ impl GeneratorRaster {
         };
 
         let white = TextColor::rgba(255, 255, 255, 255);
-        let canvas_w = w as i32;
-        let canvas_h = h as i32;
         let underline_thickness = (font_size * 0.06).max(1.0);
 
+        // Pass 1 — measure the inked extent in canvas coordinates (origin at
+        // the canvas top-left; values can fall outside `0..width`/`0..height`
+        // when the text overflows the frame).
+        let mut ink = InkBounds::default();
         for run in buffer.layout_runs() {
-            let glyph_count = run.glyphs.len();
-            // Total extra width letter spacing adds to this line (between
-            // glyphs only), so alignment accounts for it.
-            let extra = if glyph_count > 1 {
-                letter_spacing * (glyph_count as f32 - 1.0)
-            } else {
-                0.0
-            };
-            let line_w = run.line_w + extra.max(0.0);
-            let line_x_off = match style.align_h {
-                TextAlignH::Left => margin,
-                TextAlignH::Center => ((width as f32) - line_w) / 2.0,
-                TextAlignH::Right => (width as f32) - margin - line_w,
-            }
-            .round() as i32;
+            let line_x_off =
+                run_line_x_off(style.align_h, width as f32, margin, &run, letter_spacing);
             let base_y = run.line_y as i32 + y_off;
-
-            let mut min_gx = i32::MAX;
-            let mut max_gx = i32::MIN;
+            let (mut min_gx, mut max_gx) = (i32::MAX, i32::MIN);
             for (i, glyph) in run.glyphs.iter().enumerate() {
                 let spacing = (letter_spacing * i as f32).round() as i32;
                 let physical = glyph.physical((0.0, 0.0), 1.0);
                 let gx = line_x_off + spacing + physical.x;
                 let gy = base_y + physical.y;
                 swash.with_pixels(font_system, physical.cache_key, white, |x, y, color| {
-                    add_coverage(&mut mask, canvas_w, canvas_h, gx + x, gy + y, color.a());
+                    if color.a() > 0 {
+                        ink.add(gx + x, gy + y);
+                    }
                 });
                 let left = line_x_off + spacing + glyph.x.round() as i32;
                 let right = left + glyph.w.round() as i32;
                 min_gx = min_gx.min(left);
                 max_gx = max_gx.max(right);
             }
+            if style.underline && max_gx > min_gx {
+                let uy = base_y + (font_size * 0.12).round() as i32;
+                let ut = underline_thickness.round().max(1.0) as i32;
+                ink.add(min_gx, uy);
+                ink.add(max_gx - 1, uy + ut - 1);
+            }
+        }
 
+        let Some((min_x, min_y, max_x, max_y)) = ink.rect() else {
+            return (vec![0u8; (width as usize) * (height as usize) * 4], width, height);
+        };
+
+        // Effect passes (outline, drop shadow, background card) spread the
+        // coverage outward; pad the buffer so they aren't clipped at an
+        // overflow edge either.
+        let pad = effect_padding(style, scale, font_size);
+        let (cw, ch) = (width as i32, height as i32);
+        // Symmetric expansion: enough on every side to hold the farthest
+        // overflow, keeping the buffer concentric with the canvas. Capped so a
+        // pathological title can't exceed the GPU texture limit.
+        let need_x = (-(min_x - pad)).max((max_x + pad) - cw).max(0);
+        let need_y = (-(min_y - pad)).max((max_y + pad) - ch).max(0);
+        let ext_x = need_x.min((MAX_RASTER_DIM.saturating_sub(width) / 2) as i32);
+        let ext_y = need_y.min((MAX_RASTER_DIM.saturating_sub(height) / 2) as i32);
+        let buf_w = to_even(width + 2 * ext_x as u32);
+        let buf_h = to_even(height + 2 * ext_y as u32);
+        let (bw, bh) = (buf_w as i32, buf_h as i32);
+
+        // Pass 2 — draw the glyphs into the (possibly enlarged) buffer, shifted
+        // by the expansion so canvas-space `(0, 0)` lands at `(ext_x, ext_y)`.
+        let mut mask = vec![0u8; (buf_w as usize) * (buf_h as usize)];
+        for run in buffer.layout_runs() {
+            let line_x_off =
+                run_line_x_off(style.align_h, width as f32, margin, &run, letter_spacing);
+            let base_y = run.line_y as i32 + y_off + ext_y;
+            let (mut min_gx, mut max_gx) = (i32::MAX, i32::MIN);
+            for (i, glyph) in run.glyphs.iter().enumerate() {
+                let spacing = (letter_spacing * i as f32).round() as i32;
+                let physical = glyph.physical((0.0, 0.0), 1.0);
+                let gx = line_x_off + spacing + physical.x + ext_x;
+                let gy = base_y + physical.y;
+                swash.with_pixels(font_system, physical.cache_key, white, |x, y, color| {
+                    add_coverage(&mut mask, bw, bh, gx + x, gy + y, color.a());
+                });
+                let left = line_x_off + spacing + glyph.x.round() as i32;
+                let right = left + glyph.w.round() as i32;
+                min_gx = min_gx.min(left);
+                max_gx = max_gx.max(right);
+            }
             if style.underline && max_gx > min_gx {
                 // Sit the underline just below the baseline.
                 let uy = base_y + (font_size * 0.12).round() as i32;
                 let ut = underline_thickness.round().max(1.0) as i32;
                 for dy in 0..ut {
                     for x in min_gx..max_gx {
-                        add_coverage(&mut mask, canvas_w, canvas_h, x, uy + dy, 255);
+                        add_coverage(&mut mask, bw, bh, x + ext_x, uy + dy, 255);
                     }
                 }
             }
         }
 
-        mask
+        (mask, buf_w, buf_h)
     }
+}
+
+/// Accumulates the bounding box of inked pixels in signed canvas coordinates
+/// (text can extend past the frame on any side, so coordinates may be
+/// negative or exceed the canvas).
+#[derive(Default)]
+struct InkBounds {
+    min_x: i32,
+    min_y: i32,
+    max_x: i32,
+    max_y: i32,
+    any: bool,
+}
+
+impl InkBounds {
+    fn add(&mut self, x: i32, y: i32) {
+        if self.any {
+            self.min_x = self.min_x.min(x);
+            self.min_y = self.min_y.min(y);
+            self.max_x = self.max_x.max(x);
+            self.max_y = self.max_y.max(y);
+        } else {
+            self.min_x = x;
+            self.min_y = y;
+            self.max_x = x;
+            self.max_y = y;
+            self.any = true;
+        }
+    }
+
+    fn rect(&self) -> Option<(i32, i32, i32, i32)> {
+        self.any
+            .then_some((self.min_x, self.min_y, self.max_x, self.max_y))
+    }
+}
+
+/// Left edge (canvas px) of a laid-out line under the horizontal alignment,
+/// accounting for the extra width letter spacing adds between glyphs.
+fn run_line_x_off(
+    align: TextAlignH,
+    canvas_w: f32,
+    margin: f32,
+    run: &LayoutRun,
+    letter_spacing: f32,
+) -> i32 {
+    let glyph_count = run.glyphs.len();
+    let extra = if glyph_count > 1 {
+        letter_spacing * (glyph_count as f32 - 1.0)
+    } else {
+        0.0
+    };
+    let line_w = run.line_w + extra.max(0.0);
+    (match align {
+        TextAlignH::Left => margin,
+        TextAlignH::Center => (canvas_w - line_w) / 2.0,
+        TextAlignH::Right => canvas_w - margin - line_w,
+    })
+    .round() as i32
+}
+
+/// How far the effect passes (outline, drop shadow, background card) spread the
+/// text coverage outward, in raster px. The buffer pads by this on every side
+/// so those passes aren't clipped at an overflow edge.
+fn effect_padding(style: &TextStyle, scale: f32, font_size: f32) -> i32 {
+    let stroke = style
+        .stroke
+        .map(|s| (s.width * scale).round().max(0.0) as i32)
+        .unwrap_or(0);
+    let shadow = style
+        .shadow
+        .map(|s| {
+            let blur = (s.blur.clamp(0.0, 1.0) * font_size).round() as i32;
+            let off = (s.distance * scale / std::f32::consts::SQRT_2).round() as i32;
+            blur + off.abs()
+        })
+        .unwrap_or(0);
+    let background = if style.background.is_some() {
+        (font_size * 0.3).round() as i32
+    } else {
+        0
+    };
+    stroke.max(shadow).max(background).max(0)
+}
+
+/// Round up to the nearest even number (texture/encode friendliness, and so a
+/// concentric buffer stays pixel-aligned with an even canvas).
+fn to_even(v: u32) -> u32 {
+    if v.is_multiple_of(2) { v } else { v + 1 }
 }
 
 /// Tight bounding-box size of pixels with non-zero alpha in an RGBA buffer,
@@ -729,10 +891,10 @@ fn raster_shape(
     shape_h: f32,
     canvas_w: u32,
     canvas_h: u32,
-) -> Vec<u8> {
+) -> (Vec<u8>, u32, u32) {
     let mut out = vec![0u8; (canvas_w as usize) * (canvas_h as usize) * 4];
     let Some(mut pixmap) = Pixmap::new(canvas_w, canvas_h) else {
-        return out;
+        return (out, canvas_w, canvas_h);
     };
 
     let mut paint = Paint::default();
@@ -745,7 +907,7 @@ fn raster_shape(
     let x = (canvas_w as f32 - ext_w) / 2.0;
     let y = (canvas_h as f32 - ext_h) / 2.0;
     let Some(rect) = Rect::from_xywh(x, y, ext_w, ext_h) else {
-        return out;
+        return (out, canvas_w, canvas_h);
     };
 
     let mut pb = PathBuilder::new();
@@ -754,7 +916,7 @@ fn raster_shape(
         Shape::Ellipse => pb.push_oval(rect),
     }
     let Some(path) = pb.finish() else {
-        return out;
+        return (out, canvas_w, canvas_h);
     };
 
     pixmap.fill_path(
@@ -775,7 +937,7 @@ fn raster_shape(
         out[o + 2] = c.blue();
         out[o + 3] = c.alpha();
     }
-    out
+    (out, canvas_w, canvas_h)
 }
 
 #[cfg(test)]
@@ -789,7 +951,8 @@ mod tests {
     #[test]
     fn shape_rect_fills_center_not_corner() {
         let (w, h) = (64, 64);
-        let buf = raster_shape(Shape::Rectangle, [255, 0, 0, 255], 960.0, 540.0, w, h);
+        let (buf, bw, bh) = raster_shape(Shape::Rectangle, [255, 0, 0, 255], 960.0, 540.0, w, h);
+        assert_eq!((bw, bh), (w, h));
         assert_eq!(buf.len(), (w * h * 4) as usize);
         // Center is inside the legacy-default box.
         assert_eq!(alpha_at(&buf, w, w / 2, h / 2), 255);
@@ -803,7 +966,7 @@ mod tests {
     #[test]
     fn shape_ellipse_corner_of_box_is_empty() {
         let (w, h) = (64, 64);
-        let buf = raster_shape(Shape::Ellipse, [0, 255, 0, 255], 960.0, 540.0, w, h);
+        let (buf, _, _) = raster_shape(Shape::Ellipse, [0, 255, 0, 255], 960.0, 540.0, w, h);
         // Center filled.
         assert_eq!(alpha_at(&buf, w, w / 2, h / 2), 255);
         // Legacy default at 64×64: box ≈ 57×32 centered; corner (16,16) sits
@@ -991,6 +1154,58 @@ mod tests {
             single.1 < wrapped.1,
             "wrap-off should be shorter (single line): {single:?} vs wrapped {wrapped:?}"
         );
+    }
+
+    #[test]
+    fn overflowing_text_grows_the_buffer_past_the_canvas() {
+        let mut raster = GeneratorRaster::new();
+        // A long single line with wrap off can't fit a narrow canvas; the
+        // buffer must grow horizontally so none of it is clipped away.
+        let long = styled(
+            "a very long single line title that runs well past the frame edge",
+            TextStyle {
+                wrap: false,
+                ..TextStyle::default()
+            },
+        );
+        let (_, w, h) = raster.raster_layer(&long, 320, 240).unwrap();
+        assert!(w > 320, "buffer should widen past the canvas: {w}");
+        assert_eq!(h, 240, "a single line needs no vertical growth: {h}");
+        // The expansion stays concentric (the canvas sits centered in the
+        // buffer), so transforms that assume a canvas-centered raster hold.
+        assert!(w.is_multiple_of(2));
+
+        // The content box (selection/hit-test) now spans the full text, not
+        // the clipped-to-canvas remnant.
+        let (cw, _) = raster.content_size(&long, 320, 240).unwrap();
+        assert!(cw > 320, "content box should span the overflowing text: {cw}");
+    }
+
+    #[test]
+    fn tall_wrapped_text_grows_vertically() {
+        let mut raster = GeneratorRaster::new();
+        // A big title wrapped inside a short canvas stacks into more lines than
+        // fit — the buffer must grow vertically rather than clip the tail.
+        let long = styled(
+            "the quick brown fox jumps over the lazy dog and keeps on running",
+            TextStyle {
+                size: 300.0,
+                ..TextStyle::default()
+            },
+        );
+        let (_, w, h) = raster.raster_layer(&long, 200, 120).unwrap();
+        assert_eq!(w, 200, "wrap keeps width at the canvas: {w}");
+        assert!(h > 120, "wrapped block should grow past the canvas: {h}");
+    }
+
+    #[test]
+    fn text_that_fits_stays_canvas_sized() {
+        let mut raster = GeneratorRaster::new();
+        // Short text well within the frame must not enlarge the buffer (keeps
+        // the common case byte-identical to the canvas-sized raster).
+        let (bytes, w, h) = raster.raster_layer(&Generator::text("Hi"), 320, 240).unwrap();
+        assert_eq!((w, h), (320, 240));
+        assert_eq!(bytes.len(), (320 * 240 * 4) as usize);
     }
 
     #[test]

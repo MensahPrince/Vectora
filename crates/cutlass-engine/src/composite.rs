@@ -171,6 +171,39 @@ pub fn cropped_layer_placement(
     } else {
         1.0
     };
+    placement_from_size(transform, w, h, fit, canvas)
+}
+
+/// Placement for a generator raster authored at canvas pixel scale: its pixels
+/// map 1:1 onto the canvas (no aspect-fit), centered, then the clip transform
+/// applies. A text raster can exceed the canvas to hold content that overflows
+/// the frame; the excess simply falls outside the frame until the clip is
+/// moved or scaled down, instead of being clipped away during rasterization.
+pub fn generator_layer_placement(
+    transform: &ClipTransform,
+    content_w: u32,
+    content_h: u32,
+    crop: &CropRect,
+    canvas: &CompositorConfig,
+) -> LayerPlacement {
+    let (w, h) = (content_w as f32 * crop.w, content_h as f32 * crop.h);
+    placement_from_size(transform, w, h, 1.0, canvas)
+}
+
+/// Shared geometry behind [`cropped_layer_placement`] and
+/// [`generator_layer_placement`]: place content of effective size `w × h`
+/// (already reduced by crop) at `fit · transform.scale`, centered on the
+/// canvas and offset/rotated by the transform. The two callers differ only in
+/// their `fit` choice (aspect-fit for sampled media, 1:1 for generator
+/// rasters).
+fn placement_from_size(
+    transform: &ClipTransform,
+    w: f32,
+    h: f32,
+    fit: f32,
+    canvas: &CompositorConfig,
+) -> LayerPlacement {
+    let (cw, ch) = (canvas.width as f32, canvas.height as f32);
     let scale = fit * transform.scale;
     let size = [w * scale, h * scale];
     let anchor = [
@@ -537,8 +570,10 @@ fn resolve_clip_layer(
                 Some((id, g)) if id == clip.id => g,
                 _ => generator,
             };
-            // Generators raster at canvas size, so their fit is 1:1 and
-            // the clip transform applies on top of the full canvas.
+            // Solids fill the canvas. Text/shape rasters carry their own size
+            // (text can exceed the canvas to hold content overflowing the
+            // frame) and place 1:1 with canvas pixels, so the clip transform
+            // applies on top of that raster.
             let placement =
                 cropped_layer_placement(transform, canvas.width, canvas.height, crop, canvas);
             match generator {
@@ -550,12 +585,16 @@ fn resolve_clip_layer(
                     ))
                 }
                 Generator::Text { .. } | Generator::Shape { .. } => {
-                    match raster.raster(generator, canvas.width, canvas.height) {
-                        Some(bytes) => Ok(Some(
-                            CompositeLayer::rgba(bytes, canvas.width, canvas.height, placement)
-                                .with_uv(uv)
-                                .with_effects(effects),
-                        )),
+                    match raster.raster_layer(generator, canvas.width, canvas.height) {
+                        Some((bytes, raster_w, raster_h)) => {
+                            let placement =
+                                generator_layer_placement(transform, raster_w, raster_h, crop, canvas);
+                            Ok(Some(
+                                CompositeLayer::rgba(bytes, raster_w, raster_h, placement)
+                                    .with_uv(uv)
+                                    .with_effects(effects),
+                            ))
+                        }
                         None => {
                             debug!(?generator, "generator produced no raster");
                             Ok(None)

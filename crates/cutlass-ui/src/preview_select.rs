@@ -12,6 +12,7 @@
 use cutlass_compositor::{CompositorConfig, LayerPlacement};
 use cutlass_engine::anchor_canvas_position;
 use cutlass_engine::cropped_layer_placement;
+use cutlass_engine::generator_layer_placement;
 use cutlass_models::{ClipTransform, CropRect};
 use slint::Model;
 
@@ -95,11 +96,13 @@ pub(crate) fn clip_transform(clip: &Clip) -> ClipTransform {
 ///
 /// Media clips use the shared engine helper (native size aspect-fit into the
 /// canvas) — identical to what the compositor draws. Generators raster at
-/// canvas size (fit 1:1) with their content centered inside, so the canvas
-/// placement is computed the same way the compositor does and then the size
-/// is shrunk to the drawn-content bounds the projection measured — the
-/// selection box and hit-test hug the shape/text, not the transparent raster
-/// (CapCut). Unknown bounds (0×0, e.g. empty text) keep the canvas-sized box.
+/// canvas pixel scale (fit 1:1) with their content centered, so the placement
+/// is computed the same way the compositor does and then the size is shrunk to
+/// the drawn-content bounds the projection measured — the selection box and
+/// hit-test hug the shape/text, not the transparent raster (CapCut). Those
+/// bounds can exceed the canvas for text that overflows the frame, so the box
+/// extends past the frame too. Unknown bounds (0×0, e.g. empty text) keep the
+/// canvas-sized box.
 pub(crate) fn clip_placement(clip: &Clip, canvas: &CompositorConfig) -> LayerPlacement {
     let transform = clip_transform(clip);
     let crop = clip_crop(clip);
@@ -113,12 +116,15 @@ pub(crate) fn clip_placement(clip: &Clip, canvas: &CompositorConfig) -> LayerPla
         };
         return cropped_layer_placement(&transform, w, h, &crop, canvas);
     }
+    // Generators raster at canvas pixel scale (1:1), so their placement never
+    // aspect-fits — same as the compositor's generator path.
     let mut placement =
-        cropped_layer_placement(&transform, canvas.width, canvas.height, &crop, canvas);
+        generator_layer_placement(&transform, canvas.width, canvas.height, &crop, canvas);
     if has_size && crop.is_full() {
-        // Uncropped generators hug their drawn-content bounds. A cropped
-        // generator keeps the compositor's kept-region quad instead — the
-        // measured bounds describe the uncropped raster.
+        // Uncropped generators hug their drawn-content bounds — including text
+        // that overflows the frame, whose measured bounds now exceed the
+        // canvas. A cropped generator keeps the compositor's kept-region quad
+        // instead.
         placement.size = [
             clip.media_width as f32 * transform.scale,
             clip.media_height as f32 * transform.scale,
@@ -225,6 +231,64 @@ pub fn hit_test_in_viewport(
         }
     }
     PreviewHit::default()
+}
+
+/// Whether `(x, y)` (viewport-element px) lands on `clip_id`'s placement quad,
+/// *ignoring* the letterbox guard that [`hit_test_in_viewport`] applies. The
+/// normal hit-test deselects out in the letterbox bars, but a selected clip
+/// whose content overflows the frame (e.g. a long title from the text-overflow
+/// raster) extends out there — this lets a press on that overflow grab the clip
+/// to drag it back into view instead of clearing the selection. Gated to the
+/// same visual/enabled/unlocked, composited, under-the-playhead rules as
+/// picking, so only a genuinely grabbable selected clip qualifies.
+#[allow(clippy::too_many_arguments)]
+pub fn selected_clip_contains_in_viewport(
+    sequence: &Sequence,
+    clip_id: &str,
+    tick: i32,
+    x: f32,
+    y: f32,
+    view_w: f32,
+    view_h: f32,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+) -> bool {
+    if clip_id.is_empty() {
+        return false;
+    }
+    let canvas = canvas_config(sequence);
+    let (cw, ch) = (canvas.width as f32, canvas.height as f32);
+    let (scale, ox, oy) = viewport_mapping(cw, ch, view_w, view_h, zoom, pan_x, pan_y);
+    if scale <= 0.0 {
+        return false;
+    }
+    // No letterbox guard here — that's the whole point.
+    let px = (x - ox) / scale;
+    let py = (y - oy) / scale;
+
+    for row in 0..sequence.tracks.row_count() {
+        let Some(track) = sequence.tracks.row_data(row) else {
+            continue;
+        };
+        if track.kind == TrackKind::Audio || !track.enabled || track.locked {
+            continue;
+        }
+        for idx in 0..track.clips.row_count() {
+            let Some(mut clip) = track.clips.row_data(idx) else {
+                continue;
+            };
+            if clip.id != clip_id {
+                continue;
+            }
+            if !covers_tick(&clip, tick) || !is_composited(&clip) {
+                return false;
+            }
+            crate::params::apply_sampled_transform(&mut clip, tick);
+            return placement_contains(&clip_placement(&clip, &canvas), px, py);
+        }
+    }
+    false
 }
 
 /// How far below the box's bottom edge the rotate affordance floats, in
@@ -596,6 +660,49 @@ mod tests {
         );
         // Inside the canvas but outside the drawn content: falls through.
         assert_eq!(hit_test(&seq, 10, 100.0, 50.0, VW, VH).clip_id.as_str(), "");
+    }
+
+    #[test]
+    fn selected_overflow_clip_is_grabbable_in_the_letterbox() {
+        // A title wider than the canvas (4000 px content on a 1920 canvas):
+        // its raster overflows the frame into the letterbox bars. In a
+        // viewport wider than 16:9 (scale 0.5, left bar x ∈ [0, 20)), a press
+        // at x = 8 lands in the bar — the normal hit-test deselects there, but
+        // the selected clip's box still covers it, so it stays grabbable.
+        let (vw, vh) = (1000.0, 540.0);
+        let seq = sequence(vec![track(
+            "1",
+            TrackKind::Video,
+            vec![generated_clip("T", "text", 4000, 1080)],
+        )]);
+        let contains = |id: &str, tick: i32, x: f32, y: f32| {
+            selected_clip_contains_in_viewport(&seq, id, tick, x, y, vw, vh, 1.0, 0.0, 0.0)
+        };
+
+        // Normal hit-test misses out in the letterbox bar...
+        assert_eq!(hit_test(&seq, 10, 8.0, 270.0, vw, vh).clip_id.as_str(), "");
+        // ...but the selected overflowing clip is still grabbable there.
+        assert!(contains("T", 10, 8.0, 270.0));
+        // Off the playhead it isn't draggable, so it isn't grabbable.
+        assert!(!contains("T", 200, 8.0, 270.0));
+        // No selection ⇒ nothing to grab.
+        assert!(!contains("", 10, 8.0, 270.0));
+    }
+
+    #[test]
+    fn canvas_sized_clip_stays_deselectable_in_the_letterbox() {
+        // A clip that exactly fills the canvas doesn't reach the letterbox, so
+        // a press out there is genuine empty space: not grabbable (the caller
+        // deselects, CapCut-style).
+        let (vw, vh) = (1000.0, 540.0);
+        let seq = sequence(vec![track(
+            "1",
+            TrackKind::Video,
+            vec![generated_clip("C", "text", 1920, 1080)],
+        )]);
+        assert!(!selected_clip_contains_in_viewport(
+            &seq, "C", 10, 8.0, 270.0, vw, vh, 1.0, 0.0, 0.0
+        ));
     }
 
     #[test]

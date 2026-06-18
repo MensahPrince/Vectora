@@ -308,9 +308,10 @@ component NumberBox inherits Rectangle {
 }
 
 component PositionRow inherits HorizontalLayout {
+    in property <string> label: "Position";
     in property <float> x-value;
     in property <float> y-value;
-    // Position is one vec2 param: one cluster keyframes both axes.
+    // A vec2 param (position / anchor): one cluster keyframes both axes.
     in property <ParamRowState> kf;
     in property <bool> kf-can-toggle;
 
@@ -324,7 +325,7 @@ component PositionRow inherits HorizontalLayout {
     vertical-stretch: 0;
 
     LabelCell {
-        label: "Position";
+        label: root.label;
     }
 
     NumberBox {
@@ -475,6 +476,21 @@ export component TextInspector inherits VerticalLayout {
     // playhead — no history entry. Used while dragging a slider.
     function preview-style() {
         InspectorBackend.preview-text-generator(model.id, root.edit-text, root.style, TimelineStore.playhead-tick);
+    }
+
+    // Anchor edits compensate position so the rendered text stays put while
+    // the pivot moves (same semantics as the preview anchor handle); position /
+    // scale / rotation / opacity use `apply` directly.
+    function apply-anchor(ax: float, ay: float, commit: bool) {
+        let c = InspectorBackend.compensate-anchor-position(
+            model,
+            EditorStore.project.sequence,
+            TimelineStore.playhead-tick,
+            ax,
+            ay,
+            root.scale-v,
+            root.rot-v);
+        root.apply(c.position-x, c.position-y, ax, ay, root.scale-v, root.rot-v, root.opacity-v, commit);
     }
 
     function apply(px: float, py: float, ax: float, ay: float, s: float, r: float, o: float, commit: bool) {
@@ -1047,6 +1063,29 @@ export component TextInspector inherits VerticalLayout {
                 }
                 kf-set-easing(e) => {
                     root.ease-kf("position", e, root.pos-x, root.pos-y);
+                }
+            }
+
+            // Anchor as a percentage of the content box (50/50 = center); the
+            // edit keeps pixels fixed via `apply-anchor` so moving the pivot
+            // doesn't shift the title.
+            PositionRow {
+                label: "Anchor";
+                x-value: root.anchor-x * 100;
+                y-value: root.anchor-y * 100;
+                kf: root.sample.anchor-row;
+                kf-can-toggle: root.playhead-inside;
+                commit-x(v) => {
+                    root.apply-anchor(v / 100, root.anchor-y, true);
+                }
+                commit-y(v) => {
+                    root.apply-anchor(root.anchor-x, v / 100, true);
+                }
+                kf-toggle => {
+                    root.toggle-kf("anchor", root.sample.anchor-row.on-keyframe, root.anchor-x, root.anchor-y);
+                }
+                kf-set-easing(e) => {
+                    root.ease-kf("anchor", e, root.anchor-x, root.anchor-y);
                 }
             }
 

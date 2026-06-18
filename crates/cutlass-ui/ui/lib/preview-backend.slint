@@ -80,6 +80,12 @@ export global PreviewBackend {
     // can't be hit.
     pure callback hit-test(Sequence /* sequence */, int    /* playhead-tick */, float  /* x */, float  /* y */, float  /* view-w */, float  /* view-h */, float  /* zoom */, float  /* pan-x */, float  /* pan-y */, ) -> PreviewHit;
 
+    // Whether (x, y) lands on the selected clip's box, *ignoring* the letterbox
+    // guard the normal hit-test uses. Lets a press on a selected clip whose
+    // content overflows the frame (e.g. a long title) out in the letterbox grab
+    // it to drag, instead of deselecting. (src/preview_select.rs)
+    pure callback selected-contains(Sequence /* sequence */, string /* clip-id */, int    /* playhead-tick */, float  /* x */, float  /* y */, float  /* view-w */, float  /* view-h */, float  /* zoom */, float  /* pan-x */, float  /* pan-y */, ) -> bool;
+
     // Outline of `clip-id` (the primary selection) at the playhead tick,
     // mapped into viewport-element coordinates. While a gesture is live the
     // projection still holds the press-time transform, so the panel passes

@@ -5,6 +5,7 @@
 // switching themes never reflows the layout.
 import {
     Accent,
+    AgentChat,
     Layout,
     Metrics,
     Panel,
@@ -124,6 +125,18 @@ export global EmberTheme {
         },
     };
 
+    private property <AgentChat> agent: {
+        input-bg: self.surface.app-background,
+        user-message-bg: #FFB45424,
+        plan-bg: #2A221C,
+        plan-border: #FFB45445,
+        send-disabled-bg: #3D342C,
+        stop-bg: #F4EDE310,
+        stop-bg-hover: #F4EDE31c,
+        error: #FF7A6B,
+        preview-toggle-border: #F4EDE344,
+    };
+
     out property <Theme> theme: {
         surface: self.surface,
         text: self.text,
@@ -134,5 +147,6 @@ export global EmberTheme {
         panel: self.panel,
         scrollbar: self.scrollbar,
         track-lane: self.track-lane,
+        agent: self.agent,
     };
 }

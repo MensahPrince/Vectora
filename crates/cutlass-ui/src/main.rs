@@ -266,6 +266,33 @@ fn default_export_path() -> SharedString {
         .into()
 }
 
+/// Reveal a finished export in the OS file browser, selecting the file where
+/// the platform supports it (Finder on macOS, Explorer on Windows). On other
+/// platforms we fall back to opening the containing directory.
+fn reveal_in_file_browser(path: &std::path::Path) {
+    let spawn = |program: &str, args: &[&std::ffi::OsStr]| {
+        if let Err(e) = std::process::Command::new(program).args(args).spawn() {
+            tracing::error!("failed to reveal export in file browser: {e}");
+        }
+    };
+
+    #[cfg(target_os = "macos")]
+    spawn("open", &[std::ffi::OsStr::new("-R"), path.as_os_str()]);
+
+    #[cfg(target_os = "windows")]
+    {
+        let mut select = std::ffi::OsString::from("/select,");
+        select.push(path.as_os_str());
+        spawn("explorer", &[select.as_os_str()]);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let dir = path.parent().unwrap_or(path);
+        spawn("xdg-open", &[dir.as_os_str()]);
+    }
+}
+
 // The Dock icon of a bare (non-bundled) binary is the generic executable
 // glyph: AppKit takes it from the .app bundle, which `cargo run` doesn't
 // have, and winit has no window-icon concept on macOS — so `Window.icon`
@@ -771,6 +798,14 @@ fn main() -> Result<(), slint::PlatformError> {
         export_cancel_handle.cancel_export();
     });
 
+    let export_reveal_weak = export_backend.as_weak();
+    export_backend.on_reveal_output_clicked(move || {
+        if let Some(backend) = export_reveal_weak.upgrade() {
+            let path = std::path::PathBuf::from(backend.get_output_path().to_string());
+            reveal_in_file_browser(&path);
+        }
+    });
+
     // --- canvas settings (title bar → dialog → engine thread) ------------
 
     let set_canvas_handle = preview_worker.handle();
@@ -1050,6 +1085,23 @@ fn main() -> Result<(), slint::PlatformError> {
         |sequence, tick, x, y, view_w, view_h, zoom, pan_x, pan_y| {
             preview_select::hit_test_in_viewport(
                 &sequence, tick, x, y, view_w, view_h, zoom, pan_x, pan_y,
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>().on_selected_contains(
+        |sequence, clip_id, tick, x, y, view_w, view_h, zoom, pan_x, pan_y| {
+            preview_select::selected_clip_contains_in_viewport(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                x,
+                y,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
             )
         },
     );

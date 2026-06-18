@@ -33,10 +33,22 @@ pub struct DecoderPool {
 
 impl DecoderPool {
     pub fn new() -> Self {
+        Self::with_hw_accel(HwAccel::None)
+    }
+
+    /// Pool that decodes through `hw_accel` (e.g. [`HwAccel::Auto`] to probe the
+    /// platform media engine — VideoToolbox / NVDEC / VA-API — and fall back to
+    /// software if none is usable). Hardware-decoded frames come back as NV12,
+    /// which the engine's `decoded_to_yuv_layer` deinterleaves to YUV420P.
+    ///
+    /// Used by export so big 4K renders offload decode off the CPU. Preview
+    /// stays on [`HwAccel::None`] ([`Self::new`]): its YUV scrub cache packs
+    /// YUV420P planes and isn't fed NV12.
+    pub fn with_hw_accel(hw_accel: HwAccel) -> Self {
         Self {
             entries: HashMap::new(),
             stills: HashMap::new(),
-            options: DecodeOptions::default().hw_accel(HwAccel::None),
+            options: DecodeOptions::default().hw_accel(hw_accel),
         }
     }
 
