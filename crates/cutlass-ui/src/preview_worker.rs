@@ -1085,9 +1085,7 @@ fn worker_loop(
                 start_tick,
                 drop_row,
                 insert,
-            } => add_clip_and_publish(
-                engine, &media, &track, start_tick, drop_row, insert, *linkage, &ui,
-            ),
+            } => add_clip_and_publish(engine, &media, &track, start_tick, drop_row, insert, &ui),
             WorkerMsg::AddGenerated {
                 generator,
                 track,
@@ -2387,11 +2385,11 @@ fn register_media_with_workers(
 ///   new lane appears where the user dropped (above the lanes ⇒ top of the
 ///   stack, below ⇒ bottom);
 /// - dropped on the main lane with the magnet on (`insert`) → ripple-insert
-///   at `start_tick`, shifting later clips right (atomic engine command);
-/// - with `linkage` on, a video drop whose media carries audio also lands a
-///   linked audio clip at the same tick (an existing unlocked audio lane
-///   with the span free, else a fresh bottom lane) — one history entry for
-///   the pair.
+///   at `start_tick`, shifting later clips right (atomic engine command).
+///
+/// A video drop whose media carries audio lands a *single* clip — CapCut keeps
+/// the sound on the video clip and the audio mixers read it from that lane, so
+/// no separate audio lane is spawned.
 #[allow(clippy::too_many_arguments)]
 fn add_clip_and_publish(
     engine: &mut Engine,
@@ -2400,17 +2398,16 @@ fn add_clip_and_publish(
     start_tick: i64,
     drop_row: i64,
     insert: bool,
-    linkage: bool,
     ui: &UiSink,
 ) {
     let Some(media_id) = parse_raw_id(media).map(MediaId::from_raw) else {
         error!(media, "drop ignored: unparsable media id");
         return;
     };
-    let Some((source, audio_only, has_audio)) = engine
+    let Some((source, audio_only)) = engine
         .project()
         .media(media_id)
-        .map(|m| (m.full_range(), m.is_audio_only(), m.has_audio))
+        .map(|m| (m.full_range(), m.is_audio_only()))
     else {
         error!(%media_id, "drop ignored: media not in pool");
         return;
@@ -2421,10 +2418,14 @@ fn add_clip_and_publish(
         TrackKind::Video
     };
     let tl_rate = engine.project().timeline().frame_rate;
-    // Mirror Project::add_clip's source→timeline resampling so first-fit and
-    // the audio companion see the same extent the engine will validate.
+    // Mirror Project::add_clip's source→timeline resampling so first-fit sees
+    // the same extent the engine will validate.
     let duration_ticks = resample(source.duration, tl_rate).value.max(1);
-    let wants_companion = linkage && !audio_only && has_audio;
+
+    // CapCut keeps a video's sound on the video clip itself — a drop lands one
+    // clip and the audio mixers read its audio from that lane (see
+    // `audio_snapshot`). No companion lane is spawned; "Separate audio" is a
+    // later, explicit gesture.
 
     // The main-track magnet only applies to the main *video* lane.
     if insert
@@ -2440,16 +2441,8 @@ fn add_clip_and_publish(
             at: RationalTime::new(at, tl_rate),
         })) {
             Ok(ApplyOutcome::Edited(EditOutcome::Created(clip))) => {
-                let linked = !wants_companion
-                    || add_linked_audio(engine, clip, media_id, source, at, duration_ticks)
-                        .map_err(|e| error!(%clip, "linked audio drop failed: {e}"))
-                        .is_ok();
-                if linked {
-                    engine.commit_group();
-                    info!(%clip, %lane, %media_id, at, "ripple-inserted clip from library drop");
-                } else {
-                    engine.rollback_group();
-                }
+                engine.commit_group();
+                info!(%clip, %lane, %media_id, at, "ripple-inserted clip from library drop");
             }
             Ok(other) => {
                 error!(%media_id, "unexpected ripple-insert outcome: {other:?}");
@@ -2465,8 +2458,7 @@ fn add_clip_and_publish(
     }
     let desired = start_tick.max(0);
 
-    // One history entry per drop, even when it creates the landing lane(s)
-    // and the linked audio companion.
+    // One history entry per drop, even when it creates the landing lane.
     engine.begin_group();
     let (track_id, start_value) = match lane_of_kind(engine, track, lane_kind) {
         Some(lane) => {
@@ -2494,21 +2486,13 @@ fn add_clip_and_publish(
         start: RationalTime::new(start_value, tl_rate),
     })) {
         Ok(ApplyOutcome::Edited(EditOutcome::Created(clip))) => {
-            let linked = !wants_companion
-                || add_linked_audio(engine, clip, media_id, source, start_value, duration_ticks)
-                    .map_err(|e| error!(%clip, "linked audio drop failed: {e}"))
-                    .is_ok();
-            if linked {
-                engine.commit_group();
-                info!(
-                    %clip, %track_id, %media_id,
-                    start_tick = start_value,
-                    desired,
-                    "added clip from library drop"
-                );
-            } else {
-                engine.rollback_group();
-            }
+            engine.commit_group();
+            info!(
+                %clip, %track_id, %media_id,
+                start_tick = start_value,
+                desired,
+                "added clip from library drop"
+            );
             publish_projection(engine, ui);
         }
         // First-fit should have made the placement valid; the engine still
@@ -2783,11 +2767,11 @@ fn set_speed_curve_point_and_publish(
     set_speed_curve_and_publish(engine, clip, &Some(curve), linkage, ui);
 }
 
-/// Set a clip's audio mix (CapCut volume + fades, M1). Audio rides
-/// audio-lane clips, so a video half of a linked pair routes to its
-/// audio-lane link partners — the inspector edit lands where the sound is.
-/// One history group; the republish re-snapshots the playback mixer, so the
-/// change is audible within a block.
+/// Set a clip's audio mix (CapCut volume + fades, M1). A video clip carries
+/// its own sound, so the edit lands on the clicked clip; only when its audio
+/// was detached to a linked audio lane does it follow to the audible half
+/// there. One history group; the republish re-snapshots the playback mixer, so
+/// the change is audible within a block.
 fn set_clip_audio_and_publish(
     engine: &mut Engine,
     clip: &str,
@@ -2800,25 +2784,20 @@ fn set_clip_audio_and_publish(
         error!(clip, "set-clip-audio ignored: unparsable clip id");
         return;
     };
-    let on_audio_lane = |engine: &Engine, id: ClipId| {
-        let timeline = engine.project().timeline();
-        timeline
-            .track_of(id)
-            .and_then(|t| timeline.track(t))
-            .is_some_and(|t| t.kind == TrackKind::Audio)
-    };
-    let targets: Vec<ClipId> = if on_audio_lane(engine, clip_id) {
+    // CapCut keeps a video's sound on its own clip, so volume/fades land on the
+    // clicked clip when it carries its own audio (a video drop, or an audio
+    // lane). Only when its sound was detached to a linked audio lane does the
+    // edit follow to the audible half there.
+    let targets: Vec<ClipId> = if engine.project().timeline().carries_own_audio(clip_id) {
         vec![clip_id]
     } else {
-        // Always follow linkage here: volume on the video half alone is
-        // inaudible, so the edit must land on the audio companions.
         link_group_ids(engine, clip_id)
             .into_iter()
-            .filter(|id| on_audio_lane(engine, *id))
+            .filter(|id| engine.project().timeline().carries_own_audio(*id))
             .collect()
     };
     if targets.is_empty() {
-        warn!(%clip_id, "set-clip-audio ignored: no audio-lane clip to adjust");
+        warn!(%clip_id, "set-clip-audio ignored: no audible clip to adjust");
         return;
     }
 
@@ -3231,58 +3210,6 @@ fn set_generator_and_publish(engine: &mut Engine, clip: &str, generator: Generat
         }
         Err(e) => error!(%clip_id, "set generator failed: {e}"),
     }
-}
-
-/// Land the audio companion of a linked drop: the same source range at the
-/// same tick, on the topmost unlocked audio lane with the span free (a new
-/// bottom lane when none has room), then link the pair. Runs inside the
-/// drop's history group.
-fn add_linked_audio(
-    engine: &mut Engine,
-    video_clip: ClipId,
-    media_id: MediaId,
-    source: TimeRange,
-    start_tick: i64,
-    duration_ticks: i64,
-) -> Result<(), String> {
-    let tl_rate = engine.project().timeline().frame_rate;
-    // UI rows show the stack top-first, so scanning the order back-to-front
-    // prefers the audio lane closest to the video lanes.
-    let lane = {
-        let timeline = engine.project().timeline();
-        timeline.order().iter().rev().copied().find(|id| {
-            timeline.track(*id).is_some_and(|t| {
-                t.kind == TrackKind::Audio && !t.locked && span_free(t, start_tick, duration_ticks)
-            })
-        })
-    };
-    let lane = match lane {
-        Some(lane) => lane,
-        // drop_row == lane count ⇒ stack index 0 ⇒ bottom lane in the UI.
-        None => {
-            let bottom = engine.project().timeline().order().len() as i64;
-            create_track(engine, TrackKind::Audio, bottom)?
-        }
-    };
-
-    let audio_clip = match engine.apply(Command::Edit(EditCommand::AddClip {
-        track: lane,
-        media: media_id,
-        source,
-        start: RationalTime::new(start_tick, tl_rate),
-    })) {
-        Ok(ApplyOutcome::Edited(EditOutcome::Created(id))) => id,
-        Ok(other) => return Err(format!("unexpected audio add outcome: {other:?}")),
-        Err(e) => return Err(e.to_string()),
-    };
-    apply_edit(
-        engine,
-        EditCommand::LinkClips {
-            clips: vec![video_clip, audio_clip],
-        },
-    )?;
-    info!(%video_clip, %audio_clip, %lane, start_tick, "linked audio companion");
-    Ok(())
 }
 
 /// Whether `[start, start + duration)` overlaps no clip on `track`.
@@ -5002,16 +4929,18 @@ fn generator_content_sizes(engine: &mut Engine) -> HashMap<u64, (i32, i32)> {
 }
 
 /// Every audible clip on the timeline, in rational time: clips on unmuted
-/// audio lanes whose media carries an audio stream. Video lanes contribute
-/// no sound — imports land a linked audio companion for that (linkage), so
-/// audio is always *on* audio lanes, CapCut-style.
+/// lanes whose media carries an audio stream. CapCut-style, a video clip keeps
+/// its own sound — so video lanes are audible too — and only a clip detached to
+/// a linked audio-lane partner (CapCut "separate audio") defers its audio
+/// there. The export mixer applies the same rule, so what you hear is what you
+/// ship.
 fn audio_snapshot(engine: &Engine) -> AudioSnapshot {
     let project = engine.project();
     let timeline = project.timeline();
     let fps = timeline.frame_rate;
     let mut spans = Vec::new();
     for track in timeline.tracks_ordered() {
-        if track.kind != TrackKind::Audio || track.muted {
+        if track.muted {
             continue;
         }
         for clip in track.clips_ordered() {
@@ -5020,6 +4949,11 @@ fn audio_snapshot(engine: &Engine) -> AudioSnapshot {
             // time-stretch (M8 Phase 3); the export mixer matches, so what you
             // hear is what you ship.
             if clip.is_silent() {
+                continue;
+            }
+            // Audio rides the clip's own lane unless it's been split off to a
+            // linked audio lane; skip lanes that never carry media audio.
+            if !timeline.carries_own_audio(clip.id) {
                 continue;
             }
             let Some(media_id) = clip.media() else {

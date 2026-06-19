@@ -53,11 +53,12 @@ export global TimelineStore {
     // Mirrored to the worker via EditorStore.on-main-magnet-changed (paste/
     // duplicate/delete have no drag resolution, so the worker needs the flag).
     in-out property <bool> main-magnet-enabled: true;
-    // CapCut's linkage toggle: while on, clips sharing a link group (the
-    // video+audio pair from one media drop) select/move/trim together, and
-    // drops of media with audio create linked pairs. Off = clips act
-    // independently (links persist, dormant). Mirrored to the worker via
-    // EditorStore.on-linkage-changed (drops/trims/splits need the flag).
+    // CapCut's linkage toggle: while on, clips sharing a link group (e.g. a
+    // video and an audio clip that "Separate audio" split apart) select/move/
+    // trim together. A video drop keeps its sound on the clip itself, so it no
+    // longer spawns a linked audio lane. Off = clips act independently (links
+    // persist, dormant). Mirrored to the worker via
+    // EditorStore.on-linkage-changed (trims/splits/selection need the flag).
     in-out property <bool> link-enabled: true;
 
     // Ruler marker gestures (M1): wired from main.rs to the preview worker.

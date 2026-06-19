@@ -86,8 +86,9 @@ export global EditorStore {
     // A track header toggle was clicked. `flag` is "enabled" | "muted" |
     // "locked"; `value` is the new state. The worker applies it undoably.
     callback on-track-flag-toggled(track-id: string, flag: string, value: bool);
-    // The linkage toggle flipped; the worker mirrors the flag (drops of
-    // media with audio create linked pairs, trims/splits follow links).
+    // The linkage toggle flipped; the worker mirrors the flag so trims/splits/
+    // selection follow existing link groups (a video drop keeps its own sound,
+    // so it no longer creates a linked audio pair).
     callback on-linkage-changed(enabled: bool);
 
     // --- preview transform gestures (preview roadmap Phase 3) -------------

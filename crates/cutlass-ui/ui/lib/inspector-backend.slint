@@ -124,9 +124,9 @@ export global InspectorBackend {
     callback set-clip-pitch(clip-id: string, preserve: bool);
 
     // Toggle noise reduction on a media clip (CapCut "Reduce noise", M8
-    // Phase 5): true runs the clip's audio through RNNoise in both mixers. The
-    // worker routes a video clip to its audio-lane link partners, so the edit
-    // lands where the sound is. One undoable edit.
+    // Phase 5): true runs the clip's audio through RNNoise in both mixers. A
+    // video clip carries its own sound, so the edit lands on it directly —
+    // unless its audio was detached to a linked audio lane. One undoable edit.
     callback set-denoise(clip-id: string, denoise: bool);
 
     // Apply a named speed-ramp preset to a media clip (CapCut speed curves,
@@ -142,9 +142,9 @@ export global InspectorBackend {
     callback set-speed-curve-point(clip-id: string, index: int, value: float);
 
     // Set a clip's audio mix (CapCut volume + fades, M1): gain multiplier
-    // (0 mutes, 1 unchanged) plus fade in/out durations in seconds. The
-    // worker routes a video clip to its audio-lane link partners, so the
-    // edit always lands where the sound is. One undoable edit.
+    // (0 mutes, 1 unchanged) plus fade in/out durations in seconds. A video
+    // clip carries its own sound, so the edit lands on it directly — unless its
+    // audio was detached to a linked audio lane. One undoable edit.
     callback set-clip-audio(
         clip-id: string,
         volume: float,
