@@ -12,7 +12,11 @@ pub enum PixelFormat {
 impl PixelFormat {
     pub(crate) fn from_ffmpeg(px: Pixel) -> Option<Self> {
         match px {
-            Pixel::YUV420P => Some(PixelFormat::Yuv420p),
+            // `yuvj420p` is `yuv420p` with full (JPEG) range — identical plane
+            // layout. We ingest it as YUV420P and carry the range separately
+            // (see `DecodedFrame::full_range`) so the GPU picks the right
+            // matrix instead of a CPU pixel rewrite.
+            Pixel::YUV420P | Pixel::YUVJ420P => Some(PixelFormat::Yuv420p),
             Pixel::NV12 => Some(PixelFormat::Nv12),
             Pixel::RGBA => Some(PixelFormat::Rgba8),
             _ => None,
@@ -62,20 +66,26 @@ pub struct DecodedFrame {
     pub pts_ticks: i64,
     pub format: PixelFormat,
     pub planes: Vec<Plane>,
+    /// Whether the YUV samples use full (JPEG, 0–255) range rather than the
+    /// limited (studio, 16–235) range the pipeline assumes by default. Set for
+    /// `yuvj420p` sources (phones, screen recordings); the YUV→RGB conversion
+    /// branches on it. Always `false` for RGBA.
+    pub full_range: bool,
 }
 
 impl DecodedFrame {
     pub(crate) fn from_ffmpeg(
         frame: &ffmpeg_next::util::frame::video::Video,
     ) -> Result<Self, DecodeError> {
+        let raw = frame.format();
         let width = frame.width();
         let height = frame.height();
-        let format = PixelFormat::from_ffmpeg(frame.format()).ok_or_else(|| {
-            DecodeError::unsupported(format!(
-                "pixel format {:?} not supported after decode",
-                frame.format()
-            ))
+        let format = PixelFormat::from_ffmpeg(raw).ok_or_else(|| {
+            DecodeError::unsupported(format!("pixel format {raw:?} not supported after decode"))
         })?;
+        // Only the full-range `yuvj420p` fast path reaches here as a full-range
+        // frame; anything swscale-normalized arrives as limited-range YUV420P.
+        let full_range = matches!(raw, Pixel::YUVJ420P);
         let pts_ticks = frame
             .timestamp()
             .or_else(|| frame.pts())
@@ -110,6 +120,7 @@ impl DecodedFrame {
             pts_ticks,
             format,
             planes,
+            full_range,
         })
     }
 }
@@ -123,6 +134,11 @@ mod tests {
     fn from_ffmpeg_maps_supported_pixels() {
         assert_eq!(
             PixelFormat::from_ffmpeg(Pixel::YUV420P),
+            Some(PixelFormat::Yuv420p)
+        );
+        // Full-range yuvj420p shares the YUV420P layout (range tracked separately).
+        assert_eq!(
+            PixelFormat::from_ffmpeg(Pixel::YUVJ420P),
             Some(PixelFormat::Yuv420p)
         );
         assert_eq!(

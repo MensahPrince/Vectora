@@ -18,6 +18,7 @@ use crate::video::hwaccel::{
     transfer_to_cpu,
 };
 use crate::video::keyframe_indexer::KeyframeIndex;
+use crate::video::scale::{convert_to_yuv420p, is_pipeline_pixel_format};
 
 static FFMPEG_INIT: OnceLock<Result<(), FfmpegError>> = OnceLock::new();
 
@@ -34,6 +35,11 @@ pub struct SourceInfo {
     pub height: u32,
 
     pub pixel_format: PixelFormat,
+    /// Source uses full (JPEG, 0–255) YUV range rather than limited (16–235).
+    /// True for `yuvj420p` media (phones, screen recordings). Decoded frames
+    /// carry the same flag; this is the stable per-source value used to stamp
+    /// frames served from the preview cache (which stores only raw planes).
+    pub full_range: bool,
     pub time_base: Rational,
     pub frame_rate: Rational,
     pub hw_accel: HwAccel,
@@ -108,18 +114,29 @@ impl Decoder {
             return Err(DecodeError::unsupported("zero video dimensions"));
         }
 
+        // Formats outside {YUV420P, NV12, RGBA} are normalized to limited-range
+        // YUV420P at decode time (see `finish_frame`), so report that here
+        // instead of refusing to open. Hardware decode hasn't produced a frame
+        // yet, so its surface format is unknown — assume the usual NV12 transfer
+        // output; software decode already knows the codec's pixel format.
         let pixel_format = if active_hw.uses_hardware() {
             PixelFormat::from_ffmpeg(decoder.format()).unwrap_or(PixelFormat::Nv12)
         } else {
-            PixelFormat::from_ffmpeg(decoder.format()).ok_or_else(|| {
-                DecodeError::unsupported("pixel format not YUV420P, NV12, or RGBA")
-            })?
+            PixelFormat::from_ffmpeg(decoder.format()).unwrap_or(PixelFormat::Yuv420p)
         };
+        // Stable per-source range: software decode already knows the codec's
+        // pixel format, so `yuvj420p` is detectable here and matches what every
+        // decoded frame reports (used to re-stamp cache hits, which keep only
+        // raw planes). Hardware surfaces don't expose this until the first
+        // transferred frame, so they default to limited — the historical
+        // assumption, unchanged.
+        let full_range = matches!(decoder.format(), format::Pixel::YUVJ420P);
 
         let info = SourceInfo {
             width,
             height,
             pixel_format,
+            full_range,
             time_base,
             frame_rate,
             hw_accel: active_hw,
@@ -219,18 +236,32 @@ impl Decoder {
         while let Some(frame) = self.next_video_frame()? {
             let pts = frame_pts(&frame).unwrap_or(i64::MIN);
             if pts >= target_ticks {
-                let cpu = if is_hardware_pixel_format(frame.format()) {
-                    transfer_to_cpu(&frame, &mut self.sw_frame)?;
-                    &self.sw_frame
-                } else {
-                    &frame
-                };
-                let decoded = DecodedFrame::from_ffmpeg(cpu)?;
+                let decoded = self.finish_frame(&frame)?;
                 self.last_pts = Some(decoded.pts_ticks);
                 return Ok(Some(decoded));
             }
         }
         Ok(None)
+    }
+
+    /// Turn a freshly received frame into a [`DecodedFrame`]: copy it off the
+    /// GPU when hardware-decoded, then normalize any pixel format the pipeline
+    /// can't ingest directly (full-range `yuvj*`, 10-bit, 4:2:2 / 4:4:4, …) to
+    /// limited-range YUV420P.
+    fn finish_frame(&mut self, frame: &Video) -> Result<DecodedFrame, DecodeError> {
+        let cpu = if is_hardware_pixel_format(frame.format()) {
+            transfer_to_cpu(frame, &mut self.sw_frame)?;
+            &self.sw_frame
+        } else {
+            frame
+        };
+
+        if is_pipeline_pixel_format(cpu.format()) {
+            DecodedFrame::from_ffmpeg(cpu)
+        } else {
+            let converted = convert_to_yuv420p(cpu)?;
+            DecodedFrame::from_ffmpeg(&converted)
+        }
     }
 
     pub fn set_skip_frame(&mut self, discard: Discard) {
@@ -281,14 +312,7 @@ impl Decoder {
         loop {
             match self.decoder.receive_frame(&mut frame) {
                 Ok(()) => {
-                    let cpu = if is_hardware_pixel_format(frame.format()) {
-                        transfer_to_cpu(&frame, &mut self.sw_frame)?;
-                        &self.sw_frame
-                    } else {
-                        &frame
-                    };
-
-                    let decoded = DecodedFrame::from_ffmpeg(cpu)?;
+                    let decoded = self.finish_frame(&frame)?;
                     debug!(
                         width = decoded.width,
                         height = decoded.height,

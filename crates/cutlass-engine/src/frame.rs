@@ -52,7 +52,8 @@ pub fn decoded_to_yuv_layer(frame: &DecodedFrame) -> Result<Yuv420pLayer, Engine
                 u.stride as u32,
                 v.data.clone(),
                 v.stride as u32,
-            ))
+            )
+            .with_full_range(frame.full_range))
         }
         // Hardware decoders (VideoToolbox / NVDEC) deliver frames as NV12 after
         // the GPU→CPU transfer; the compositor's YUV pipeline wants planar U/V,
@@ -70,7 +71,8 @@ pub fn decoded_to_yuv_layer(frame: &DecodedFrame) -> Result<Yuv420pLayer, Engine
                 uv_stride,
                 v,
                 uv_stride,
-            ))
+            )
+            .with_full_range(frame.full_range))
         }
         PixelFormat::Rgba8 => Err(EngineError::Preview(
             "RGBA source must use legacy CPU path".into(),
@@ -123,6 +125,7 @@ fn nv12_as_yuv420p(frame: &DecodedFrame) -> Result<DecodedFrame, EngineError> {
         height: frame.height,
         pts_ticks: frame.pts_ticks,
         format: PixelFormat::Yuv420p,
+        full_range: frame.full_range,
         planes: vec![
             frame.planes[0].clone(),
             cutlass_decoder::Plane {
@@ -225,6 +228,8 @@ pub fn unpack_yuv420p(bytes: &[u8], width: u32, height: u32) -> Result<DecodedFr
         height,
         pts_ticks: 0,
         format: PixelFormat::Yuv420p,
+        // The cache stores raw planes only; callers re-stamp the source range.
+        full_range: false,
         planes: vec![
             cutlass_decoder::Plane {
                 data: bytes[..y_size].to_vec(),
@@ -258,9 +263,21 @@ fn yuv420p_to_rgba(frame: &DecodedFrame) -> Result<RgbaFrame, EngineError> {
             let u = i32::from(u_plane.data[uv_row * u_plane.stride + uv_col]) - 128;
             let v = i32::from(v_plane.data[uv_row * v_plane.stride + uv_col]) - 128;
 
-            let r = ((298 * (y - 16) + 409 * v + 128) >> 8).clamp(0, 255) as u8;
-            let g = ((298 * (y - 16) - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8;
-            let b = ((298 * (y - 16) + 516 * u + 128) >> 8).clamp(0, 255) as u8;
+            // Mirror the GPU shader (yuv_blit.wgsl): full-range YUV (yuvj420p)
+            // skips the 16/219 studio rescale.
+            let (r, g, b) = if frame.full_range {
+                (
+                    ((256 * y + 359 * v + 128) >> 8).clamp(0, 255) as u8,
+                    ((256 * y - 88 * u - 183 * v + 128) >> 8).clamp(0, 255) as u8,
+                    ((256 * y + 454 * u + 128) >> 8).clamp(0, 255) as u8,
+                )
+            } else {
+                (
+                    ((298 * (y - 16) + 409 * v + 128) >> 8).clamp(0, 255) as u8,
+                    ((298 * (y - 16) - 100 * u - 208 * v + 128) >> 8).clamp(0, 255) as u8,
+                    ((298 * (y - 16) + 516 * u + 128) >> 8).clamp(0, 255) as u8,
+                )
+            };
 
             let i = (row * w + col) * 4;
             rgba[i] = r;
@@ -286,6 +303,7 @@ mod tests {
             height,
             pts_ticks: 0,
             format: PixelFormat::Yuv420p,
+            full_range: false,
             planes: vec![
                 Plane {
                     data: vec![y; w * h],
@@ -337,6 +355,7 @@ mod tests {
             height,
             pts_ticks: 0,
             format: PixelFormat::Nv12,
+            full_range: false,
             planes: vec![
                 Plane {
                     data: vec![y; w * h],
@@ -380,5 +399,32 @@ mod tests {
             decoded_to_rgba_inner(&nv12).unwrap(),
             decoded_to_rgba_inner(&planar).unwrap()
         );
+    }
+
+    #[test]
+    fn full_range_flag_rides_into_the_gpu_layer() {
+        let mut frame = solid_yuv420p(4, 4, 128, 128, 128);
+        frame.full_range = true;
+        assert!(decoded_to_yuv_layer(&frame).unwrap().full_range);
+        let limited = solid_yuv420p(4, 4, 128, 128, 128);
+        assert!(!decoded_to_yuv_layer(&limited).unwrap().full_range);
+    }
+
+    /// At Y=235 the two ranges diverge: limited treats it as peak white (255),
+    /// full range treats it as the literal level (~235). This is exactly the
+    /// washed-out/clipped look we'd get if range were ignored.
+    #[test]
+    fn full_range_luma_skips_the_studio_rescale() {
+        let mut full = solid_yuv420p(2, 2, 235, 128, 128);
+        full.full_range = true;
+        let r_full = yuv420p_to_rgba(&full).unwrap().bytes[0];
+        assert!(
+            (231..=239).contains(&r_full),
+            "full-range Y=235 should stay ~235, got {r_full}"
+        );
+
+        let limited = solid_yuv420p(2, 2, 235, 128, 128);
+        let r_limited = yuv420p_to_rgba(&limited).unwrap().bytes[0];
+        assert_eq!(r_limited, 255, "limited Y=235 is peak white");
     }
 }

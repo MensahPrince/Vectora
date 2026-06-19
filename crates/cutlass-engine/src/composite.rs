@@ -670,6 +670,10 @@ fn decode_media_frame(
     let source_id = fingerprint.id();
 
     let (decoder, index) = pool.decoder_and_index(clip.id, media_id, media.path())?;
+    // Stable per-source YUV range. The cache stores raw planes only, so we
+    // re-stamp it onto every frame (hit or miss) — full-range `yuvj420p`
+    // composites correctly on the GPU without a per-frame CPU rewrite.
+    let full_range = decoder.info().full_range;
     // Exact rational → stream-tick conversion. The old `RationalTime →
     // Duration → ticks` path truncated twice, landing rate-matched targets
     // one tick below the frame's stored PTS — a guaranteed cache miss on
@@ -699,7 +703,9 @@ fn decode_media_frame(
             pts = target_ticks,
             "preview frame cache hit"
         );
-        return crate::frame::unpack_yuv420p(&packed, preview_w, preview_h);
+        let mut frame = crate::frame::unpack_yuv420p(&packed, preview_w, preview_h)?;
+        frame.full_range = full_range;
+        return Ok(frame);
     }
 
     let decoded = decoder
@@ -713,11 +719,14 @@ fn decode_media_frame(
 
     // Downscale once on the decode miss (native → preview height) so every
     // later cache hit, GPU upload, composite, and readback is the small size.
-    let decoded = if cache.is_some() && (decoded.width, decoded.height) != (preview_w, preview_h) {
-        cutlass_decoder::scale_yuv420p(&decoded, preview_w, preview_h)?
-    } else {
-        decoded
-    };
+    let mut decoded =
+        if cache.is_some() && (decoded.width, decoded.height) != (preview_w, preview_h) {
+            cutlass_decoder::scale_yuv420p(&decoded, preview_w, preview_h)?
+        } else {
+            decoded
+        };
+    // Keep the range in lock-step with cache hits (both come from the source).
+    decoded.full_range = full_range;
 
     // Cache under the *requested* `target_ticks`, not the decoded frame's
     // PTS. The reader looks up by `target_ticks`, and a target rarely lands

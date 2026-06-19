@@ -96,7 +96,51 @@ pub fn scale_yuv420p(
         pts_ticks: frame.pts_ticks,
         format: PixelFormat::Yuv420p,
         planes,
+        // Downscaling is range-agnostic — the studio/full swing of the input
+        // samples carries straight through.
+        full_range: frame.full_range,
     })
+}
+
+/// Pixel formats the rest of the pipeline ingests directly, no conversion
+/// needed: limited-range planar YUV420P, full-range `yuvj420p` (same layout,
+/// range tracked separately), semi-planar NV12 (the usual hardware transfer
+/// output), and packed RGBA.
+pub(crate) fn is_pipeline_pixel_format(px: Pixel) -> bool {
+    matches!(
+        px,
+        Pixel::YUV420P | Pixel::YUVJ420P | Pixel::NV12 | Pixel::RGBA
+    )
+}
+
+/// Convert a decoded frame in any other pixel format to limited-range
+/// [`Pixel::YUV420P`] via libswscale, preserving dimensions.
+///
+/// Real-world media is full of formats the engine can't composite directly —
+/// full-range `yuvj420p` (phone clips, screen recordings), 10-bit
+/// (`yuv420p10le` / `p010le`), and 4:2:2 / 4:4:4 chroma. Rather than rejecting
+/// them at open/decode time, normalize once here so preview and export work.
+/// swscale applies the color-range (full → limited) and chroma-subsampling
+/// conversion; everything downstream keeps its limited-range YUV420P
+/// assumption (see `yuv_blit.wgsl`).
+pub(crate) fn convert_to_yuv420p(src: &Video) -> Result<Video, DecodeError> {
+    let mut scaler = scaling::Context::get(
+        src.format(),
+        src.width(),
+        src.height(),
+        Pixel::YUV420P,
+        src.width(),
+        src.height(),
+        scaling::Flags::BILINEAR,
+    )
+    .map_err(DecodeError::Decode)?;
+
+    let mut out = Video::empty();
+    scaler.run(src, &mut out).map_err(DecodeError::Decode)?;
+    // swscale does not propagate timing; carry the source PTS over so the
+    // frame still keys correctly into the cache and timeline.
+    out.set_pts(src.pts().or_else(|| src.timestamp()));
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -111,6 +155,7 @@ mod tests {
             height,
             pts_ticks: 42,
             format: PixelFormat::Yuv420p,
+            full_range: false,
             planes: vec![
                 Plane {
                     data: vec![y; w * h],
@@ -161,5 +206,57 @@ mod tests {
     fn odd_target_is_rejected() {
         let src = solid(16, 16, 1, 2, 3);
         assert!(scale_yuv420p(&src, 15, 16).is_err());
+    }
+
+    #[test]
+    fn pipeline_formats_skip_conversion() {
+        assert!(is_pipeline_pixel_format(Pixel::YUV420P));
+        assert!(is_pipeline_pixel_format(Pixel::NV12));
+        assert!(is_pipeline_pixel_format(Pixel::RGBA));
+        // yuvj420p shares the YUV420P layout, so it rides the fast path too —
+        // its full range is handled downstream on the GPU, not by swscale.
+        assert!(is_pipeline_pixel_format(Pixel::YUVJ420P));
+        // Genuinely different layouts still need normalization.
+        assert!(!is_pipeline_pixel_format(Pixel::YUV420P10LE));
+        assert!(!is_pipeline_pixel_format(Pixel::YUV422P));
+        assert!(!is_pipeline_pixel_format(Pixel::YUVJ422P));
+    }
+
+    fn fill_plane(frame: &mut Video, plane: usize, val: u8) {
+        for b in frame.data_mut(plane).iter_mut() {
+            *b = val;
+        }
+    }
+
+    /// Exotic full-range chroma layouts (here `yuvj422p`) can't be relabeled —
+    /// swscale must both subsample chroma to 4:2:0 and remap the 0..255 luma
+    /// into the 16..235 limited swing the GPU's default matrix expects.
+    #[test]
+    fn full_range_422_normalizes_to_limited_range_yuv420p() {
+        let (w, h) = (16u32, 16u32);
+
+        let mut white = Video::new(Pixel::YUVJ422P, w, h);
+        fill_plane(&mut white, 0, 255);
+        fill_plane(&mut white, 1, 128);
+        fill_plane(&mut white, 2, 128);
+        let out = convert_to_yuv420p(&white).expect("convert white");
+        assert_eq!(out.format(), Pixel::YUV420P);
+        assert_eq!((out.width(), out.height()), (w, h));
+        let y_white = out.data(0)[0];
+        assert!(
+            (230..=240).contains(&y_white),
+            "full-range white (255) should compress to limited white (~235), got {y_white}"
+        );
+
+        let mut black = Video::new(Pixel::YUVJ422P, w, h);
+        fill_plane(&mut black, 0, 0);
+        fill_plane(&mut black, 1, 128);
+        fill_plane(&mut black, 2, 128);
+        let out = convert_to_yuv420p(&black).expect("convert black");
+        let y_black = out.data(0)[0];
+        assert!(
+            (12..=20).contains(&y_black),
+            "full-range black (0) should lift to limited black (~16), got {y_black}"
+        );
     }
 }
