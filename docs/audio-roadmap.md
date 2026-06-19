@@ -42,7 +42,8 @@ beat markers all mirror CapCut desktop's audio panel.
 - **`ClipParam::Volume` is an audio property**: it bypasses the visual
   `check_param_target` (audio clips have no canvas placement to animate) and
   takes an audio-capable target check instead (media-backed; volume rides
-  any media clip, since linkage lands the audible half on an audio lane).
+  any media clip, since a video clip carries its own sound — CapCut keeps a
+  video's audio on the clip itself rather than on a separate audio lane).
   Values are validated in `0..=MAX_CLIP_VOLUME` per keyframe, finite.
 - **A keyframed envelope is never "silent."** `Clip::is_silent` is true
   only for a constant gain of `0`; an envelope is kept by both mixers (it
