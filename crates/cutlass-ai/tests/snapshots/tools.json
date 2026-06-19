@@ -1121,72 +1121,6 @@
       }
     },
     {
-      "description": "Cut the silences out of a media clip (AutoCut): finds the pauses in its audio and ripple-deletes each one so the remaining speech closes up (later clips on the track slide left). Optional min_pause (shortest gap to cut, default 0.5s), padding (audio kept around speech, default 0.08s), and threshold (0..1 loudness gate, default 0.01). Target a media-backed clip with sound. Not valid for generated or retimed clips.",
-      "name": "remove_silences",
-      "parameters": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Remove the silences from a media clip (CapCut AutoCut). The editor decodes\nthe clip's audio, finds the pauses, and ripple-deletes each one so the\nremaining speech closes up — the cut shifts later clips on the same track\nleft. Target a media-backed clip with sound. Not valid for generated clips\nor retimed clips (speed change / reverse / ramp).",
-        "properties": {
-          "clip": {
-            "description": "Id of the media clip to cut.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          },
-          "min_pause": {
-            "description": "Shortest pause worth cutting, in seconds — gaps shorter than this (the\nbreaths between words) are kept. Defaults to 0.5.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "padding": {
-            "description": "Audio kept on each side of a cut, in seconds, so a cut never clips a\nword's start or end. Defaults to 0.08.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "threshold": {
-            "description": "Loudness at or below which audio counts as silent, 0.0–1.0 (linear,\nroughly -40 dB at the 0.01 default). Raise it to cut quiet mumbling\ntoo; lower it to keep more.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          }
-        },
-        "required": [
-          "clip"
-        ],
-        "title": "RemoveSilences",
-        "type": "object"
-      }
-    },
-    {
-      "description": "Auto-caption a media clip (auto captions): transcribes its speech and adds the words as subtitle-styled text clips on a fresh 'Captions' lane. Captions are ordinary text clips afterward, so they can be restyled, moved, or deleted like any title. Target a media-backed clip with sound. Not valid for generated or retimed clips. Requires a transcription backend to be configured.",
-      "name": "caption_clip",
-      "parameters": {
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Auto-caption a media clip (CapCut \"Auto captions\"). The editor decodes the\nclip's speech, transcribes it, and adds the words as subtitle-styled text\nclips on a fresh \"Captions\" lane — captions are ordinary text clips, so the\nuser can restyle, move, and delete them like any title afterward. Target a\nmedia-backed clip with sound. Not valid for generated clips or retimed clips\n(speed change / reverse / ramp).",
-        "properties": {
-          "clip": {
-            "description": "Id of the media clip to caption.",
-            "format": "uint64",
-            "minimum": 0,
-            "type": "integer"
-          }
-        },
-        "required": [
-          "clip"
-        ],
-        "title": "CaptionClip",
-        "type": "object"
-      }
-    },
-    {
       "description": "Split a clip at a timeline position (seconds) into two abutting clips.",
       "name": "split_clip",
       "parameters": {
@@ -1695,5 +1629,5 @@
       }
     }
   ],
-  "version": 20
+  "version": 18
 }
