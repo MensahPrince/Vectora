@@ -400,6 +400,41 @@ impl Timeline {
         self.clip_index.get(&clip_id).copied()
     }
 
+    /// Whether `clip_id`'s media audio is heard from its *own* lane.
+    ///
+    /// CapCut keeps a video's sound on the video clip itself; a dropped clip
+    /// is audible without a second lane. `true` for audio-lane media clips and
+    /// for video-lane media clips, with one exception: a video clip whose sound
+    /// has been *detached* to a linked audio-lane partner (CapCut "separate
+    /// audio") goes silent on its own lane — the partner carries it instead.
+    /// `false` for lanes that never carry media audio (text/effect/etc.).
+    ///
+    /// Callers still layer mute / silence / `has_audio` on top; this answers
+    /// only "does this clip's media audio belong to *this* lane?". The detach
+    /// scan only runs for *linked* video clips, so undetached drops (the common
+    /// case, `link == None`) short-circuit.
+    pub fn carries_own_audio(&self, clip_id: ClipId) -> bool {
+        let Some(track) = self.track_of(clip_id).and_then(|t| self.track(t)) else {
+            return false;
+        };
+        match track.kind {
+            TrackKind::Audio => true,
+            TrackKind::Video => !self.detached_to_audio_lane(clip_id),
+            _ => false,
+        }
+    }
+
+    /// Whether `clip_id` shares a link group with a clip on an audio lane — the
+    /// CapCut "separate audio" companion that took over its sound.
+    fn detached_to_audio_lane(&self, clip_id: ClipId) -> bool {
+        let Some(link) = self.clip(clip_id).and_then(|c| c.link) else {
+            return false;
+        };
+        self.tracks_ordered().any(|t| {
+            t.kind == TrackKind::Audio && t.clips_ordered().iter().any(|c| c.link == Some(link))
+        })
+    }
+
     pub fn clip_count(&self) -> usize {
         self.clip_index.len()
     }
@@ -709,6 +744,41 @@ mod tests {
         let second = timeline.add_clip(track, generated_clip(50, 50)).unwrap();
         assert_eq!(timeline.clip_count(), 2);
         assert_eq!(timeline.clip(second).unwrap().start().value, 50);
+    }
+
+    #[test]
+    fn carries_own_audio_follows_lane_and_detach() {
+        let mut timeline = Timeline::new(R24);
+        let v = timeline.add_track(Track::new(TrackKind::Video, "V1"));
+        let a = timeline.add_track(Track::new(TrackKind::Audio, "A1"));
+        let fx = timeline.add_track(Track::new(TrackKind::Adjustment, "FX1"));
+
+        let media = crate::ids::MediaId::from_raw(1);
+        let media_clip = |start, dur| Clip::from_media(media, tr(start, dur), tr(start, dur));
+
+        // CapCut keeps a video's sound on the clip, so a video clip carries its
+        // own audio; audio lanes always do; non-AV lanes never do.
+        let vc = timeline.add_clip(v, media_clip(0, 24)).unwrap();
+        let ac = timeline.add_clip(a, media_clip(0, 24)).unwrap();
+        let fxc = timeline.add_clip(fx, generated_clip(0, 24)).unwrap();
+        assert!(timeline.carries_own_audio(vc));
+        assert!(timeline.carries_own_audio(ac));
+        assert!(!timeline.carries_own_audio(fxc));
+
+        // "Separate audio": link the video clip to a clip on an audio lane and
+        // the video half defers its sound there (silent on its own lane).
+        let companion = timeline.add_clip(a, media_clip(48, 24)).unwrap();
+        let link = crate::ids::LinkId::next();
+        timeline.clip_mut(vc).unwrap().link = Some(link);
+        timeline.clip_mut(companion).unwrap().link = Some(link);
+        assert!(
+            !timeline.carries_own_audio(vc),
+            "detached video half is silent"
+        );
+        assert!(
+            timeline.carries_own_audio(companion),
+            "the audio-lane partner sounds"
+        );
     }
 
     // --- remove_clip / lookup ---------------------------------------------
