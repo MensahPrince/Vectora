@@ -36,7 +36,10 @@ use serde::{Deserialize, Serialize};
 /// 15: shape generators gain optional width/height.
 /// 16: optional `anchor_x`/`anchor_y` on `set_clip_transform`.
 /// 17: M8 beat detection (`detect_beats`).
-pub const TOOL_SCHEMA_VERSION: u32 = 18;
+/// 18: M8 noise reduction (`set_denoise`).
+/// 19: video clips carry their own audio (CapCut embedded audio) — the audio
+///     tool descriptions drop the "linked audio companion" steering.
+pub const TOOL_SCHEMA_VERSION: u32 = 19;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -404,11 +407,12 @@ pub struct SetClipPitch {
 
 /// Set a clip's audio mix: a constant volume gain plus linear fade-in/out
 /// ramps. Volume 1.0 is unchanged, 0.0 mutes, 2.0 doubles (max 10). Fades
-/// are seconds of ramp at the clip's head/tail. Audio lives on audio-lane
-/// clips; for a video clip, target its linked audio companion instead.
+/// are seconds of ramp at the clip's head/tail. A video clip keeps its own
+/// sound, so target it directly; only when a clip's audio was separated onto a
+/// linked audio lane do you target that clip instead.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SetClipAudio {
-    /// The audio-lane media clip to adjust.
+    /// The media clip to adjust — a video clip with sound, or an audio clip.
     pub clip: u64,
     /// Gain multiplier: 0.0 mutes, 1.0 keeps the recorded level, up to a
     /// maximum of 10. Omit to keep the current volume.
@@ -427,9 +431,10 @@ pub struct SetClipAudio {
 /// Turn noise reduction on or off for a media clip (CapCut "Reduce noise").
 /// Runs the clip's audio through a speech-preserving denoiser that suppresses
 /// steady background noise — fan hum, hiss, air-conditioning, room tone — while
-/// keeping voice. Best on clips with a constant background drone. Audio lives
-/// on audio-lane clips; for a video clip, target its linked audio companion.
-/// Not valid for generated clips.
+/// keeping voice. Best on clips with a constant background drone. A video clip
+/// keeps its own sound, so target it directly; only when its audio was
+/// separated onto a linked audio lane do you target that clip instead. Not
+/// valid for generated clips.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SetDenoise {
     /// The media clip to clean.
@@ -442,8 +447,8 @@ pub struct SetDenoise {
 /// editor measures how loud the voice clips are in the speech band and writes
 /// volume keyframes that dip the music while the voice talks, recovering in
 /// the gaps. The result is ordinary, editable volume automation on each music
-/// clip. Target audio-lane clips by id (for a video clip with sound, its
-/// linked audio companion).
+/// clip. Target the clips that carry the sound by id — a video clip with
+/// audio, or an audio clip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Duck {
     /// Ids of the voice / narration clips that drive the ducking (at least
@@ -469,8 +474,7 @@ pub struct Duck {
 /// Detect beat positions on a media clip's audio (CapCut "Beat" markers). The
 /// editor runs onset/tempo analysis and drops a beat grid the timeline magnet
 /// snaps clip edges to — the substrate for beat-synced cutting. Target a
-/// media-backed clip with sound (for a video clip, its linked audio companion
-/// also works).
+/// media-backed clip with sound — a video clip with audio, or an audio clip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct DetectBeats {
     /// Id of the media clip to analyze.
@@ -948,13 +952,13 @@ tools! {
     "set_clip_pitch" => SetClipPitch(SetClipPitch),
         "Lock or unlock a retimed media clip's pitch. preserve_pitch true (default) keeps the original pitch while time-stretching; false lets pitch follow speed (the chipmunk effect when sped up). Only affects a clip that is retimed (speed change, reverse, or ramp). Not valid for generated clips.";
     "set_clip_audio" => SetClipAudio(SetClipAudio),
-        "Set an audio-lane clip's volume (0.0 mutes, 1.0 unchanged, 2.0 doubles) and/or fade-in/fade-out durations in seconds. Omitted fields keep their current value. For a video clip, target its linked audio companion clip.";
+        "Set a clip's volume (0.0 mutes, 1.0 unchanged, 2.0 doubles) and/or fade-in/fade-out durations in seconds. Omitted fields keep their current value. A video clip keeps its own sound, so target it directly.";
     "set_denoise" => SetDenoise(SetDenoise),
-        "Turn noise reduction on or off for a media clip: runs its audio through a speech-preserving denoiser that suppresses steady background noise (hum, hiss, air-conditioning, room tone) while keeping voice. Use on clips with a constant background drone. For a video clip, target its linked audio companion. Not valid for generated clips.";
+        "Turn noise reduction on or off for a media clip: runs its audio through a speech-preserving denoiser that suppresses steady background noise (hum, hiss, air-conditioning, room tone) while keeping voice. Use on clips with a constant background drone. A video clip keeps its own sound, so target it directly. Not valid for generated clips.";
     "duck" => Duck(Duck),
-        "Duck music clips under voice/narration clips (sidechain): measures speech-band loudness on the voice clips and writes volume keyframes that dip the music while the voice talks, recovering in the gaps. amount 0..1 sets how far it dips (default ~0.66). Pass audio-lane clip ids for both lists. The result is ordinary, editable volume automation.";
+        "Duck music clips under voice/narration clips (sidechain): measures speech-band loudness on the voice clips and writes volume keyframes that dip the music while the voice talks, recovering in the gaps. amount 0..1 sets how far it dips (default ~0.66). Pass the clip ids that carry the sound for both lists (a video clip with audio, or an audio clip). The result is ordinary, editable volume automation.";
     "detect_beats" => DetectBeats(DetectBeats),
-        "Detect beat positions on a media clip's audio (onset/tempo analysis) and store them as beat markers the timeline magnet snaps clip edges to — use this to set up beat-synced cuts. Target a media-backed clip with sound (for a video clip, its linked audio companion). Not valid for generated clips.";
+        "Detect beat positions on a media clip's audio (onset/tempo analysis) and store them as beat markers the timeline magnet snaps clip edges to — use this to set up beat-synced cuts. Target a media-backed clip with sound — a video clip with audio, or an audio clip. Not valid for generated clips.";
     "split_clip" => SplitClip(SplitClip),
         "Split a clip at a timeline position (seconds) into two abutting clips.";
     "trim_clip" => TrimClip(TrimClip),

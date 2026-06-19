@@ -363,15 +363,12 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                     args.clip
                 )));
             }
-            // Denoise acts on sound, which rides audio-lane clips: a video-lane
-            // target would be a silent no-op, so steer to the clip that sounds
-            // (same rule as set_clip_audio).
+            // CapCut keeps a video's sound on the clip itself, so denoise lands
+            // on the clip directly — unless its audio was detached to a linked
+            // audio lane, where the audible half now lives (same rule as
+            // set_clip_audio).
             let timeline = project.timeline();
-            let on_audio_lane = timeline
-                .track_of(clip.id)
-                .and_then(|id| timeline.track(id))
-                .is_some_and(|t| t.kind == TrackKind::Audio);
-            if !on_audio_lane {
+            if !timeline.carries_own_audio(clip.id) {
                 let companion = clip.link.and_then(|link| {
                     timeline
                         .tracks_ordered()
@@ -407,14 +404,11 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                     args.clip
                 )));
             }
-            // Audio rides audio-lane clips: a video-lane target would be a
-            // silent no-op, so steer the model to the clip that sounds.
+            // CapCut keeps a video's sound on the clip itself, so volume/fades
+            // land on the clip directly — unless its audio was detached to a
+            // linked audio lane, where the audible half now lives.
             let timeline = project.timeline();
-            let on_audio_lane = timeline
-                .track_of(clip.id)
-                .and_then(|id| timeline.track(id))
-                .is_some_and(|t| t.kind == TrackKind::Audio);
-            if !on_audio_lane {
+            if !timeline.carries_own_audio(clip.id) {
                 let companion = clip.link.and_then(|link| {
                     timeline
                         .tracks_ordered()
@@ -2014,6 +2008,48 @@ mod tests {
             }),
         );
         assert!(msg.contains("generated clip"), "{msg}");
+    }
+
+    #[test]
+    fn audio_edits_on_a_video_clip_with_sound_target_the_clip_itself() {
+        // CapCut keeps a video's audio on the clip — a drop lands a single
+        // clip, not a linked audio companion — so volume/fades and denoise on
+        // the video clip adjust it directly, with no steering.
+        let (project, _, _, _, video_clip, _) = fixture();
+
+        let edit = lower(
+            &project,
+            WireCommand::SetClipAudio(wire::SetClipAudio {
+                clip: video_clip,
+                volume: Some(0.5),
+                fade_in: None,
+                fade_out: None,
+            }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::SetClipAudio {
+                clip: ClipId::from_raw(video_clip),
+                volume: Some(0.5),
+                fade_in: RationalTime::new(0, R24),
+                fade_out: RationalTime::new(0, R24),
+            }
+        );
+
+        let edit = lower(
+            &project,
+            WireCommand::SetDenoise(wire::SetDenoise {
+                clip: video_clip,
+                denoise: true,
+            }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::SetClipDenoise {
+                clip: ClipId::from_raw(video_clip),
+                denoise: true,
+            }
+        );
     }
 
     #[test]
