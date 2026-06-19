@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 
 use cutlass_decoder::{AUDIO_CHANNELS, AudioReader};
-use cutlass_models::{Param, Project, TrackKind, audio_gain_at};
+use cutlass_models::{Param, Project, audio_gain_at};
 
 use crate::error::EngineError;
 
@@ -72,16 +72,18 @@ pub struct ExportAudioMixer {
 }
 
 impl ExportAudioMixer {
-    /// Audible spans: clips on unmuted audio lanes whose media carries an
-    /// audio stream (video lanes contribute no sound — linkage lands audio
-    /// companions on audio lanes). `None` when the timeline is silent, so
-    /// callers can skip the audio track entirely.
+    /// Audible spans: clips on unmuted lanes whose media carries an audio
+    /// stream. CapCut-style, a video clip keeps its own sound, so video lanes
+    /// are audible too; only a clip detached to a linked audio-lane partner
+    /// (CapCut "separate audio") defers its audio there. Mirrors the preview
+    /// mixer's `audio_snapshot`. `None` when the timeline is silent, so callers
+    /// can skip the audio track entirely.
     pub fn for_project(project: &Project) -> Option<Self> {
         let timeline = project.timeline();
         let fps = timeline.frame_rate;
         let mut spans = Vec::new();
         for track in timeline.tracks_ordered() {
-            if track.kind != TrackKind::Audio || track.muted {
+            if track.muted {
                 continue;
             }
             for clip in track.clips_ordered() {
@@ -90,6 +92,11 @@ impl ExportAudioMixer {
                 // time-stretches (M8 Phase 3) so export matches the preview
                 // mixer.
                 if clip.is_silent() {
+                    continue;
+                }
+                // Audio rides the clip's own lane unless it's been split off to
+                // a linked audio lane; skip lanes that never carry media audio.
+                if !timeline.carries_own_audio(clip.id) {
                     continue;
                 }
                 let Some(media_id) = clip.media() else {
@@ -348,7 +355,7 @@ pub fn sample_boundary(n: i64, out_num: i32, out_den: i32) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cutlass_models::{ClipId, MediaSource, Rational, RationalTime, TimeRange};
+    use cutlass_models::{ClipId, MediaSource, Rational, RationalTime, TimeRange, TrackKind};
 
     #[test]
     fn ticks_to_samples_is_exact_for_common_rates() {
@@ -379,6 +386,76 @@ mod tests {
     fn silent_project_has_no_mixer() {
         let project = Project::new("test", Rational::FPS_24);
         assert!(ExportAudioMixer::for_project(&project).is_none());
+    }
+
+    #[test]
+    fn video_lane_clip_with_audio_is_audible() {
+        // CapCut keeps a video's sound on the clip itself: a media clip on a
+        // *video* lane whose media carries audio contributes a span, with no
+        // separate audio lane.
+        let mut project = Project::new("test", Rational::FPS_24);
+        let media = project.add_media(MediaSource::new(
+            "/tmp/clip.mp4",
+            640,
+            480,
+            Rational::FPS_24,
+            100,
+            true,
+        ));
+        let lane = project.add_track(TrackKind::Video, "V1");
+        project
+            .add_clip(
+                lane,
+                media,
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+                RationalTime::new(0, Rational::FPS_24),
+            )
+            .unwrap();
+        let mixer = ExportAudioMixer::for_project(&project)
+            .expect("a video clip with audio is audible from its own lane");
+        assert_eq!(mixer.spans.len(), 1);
+    }
+
+    #[test]
+    fn detached_video_half_defers_audio_to_its_linked_audio_lane() {
+        // CapCut "separate audio": once a video clip's sound is split onto a
+        // linked audio lane, the video half goes silent and only the audio-lane
+        // partner sounds — no doubled audio.
+        let mut project = Project::new("test", Rational::FPS_24);
+        let media = project.add_media(MediaSource::new(
+            "/tmp/clip.mp4",
+            640,
+            480,
+            Rational::FPS_24,
+            100,
+            true,
+        ));
+        let v = project.add_track(TrackKind::Video, "V1");
+        let a = project.add_track(TrackKind::Audio, "A1");
+        let video_clip = project
+            .add_clip(
+                v,
+                media,
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+                RationalTime::new(0, Rational::FPS_24),
+            )
+            .unwrap();
+        let audio_clip = project
+            .add_clip(
+                a,
+                media,
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+                RationalTime::new(0, Rational::FPS_24),
+            )
+            .unwrap();
+        let link = cutlass_models::LinkId::next();
+        for id in [video_clip, audio_clip] {
+            project.timeline_mut().clip_mut(id).unwrap().link = Some(link);
+        }
+        let mixer =
+            ExportAudioMixer::for_project(&project).expect("the audio-lane half still sounds");
+        // Exactly one span — the audio-lane partner, not the now-silent video.
+        assert_eq!(mixer.spans.len(), 1);
     }
 
     fn audio_clip_project(speed: Rational, reversed: bool) -> (Project, ClipId) {
