@@ -17,11 +17,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Apple Silicon only. GitHub is sunsetting the Intel macos-13 runners and
+        # they get starved for long stretches, which used to hang/gate releases.
+        # To bring back an Intel/universal build, cross-compile x86_64 here on the
+        # arm64 runner rather than depending on a macos-13 runner.
         include:
           - runner: macos-14   # Apple Silicon
             arch: arm64
-          - runner: macos-13   # Intel
-            arch: x86_64
     steps:
       - uses: actions/checkout@v4
 
