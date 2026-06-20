@@ -32,7 +32,7 @@ use tracing::debug;
 
 use crate::error::EncodeError;
 use crate::h264::{
-    drain_encoder, ensure_ffmpeg_init, open_first_h264_encoder, is_eagain, scaled_dims,
+    drain_encoder, ensure_ffmpeg_init, is_eagain, open_first_h264_encoder, scaled_dims,
 };
 
 /// How to build a proxy file.
