@@ -9,7 +9,9 @@
 #
 # Prerequisites:
 #   - Rust stable (see rust-toolchain.toml)
-#   - FFmpeg via vcpkg (x64-windows), with VCPKG_ROOT set
+#   - FFmpeg runtime DLLs, discovered (in order) from:
+#       * FFMPEG_DIR  (prebuilt build; see scripts/fetch-ffmpeg-windows.ps1) -> $FFMPEG_DIR\bin
+#       * VCPKG_ROOT  (vcpkg build) -> $VCPKG_ROOT\installed\<triplet>\bin
 #   - release build: cargo build --release -p cutlass-ui
 
 param(
@@ -62,16 +64,20 @@ See https://github.com/1Mr-Newton/cutlass for source and issue tracker.
 Set-Content -Path (Join-Path $PkgDir "README-INSTALL.txt") -Value $Readme -Encoding utf8
 
 if (-not $NoFfmpeg) {
-    if (-not $env:VCPKG_ROOT) {
-        throw "VCPKG_ROOT is not set; required to bundle FFmpeg DLLs (or pass -NoFfmpeg for local dev)"
+    # Prefer a prebuilt FFmpeg (FFMPEG_DIR); fall back to vcpkg for local dev.
+    if ($env:FFMPEG_DIR) {
+        $FfmpegBin = Join-Path $env:FFMPEG_DIR "bin"
+    } elseif ($env:VCPKG_ROOT) {
+        $FfmpegBin = Join-Path $env:VCPKG_ROOT "installed\$Triplet\bin"
+    } else {
+        throw "Set FFMPEG_DIR (prebuilt) or VCPKG_ROOT (vcpkg) to bundle FFmpeg DLLs (or pass -NoFfmpeg for local dev)"
     }
-    $VcpkgBin = Join-Path $env:VCPKG_ROOT "installed\$Triplet\bin"
-    if (-not (Test-Path $VcpkgBin)) {
-        throw "vcpkg FFmpeg bin dir not found: $VcpkgBin"
+    if (-not (Test-Path $FfmpegBin)) {
+        throw "FFmpeg bin dir not found: $FfmpegBin"
     }
 
-    Write-Host "==> bundling FFmpeg runtime DLLs from $VcpkgBin"
-    Get-ChildItem (Join-Path $VcpkgBin "*.dll") |
+    Write-Host "==> bundling FFmpeg runtime DLLs from $FfmpegBin"
+    Get-ChildItem (Join-Path $FfmpegBin "*.dll") |
         Where-Object { $_.Name -notmatch '^(clang|llvm|libclang)' } |
         Copy-Item -Destination $PkgDir
 }

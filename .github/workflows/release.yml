@@ -13,6 +13,7 @@ jobs:
   build-macos:
     name: macos / ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -48,6 +49,7 @@ jobs:
   build-linux:
     name: linux / x86_64
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - name: Install FFmpeg development libraries
@@ -77,18 +79,15 @@ jobs:
   build-windows:
     name: windows / ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: windows-latest
             arch: x86_64
-            triplet: x64-windows
           - runner: windows-11-arm
             arch: arm64
-            triplet: arm64-windows
-    env:
-      VCPKG_ROOT: ${{ github.workspace }}/vcpkg
     steps:
       - uses: actions/checkout@v4
 
@@ -98,22 +97,10 @@ jobs:
           version: "18.1"
           directory: ${{ github.workspace }}/llvm
 
-      - name: Cache vcpkg
-        id: vcpkg-cache
-        uses: actions/cache@v4
-        with:
-          path: vcpkg
-          key: vcpkg-ffmpeg-${{ matrix.triplet }}-v1
-
-      - name: Install FFmpeg (vcpkg)
+      # Prebuilt FFmpeg (sets FFMPEG_DIR) — replaces a ~40 min vcpkg source build.
+      - name: Fetch prebuilt FFmpeg
         shell: pwsh
-        run: |
-          if (-not (Test-Path vcpkg)) {
-            git clone https://github.com/microsoft/vcpkg --depth 1 vcpkg
-          }
-          ./vcpkg/bootstrap-vcpkg.bat
-          ./vcpkg/vcpkg.exe install `
-            "ffmpeg[core,avcodec,avdevice,avfilter,avformat,swresample,swscale]:${{ matrix.triplet }}"
+        run: ./scripts/fetch-ffmpeg-windows.ps1 -Arch ${{ matrix.arch }}
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -142,6 +129,7 @@ jobs:
     name: github release
     needs: [build-macos, build-linux, build-windows]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
