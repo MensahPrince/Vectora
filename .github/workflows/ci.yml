@@ -91,3 +91,12 @@ jobs:
         env:
           LIBCLANG_PATH: ${{ github.workspace }}/llvm/bin
         run: cargo build --release -p cutlass-ui
+
+      # Exercise the full Windows packaging path on PRs too: it's broken releases
+      # before (e.g. the -Arch splatting bug) while compile-only CI stayed green.
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Package zip + installer
+        shell: pwsh
+        run: ./scripts/package-windows-installer.ps1 -Arch x86_64

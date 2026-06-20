@@ -31,9 +31,11 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 # Stage the payload (builds the release binary and bundles FFmpeg if needed).
+# Use hashtable splatting so the values bind to named parameters; array
+# splatting would pass them positionally and bind "-Arch" as the value.
 Write-Host "==> staging Windows payload via package-windows.ps1 ($Arch)"
-$StageArgs = @("-Arch", $Arch)
-if ($NoFfmpeg) { $StageArgs += "-NoFfmpeg" }
+$StageArgs = @{ Arch = $Arch }
+if ($NoFfmpeg) { $StageArgs.NoFfmpeg = $true }
 & (Join-Path $Root "scripts\package-windows.ps1") @StageArgs
 
 $VersionLine = (Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1).Line
