@@ -30,7 +30,7 @@ use tracing::debug;
 
 use crate::error::EncodeError;
 use crate::h264::{
-    drain_encoder, ensure_ffmpeg_init, fill_rgba_frame, fill_yuv420p_frame, find_h264_encoder,
+    drain_encoder, ensure_ffmpeg_init, fill_rgba_frame, fill_yuv420p_frame, open_first_h264_encoder,
 };
 
 /// Audio is always interleaved stereo at the sink boundary.
@@ -271,39 +271,41 @@ impl VideoExport {
         let fps = Rational::new(config.frame_rate_num, config.frame_rate_den);
         let enc_tb = fps.invert();
 
-        let chosen = find_h264_encoder(config.hardware)
-            .ok_or_else(|| EncodeError::unsupported("no H.264 encoder available"))?;
-        let codec = chosen.codec;
-        let enc_fmt = chosen.pixel;
-        let use_crf = codec.name() == "libx264";
-
         let mut octx = format::output(output).map_err(EncodeError::Open)?;
         let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
-        let mut enc = codec::context::Context::new_with_codec(codec)
-            .encoder()
-            .video()
-            .map_err(EncodeError::Open)?;
-        enc.set_width(width);
-        enc.set_height(height);
-        enc.set_format(enc_fmt);
-        enc.set_color_range(ffmpeg_next::color::Range::MPEG);
-        enc.set_frame_rate(Some(fps));
-        enc.set_time_base(enc_tb);
-        if !use_crf {
-            enc.set_bit_rate(config.bitrate);
-        }
-        if global_header {
-            enc.set_flags(codec::Flags::GLOBAL_HEADER);
-        }
+        let (chosen, encoder) = open_first_h264_encoder(config.hardware, |chosen| {
+            let codec = chosen.codec;
+            let enc_fmt = chosen.pixel;
+            let use_crf = codec.name() == "libx264";
 
-        let mut enc_opts = Dictionary::new();
-        if use_crf {
-            let crf = config.quality.to_string();
-            enc_opts.set("crf", &crf);
-            enc_opts.set("preset", "medium");
-        }
-        let encoder = enc.open_with(enc_opts).map_err(EncodeError::Open)?;
+            let mut enc = codec::context::Context::new_with_codec(codec)
+                .encoder()
+                .video()
+                .map_err(EncodeError::Open)?;
+            enc.set_width(width);
+            enc.set_height(height);
+            enc.set_format(enc_fmt);
+            enc.set_color_range(ffmpeg_next::color::Range::MPEG);
+            enc.set_frame_rate(Some(fps));
+            enc.set_time_base(enc_tb);
+            if !use_crf {
+                enc.set_bit_rate(config.bitrate);
+            }
+            if global_header {
+                enc.set_flags(codec::Flags::GLOBAL_HEADER);
+            }
+
+            let mut enc_opts = Dictionary::new();
+            if use_crf {
+                let crf = config.quality.to_string();
+                enc_opts.set("crf", &crf);
+                enc_opts.set("preset", "medium");
+            }
+            enc.open_with(enc_opts).map_err(EncodeError::Open)
+        })?;
+        let codec = chosen.codec;
+        let enc_fmt = chosen.pixel;
 
         let ost_index = {
             let mut ost = octx.add_stream(codec).map_err(EncodeError::Open)?;

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use ffmpeg_next::error::EAGAIN;
@@ -101,36 +102,70 @@ fn named_software_encoder(name: &str) -> Option<H264Encoder> {
     encoder::find_by_name(name).and_then(as_software_encoder)
 }
 
-fn first_software_encoder(names: &[&str]) -> Option<H264Encoder> {
-    names.iter().copied().find_map(named_software_encoder)
+/// Ordered H.264 encoders to try. Hardware-first when requested, then software,
+/// then CPU-frame-capable hardware fallbacks, then the build default.
+///
+/// A hardware-surface-only encoder is never included — those reject the
+/// pipeline's software frames at open time. Encoders that advertise CPU layouts
+/// yet fail to open (NVENC without CUDA, VAAPI without a render node, …) are
+/// skipped at open time via [`open_first_h264_encoder`].
+pub(crate) fn h264_encoder_candidates(hardware: bool) -> Vec<H264Encoder> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push = |enc: H264Encoder| {
+        if seen.insert(enc.codec.name().to_string()) {
+            out.push(enc);
+        }
+    };
+
+    if hardware {
+        for &name in HARDWARE_H264 {
+            if let Some(enc) = named_software_encoder(name) {
+                push(enc);
+            }
+        }
+    }
+
+    for &name in &["libx264", "libopenh264"] {
+        if let Some(enc) = named_software_encoder(name) {
+            push(enc);
+        }
+    }
+
+    for &name in FALLBACK_H264 {
+        if let Some(enc) = named_software_encoder(name) {
+            push(enc);
+        }
+    }
+
+    if let Some(enc) = encoder::find(codec::Id::H264).and_then(as_software_encoder) {
+        push(enc);
+    }
+
+    out
 }
 
-/// Pick an H.264 encoder and the software pixel format to feed it.
-///
-/// Order: requested hardware encoder (if any) → software libx264/libopenh264 →
-/// a CPU-frame-capable hardware encoder → the build's default H.264 encoder.
-/// A hardware-surface-only encoder is *never* returned for our software-frame
-/// pipeline — that would surface as a confusing "failed to open media" when the
-/// encoder rejects the `yuv420p` frames at open time.
-pub(crate) fn find_h264_encoder(hardware: bool) -> Option<H264Encoder> {
-    if hardware && let Some(enc) = first_software_encoder(HARDWARE_H264) {
-        return Some(enc);
+/// Try `try_open` on each candidate in order; the first successful open wins.
+pub(crate) fn open_first_h264_encoder<F, T>(
+    hardware: bool,
+    mut try_open: F,
+) -> Result<(H264Encoder, T), EncodeError>
+where
+    F: FnMut(H264Encoder) -> Result<T, EncodeError>,
+{
+    let candidates = h264_encoder_candidates(hardware);
+    if candidates.is_empty() {
+        return Err(EncodeError::unsupported("no H.264 encoder available"));
     }
 
-    // Software encoders: cleanest deliverable, deterministic, always YUV420P.
-    if let Some(enc) = first_software_encoder(&["libx264", "libopenh264"]) {
-        return Some(enc);
+    let mut last = None;
+    for chosen in candidates {
+        match try_open(chosen) {
+            Ok(result) => return Ok((chosen, result)),
+            Err(e) => last = Some(e),
+        }
     }
-
-    // No software H.264 in this build: rather than fail the export, accept a
-    // hardware encoder that still takes CPU frames (Media Foundation, NVENC, …).
-    if let Some(enc) = first_software_encoder(FALLBACK_H264) {
-        return Some(enc);
-    }
-
-    // Last resort: whatever the build registered for H.264 — but only if it can
-    // take software frames, never a hardware-surface-only encoder.
-    encoder::find(codec::Id::H264).and_then(as_software_encoder)
+    Err(last.unwrap_or_else(|| EncodeError::unsupported("no H.264 encoder available")))
 }
 
 pub(crate) fn is_eagain(e: &FfmpegError) -> bool {
@@ -229,7 +264,7 @@ mod tests {
     fn selected_encoder_always_takes_software_frames() {
         ensure_ffmpeg_init().expect("ffmpeg init");
         for hardware in [false, true] {
-            if let Some(enc) = find_h264_encoder(hardware) {
+            for enc in h264_encoder_candidates(hardware) {
                 assert!(
                     SOFTWARE_INPUT_FORMATS.contains(&enc.pixel),
                     "{} selected non-software pixel {:?}",
@@ -242,6 +277,7 @@ mod tests {
                     "{} pixel choice disagrees with advertised formats",
                     enc.codec.name(),
                 );
+                break;
             }
         }
     }
@@ -252,9 +288,25 @@ mod tests {
     fn software_path_prefers_libx264_when_present() {
         ensure_ffmpeg_init().expect("ffmpeg init");
         if encoder::find_by_name("libx264").is_some() {
-            let enc = find_h264_encoder(false).expect("an H.264 encoder");
+            let enc = h264_encoder_candidates(false)
+                .into_iter()
+                .next()
+                .expect("an H.264 encoder");
             assert_eq!(enc.codec.name(), "libx264");
             assert_eq!(enc.pixel, Pixel::YUV420P);
+        }
+    }
+
+    #[test]
+    fn hardware_candidates_include_software_fallback() {
+        ensure_ffmpeg_init().expect("ffmpeg init");
+        let candidates = h264_encoder_candidates(true);
+        assert!(!candidates.is_empty());
+        if encoder::find_by_name("libx264").is_some() {
+            assert!(
+                candidates.iter().any(|c| c.codec.name() == "libx264"),
+                "hardware path must fall back to libx264 when HW encoders fail to open"
+            );
         }
     }
 }

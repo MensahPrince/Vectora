@@ -31,7 +31,9 @@ use ffmpeg_next::{
 use tracing::debug;
 
 use crate::error::EncodeError;
-use crate::h264::{drain_encoder, ensure_ffmpeg_init, find_h264_encoder, is_eagain, scaled_dims};
+use crate::h264::{
+    drain_encoder, ensure_ffmpeg_init, open_first_h264_encoder, is_eagain, scaled_dims,
+};
 
 /// How to build a proxy file.
 #[derive(Debug, Clone, Copy)]
@@ -180,64 +182,66 @@ pub fn build_proxy_with(
 
     let enc_tb = fps.invert();
 
-    let chosen = find_h264_encoder(config.hardware)
-        .ok_or_else(|| EncodeError::unsupported("no H.264 encoder available"))?;
-    let codec = chosen.codec;
-    let enc_fmt = chosen.pixel;
-    let use_crf = codec.name() == "libx264";
-
     let mut octx = format::output(output).map_err(EncodeError::Open)?;
     let global_header = octx.format().flags().contains(format::Flags::GLOBAL_HEADER);
 
-    let mut enc = codec::context::Context::new_with_codec(codec)
-        .encoder()
-        .video()
-        .map_err(EncodeError::Open)?;
+    let (chosen, mut encoder) = open_first_h264_encoder(config.hardware, |chosen| {
+        let codec = chosen.codec;
+        let enc_fmt = chosen.pixel;
+        let use_crf = codec.name() == "libx264";
 
-    enc.set_width(dst_w);
-    enc.set_height(dst_h);
-    enc.set_format(enc_fmt);
-    enc.set_color_range(ffmpeg_next::color::Range::MPEG);
-    enc.set_frame_rate(Some(fps));
-    enc.set_time_base(enc_tb);
+        let mut enc = codec::context::Context::new_with_codec(codec)
+            .encoder()
+            .video()
+            .map_err(EncodeError::Open)?;
 
-    // GOP = 1 forces a keyframe on *every* frame (libx264 keyint=1, VideoToolbox
-    // max-keyframe-interval=1). This is the whole point of the proxy — do NOT
-    // set 0 here: 0 means "let the encoder pick", which on libx264 collapses to
-    // a single keyframe at the head and kills exact-seek. `max_b_frames(0)` only
-    // removes B-frames; it does not make the stream all-intra on its own.
-    enc.set_gop(1);
-    enc.set_max_b_frames(0);
+        enc.set_width(dst_w);
+        enc.set_height(dst_h);
+        enc.set_format(enc_fmt);
+        enc.set_color_range(ffmpeg_next::color::Range::MPEG);
+        enc.set_frame_rate(Some(fps));
+        enc.set_time_base(enc_tb);
 
-    if !use_crf {
-        enc.set_bit_rate(config.bitrate);
-    }
+        // GOP = 1 forces a keyframe on *every* frame (libx264 keyint=1, VideoToolbox
+        // max-keyframe-interval=1). This is the whole point of the proxy — do NOT
+        // set 0 here: 0 means "let the encoder pick", which on libx264 collapses to
+        // a single keyframe at the head and kills exact-seek. `max_b_frames(0)` only
+        // removes B-frames; it does not make the stream all-intra on its own.
+        enc.set_gop(1);
+        enc.set_max_b_frames(0);
 
-    if global_header {
-        enc.set_flags(codec::Flags::GLOBAL_HEADER);
-    }
-
-    enc.set_threading(codec::threading::Config {
-        kind: codec::threading::Type::Slice,
-        count: opts.encode_threads as usize,
-    });
-
-    let mut enc_opts = Dictionary::new();
-
-    if use_crf {
-        let crf = config.quality.to_string();
-        enc_opts.set("crf", &crf);
-        enc_opts.set("preset", "faster");
-        // Belt-and-suspenders: pin keyint so no muxer/encoder default can
-        // reintroduce inter frames. Redundant with set_gop(1), cheap insurance.
-        enc_opts.set("keyint", "1");
-        enc_opts.set("min-keyint", "1");
-        if opts.encode_threads > 0 {
-            enc_opts.set("threads", &opts.encode_threads.to_string());
+        if !use_crf {
+            enc.set_bit_rate(config.bitrate);
         }
-    }
 
-    let mut encoder = enc.open_with(enc_opts).map_err(EncodeError::Open)?;
+        if global_header {
+            enc.set_flags(codec::Flags::GLOBAL_HEADER);
+        }
+
+        enc.set_threading(codec::threading::Config {
+            kind: codec::threading::Type::Slice,
+            count: opts.encode_threads as usize,
+        });
+
+        let mut enc_opts = Dictionary::new();
+
+        if use_crf {
+            let crf = config.quality.to_string();
+            enc_opts.set("crf", &crf);
+            enc_opts.set("preset", "faster");
+            // Belt-and-suspenders: pin keyint so no muxer/encoder default can
+            // reintroduce inter frames. Redundant with set_gop(1), cheap insurance.
+            enc_opts.set("keyint", "1");
+            enc_opts.set("min-keyint", "1");
+            if opts.encode_threads > 0 {
+                enc_opts.set("threads", &opts.encode_threads.to_string());
+            }
+        }
+
+        enc.open_with(enc_opts).map_err(EncodeError::Open)
+    })?;
+    let codec = chosen.codec;
+    let enc_fmt = chosen.pixel;
 
     let ost_index = {
         let mut ost = octx.add_stream(codec).map_err(EncodeError::Open)?;
