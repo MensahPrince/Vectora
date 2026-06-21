@@ -11,7 +11,6 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use crate::config::AiSection;
 use crate::provider::{
     ChatProvider, ChatRequest, ChatTurn, FinishReason, Message, ProviderError, ToolCall,
 };
@@ -35,12 +34,40 @@ impl OpenAiCompatProvider {
         }
     }
 
-    /// Build from a parsed `[ai]` config section (resolves `api_key_env`).
-    pub fn from_config(config: &AiSection) -> Result<Self, ProviderError> {
-        let api_key = config
-            .resolve_api_key()
-            .map_err(ProviderError::NotConfigured)?;
-        Ok(Self::new(&config.base_url, &config.model, api_key))
+    /// Liveness probe for the Settings dialog: `GET {base_url}/models`, the
+    /// OpenAI-compatible health endpoint (Ollama/LM Studio/OpenAI all serve
+    /// it). Returns a short human summary on success; spends no tokens.
+    pub fn test_connection(&self) -> Result<String, ProviderError> {
+        let url = format!("{}/models", self.base_url);
+        let mut http = self.agent.get(&url);
+        if let Some(key) = &self.api_key {
+            http = http.set("Authorization", &format!("Bearer {key}"));
+        }
+        match http.call() {
+            Ok(response) => {
+                let body = response
+                    .into_string()
+                    .map_err(|e| ProviderError::Network(format!("reading /models: {e}")))?;
+                let parsed: serde_json::Value = serde_json::from_str(&body)
+                    .map_err(|e| ProviderError::Protocol(format!("bad /models response: {e}")))?;
+                let count = parsed["data"].as_array().map(|a| a.len()).unwrap_or(0);
+                Ok(match count {
+                    0 => "Connected.".to_string(),
+                    1 => "Connected · 1 model available.".to_string(),
+                    n => format!("Connected · {n} models available."),
+                })
+            }
+            Err(ureq::Error::Status(status, response)) => {
+                let message = response
+                    .into_string()
+                    .unwrap_or_else(|_| "<unreadable error body>".to_string());
+                Err(ProviderError::Provider {
+                    status,
+                    message: truncate(&message, 200),
+                })
+            }
+            Err(ureq::Error::Transport(t)) => Err(ProviderError::Network(format!("{url}: {t}"))),
+        }
     }
 
     fn request_body(&self, request: &ChatRequest<'_>) -> serde_json::Value {

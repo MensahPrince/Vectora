@@ -8,7 +8,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use cutlass_ai::config::{default_config_path, load_ai_config};
+use cutlass_ai::config::resolve_api_key;
 use cutlass_ai::provider::{ChatProvider, ChatRequest, Message};
 use cutlass_ai::providers::OpenAiCompatProvider;
 
@@ -17,27 +17,29 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "Reply with one sentence: what kind of assistant are you?".to_string());
 
-    let path = default_config_path();
-    let section = match load_ai_config(&path) {
-        Ok(Some(section)) => section,
-        Ok(None) => {
-            eprintln!(
-                "no [ai] section in {}; see cutlass-ai/src/config.rs",
-                path.display()
-            );
-            std::process::exit(1);
-        }
+    let path = cutlass_settings::default_config_path();
+    let ai = match cutlass_settings::load(&path) {
+        Ok(settings) => settings.ai,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    println!("endpoint: {}  model: {}\n", section.base_url, section.model);
-
-    let provider = OpenAiCompatProvider::from_config(&section).unwrap_or_else(|e| {
-        eprintln!("{e}");
+    if !ai.is_configured() {
+        eprintln!(
+            "no [ai] section in {}; see cutlass-settings",
+            path.display()
+        );
         std::process::exit(1);
-    });
+    }
+    println!("endpoint: {}  model: {}\n", ai.base_url, ai.model);
+
+    let api_key =
+        resolve_api_key(ai.api_key.as_deref(), ai.api_key_env.as_deref()).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        });
+    let provider = OpenAiCompatProvider::new(&ai.base_url, &ai.model, api_key);
 
     let messages = vec![
         Message::System {

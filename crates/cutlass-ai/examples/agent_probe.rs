@@ -8,7 +8,7 @@
 use std::sync::atomic::AtomicBool;
 
 use cutlass_ai::agent::{AgentConfig, AgentEvent, EngineBridge, run_prompt};
-use cutlass_ai::config::{default_config_path, load_ai_config};
+use cutlass_ai::config::resolve_api_key;
 use cutlass_ai::providers::OpenAiCompatProvider;
 use cutlass_ai::{EditorContext, ProjectSummary, WireCommand, summarize, validate};
 use cutlass_commands::EditOutcome;
@@ -53,18 +53,20 @@ fn main() {
         .nth(1)
         .unwrap_or_else(|| "cut the first 3 seconds of the selected clip".to_string());
 
-    let section = match load_ai_config(&default_config_path()) {
-        Ok(Some(s)) => s,
-        Ok(None) => {
-            eprintln!("no [ai] config; see cutlass-ai/src/config.rs");
-            std::process::exit(1);
-        }
+    let path = cutlass_settings::default_config_path();
+    let ai = match cutlass_settings::load(&path) {
+        Ok(settings) => settings.ai,
         Err(e) => {
             eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    let provider = OpenAiCompatProvider::from_config(&section).unwrap();
+    if !ai.is_configured() {
+        eprintln!("no [ai] config in {}; see cutlass-settings", path.display());
+        std::process::exit(1);
+    }
+    let api_key = resolve_api_key(ai.api_key.as_deref(), ai.api_key_env.as_deref()).unwrap();
+    let provider = OpenAiCompatProvider::new(&ai.base_url, &ai.model, api_key);
 
     // Fixture: one 10s clip (of a 60s source) on V1, currently selected.
     let mut project = Project::new("probe", R24);
@@ -105,7 +107,7 @@ fn main() {
         ..Default::default()
     };
 
-    println!("model: {}  prompt: {prompt:?}\n", section.model);
+    println!("model: {}  prompt: {prompt:?}\n", ai.model);
     let cancel = AtomicBool::new(false);
     let outcome = run_prompt(
         &provider,

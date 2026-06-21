@@ -16,8 +16,8 @@
 //!   calling, streamed text) with the generic OpenAI-compatible HTTP
 //!   implementation (Ollama / llama.cpp / LM Studio / cloud gateways) and
 //!   the deterministic `ScriptedProvider` test double.
-//! - [`config`]: `~/.cutlass/config.toml` `[ai]` parsing; keys never live
-//!   in project files.
+//! - [`config`]: API-key resolution (`api_key_env` indirection). The config
+//!   *file* is owned by `cutlass-settings`; keys never live in project files.
 //!
 //! Invariant: **AI proposes, the engine disposes.** Nothing in this crate
 //! mutates a project; output is validated commands for the caller to apply
