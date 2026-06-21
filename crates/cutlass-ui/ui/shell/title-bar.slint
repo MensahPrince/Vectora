@@ -212,6 +212,40 @@ export component TitleBar inherits Rectangle {
             width: AppStore.theme.metrics.spacing.sm;
         }
 
+        // Settings — reachable on every platform (the macOS Cutlass menu also
+        // opens it). Gear glyph is a placeholder until the lucide icon lands
+        // (see docs/icons.md).
+        VerticalLayout {
+            alignment: center;
+
+            gear := Rectangle {
+                width: 28px;
+                height: 26px;
+                border-radius: AppStore.theme.metrics.radius.sm;
+                background: gear-ta.has-hover ? #ffffff14 : transparent;
+
+                CutlassText {
+                    width: parent.width;
+                    height: parent.height;
+                    text: "⚙";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    style: AppStore.theme.typography.label;
+                    foreground: gear-ta.has-hover ? AppStore.theme.text.primary : AppStore.theme.text.secondary;
+                }
+
+                gear-ta := TouchArea {
+                    clicked => {
+                        AppState.settings-open = true;
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            width: AppStore.theme.metrics.spacing.sm;
+        }
+
         VerticalLayout {
             alignment: center;
 
