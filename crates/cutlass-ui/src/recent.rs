@@ -1,7 +1,8 @@
 //! Recent-projects MRU (lifecycle roadmap Phase 3).
 //!
 //! The last [`MAX_ENTRIES`] `.cutlass` paths, newest first, persisted as a
-//! plain JSON array at `~/.cutlass/recent.json`. The worker notes every
+//! plain JSON array at `recent.json` in the per-user OS data dir (see
+//! [`crate::paths`]). The worker notes every
 //! successful save and open (the moments a path is proven real and current)
 //! and republishes the list to `EditorStore.recent-projects`; reads prune
 //! entries whose files no longer exist, so the File menu and the welcome
@@ -14,14 +15,11 @@ use tracing::warn;
 /// Most paths kept in the list.
 pub const MAX_ENTRIES: usize = 10;
 
-/// `~/.cutlass/recent.json` (HOME-relative; falls back to the working
-/// directory when HOME is unset, mirroring the autosave sidecar dir).
+/// `recent.json` in the per-user OS data dir (see [`crate::paths`]):
+/// `%APPDATA%\Cutlass` on Windows, `~/Library/Application Support/Cutlass` on
+/// macOS, `~/.local/share/Cutlass` on Linux.
 pub fn default_path() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cutlass")
-        .join("recent.json")
+    crate::paths::data_dir().join("recent.json")
 }
 
 /// Read the MRU list: newest first, entries whose files are gone pruned,

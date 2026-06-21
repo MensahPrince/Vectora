@@ -29,6 +29,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 rfd = "0.17.2"
 cpal = "0.18.1"
+dirs = "6.0.0"
 
 [dev-dependencies]
 tempfile = "3"

@@ -1,7 +1,8 @@
 //! Autosave sidecars & crash recovery (lifecycle roadmap Phase 4).
 //!
-//! Dirty sessions snapshot to `~/.cutlass/autosave/` on a periodic sweep —
-//! never to the user's file. Each slot is a plain `.cutlass` project plus a
+//! Dirty sessions snapshot to an `autosave/` dir in the per-user OS data dir
+//! (see [`crate::paths`]) on a periodic sweep — never to the user's file.
+//! Each slot is a plain `.cutlass` project plus a
 //! `.meta.json` sidecar naming the file it stands in for (`None` for a
 //! session that was never saved). On launch, [`newest_candidate`] finds
 //! work worth offering back: an orphan from an unsaved session, or a slot
@@ -22,14 +23,11 @@ use serde::{Deserialize, Serialize};
 /// write when the session is clean). Worst case loss after a crash.
 pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// `~/.cutlass/autosave` (HOME-relative; falls back to the working
-/// directory when HOME is unset, mirroring the engine's relative cache).
+/// `autosave/` in the per-user OS data dir (see [`crate::paths`]):
+/// `%APPDATA%\Cutlass` on Windows, `~/Library/Application Support/Cutlass` on
+/// macOS, `~/.local/share/Cutlass` on Linux.
 pub fn default_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".cutlass")
-        .join("autosave")
+    crate::paths::data_dir().join("autosave")
 }
 
 /// Sidecar naming the file a slot stands in for.

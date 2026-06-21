@@ -2265,8 +2265,9 @@ fn new_project_and_publish(engine: &mut Engine, ui: &UiSink) {
     bump_session_epoch(ui);
 }
 
-/// One autosave sweep: snapshot a dirty session to its sidecar slot
-/// (`~/.cutlass/autosave/`), never to the user's file. Clean session ⇒ any
+/// One autosave sweep: snapshot a dirty session to its sidecar slot (in the
+/// per-user OS data dir, see [`crate::paths`]), never to the user's file.
+/// Clean session ⇒ any
 /// existing slot is stale (just saved, or untouched) and gets removed. A
 /// session whose identity changed since the last write (Save As / Open /
 /// New) cleans its orphaned slot up first. `slot_state` carries the slot

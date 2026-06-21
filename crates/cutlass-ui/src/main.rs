@@ -3,6 +3,7 @@ mod audio;
 mod autosave;
 mod inspector;
 mod params;
+mod paths;
 mod preview;
 mod preview_gesture;
 mod preview_select;
@@ -246,20 +247,14 @@ async fn pick_export_path(current: std::path::PathBuf) -> Option<std::path::Path
         .map(|file| file.path().to_path_buf())
 }
 
-/// Prefilled export destination: ~/Movies when present, else the home
-/// directory, else the working directory. Only seeds the save panel — the
-/// user picks the real spot from the dialog.
+/// Prefilled export destination: the OS videos folder (Movies on macOS,
+/// Videos on Windows, XDG videos on Linux), else the home directory, else the
+/// temp dir — never the working directory, which is the read-only install
+/// folder on Windows. Only seeds the save panel; the user picks the real spot.
 fn default_export_path() -> SharedString {
-    let home = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from);
-    let dir = match home {
-        Some(home) => {
-            let movies = home.join("Movies");
-            if movies.is_dir() { movies } else { home }
-        }
-        None => std::path::PathBuf::from("."),
-    };
+    let dir = dirs::video_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir);
     dir.join("untitled.mp4")
         .to_string_lossy()
         .into_owned()
@@ -441,7 +436,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let audio_system = audio::AudioSystem::start();
 
     let (preview_worker, session) = preview_worker::PreviewWorker::spawn(
-        EngineConfig::default(),
+        EngineConfig {
+            // Per-user OS cache dir, not the (read-only on Windows) install
+            // directory the relative default would resolve against. See paths.
+            cache_dir: paths::cache_dir(),
+            ..EngineConfig::default()
+        },
         preview_store_weak,
         editor_store_weak,
         app.global::<ExportBackend>().as_weak(),
