@@ -412,8 +412,12 @@ impl AudioReader {
     }
 
     fn read_packet(&mut self) -> Result<(), DecodeError> {
-        let mut packet = Packet::empty();
         loop {
+            // Fresh packet per read: non-target packets are dropped (and their
+            // payload unref'd) at the end of each iteration. `Packet::read` does
+            // not unref and `Packet` only unrefs on drop, so reusing one packet
+            // would leak every skipped packet's payload.
+            let mut packet = Packet::empty();
             match packet.read(&mut self.input) {
                 Ok(()) => {
                     if packet.stream() == self.stream_index {

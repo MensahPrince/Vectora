@@ -72,8 +72,12 @@ impl Mp3SeekIndex {
         // Fallback PTS for the rare frame the demuxer hands over without one:
         // accumulate frame durations from the last known anchor.
         let mut running_pts: i64 = 0;
-        let mut packet = Packet::empty();
         loop {
+            // Fresh packet each iteration: `Packet::read` (av_read_frame) does
+            // not unref the previous buffer, and `Packet` only unrefs on drop —
+            // reusing one packet across the whole file leaks every packet's
+            // payload (GBs on a long source).
+            let mut packet = Packet::empty();
             match packet.read(&mut input) {
                 Ok(()) => {
                     if packet.stream() != stream_index {

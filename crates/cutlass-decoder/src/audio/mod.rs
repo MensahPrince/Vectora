@@ -167,8 +167,11 @@ fn decode_coarse_peaks(
                 if demuxer_done {
                     break;
                 }
-                let mut packet = Packet::empty();
                 loop {
+                    // Fresh packet per read so skipped (non-audio) packets unref
+                    // on drop; `Packet::read` never unrefs and reusing one packet
+                    // would leak every packet's payload across the demux.
+                    let mut packet = Packet::empty();
                     match packet.read(&mut input) {
                         Ok(()) if packet.stream() == stream_index => {
                             decoder.send_packet(&packet).map_err(DecodeError::Decode)?;
