@@ -90,6 +90,14 @@ impl Decoder {
         let stream_index = stream.index();
         let time_base = stream.time_base();
         let frame_rate = stream.avg_frame_rate();
+        // Source dimensions, read before the decoder opens so threading can be
+        // sized to the frame (the decoder doesn't report width/height until
+        // after `avcodec_open2`, which is too late to configure threading).
+        let (src_w, src_h) = unsafe {
+            let params = stream.parameters();
+            let raw = params.as_ptr();
+            ((*raw).width.max(0) as u32, (*raw).height.max(0) as u32)
+        };
 
         let mut ctx = Context::from_parameters(stream.parameters()).map_err(DecodeError::Open)?;
 
@@ -98,10 +106,7 @@ impl Decoder {
         // backends decode on a single async device queue; combining both tends
         // to add latency on the first receive_frame after send_packet.
         if !active_hw.uses_hardware() {
-            ctx.set_threading(threading::Config {
-                kind: threading::Type::Frame,
-                count: 0,
-            });
+            ctx.set_threading(frame_threading(src_w, src_h));
         }
 
         let hw_device = retain_device_ref(&ctx);
@@ -382,6 +387,53 @@ impl Drop for Decoder {
     }
 }
 
+/// Software frame-thread configuration for a `width`×`height` source.
+///
+/// Frame threading copies the decoder's reference-frame working set into every
+/// worker, so FFmpeg's all-cores default (`count: 0`) makes RAM scale with the
+/// core count: a 3200×2400 HEVC needs ~680 MB across 18 workers but only
+/// ~165–250 MB at 2–4. Cap the worker count so the estimated working set stays
+/// within a budget (clamped to the machine's cores); small frames keep full
+/// parallelism. `CUTLASS_DECODE_THREADS` overrides the heuristic (`1` disables
+/// frame threading entirely).
+fn frame_threading(width: u32, height: u32) -> threading::Config {
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let count = std::env::var("CUTLASS_DECODE_THREADS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.max(1))
+        .unwrap_or_else(|| budget_thread_count(width, height, cores));
+    threading::Config {
+        kind: if count <= 1 {
+            threading::Type::None
+        } else {
+            threading::Type::Frame
+        },
+        count,
+    }
+}
+
+/// Worker count whose per-worker reference-frame buffers fit a fixed memory
+/// budget, clamped to `cores` (and 16 — FFmpeg warns past that). Unknown
+/// dimensions fall back to the ceiling.
+fn budget_thread_count(width: u32, height: u32, cores: usize) -> usize {
+    // FFmpeg over-subscribes and warns beyond 16 frame-decode threads.
+    const MAX_WORKERS: usize = 16;
+    let ceiling = cores.clamp(1, MAX_WORKERS);
+    if width == 0 || height == 0 {
+        return ceiling;
+    }
+    // ~256 MB budget against a YUV420P frame times the reference-frame depth a
+    // worker holds (≈5, calibrated to measured RSS): 3200×2400 → 4 workers
+    // (~250 MB), 1080p → the ceiling (cheap frames).
+    const BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+    const REF_FRAMES_PER_WORKER: u64 = 5;
+    let frame_bytes = (width as u64) * (height as u64) * 3 / 2;
+    ((BUDGET_BYTES / (frame_bytes * REF_FRAMES_PER_WORKER)).max(1) as usize).clamp(1, ceiling)
+}
+
 fn is_eagain(e: &FfmpegError) -> bool {
     matches!(e, FfmpegError::Other { errno } if *errno == EAGAIN)
 }
@@ -500,6 +552,29 @@ mod tests {
         assert_eq!(hw_accel_from_env("videotoolbox"), HwAccel::VideoToolbox);
         assert_eq!(hw_accel_from_env(" vt "), HwAccel::VideoToolbox);
         assert_eq!(hw_accel_from_env("bogus-backend"), HwAccel::Auto);
+    }
+
+    #[test]
+    fn thread_budget_caps_high_res_and_frees_low_res() {
+        // A high-resolution source is held to a few workers (memory-bounded)...
+        let big = budget_thread_count(3200, 2400, 18);
+        assert!(
+            (1..=4).contains(&big),
+            "3200x2400 should cap to ~2-4 workers, got {big}"
+        );
+        // ...while ordinary HD keeps far more parallelism than the big frame...
+        let hd = budget_thread_count(1920, 1080, 18);
+        assert!(
+            hd > big,
+            "1080p ({hd}) should allow more workers than 4K ({big})"
+        );
+        // ...and small frames use every available core.
+        assert_eq!(budget_thread_count(640, 360, 8), 8);
+        // Unknown dimensions fall back to the ceiling rather than throttling.
+        assert_eq!(budget_thread_count(0, 0, 8), 8);
+        // Never exceeds the core count, nor FFmpeg's 16-thread recommendation.
+        assert!(budget_thread_count(320, 240, 4) <= 4);
+        assert!(budget_thread_count(320, 240, 64) <= 16);
     }
 
     #[test]
