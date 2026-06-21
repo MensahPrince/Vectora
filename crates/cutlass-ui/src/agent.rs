@@ -310,11 +310,10 @@ fn agent_main(
     let mut history: Vec<Message> = Vec::new();
 
     // Surface the configured/not-configured state before the first send.
-    let config_path = cutlass_ai::config::default_config_path();
-    let configured = matches!(
-        cutlass_ai::config::load_ai_config(&config_path),
-        Ok(Some(_))
-    );
+    let config_path = cutlass_settings::default_config_path();
+    let configured = cutlass_settings::load(&config_path)
+        .map(|s| s.ai.is_configured())
+        .unwrap_or(false);
     let path_text: SharedString = config_path.display().to_string().into();
     with_store(&store, move |s| {
         s.set_configured(configured);
@@ -411,30 +410,34 @@ fn run_one_prompt(
     dry_run: bool,
     cancel: &AtomicBool,
 ) {
-    // Config is re-read per prompt so edits to config.toml apply without
-    // an app restart (the file is tiny; this is a cold path).
-    let config_path = cutlass_ai::config::default_config_path();
-    let section = match cutlass_ai::config::load_ai_config(&config_path) {
-        Ok(Some(section)) => section,
-        Ok(None) => {
-            with_store(store, |s| s.set_configured(false));
-            push_entry(
-                store,
-                "error",
-                format!(
-                    "No AI provider configured. Add an [ai] table to {} \
-                     (base_url + model), then send again.",
-                    config_path.display()
-                ),
-            );
-            return;
-        }
+    // Config is re-read per prompt so edits made in Settings (or by hand to
+    // config.toml) apply without an app restart (the file is tiny; this is a
+    // cold path).
+    let config_path = cutlass_settings::default_config_path();
+    let section = match cutlass_settings::load(&config_path) {
+        Ok(settings) => settings.ai,
         Err(e) => {
             push_entry(store, "error", e);
             return;
         }
     };
-    let api_key = match section.resolve_api_key() {
+    if !section.is_configured() {
+        with_store(store, |s| s.set_configured(false));
+        push_entry(
+            store,
+            "error",
+            format!(
+                "No AI provider configured. Add an endpoint and model in \
+                 Settings (or an [ai] table in {}), then send again.",
+                config_path.display()
+            ),
+        );
+        return;
+    }
+    let api_key = match cutlass_ai::config::resolve_api_key(
+        section.api_key.as_deref(),
+        section.api_key_env.as_deref(),
+    ) {
         Ok(key) => key,
         Err(e) => {
             push_entry(store, "error", e);

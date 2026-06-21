@@ -288,6 +288,48 @@ fn reveal_in_file_browser(path: &std::path::Path) {
     }
 }
 
+/// A trimmed, non-empty string, else `None` — the shape `cutlass_settings`'
+/// optional fields want (an empty text box clears the key rather than writing
+/// `""`).
+fn non_empty(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// Total bytes of every file under `dir`, recursively. Unreadable entries
+/// (and a missing dir) count as zero — the cache size is informational.
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        match entry.metadata() {
+            Ok(meta) if meta.is_dir() => total += dir_size_bytes(&entry.path()),
+            Ok(meta) => total += meta.len(),
+            Err(_) => {}
+        }
+    }
+    total
+}
+
+/// Human-readable byte size for the cache readout (binary units, one place).
+fn format_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.1} GB", b / GB)
+    } else if b >= MB {
+        format!("{:.0} MB", b / MB)
+    } else if b >= KB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 // The Dock icon of a bare (non-bundled) binary is the generic executable
 // glyph: AppKit takes it from the .app bundle, which `cargo run` doesn't
 // have, and winit has no window-icon concept on macOS — so `Window.icon`
@@ -435,11 +477,23 @@ fn main() -> Result<(), slint::PlatformError> {
     // output device degrades to the wall-clock transport, silent.
     let audio_system = audio::AudioSystem::start();
 
+    // User settings (~/.cutlass/config.toml). A missing/broken file falls
+    // back to defaults so launch never depends on it; the cache section feeds
+    // the engine config below, the rest seeds the Settings dialog later.
+    let app_settings =
+        cutlass_settings::load(&cutlass_settings::default_config_path()).unwrap_or_default();
+
     let (preview_worker, session) = preview_worker::PreviewWorker::spawn(
         EngineConfig {
-            // Per-user OS cache dir, not the (read-only on Windows) install
-            // directory the relative default would resolve against. See paths.
-            cache_dir: paths::cache_dir(),
+            // Per-user OS cache dir by default (not the read-only-on-Windows
+            // install dir the relative default would resolve against; see
+            // paths), or a user override from settings.
+            cache_dir: app_settings
+                .cache
+                .dir
+                .clone()
+                .unwrap_or_else(paths::cache_dir),
+            cache_budget_bytes: app_settings.cache.budget_mb.max(1) * 1024 * 1024,
             ..EngineConfig::default()
         },
         preview_store_weak,
@@ -703,14 +757,32 @@ fn main() -> Result<(), slint::PlatformError> {
     // --- autosave & crash recovery (Phase 4) ------------------------------
 
     // Periodic sweep: the worker snapshots dirty sessions to the sidecar
-    // slot (never the user's file) and cleans stale slots up. The timer
-    // lives until `run()` returns.
-    let autosave_timer = slint::Timer::default();
+    // slot (never the user's file) and cleans stale slots up. The cadence is
+    // user-configurable (Settings ▸ General), so the timer is restartable —
+    // `apply_autosave` (re)starts or stops it, called once now and again from
+    // the settings save handler. Lives until `run()` returns.
+    let autosave_timer = std::rc::Rc::new(slint::Timer::default());
     let autosave_handle = preview_worker.handle();
-    autosave_timer.start(
-        slint::TimerMode::Repeated,
-        autosave::SWEEP_INTERVAL,
-        move || autosave_handle.autosave(),
+    let apply_autosave: std::rc::Rc<dyn Fn(bool, u64)> = {
+        let timer = autosave_timer.clone();
+        std::rc::Rc::new(move |enabled: bool, interval_secs: u64| {
+            if enabled {
+                let handle = autosave_handle.clone();
+                timer.start(
+                    slint::TimerMode::Repeated,
+                    std::time::Duration::from_secs(
+                        interval_secs.max(cutlass_settings::MIN_AUTOSAVE_INTERVAL_SECS),
+                    ),
+                    move || handle.autosave(),
+                );
+            } else {
+                timer.stop();
+            }
+        })
+    };
+    apply_autosave(
+        app_settings.general.autosave_enabled,
+        app_settings.general.autosave_interval_secs,
     );
 
     // Launch offer: a leftover slot means the previous session never got to
@@ -805,6 +877,166 @@ fn main() -> Result<(), slint::PlatformError> {
             reveal_in_file_browser(&path);
         }
     });
+
+    // --- app settings (gear / Cutlass menu → dialog → config.toml) -------
+
+    let settings_backend = app.global::<SettingsBackend>();
+    let config_path = cutlass_settings::default_config_path();
+    let effective_cache_dir = app_settings
+        .cache
+        .dir
+        .clone()
+        .unwrap_or_else(paths::cache_dir);
+
+    // Seed the dialog from the loaded config. The theme rides AppStore so it
+    // drives the live theme binding the whole shell reads.
+    settings_backend.set_config_path(config_path.display().to_string().into());
+    settings_backend.set_ai_base_url(app_settings.ai.base_url.clone().into());
+    settings_backend.set_ai_model(app_settings.ai.model.clone().into());
+    settings_backend.set_ai_api_key(app_settings.ai.api_key.clone().unwrap_or_default().into());
+    settings_backend.set_ai_api_key_env(
+        app_settings
+            .ai
+            .api_key_env
+            .clone()
+            .unwrap_or_default()
+            .into(),
+    );
+    settings_backend.set_autosave_enabled(app_settings.general.autosave_enabled);
+    settings_backend.set_autosave_interval_secs(app_settings.general.autosave_interval_secs as i32);
+    settings_backend.set_cache_budget_gb(app_settings.cache.budget_mb as f32 / 1024.0);
+    settings_backend.set_cache_dir_effective(effective_cache_dir.display().to_string().into());
+    app.global::<AppStore>()
+        .set_theme_id(app_settings.appearance.theme.index());
+
+    // Persist on dismiss (Done / ✕ / Esc). Load-then-patch so any hand-set
+    // keys the UI doesn't surface (e.g. an explicit cache.dir) survive, then
+    // apply the live-settable bits immediately.
+    {
+        let app_weak = app.as_weak();
+        let config_path = config_path.clone();
+        let apply_autosave = apply_autosave.clone();
+        settings_backend.on_save(move || {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let sb = app.global::<SettingsBackend>();
+            let mut s = cutlass_settings::load(&config_path).unwrap_or_default();
+            s.ai.base_url = sb.get_ai_base_url().trim().to_string();
+            s.ai.model = sb.get_ai_model().trim().to_string();
+            s.ai.api_key = non_empty(&sb.get_ai_api_key());
+            s.ai.api_key_env = non_empty(&sb.get_ai_api_key_env());
+            s.appearance.theme =
+                cutlass_settings::ThemeChoice::from_index(app.global::<AppStore>().get_theme_id());
+            s.general.autosave_enabled = sb.get_autosave_enabled();
+            s.general.autosave_interval_secs = (sb.get_autosave_interval_secs().max(0) as u64)
+                .max(cutlass_settings::MIN_AUTOSAVE_INTERVAL_SECS);
+            s.cache.budget_mb = (sb.get_cache_budget_gb().max(0.0) * 1024.0).round() as u64;
+
+            if let Err(e) = cutlass_settings::save(&config_path, &s) {
+                tracing::error!("failed to save settings: {e}");
+                return;
+            }
+            apply_autosave(s.general.autosave_enabled, s.general.autosave_interval_secs);
+            // The agent re-reads config per prompt, but refresh its panel's
+            // configured state now so the chat box appears the moment a
+            // provider is filled in.
+            app.global::<AgentStore>()
+                .set_configured(s.ai.is_configured());
+        });
+    }
+
+    // Test the endpoint with the current (unsaved) AI fields, off the UI
+    // thread; report back through the status line.
+    {
+        let app_weak = app.as_weak();
+        settings_backend.on_test_connection(move || {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let sb = app.global::<SettingsBackend>();
+            let base_url = sb.get_ai_base_url().trim().to_string();
+            let model = sb.get_ai_model().trim().to_string();
+            let api_key = non_empty(&sb.get_ai_api_key());
+            let api_key_env = non_empty(&sb.get_ai_api_key_env());
+            sb.set_ai_testing(true);
+            sb.set_ai_test_status(SharedString::new());
+
+            let app_weak = app.as_weak();
+            std::thread::spawn(move || {
+                let result =
+                    cutlass_ai::config::resolve_api_key(api_key.as_deref(), api_key_env.as_deref())
+                        .and_then(|key| {
+                            cutlass_ai::providers::OpenAiCompatProvider::new(&base_url, &model, key)
+                                .test_connection()
+                                .map_err(|e| e.to_string())
+                        });
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = app_weak.upgrade() {
+                        let sb = app.global::<SettingsBackend>();
+                        sb.set_ai_testing(false);
+                        match result {
+                            Ok(msg) => {
+                                sb.set_ai_test_ok(true);
+                                sb.set_ai_test_status(msg.into());
+                            }
+                            Err(e) => {
+                                sb.set_ai_test_ok(false);
+                                sb.set_ai_test_status(e.into());
+                            }
+                        }
+                    }
+                });
+            });
+        });
+    }
+
+    // Recompute the on-disk cache size off-thread (the dir can be large); the
+    // dialog kicks this on open.
+    {
+        let app_weak = app.as_weak();
+        let cache_dir = effective_cache_dir.clone();
+        settings_backend.on_refresh_cache_size(move || {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            app.global::<SettingsBackend>()
+                .set_cache_size_text("…".into());
+            let app_weak = app.as_weak();
+            let cache_dir = cache_dir.clone();
+            std::thread::spawn(move || {
+                let text = format_size(dir_size_bytes(&cache_dir));
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = app_weak.upgrade() {
+                        app.global::<SettingsBackend>()
+                            .set_cache_size_text(text.into());
+                    }
+                });
+            });
+        });
+    }
+
+    // Reveal config file / cache dir in the OS file browser.
+    {
+        let config_path = config_path.clone();
+        settings_backend.on_reveal_config(move || {
+            let target = if config_path.exists() {
+                config_path.clone()
+            } else {
+                config_path
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| config_path.clone())
+            };
+            reveal_in_file_browser(&target);
+        });
+    }
+    {
+        let cache_dir = effective_cache_dir.clone();
+        settings_backend.on_reveal_cache(move || {
+            reveal_in_file_browser(&cache_dir);
+        });
+    }
 
     // --- canvas settings (title bar → dialog → engine thread) ------------
 

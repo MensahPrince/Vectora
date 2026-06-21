@@ -35,6 +35,7 @@ import {
     PreviewView,
 } from "lib/preview-backend.slint";
 import { WindowBackend } from "lib/window-backend.slint";
+import { SettingsBackend } from "lib/settings-backend.slint";
 
 // Re-export globals so Slint's codegen generates accessors on `AppWindow`.
 // Slint only exposes globals from the entry file's exports to the host
@@ -44,6 +45,7 @@ export { AppState }from "state.slint";
 export {
     AgentStore,
     AgentEntry,
+    AppStore,
     EditorStore,
     RecentProject,
     TimelineStore,
@@ -77,6 +79,7 @@ export { WindowBackend }from "lib/window-backend.slint";
 export { ExportBackend }from "lib/export-backend.slint";
 export { CanvasBackend }from "lib/canvas-backend.slint";
 export { EffectsBackend }from "lib/effects-backend.slint";
+export { SettingsBackend }from "lib/settings-backend.slint";
 
 export component AppWindow inherits Window {
     title: "Cutlass";
@@ -258,6 +261,9 @@ export component AppWindow inherits Window {
             // else is swallowed.
             if (AppState.settings-open) {
                 if (event.text == Key.Escape) {
+                    // Esc dismisses; persist first so a theme/field change
+                    // made just before closing isn't lost (same as Done/✕).
+                    SettingsBackend.save();
                     AppState.settings-open = false;
                 }
                 return accept;

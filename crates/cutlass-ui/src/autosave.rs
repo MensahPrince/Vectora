@@ -19,10 +19,6 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-/// How often the UI timer asks the worker to sweep (the worker skips the
-/// write when the session is clean). Worst case loss after a crash.
-pub const SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// `autosave/` in the per-user OS data dir (see [`crate::paths`]):
 /// `%APPDATA%\Cutlass` on Windows, `~/Library/Application Support/Cutlass` on
 /// macOS, `~/.local/share/Cutlass` on Linux.

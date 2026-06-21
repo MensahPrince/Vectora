@@ -16,6 +16,7 @@ cutlass-decoder = { path = "../cutlass-decoder" }
 cutlass-engine = { path = "../cutlass-engine" }
 cutlass-models = { path = "../cutlass-models" }
 cutlass-commands = { path = "../cutlass-commands" }
+cutlass-settings = { path = "../cutlass-settings" }
 crossbeam-channel = "0.5.15"
 serde = { workspace = true }
 serde_json = { workspace = true }
