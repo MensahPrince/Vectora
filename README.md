@@ -1,45 +1,90 @@
 # Cutlass
 
-Cutlass is an open-source video editor built around a simple idea: describe the edit you want, then keep refining it on a real timeline.
+Cutlass is a free, open-source video editor with an AI assistant built in.
+Edit the normal way on a timeline — cut, trim, arrange, add effects and audio —
+or just tell the assistant what you want and watch it do the edit for you.
 
-It is early alpha software. The editor already supports practical timeline work, live preview, export, and an AI assistant panel, but the experience is still changing quickly.
+It's still alpha and moving fast, but it's a real editor now, not a toy.
 
-## What Cutlass Does
+## What you can do
 
-Cutlass is aimed at fast everyday editing:
+**Edit a timeline**
 
-- Import videos, audio, and still images.
-- Arrange clips on a multi-lane timeline.
-- Trim, split, move, duplicate, link, unlink, and ripple-delete clips.
-- Adjust speed, reverse playback, crop, flip, transform, fade, and volume.
-- Add styled text, solid color clips, and simple shapes.
-- Preview edits live with GPU rendering and audio playback.
-- Export H.264/AAC MP4 files.
-- Ask the AI assistant to make timeline edits from plain-language prompts.
+- Import video, audio, and images onto a multi-lane timeline.
+- Cut, trim, split, move, duplicate, link/unlink, ripple-delete, multi-select.
+- Change speed and reverse, crop and flip, move/scale/rotate, set opacity.
+- Add styled text, solid colors, and shapes.
+- Pick a canvas shape (16:9, 9:16, 1:1, 4:5, 21:9) and a background color.
+- Keyframe almost anything — animate transforms and effect settings over time.
 
-The AI assistant does not replace the editor. It drives the same timeline actions you can perform by hand, so prompted edits remain visible, undoable, and reviewable.
+**Effects & transitions**
 
-## Current Status
+- A GPU effect engine with a starter pack: blur, vignette, sharpen, pixelate,
+  glitch, chromatic aberration, grain, glow, zoom-blur, mirror.
+- Transitions between clips: crossfade, dip to black/white, wipes, slide, zoom,
+  blur.
+- Adjustment layers that affect everything beneath them.
 
-Cutlass is under active development. It is useful for testing the core editing workflow, experimenting with prompt-to-edit interactions, and contributing to the project.
+**Audio that doesn't need a separate app**
 
-Expect rough edges. Alpha builds are not notarized on macOS, Windows builds are not published yet, and advanced editing features such as effects stacks, transitions, captions, masks, and full audio mixing are still evolving.
+- Volume envelopes and draggable fade handles.
+- Change speed without the chipmunk effect — pitch stays put, ramps included.
+- Auto-duck music under a voice track.
+- One-click noise reduction.
+- Beat detection you can snap your cuts to.
 
-## Roadmap
+**Preview & export**
 
-Visit the [Cutlass v1 roadmap](docs/v1-roadmap.md) to see what is planned, what is in progress, and what has already landed.
+- Live GPU preview with scrubbing and real-time playback.
+- Export to H.264/AAC MP4.
+
+**The AI assistant**
+
+Describe an edit in plain language and the assistant makes it on your timeline.
+It uses the same actions you would, so every change stays visible, undoable, and
+reviewable — nothing happens behind your back, and you can preview the plan
+before it runs. It's optional; the editor works fine without it.
 
 ## Install
 
-Prebuilt alpha releases are published on [GitHub Releases](https://github.com/1Mr-Newton/cutlass/releases) when tagged.
+Download a build from the [releases page](https://github.com/1Mr-Newton/cutlass/releases).
 
-For macOS Apple Silicon, download `Cutlass-*-macos-arm64.zip`, unzip it, and drag `Cutlass.app` to Applications. On first launch, right-click `Cutlass.app` and choose **Open** because alpha builds are not notarized.
+- **Windows** (x64 / Arm64) — run the `Setup.exe` installer, or use the
+  portable `.zip`.
+- **macOS** (Apple Silicon) — unzip and drag `Cutlass.app` to Applications.
+  On first launch, right-click the app and choose **Open** (builds aren't
+  notarized yet).
+- **Linux** (x86_64) — extract the `.tar.gz` and run `./cutlass-ui`. You'll need
+  FFmpeg installed.
 
-For Linux x86_64, download `Cutlass-*-linux-x86_64.tar.gz`, extract it, and run `./cutlass-ui`. Install FFmpeg runtime libraries first if your distribution does not already provide them.
+## Setting up the AI assistant
 
-## Build From Source
+Cutlass doesn't ship a model. Point it at any OpenAI-compatible endpoint — a
+local one like [Ollama](https://ollama.com), or a cloud provider.
 
-You need a recent stable Rust toolchain and FFmpeg development libraries.
+Create `~/.cutlass/config.toml`:
+
+```toml
+[ai]
+base_url = "http://localhost:11434/v1"   # e.g. Ollama
+model = "qwen3:14b"
+# api_key = "sk-..."                      # for cloud endpoints, or:
+# api_key_env = "OPENAI_API_KEY"          # read the key from an env var
+```
+
+Your key stays in that file or your environment — it's never written into
+project files. Smaller local models work but tool-call less reliably; the
+assistant's dry-run mode lets you preview a plan before it touches anything.
+
+## Projects
+
+Projects are saved as `.cutlass` files. Media is referenced from where it lives
+on disk, so moving a project to another machine may ask you to relink media when
+you open it.
+
+## Build from source
+
+You need a recent stable Rust toolchain and FFmpeg.
 
 ```bash
 # macOS
@@ -51,71 +96,42 @@ sudo apt-get install -y pkg-config clang \
   libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
 ```
 
-Build and test the workspace:
+Then run the editor:
+
+```bash
+cargo run -p cutlass-ui
+# or open straight into a file:
+cargo run -p cutlass-ui -- path/to/video.mp4
+```
+
+To build and test the whole workspace:
 
 ```bash
 cargo build --workspace
 cargo test --workspace
 ```
 
-Run the desktop editor:
+## Roadmap
 
-```bash
-cargo run -p cutlass-ui
-```
-
-You can also start with a media file:
-
-```bash
-cargo run -p cutlass-ui -- path/to/video.mp4
-```
-
-## AI Assistant
-
-The assistant works with OpenAI-compatible chat endpoints, including local servers such as Ollama and cloud providers that expose the same API shape.
-
-Configure it in `~/.cutlass/config.toml`:
-
-```toml
-[ai]
-base_url = "http://localhost:11434/v1"
-model = "qwen3:14b"
-# api_key_env = "OPENAI_API_KEY"
-```
-
-API keys should stay in your user config or environment. They are not stored in Cutlass project files.
-
-## Project Files
-
-Cutlass projects are saved as `.cutlass` files. Media is referenced from its location on disk, so moving a project between machines may require relinking missing media when it is opened.
-
-## Developing
-
-This repository is a Rust workspace. The root commands above build and test everything, while individual crates can be run or tested with Cargo's `-p` flag.
-
-Each crate has its own README under `crates/` with the details for that part of the system. Packaging notes for maintainers are in [packaging/README.md](packaging/README.md).
+See the [v1 roadmap](docs/v1-roadmap.md) for what's planned, in progress, and
+already done.
 
 ## Contributing
 
-Contributions are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup, project layout, coding conventions, commit style, and how to open a pull request.
+Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the
+project layout, and the commit/PR style. Each crate also has its own README
+under `crates/`, and packaging notes live in [packaging/](packaging/README.md).
 
-## AI-Assisted Development
-
-Cutlass is built with significant help from AI coding tools. A large part of the code is AI-generated or AI-assisted, then reviewed and integrated by maintainers. We welcome contributions on the same footing whether they come from humans or AI, as long as they are useful and meet the project's quality bar — see [CONTRIBUTING.md](CONTRIBUTING.md).
+A lot of Cutlass is written with AI coding tools and then reviewed by
+maintainers. Contributions are welcome on the same footing whether they come
+from a person or an assistant, as long as they're solid and meet the bar.
 
 ## License
 
-Cutlass is licensed under either of:
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
-- MIT license ([LICENSE-MIT](LICENSE-MIT))
-
+Dual-licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT),
 at your option.
 
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in Cutlass, as defined in the Apache-2.0 license, shall be dual licensed as above without additional terms or conditions.
-
-## Third-Party Licenses
-
-Cutlass builds on third-party components that keep their own licenses.
-
-FFmpeg, used through [`ffmpeg-next`](https://crates.io/crates/ffmpeg-next), is licensed under LGPL-2.1-or-later by default and may fall under GPL depending on how the linked FFmpeg libraries were configured. If you distribute Cutlass builds that link FFmpeg, review the licensing terms of the FFmpeg build you ship.
+Cutlass links FFmpeg (via [`ffmpeg-next`](https://crates.io/crates/ffmpeg-next)),
+which is LGPL-2.1-or-later by default and may be GPL depending on how the FFmpeg
+you link was built. If you distribute builds that link FFmpeg, check the terms of
+the FFmpeg build you ship.
