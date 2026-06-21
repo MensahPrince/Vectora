@@ -3,22 +3,22 @@
 Notes for the latest release. For previous releases, see the
 [GitHub releases page](https://github.com/1Mr-Newton/cutlass/releases).
 
-## [alpha-0.5.2] — 2026-06-21
+## [alpha-0.5.3] — 2026-06-21
 
-### Fixed
+### Added
 
-- **Huge memory leak when importing video.** Every demux pass leaked the packets
-  it read, so opening a clip leaked hundreds of MB to several GB that was never
-  reclaimed — even after deleting the clip and its media. A single long,
-  high-bitrate source could push RAM past 4 GB. All decode paths (video, audio,
-  keyframe and MP3 indexing) now free packets as they go.
-- **Bounded preview decoder memory.** Per-clip decoders are released as soon as a
-  clip leaves the timeline (delete, split, trim, undo) instead of living until
-  the project is swapped, with an LRU cap as a backstop. Software decode now also
-  sizes its worker threads to the frame, so a high-resolution source no longer
-  scales RAM with CPU core count (e.g. ~680 MB → ~245 MB for a 3200×2400 clip on
-  an 18-core machine).
-- **Windows: the AI assistant config is found again.** Its path now resolves from
-  the user's home directory.
+- **Settings screen.** A new in-app Settings dialog, reachable from the
+  title-bar gear (or the Cutlass menu on macOS), with four sections:
+  - **AI provider** — set the assistant's endpoint, model, and API key (a
+    literal or read from an environment variable) without hand-editing a file,
+    with a one-click **Test connection**.
+  - **Appearance** — switch between the Graphite, Ember, and Dark blue themes,
+    applied instantly.
+  - **General** — turn autosave on or off and set how often it runs.
+  - **Cache** — see the frame cache location and on-disk size, reveal it in
+    your file browser, and set the disk budget.
 
-[alpha-0.5.2]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.5.2
+  Settings are saved to `~/.cutlass/config.toml`, preserving any comments and
+  hand-edits already in the file.
+
+[alpha-0.5.3]: https://github.com/1Mr-Newton/cutlass/releases/tag/alpha-0.5.3
