@@ -289,6 +289,9 @@ pub enum EditCommand {
         aspect: CanvasAspect,
         background: [u8; 3],
     },
+    /// Rename the project (the app-owned draft's display name shown in the
+    /// title bar and project gallery). The inverse restores the prior name.
+    SetProjectName { name: String },
 }
 
 /// Top-level command surface: media registration or a timeline edit.
@@ -316,4 +319,6 @@ pub enum EditOutcome {
     RemovedMarker(MarkerId),
     /// The project canvas settings changed (M1 canvas settings).
     UpdatedCanvas,
+    /// The project's display name changed (draft rename).
+    UpdatedProject,
 }

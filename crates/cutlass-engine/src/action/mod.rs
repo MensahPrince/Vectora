@@ -167,7 +167,7 @@ mod tests {
     use super::*;
     use crate::action::edit::{
         add_clip, add_generated, add_track, link_clips, move_clip, remove_media, ripple_delete,
-        ripple_insert, set_track_flags, shift_clips, split_clip, trim_clip,
+        ripple_insert, set_project_name, set_track_flags, shift_clips, split_clip, trim_clip,
     };
     use cutlass_cache::FrameCache;
     use cutlass_models::{
@@ -874,6 +874,25 @@ mod tests {
             None,
             "validated before mutating"
         );
+    }
+
+    #[test]
+    fn set_project_name_inverse_oscillates() {
+        let (_dir, mut project, cache) = setup();
+        assert_eq!(project.name, "test");
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+
+        let inv1 = set_project_name::set_project_name(&mut ctx, "renamed".to_string()).unwrap();
+        assert_eq!(ctx.project.name, "renamed");
+
+        let inv2 = inv1.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.name, "test", "undo restores the prior name");
+
+        let _ = inv2.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.name, "renamed", "redo re-applies");
     }
 
     #[test]
