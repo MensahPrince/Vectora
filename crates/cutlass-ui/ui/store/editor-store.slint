@@ -1,12 +1,13 @@
 import { Project } from "../models/index.slint";
 import { ClipMove } from "../lib/drag-backend.slint";
 
-// A recently used project file (lifecycle roadmap Phase 3): `name` is the
-// file stem shown in the File menu and the welcome panel, `path` the full
-// path handed back to `on-open-recent-requested`.
-export struct RecentProject {
+// One app-owned project draft, for the launch gallery: `name` is the editable
+// display name, `path` the draft's `project.cutlass` (the identity handed back
+// to open / delete callbacks), `modified` a coarse "5 minutes ago" subtitle.
+export struct ProjectSummary {
     name: string,
     path: string,
+    modified: string,
 }
 
 // Slint-side view model. This is a read-only projection of the engine's
@@ -107,25 +108,27 @@ export global EditorStore {
     // SetClipTransform; the worker clears any override in the same step.
     callback on-clip-transform-committed(clip-id: string, position-x: float, position-y: float, anchor-x: float, anchor-y: float, scale: float, rotation: float, opacity: float, tick: int);
 
-    // --- project lifecycle (lifecycle roadmap Phases 1–2) ------------------
-    // Save the session to its .cutlass file. `save-as` forces a path picker
-    // (Cmd/Ctrl+Shift+S); a plain save reuses the current file, or asks for
-    // one on the first save (main.rs decides — it owns the async dialog).
+    // --- project lifecycle (app-owned drafts) ------------------------------
+    // Flush the live draft to disk now (Cmd/Ctrl+S). Edits already auto-save,
+    // so this is just an explicit "write now"; `save-as` is ignored (there is
+    // no user-chosen file in the draft model). main.rs forwards it to the
+    // worker.
     callback on-save-requested(save-as: bool);
-    // Open a .cutlass project / start a fresh session (Cmd/Ctrl+O / +N).
-    // No save prompt: autosave keeps the outgoing session safe, so main.rs
-    // forces one snapshot and then swaps (Open shows the picker first).
+    // Import an external `.cutlass` into a new draft (Open file…, Cmd/Ctrl+O):
+    // main.rs runs the picker and copies the file into the draft store, then
+    // swaps. New (Cmd/Ctrl+N) creates a fresh empty draft. Both flush the
+    // outgoing draft first.
     callback on-open-requested();
     callback on-new-requested();
-    // Open a specific .cutlass file (Open Recent, launch screen list): same
-    // autosave-then-swap as on-open-requested, no picker — the path is
-    // already known. A file that vanished since the list was read fails
-    // like any open and surfaces through `session-error`.
-    callback on-open-recent-requested(path: string);
-    // Rust→Rust completion signal: the worker invokes it after every save
-    // attempt. Currently unconsumed (the save guard is gone); kept so the
-    // worker's save path has a stable hook for future wiring.
-    callback save-finished(ok: bool);
+    // Open an existing draft from the launch gallery, by its `project.cutlass`
+    // path. main.rs flushes the outgoing draft, then swaps.
+    callback on-open-project-requested(path: string);
+    // Delete a draft from the launch gallery (its whole directory), by its
+    // `project.cutlass` path. main.rs removes it and refreshes the gallery.
+    callback on-delete-project-requested(path: string);
+    // Rename the live draft from the title bar. main.rs forwards the trimmed
+    // name to the worker, which applies it as one undoable edit.
+    callback on-rename-project(name: string);
 
     // --- library asset management ------------------------------------------
     // Delete a source from the media pool (Library bin right-click → Remove
@@ -166,11 +169,10 @@ export global EditorStore {
     // Non-empty mounts the error dialog (save/open failures); dismissing
     // clears it. Worker-set, UI-cleared.
     in-out property <string> session-error: "";
-    // MRU project list, newest first (lifecycle roadmap Phase 3): loaded
-    // from ~/.cutlass/recent.json at launch (main.rs), republished by the
-    // worker after every successful save/open. Drives the File menu's
-    // Open Recent submenu and the library welcome panel.
-    in-out property <[RecentProject]> recent-projects: [];
+    // App-owned project drafts, newest-modified first: the launch gallery's
+    // source. Seeded by main.rs at launch and refreshed when returning to the
+    // gallery (close) or after a delete (`drafts::list`).
+    in-out property <[ProjectSummary]> projects: [];
 
     // Engine history state, republished by the worker after every
     // mutation — drives the toolbar's undo/redo enabled states.
