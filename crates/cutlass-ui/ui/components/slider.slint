@@ -46,8 +46,8 @@ export component CutlassSlider {
     private property <float> ratio: root.maximum > root.minimum
         ? clamp((root.value - root.minimum) / (root.maximum - root.minimum), 0, 1) : 0;
 
-    min-width: root.vertical ? 20px : 0px;
-    min-height: root.vertical ? 0px : 20px;
+    min-width: root.vertical ? 50px : 0px;
+    min-height: root.vertical ? 0px : 50px;
     vertical-stretch: root.vertical ? 1 : 0;
     horizontal-stretch: root.vertical ? 0 : 1;
     opacity: root.enabled ? 1.0 : 0.4;
@@ -109,7 +109,10 @@ export component CutlassSlider {
         border-radius: self.width / 2;
         background: root.handle-color;
         opacity: 0.15;
-        animate width { duration: 120ms; easing: ease-out; }
+        animate width {
+            duration: 120ms;
+            easing: ease-out;
+        }
     }
 
     handle := Rectangle {
@@ -134,7 +137,6 @@ export component CutlassSlider {
             if (event.button != PointerEventButton.left) {
                 return;
             }
-
             if (event.kind == PointerEventKind.up) {
                 if (root.handle-pressed) {
                     root.released(root.value);
@@ -142,12 +144,10 @@ export component CutlassSlider {
                 root.handle-pressed = false;
                 return;
             }
-
             if (event.kind == PointerEventKind.cancel) {
                 root.handle-pressed = false;
                 return;
             }
-
             if (event.kind != PointerEventKind.down) {
                 return;
             }
@@ -159,7 +159,6 @@ export component CutlassSlider {
                 root.set-value((!root.vertical ? root.size-to-value(touch-area.mouse-x, root.width)
                     : root.size-to-value(root.height - touch-area.mouse-y, root.height)) + root.minimum);
             }
-
             self.pressed-value = root.value;
             focus-scope.focus();
             root.handle-pressed = true;
@@ -169,7 +168,6 @@ export component CutlassSlider {
             if (!self.enabled) {
                 return;
             }
-
             root.set-value(self.pressed-value + (!root.vertical
                 ? root.size-to-value(touch-area.mouse-x - touch-area.pressed-x, root.width - root.ref-size)
                 : root.size-to-value(touch-area.pressed-y - touch-area.mouse-y, root.height - root.ref-size)));
@@ -187,7 +185,6 @@ export component CutlassSlider {
             if (!self.enabled || root.step <= 0) {
                 return reject;
             }
-
             if ((!root.vertical && event.text == Key.RightArrow) || (root.vertical && event.text == Key.UpArrow)) {
                 root.increment();
                 return accept;
@@ -201,7 +198,6 @@ export component CutlassSlider {
                 root.set-value(root.maximum);
                 return accept;
             }
-
             reject
         }
 
@@ -226,7 +222,6 @@ export component CutlassSlider {
         if (root.value == new-value) {
             return;
         }
-
         root.value = max(root.minimum, min(root.maximum, new-value));
         root.changed(root.value);
     }
