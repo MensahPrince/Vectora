@@ -8,7 +8,7 @@ This crate owns application behavior and presentation. Timeline state and edit v
 
 - Launch the desktop application.
 - Bind Slint UI state to Rust application state.
-- Import, open, save, save as, autosave, and relink projects.
+- Manage app-owned projects: continuous auto-save, the launch gallery, import (Open file…), and relink.
 - Display and edit the media library, timeline, preview, inspector, transport, and assistant panel.
 - Translate user gestures into `cutlass-commands`.
 - Send commands to `cutlass-engine` through the preview worker.
@@ -25,6 +25,7 @@ This crate owns application behavior and presentation. Timeline state and edit v
 - `src/timeline.rs`, `src/ruler.rs`, `src/snap.rs`, and `src/selection.rs`: timeline interaction and editing helpers.
 - `src/inspector.rs` and `src/params.rs`: inspector bindings and editable clip parameters.
 - `src/agent.rs`: assistant panel integration.
+- `src/drafts.rs`: app-owned project store (gallery listing, import, continuous auto-save targets).
 - `ui/`: Slint components, panels, models, and stores.
 
 ## Running

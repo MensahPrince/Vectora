@@ -36,8 +36,8 @@ phantom-feature problem with a megaphone.
   LM Studio locally *and* OpenAI-class clouds day one. Adding providers
   is config or one adapter, never an agent change.
 - **Keys and provider config live in `~/.cutlass/config.toml`** (the
-  config-dir convention `recent.json` and `autosave/` established) —
-  never in project files, never serialized into `.cutlass`.
+  config-dir convention the settings crate established) — never in
+  project files, never serialized into `.cutlass`.
 - **Network and inference stay off the UI thread.** The agent runs on
   its own thread, talks to the engine via the worker's ordered mutation
   lane, and streams status to the UI through the established
@@ -71,7 +71,8 @@ All engine-side, all tested:
 - [x] Models are fully serde (`cutlass-models`, project persistence) —
       ids serialize, `RationalTime`/`TimeRange` serialize, and the UI
       already round-trips raw u64 ids (`parse_raw_id`).
-- [x] Config-dir convention: `~/.cutlass/{recent.json, autosave/}`.
+- [x] Config-dir convention: `~/.cutlass/config.toml` for settings; the
+      per-user data dir's `projects/` for app-owned project drafts.
 
 What does **not** exist (the work): `cutlass-commands` has no serde and
 no JSON schema; there is no provider code, no agent loop, no chat UI, no
