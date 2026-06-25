@@ -6,6 +6,7 @@
 // above it and keep their clicks.
 
 import { CutlassText, AccentButton, SubtleButton } from "../components/index.slint";
+import { LineTextInput } from "../panels/inspector/inspector-widgets.slint";
 import { AppStore, EditorStore } from "../store/index.slint";
 import { WindowBackend } from "../lib/window-backend.slint";
 import { ExportBackend } from "../lib/export-backend.slint";
@@ -45,6 +46,17 @@ export component TitleBar inherits Rectangle {
     height: AppStore.theme.metrics.layout.toolbar-height;
     background: AppStore.theme.surface.app-background;
 
+    // The committed draft name (projection republishes it after a rename or a
+    // session swap). The edit field seeds off this and the watcher below
+    // re-syncs it after editing drops the seed binding — the same pattern the
+    // inspector's numeric fields use.
+    property <string> committed-title: EditorStore.project.title == ""
+        ? "Untitled project"
+        : EditorStore.project.title;
+    changed committed-title => {
+        name-edit.text = committed-title;
+    }
+
     drag := TouchArea {
         moved => {
             // Small threshold so a stationary double-click never turns
@@ -58,20 +70,25 @@ export component TitleBar inherits Rectangle {
         }
     }
 
-    // Centered over the full bar (not the leftover layout space) so the
-    // title doesn't shift when buttons appear. Text takes no pointer
-    // input, so the drag region underneath keeps working. Once the
-    // session has a file the title is the file stem; the leading dot
-    // marks unsaved changes (lifecycle roadmap Phase 1).
-    CutlassText {
+    // Centered editable draft name (CapCut renames inline from the title).
+    // Declared after the drag TouchArea so it stacks above and keeps its
+    // clicks; the rest of the bar stays draggable. Edits auto-save, so there
+    // is no dirty dot — commit on Enter or blur forwards the trimmed name to
+    // the worker, which renames as one undoable edit (a no-op rename is
+    // dropped worker-side, so a focus-and-leave costs nothing).
+    name-edit := LineTextInput {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        text: (EditorStore.project-dirty ? "● " : "")
-            + (EditorStore.project-file-name != "" ? EditorStore.project-file-name
-                : EditorStore.project.title == "" ? "Untitled project"
-                : EditorStore.project.title);
-        style: AppStore.theme.typography.caption;
-        foreground: AppStore.theme.text.secondary;
+        width: 280px;
+        horizontal-alignment: TextHorizontalAlignment.center;
+        text: committed-title;
+        accepted(entered) => {
+            EditorStore.on-rename-project(entered);
+            // Restore the committed name immediately: a rejected (blank) entry
+            // would otherwise leave the box empty, and a valid one round-trips
+            // back through `committed-title` on the next projection republish.
+            self.text = committed-title;
+        }
     }
 
     HorizontalLayout {
@@ -124,12 +141,11 @@ export component TitleBar inherits Rectangle {
         VerticalLayout {
             alignment: center;
 
-            // File menu (lifecycle roadmap Phase 3): New / Open / Open
-            // Recent / Save / Save As. Phase 1's standalone Save button
-            // folded in here; the dirty dot in the title still marks
-            // unsaved work. The recents submenu mirrors
-            // EditorStore.recent-projects (newest first, dead paths pruned
-            // on read) and grays out while empty.
+            // File menu (app-owned drafts): New starts a fresh draft, Open
+            // file… imports an external `.cutlass` into the project store, and
+            // Save is just an explicit "flush now" — edits already auto-save,
+            // so there is no Save As (no user-chosen path) and no dirty dot.
+            // The launch gallery lists existing projects.
             file-menu := ContextMenuArea {
                 width: file-button.width;
                 height: file-button.height;
@@ -142,33 +158,16 @@ export component TitleBar inherits Rectangle {
                         }
                     }
                     MenuItem {
-                        title: "Open…";
+                        title: "Open file…";
                         activated => {
                             EditorStore.on-open-requested();
-                        }
-                    }
-                    Menu {
-                        title: "Open Recent";
-                        enabled: EditorStore.recent-projects.length > 0;
-                        for entry in EditorStore.recent-projects: MenuItem {
-                            title: entry.name;
-                            activated => {
-                                EditorStore.on-open-recent-requested(entry.path);
-                            }
                         }
                     }
                     MenuSeparator { }
                     MenuItem {
                         title: "Save";
-                        enabled: EditorStore.project-dirty || !EditorStore.project-has-path;
                         activated => {
                             EditorStore.on-save-requested(false);
-                        }
-                    }
-                    MenuItem {
-                        title: "Save As…";
-                        activated => {
-                            EditorStore.on-save-requested(true);
                         }
                     }
                     MenuSeparator { }

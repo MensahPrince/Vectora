@@ -1,5 +1,30 @@
 # Project Lifecycle Roadmap — save, open, never lose work
 
+> **Update (app-owned drafts — supersedes Phases 1–4 below).** Cutlass moved
+> off the explicit file-based model to the CapCut-style one this doc deferred:
+> the app now **owns every project**. There is no user-chosen `.cutlass` path,
+> no manual Save / Save As, no dirty dot, and no unsaved-changes or
+> crash-recovery prompt — there's nothing to lose because every edit
+> auto-saves.
+>
+> - **Storage.** Each project is a directory under `projects/` in the per-user
+>   data dir, holding `project.cutlass` (read/written through the unchanged
+>   engine `Save`/`Load`, so the path-keyed plumbing below is reused as-is) and
+>   a `meta.json` sidecar caching the display name for the gallery
+>   (`crates/cutlass-ui/src/drafts.rs`).
+> - **Cadence.** The worker debounces edits (~300 ms idle) into one write, with
+>   an immediate flush on session swap and on close. Scrub/seek frames don't
+>   defer the flush (`preview_worker.rs`, `PERSIST_DEBOUNCE`).
+> - **UI.** The launch screen is a project gallery (open / delete per row); the
+>   title bar renames the live project inline
+>   (`EditCommand::SetProjectName`, undoable). **Open file…** imports an
+>   external `.cutlass` into a new draft; **Export** is the way out.
+> - **Removed.** `Engine::restore_session`, `src/autosave.rs`, `src/recent.rs`,
+>   the Save As / Open Recent menu items, and the General settings pane.
+>
+> Phase 5 (missing-media relink) and the architecture invariants still stand.
+> The shipped-✅ phases are kept below as history of how we got here.
+
 Policy: **we follow CapCut** — but lifecycle is the one area where we follow
 the *desktop platform* first: Cmd/Ctrl+S saves, a dot in the title marks
 unsaved changes, closing with unsaved work asks, and a crash never costs

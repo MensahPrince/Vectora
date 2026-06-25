@@ -84,45 +84,6 @@ fn new_session_resets_project_path_history_and_dirty() {
 }
 
 #[test]
-fn restore_session_binds_to_source_and_reads_dirty() {
-    let (dir, mut engine) = temp_engine();
-    common::add_track(&mut engine, TrackKind::Video, "V1");
-
-    // The autosave sidecar is an ordinary project file written elsewhere.
-    let autosave = dir.path().join("autosave-slot.cutlass");
-    engine
-        .project()
-        .save_to_file(&autosave)
-        .expect("write autosave");
-
-    let source = dir.path().join("the-real-project.cutlass");
-    let mut engine2 = Engine::new(engine_config(dir.path().join("cache-restore"))).expect("engine");
-    engine2
-        .restore_session(&autosave, Some(source.clone()))
-        .expect("restore");
-
-    assert_eq!(engine2.project().timeline().tracks_ordered().count(), 1);
-    assert_eq!(
-        engine2.project_path(),
-        Some(&source),
-        "the session binds to the user's file, not the autosave"
-    );
-    assert!(
-        engine2.is_dirty(),
-        "restored content is not on disk at the source path yet"
-    );
-    assert!(!engine2.can_undo(), "restore clears history");
-
-    // An unsaved-session orphan restores with no binding.
-    let mut engine3 = Engine::new(engine_config(dir.path().join("cache-orphan"))).expect("engine");
-    engine3
-        .restore_session(&autosave, None)
-        .expect("restore orphan");
-    assert!(engine3.project_path().is_none());
-    assert!(engine3.is_dirty());
-}
-
-#[test]
 fn save_and_open_roundtrip_restores_session() {
     let Some(path) = small_video_asset() else {
         return;

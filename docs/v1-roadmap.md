@@ -32,8 +32,9 @@ Scope policy, stated once:
 v1 is the release where a creator can pick Cutlass instead of CapCut for a
 real short-form/medium-form project and not hit a wall. Concretely:
 
-1. **Project lifecycle is safe.** New / Open / Save / Save As / Recent /
-   autosave / crash recovery — you cannot lose work.
+1. **Project lifecycle is safe.** App-owned projects with continuous
+   auto-save (CapCut-style): New, a project gallery to reopen past work,
+   and Open file… to import an external `.cutlass` — you cannot lose work.
 2. **Editing core is at parity** with daily-driver CapCut: cut, trim
    (ripple included), speed, volume, fades, crop, multi-track, linked A/V,
    keyframes on the core properties.
@@ -320,13 +321,13 @@ M10 is performance, platform, and release hardening.
 
 Goal: nothing in the shipped app lies to users or loses their work.
 
-- [x] **Project lifecycle in the UI**: New / Open / Save / Save As /
-      Recent menu, riding the existing `ProjectCommand::{Save, Open}`;
-      dirty-state tracking (title-bar dot), save prompt on close.
-      Detailed plan: `project-lifecycle-roadmap.md` (Phases 1–3 — done).
-- [x] **Autosave + crash recovery**: periodic snapshot to
-      `~/.cutlass/autosave/`, offer restore on next launch
-      (`project-lifecycle-roadmap.md` Phase 4 — done).
+- [x] **Project lifecycle in the UI**: app-owned projects with continuous
+      auto-save (CapCut-style) — a project gallery on launch, New, inline
+      rename, Open file… to import an external `.cutlass`. Rides the
+      existing `ProjectCommand::{Save, Open}` against an app-managed draft
+      directory; no manual Save As / Recent and no dirty dot. (This replaced
+      the file-based Save/Recent/autosave/crash-recovery plan — see the
+      `project-lifecycle-roadmap.md` update banner.)
 - [x] **Missing-media relink** flow on open (engine `Load` already keeps
       placeholder entries; UI needs the relink dialog). Shipped: UI open is
       now tolerant (`Load`), a relink dialog lists missing entries after

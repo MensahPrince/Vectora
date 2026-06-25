@@ -3,6 +3,24 @@
 Notes for the latest release. For previous releases, see the
 [GitHub releases page](https://github.com/1Mr-Newton/cutlass/releases).
 
+## [Unreleased]
+
+### Changed
+
+- **App-owned projects with continuous auto-save (CapCut-style).** Cutlass now
+  owns every project: each one auto-saves on every edit, so there's no manual
+  save and a clean exit never loses work. The launch screen is a project
+  gallery — reopen or delete past projects — and the title bar renames the
+  current project inline. **Open file…** imports an external `.cutlass` into
+  your projects; **Export** renders an `.mp4`.
+
+### Removed
+
+- Manual **Save As**, **Open Recent**, and the unsaved-changes / crash-recovery
+  prompts — there's nothing to lose now that edits save continuously.
+- The **General** settings pane (the autosave on/off + interval controls):
+  auto-save is always on and needs no tuning.
+
 ## [alpha-0.5.3] — 2026-06-21
 
 ### Added

@@ -47,7 +47,7 @@ export {
     AgentEntry,
     AppStore,
     EditorStore,
-    RecentProject,
+    ProjectSummary,
     TimelineStore,
     PreviewStore,
 }from "store/index.slint";
@@ -330,15 +330,15 @@ export component AppWindow inherits Window {
             }
             // Accept both Ctrl and Cmd (macOS) as the command modifier.
             if (event.modifiers.control || event.modifiers.meta) {
-                // Save / Save As (lifecycle roadmap Phase 1): Shift forces
-                // the path picker; main.rs owns the async dialog and the
-                // first-save fallback.
+                // Save (app-owned drafts): edits already auto-save, so this is
+                // just an explicit flush-now; `save-as` is ignored (no
+                // user-chosen path in the draft model).
                 if (event.text == "s" || event.text == "S") {
                     EditorStore.on-save-requested(event.modifiers.shift);
                     return accept;
                 }
-                // Open / New (lifecycle roadmap Phase 2): main.rs runs the
-                // unsaved-changes guard before the session is replaced.
+                // Open file… / New: main.rs flushes the live draft before it
+                // swaps the session (Open imports an external `.cutlass`).
                 if (event.text == "o" || event.text == "O") {
                     EditorStore.on-open-requested();
                     return accept;

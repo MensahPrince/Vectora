@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, EngineError, ExportSettings};
 use cutlass_models::{
@@ -378,12 +378,12 @@ enum WorkerMsg {
     Export(ExportRequest),
     /// Flag the running export job to stop after the frame in flight.
     CancelExport,
-    /// Write the session to a `.cutlass` file. `None` reuses the engine's
-    /// current project path (plain Cmd+S on a saved project — the UI gates
-    /// on a path existing); `Some` rebinds it (first save / Save As). Not
-    /// undoable; on success the projection republish clears the dirty dot.
-    /// Either way `save-finished(ok)` fires so a pending guarded transition
-    /// (open/new/close waiting on "Save") can continue or abort.
+    /// Flush the live draft to its project file. `None` reuses the engine's
+    /// current draft path (the normal case: explicit Cmd+S, or the debounce /
+    /// session-swap / close flush); `Some` rebinds it (binding a freshly
+    /// created draft after `NewProject`). Not undoable; on success the
+    /// projection republish refreshes the title and the meta sidecar is
+    /// rewritten so the gallery name tracks the project name.
     SaveProject {
         path: Option<PathBuf>,
     },
@@ -421,22 +421,15 @@ enum WorkerMsg {
         media: String,
         force: bool,
     },
-    /// Replace the session with a fresh, empty, unsaved project (File →
-    /// New). Same epoch bump as `OpenProject`; guard ran UI-side.
+    /// Replace the session with a fresh, empty project (the draft's
+    /// `project.cutlass` is written by the `SaveProject` that follows).
+    /// Same epoch bump as `OpenProject`.
     NewProject,
-    /// Periodic autosave sweep (UI timer, every
-    /// [`autosave::SWEEP_INTERVAL`](crate::autosave::SWEEP_INTERVAL)).
-    /// Dirty session ⇒ snapshot to the sidecar slot; clean ⇒ the slot is
-    /// stale and gets removed. Failures only log — autosave must never
-    /// interrupt editing.
-    Autosave,
-    /// Restore a crash-recovery snapshot (launch offer, accepted). Loads
-    /// `autosave` tolerantly, binds the session to `source` (the user's
-    /// file — `None` for a never-saved session), and leaves it dirty so
-    /// Cmd+S writes the recovered work back to the real file.
-    RestoreAutosave {
-        autosave: PathBuf,
-        source: Option<PathBuf>,
+    /// Rename the current draft (its display name). Applied as one undoable
+    /// edit; the projection republish updates the title bar and the next
+    /// auto-save writes the name into the draft's project file and meta.
+    RenameProject {
+        name: String,
     },
     /// Clone the live project for the AI agent's sandbox rehearsal
     /// (`src/agent.rs`). Ordered with mutations, so the snapshot always
@@ -535,14 +528,8 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::NewProject);
     }
 
-    pub fn autosave(&self) {
-        let _ = self.tx.send(WorkerMsg::Autosave);
-    }
-
-    pub fn restore_autosave(&self, autosave: PathBuf, source: Option<PathBuf>) {
-        let _ = self
-            .tx
-            .send(WorkerMsg::RestoreAutosave { autosave, source });
+    pub fn rename_project(&self, name: String) {
+        let _ = self.tx.send(WorkerMsg::RenameProject { name });
     }
 
     pub fn relink_media(&self, media: String, path: PathBuf) {
@@ -1062,10 +1049,13 @@ fn worker_loop(
     // clears it on exit); `cancel` is reset at every job start so a stale
     // cancel can't kill the next run.
     let export_state = ExportJobState::default();
-    // The autosave slot last written, with the engine revision it captured:
-    // a dirty-but-idle session skips the redundant rewrite, and a session
-    // identity change (Save As / Open / New) cleans the orphaned slot up.
-    let mut autosave_slot: Option<(PathBuf, u64)> = None;
+    // Debounced auto-save: an edit arms a deadline; once the worker has been
+    // idle of further work for `PERSIST_DEBOUNCE` the dirty draft is written
+    // to its `project.cutlass`. Scrub/seek `Frame`s deliberately don't push
+    // the deadline out (they're reads), so playback over a pending edit still
+    // flushes between frames; a session swap / close forces an immediate
+    // write through `SaveProject`.
+    let mut persist_deadline: Option<Instant> = None;
     // Last tick the preview rendered (the playhead). Scrub/seek `Frame`s keep
     // it current; edits re-render here so the composite reflects a delete,
     // generator change, etc. without waiting for the user to move the playhead.
@@ -1075,7 +1065,6 @@ fn worker_loop(
                   clipboard: &mut Option<Vec<ClipboardClip>>,
                   main_magnet: &mut bool,
                   linkage: &mut bool,
-                  autosave_slot: &mut Option<(PathBuf, u64)>,
                   msg: WorkerMsg| {
         match msg {
             WorkerMsg::Import(path) => import_and_publish(engine, &path, &ui, &thumbs, &strips),
@@ -1346,16 +1335,7 @@ fn worker_loop(
                 remove_media_and_publish(engine, &media, force, &ui)
             }
             WorkerMsg::NewProject => new_project_and_publish(engine, &ui),
-            WorkerMsg::Autosave => autosave_sweep(engine, autosave_slot),
-            WorkerMsg::RestoreAutosave { autosave, source } => restore_autosave_and_publish(
-                engine,
-                autosave,
-                source,
-                autosave_slot,
-                &ui,
-                &thumbs,
-                &strips,
-            ),
+            WorkerMsg::RenameProject { name } => rename_project_and_publish(engine, name, &ui),
             WorkerMsg::SnapshotProject { reply } => {
                 let _ = reply.send(engine.project().clone());
             }
@@ -1374,7 +1354,20 @@ fn worker_loop(
         }
     };
 
-    while let Ok(msg) = req_rx.recv() {
+    loop {
+        let msg = match next_message(&req_rx, persist_deadline) {
+            Wake::Stop => break,
+            // The debounce elapsed: write the dirty draft to its project file.
+            Wake::Persist => {
+                save_project_and_publish(engine, None, &ui);
+                persist_deadline = None;
+                continue;
+            }
+            Wake::Message(msg) => msg,
+        };
+        // Scrub/seek frames are reads — they must not push the auto-save
+        // deadline out, or playback over a pending edit would never flush.
+        let resets_deadline = !matches!(msg, WorkerMsg::Frame(_));
         match msg {
             WorkerMsg::Frame(mut tick) => {
                 while let Ok(next) = req_rx.try_recv() {
@@ -1393,7 +1386,6 @@ fn worker_loop(
                             &mut clipboard,
                             &mut main_magnet,
                             &mut linkage,
-                            &mut autosave_slot,
                             other,
                         ),
                     }
@@ -1440,7 +1432,6 @@ fn worker_loop(
                                 &mut clipboard,
                                 &mut main_magnet,
                                 &mut linkage,
-                                &mut autosave_slot,
                                 other,
                             )
                         }
@@ -1485,7 +1476,6 @@ fn worker_loop(
                                 &mut clipboard,
                                 &mut main_magnet,
                                 &mut linkage,
-                                &mut autosave_slot,
                                 other,
                             )
                         }
@@ -1536,7 +1526,6 @@ fn worker_loop(
                                 &mut clipboard,
                                 &mut main_magnet,
                                 &mut linkage,
-                                &mut autosave_slot,
                                 other,
                             )
                         }
@@ -1557,7 +1546,6 @@ fn worker_loop(
                     &mut clipboard,
                     &mut main_magnet,
                     &mut linkage,
-                    &mut autosave_slot,
                     other,
                 );
                 // Edits otherwise only repaint when the playhead moves; refresh
@@ -1565,6 +1553,45 @@ fn worker_loop(
                 if redraw {
                     render_frame(engine, tl_rate, &preview_weak, last_tick);
                 }
+            }
+        }
+        // After any non-scrub work, (re)arm the debounce while the draft has
+        // unsaved edits, or clear it once a save/swap left the draft clean.
+        if resets_deadline {
+            persist_deadline = engine.is_dirty().then(|| Instant::now() + PERSIST_DEBOUNCE);
+        }
+    }
+}
+
+/// Idle gap after the last edit before the dirty draft is written. Long
+/// enough to coalesce a burst of rapid edits (typing a title, dragging a
+/// slider) into one write, short enough that work is never far from disk.
+const PERSIST_DEBOUNCE: Duration = Duration::from_millis(300);
+
+/// What the worker should do next (see [`next_message`]).
+enum Wake {
+    /// A request arrived; process it.
+    Message(WorkerMsg),
+    /// The debounce elapsed with the draft dirty; write it.
+    Persist,
+    /// The request channel closed; the loop should exit.
+    Stop,
+}
+
+/// Block for the next request, waking to auto-save when `deadline` passes.
+/// With no edit pending (`deadline` is `None`) it's a plain blocking receive.
+fn next_message(req_rx: &Receiver<WorkerMsg>, deadline: Option<Instant>) -> Wake {
+    match deadline {
+        None => match req_rx.recv() {
+            Ok(msg) => Wake::Message(msg),
+            Err(_) => Wake::Stop,
+        },
+        Some(deadline) => {
+            let timeout = deadline.saturating_duration_since(Instant::now());
+            match req_rx.recv_timeout(timeout) {
+                Ok(msg) => Wake::Message(msg),
+                Err(RecvTimeoutError::Timeout) => Wake::Persist,
+                Err(RecvTimeoutError::Disconnected) => Wake::Stop,
             }
         }
     }
@@ -1576,7 +1603,7 @@ fn worker_loop(
 /// change, …) looked stale until the user scrubbed. `SetTransform` and
 /// `ClearTransformOverride` render themselves with their own tick, so they're
 /// excluded here to avoid a redundant second composite; pure session ops
-/// (import, copy, save, autosave, export, linkage) don't alter the canvas.
+/// (import, copy, auto-save, export, linkage, rename) don't alter the canvas.
 fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
     matches!(
         msg,
@@ -1614,7 +1641,6 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::SetTrackFlag { .. }
             | WorkerMsg::OpenProject { .. }
             | WorkerMsg::NewProject
-            | WorkerMsg::RestoreAutosave { .. }
             // Relinked media decodes again — refresh the stale composite.
             | WorkerMsg::RelinkMedia { .. }
             | WorkerMsg::RelinkFolder { .. }
@@ -2001,39 +2027,31 @@ fn import_and_publish(
     }
 }
 
-/// Write the session to `path` — or the engine's current project path when
-/// `None` (plain save on an already-saved project). Success republishes the
-/// projection, which is what clears the title bar's dirty dot; failure
-/// publishes `session-error` and leaves the dot on (honest: the file on
-/// disk is still stale). Either way `save-finished(ok)` fires so a pending
-/// guarded transition in main.rs can continue or abort. A `None` path with
-/// no current path is a UI gating bug, not a user state.
+/// Persist the session to its draft file. `path` is the draft's
+/// `project.cutlass` (binding a freshly created draft); `None` reuses the
+/// engine's current path — the debounced auto-save and the flush before a
+/// session swap / close. Success refreshes the draft's name sidecar and
+/// republishes the projection; failure surfaces through `session-error`. A
+/// `None` flush with no bound draft (e.g. New from the launch screen over the
+/// empty boot session) has nothing to persist and is a quiet no-op.
 fn save_project_and_publish(engine: &mut Engine, path: Option<PathBuf>, ui: &UiSink) {
     let Some(path) = path.or_else(|| engine.project_path().cloned()) else {
-        error!("save requested with no target path and no current project path");
-        notify_save_finished(ui, false);
         return;
     };
     match engine.apply(Command::Project(ProjectCommand::Save {
         path: path.clone(),
     })) {
         Ok(ApplyOutcome::Saved) => {
-            info!(path = %path.display(), "project saved");
-            note_recent_project(&path, ui);
+            crate::drafts::write_meta(&path, &engine.project().name);
             publish_projection(engine, ui);
-            notify_save_finished(ui, true);
         }
-        Ok(other) => {
-            error!(path = %path.display(), "unexpected save outcome: {other:?}");
-            notify_save_finished(ui, false);
-        }
+        Ok(other) => error!(path = %path.display(), "unexpected save outcome: {other:?}"),
         Err(e) => {
-            error!(path = %path.display(), "save failed: {e}");
+            error!(path = %path.display(), "auto-save failed: {e}");
             publish_session_error(
                 ui,
                 format!("Couldn't save the project to {}: {e}", path.display()),
             );
-            notify_save_finished(ui, false);
         }
     }
 }
@@ -2070,7 +2088,6 @@ fn open_project_and_publish(
                     register_media_with_workers(media, thumbs, strips);
                 }
             }
-            note_recent_project(&path, ui);
             publish_projection(engine, ui);
             bump_session_epoch(ui);
         }
@@ -2256,8 +2273,9 @@ fn remove_media_and_publish(engine: &mut Engine, media: &str, force: bool, ui: &
     publish_projection(engine, ui);
 }
 
-/// Replace the session with a fresh, empty, unsaved project (File → New).
-/// The unsaved-changes guard ran UI-side; this is unconditional.
+/// Replace the session with a fresh, empty project (the launch screen's New,
+/// or New from the editor). The draft's `project.cutlass` is written by the
+/// `SaveProject { Some(path) }` main.rs sends right after.
 fn new_project_and_publish(engine: &mut Engine, ui: &UiSink) {
     engine.new_session();
     info!("new session");
@@ -2265,94 +2283,20 @@ fn new_project_and_publish(engine: &mut Engine, ui: &UiSink) {
     bump_session_epoch(ui);
 }
 
-/// One autosave sweep: snapshot a dirty session to its sidecar slot (in the
-/// per-user OS data dir, see [`crate::paths`]), never to the user's file.
-/// Clean session ⇒ any
-/// existing slot is stale (just saved, or untouched) and gets removed. A
-/// session whose identity changed since the last write (Save As / Open /
-/// New) cleans its orphaned slot up first. `slot_state` carries the slot
-/// path and the engine revision it captured, so a dirty-but-idle session
-/// doesn't rewrite an identical snapshot every sweep. Failures only log:
-/// autosave is invisible by contract.
-fn autosave_sweep(engine: &Engine, slot_state: &mut Option<(PathBuf, u64)>) {
-    let dir = crate::autosave::default_dir();
-    let source = engine.project_path().map(PathBuf::as_path);
-    let slot = crate::autosave::slot_for(&dir, source);
-
-    if let Some((old, _)) = slot_state.take_if(|(old, _)| *old != slot) {
-        crate::autosave::discard(&old);
-    }
-    if !engine.is_dirty() {
-        crate::autosave::discard(&slot);
-        *slot_state = None;
+/// Rename the current draft (title bar). Applied as one undoable edit so it
+/// joins the undo history and dirties the session; the projection republish
+/// updates the title, and the debounced auto-save writes the new name into
+/// the draft's project file and meta sidecar.
+fn rename_project_and_publish(engine: &mut Engine, name: String, ui: &UiSink) {
+    // The title field commits on blur as well as Enter, so a focus-and-leave
+    // with no change arrives here unchanged — skip it so it never spends an
+    // undo entry or dirties the draft.
+    if engine.project().name == name {
         return;
     }
-    let revision = engine.revision();
-    if slot_state.as_ref().is_some_and(|(_, rev)| *rev == revision) {
-        return; // dirty but idle: the snapshot on disk is already current
-    }
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        warn!(dir = %dir.display(), "autosave skipped: couldn't create dir: {e}");
-        return;
-    }
-    match engine.project().save_to_file(&slot) {
-        Ok(()) => {
-            // Meta lands after the snapshot: a crash between the two writes
-            // degrades to "no candidate", never to a mislabeled restore.
-            if let Err(e) = crate::autosave::write_meta(&slot, source) {
-                warn!(slot = %slot.display(), "autosave meta write failed: {e}");
-                return;
-            }
-            *slot_state = Some((slot, revision));
-        }
-        Err(e) => warn!(slot = %slot.display(), "autosave failed: {e}"),
-    }
-}
-
-/// Restore an accepted crash-recovery snapshot: tolerant load (missing
-/// media entries survive, like `Load`), session bound to `source` — the
-/// user's file, not the sidecar — and left dirty so the first Cmd+S writes
-/// the recovered work where it belongs. Media that still exist on disk
-/// re-register with the tile workers; the epoch bump resets UI session
-/// state, same as an open.
-fn restore_autosave_and_publish(
-    engine: &mut Engine,
-    autosave: PathBuf,
-    source: Option<PathBuf>,
-    slot_state: &mut Option<(PathBuf, u64)>,
-    ui: &UiSink,
-    thumbs: &ThumbnailHandle,
-    strips: &StripHandle,
-) {
-    match engine.restore_session(&autosave, source) {
-        Ok(()) => {
-            info!(
-                autosave = %autosave.display(),
-                pool = engine.project().media_count(),
-                "restored autosave"
-            );
-            for media in engine.project().media_iter() {
-                if media.path().exists() {
-                    register_media_with_workers(media, thumbs, strips);
-                }
-            }
-            // The snapshot becomes the session's live slot (it already holds
-            // this exact content); a pid-named orphan gets swept into the
-            // current slot — and deleted — on the next dirty sweep.
-            *slot_state = Some((autosave, engine.revision()));
-            publish_projection(engine, ui);
-            bump_session_epoch(ui);
-        }
-        Err(e) => {
-            error!(autosave = %autosave.display(), "restore failed: {e}");
-            publish_session_error(
-                ui,
-                format!(
-                    "Couldn't restore the recovered project {}: {e}",
-                    autosave.display()
-                ),
-            );
-        }
+    match engine.apply(Command::Edit(EditCommand::SetProjectName { name })) {
+        Ok(_) => publish_projection(engine, ui),
+        Err(e) => error!("project rename failed: {e}"),
     }
 }
 
@@ -4869,38 +4813,6 @@ fn publish_session_error(ui: &UiSink, message: String) {
         }
     }) {
         error!("failed to publish session error: {e}");
-    }
-}
-
-/// Record `path` at the front of the recent-projects MRU (lifecycle
-/// roadmap Phase 3) and push the refreshed list to
-/// `EditorStore.recent-projects`. Called on every successful save and
-/// open — the moments a `.cutlass` path is proven real and current.
-fn note_recent_project(path: &Path, ui: &UiSink) {
-    let entries = crate::recent::note(&crate::recent::default_path(), path);
-    let editor_weak = ui.editor.clone();
-    if let Err(e) = slint::invoke_from_event_loop(move || {
-        if let Some(store) = editor_weak.upgrade() {
-            store.set_recent_projects(slint::ModelRc::new(slint::VecModel::from(
-                crate::recent::to_rows(&entries),
-            )));
-        }
-    }) {
-        error!("failed to publish recent projects: {e}");
-    }
-}
-
-/// Fire `EditorStore.save-finished(ok)` — a Rust→Rust completion signal:
-/// main.rs handles it to continue (or abort) a guarded transition waiting
-/// on "Save". Plain saves fire it too; with nothing pending it's a no-op.
-fn notify_save_finished(ui: &UiSink, ok: bool) {
-    let editor_weak = ui.editor.clone();
-    if let Err(e) = slint::invoke_from_event_loop(move || {
-        if let Some(store) = editor_weak.upgrade() {
-            store.invoke_save_finished(ok);
-        }
-    }) {
-        error!("failed to notify save completion: {e}");
     }
 }
 

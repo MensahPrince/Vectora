@@ -78,9 +78,14 @@ assistant's dry-run mode lets you preview a plan before it touches anything.
 
 ## Projects
 
-Projects are saved as `.cutlass` files. Media is referenced from where it lives
-on disk, so moving a project to another machine may ask you to relink media when
-you open it.
+Cutlass owns your projects, CapCut-style — there's no file to save by hand.
+Every edit auto-saves continuously, so a clean exit never loses work, and the
+launch screen lists your projects to reopen or delete. Rename a project inline
+from the title bar.
+
+Use **Open file…** to import an external `.cutlass` into your projects, and
+**Export** to render an `.mp4`. Media is referenced from where it lives on
+disk, so importing a project from another machine may ask you to relink media.
 
 ## Build from source
 

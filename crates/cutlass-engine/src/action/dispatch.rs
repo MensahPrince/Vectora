@@ -470,5 +470,12 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::SetProjectName { name } => {
+            let inverse = edit::set_project_name::set_project_name(ctx, name)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::UpdatedProject),
+                Some(inverse),
+            ))
+        }
     }
 }

@@ -1,6 +1,6 @@
 mod agent;
 mod audio;
-mod autosave;
+mod drafts;
 mod inspector;
 mod params;
 mod paths;
@@ -10,7 +10,6 @@ mod preview_select;
 mod preview_view;
 mod preview_worker;
 mod projection;
-mod recent;
 mod ruler;
 mod selection;
 mod snap;
@@ -104,34 +103,8 @@ async fn pick_import_path() -> Option<std::path::PathBuf> {
         .map(|file| file.path().to_path_buf())
 }
 
-/// Save panel for the first save / Save As (lifecycle roadmap Phase 1).
-/// `default_stem` pre-fills the field (the current file stem on Save As,
-/// "Untitled" before the first save); the `.cutlass` extension is enforced
-/// on whatever the user types.
-async fn pick_save_path(default_stem: String) -> Option<std::path::PathBuf> {
-    let stem = if default_stem.is_empty() {
-        "Untitled".to_owned()
-    } else {
-        default_stem
-    };
-    let mut path = rfd::AsyncFileDialog::new()
-        .add_filter("Cutlass project", &["cutlass"])
-        .set_file_name(format!("{stem}.cutlass"))
-        .save_file()
-        .await
-        .map(|file| file.path().to_path_buf())?;
-    if path.extension().is_none_or(|ext| ext != "cutlass") {
-        // Append rather than `set_extension`: a typed "v1.2" must become
-        // "v1.2.cutlass", not "v1.cutlass".
-        let name = path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "Untitled".into());
-        path.set_file_name(format!("{name}.cutlass"));
-    }
-    Some(path)
-}
-
+/// File picker for Open file… — choose an external `.cutlass` to import into
+/// a new draft (the app-owned store; see [`drafts`]).
 async fn pick_open_path() -> Option<std::path::PathBuf> {
     rfd::AsyncFileDialog::new()
         .add_filter("Cutlass project", &["cutlass"])
@@ -164,57 +137,82 @@ async fn pick_relink_folder() -> Option<std::path::PathBuf> {
         .map(|file| file.path().to_path_buf())
 }
 
-// --- session lifecycle: autosave-backed, no save prompts (CapCut-style) ---
+// --- session lifecycle: app-owned drafts, auto-saved (CapCut-style) -------
 //
-// Cutlass autosaves continuously (the periodic sweep wired up below snapshots
-// every dirty session to its recovery slot), so the user never has to save by
-// hand and no edit is lost. Replacing the live session — New, Open, Open
-// Recent — therefore needs no "save your changes?" gate: we force one
-// autosave so the outgoing project's recovery slot is current, then swap.
-// Closing is handled separately (`request_close`): from the editor it returns
-// to the launch screen, from the launch screen it quits the app.
+// Cutlass owns every project as a draft under the per-user data dir (see the
+// `drafts` module); the worker auto-saves the live draft after every edit, so
+// the user never saves by hand and a clean exit loses nothing. Switching the
+// live session — New, opening another draft, importing a file — flushes the
+// outgoing draft first (an ordered `SaveProject` on the worker's queue), then
+// swaps. Closing is handled separately (`request_close`): the editor returns
+// to the launch gallery, the gallery quits the app.
 
 enum SessionChange {
+    /// Create a fresh, empty draft and switch to it.
     New,
-    /// Pick a `.cutlass` file from a dialog, then open it.
-    Open,
-    /// Open a known `.cutlass` path (Open Recent / launch screen list).
-    OpenPath(std::path::PathBuf),
+    /// Pick an external `.cutlass` file and import it into a new draft.
+    Import,
+    /// Open an existing draft by its `project.cutlass` path (gallery card).
+    OpenDraft(std::path::PathBuf),
 }
 
-/// Snapshot the outgoing session to its recovery slot (a no-op when it is
-/// already clean or idle), then replace it. The autosave and the replacement
-/// are ordered on the worker's single message queue, so the snapshot always
-/// captures the project we're leaving.
+/// Flush the outgoing draft (a no-op when nothing is bound yet), then replace
+/// the session. The flush and the swap are ordered on the worker's single
+/// message queue, so the flush always captures the draft we're leaving.
 fn change_session(handle: &preview_worker::WorkerHandle, change: SessionChange) {
     match change {
-        SessionChange::New => {
-            handle.autosave();
-            handle.new_project();
-        }
-        SessionChange::OpenPath(path) => {
-            handle.autosave();
+        SessionChange::New => match drafts::create() {
+            Ok(path) => {
+                handle.save_project(None);
+                handle.new_project();
+                handle.save_project(Some(path));
+            }
+            Err(e) => tracing::error!("couldn't create a new project: {e}"),
+        },
+        SessionChange::OpenDraft(path) => {
+            handle.save_project(None);
             handle.open_project(path);
         }
-        SessionChange::Open => {
+        SessionChange::Import => {
             let handle = handle.clone();
             let task = slint::spawn_local(async move {
-                if let Some(path) = pick_open_path().await {
-                    handle.autosave();
-                    handle.open_project(path);
+                if let Some(source) = pick_open_path().await {
+                    match drafts::import_external(&source) {
+                        Ok(path) => {
+                            handle.save_project(None);
+                            handle.open_project(path);
+                        }
+                        Err(e) => {
+                            tracing::error!("couldn't import {}: {e}", source.display())
+                        }
+                    }
                 }
             });
             if let Err(e) = task {
-                tracing::error!("failed to open project dialog: {e}");
+                tracing::error!("failed to open import dialog: {e}");
             }
         }
     }
 }
 
+/// Republish the launch gallery from the draft store, newest first.
+fn refresh_projects(app: &AppWindow) {
+    let rows: Vec<ProjectSummary> = drafts::list()
+        .into_iter()
+        .map(|draft| ProjectSummary {
+            name: draft.name.into(),
+            path: draft.project.to_string_lossy().into_owned().into(),
+            modified: drafts::relative_time(draft.modified).into(),
+        })
+        .collect();
+    app.global::<EditorStore>()
+        .set_projects(ModelRc::new(VecModel::from(rows)));
+}
+
 /// The window close button, context-aware (CapCut-style). In the editor it
-/// closes the project back to the launch screen — autosave already keeps the
-/// work safe, so there's no save prompt and the app stays open; on the launch
-/// screen there's nothing left to return to, so it quits. Wired to both the
+/// flushes the draft and returns to the launch gallery (refreshed) — the work
+/// is already auto-saved, so there's no prompt and the app stays open; on the
+/// gallery there's nothing left to return to, so it quits. Wired to both the
 /// custom caption ✕ and the OS close request (the macOS traffic light).
 fn request_close(app_weak: &slint::Weak<AppWindow>, handle: &preview_worker::WorkerHandle) {
     let Some(app) = app_weak.upgrade() else {
@@ -223,9 +221,8 @@ fn request_close(app_weak: &slint::Weak<AppWindow>, handle: &preview_worker::Wor
     if app.global::<AppState>().get_launch_visible() {
         let _ = slint::quit_event_loop();
     } else {
-        // Force a final snapshot of the project we're closing, then reveal the
-        // launch screen over the (still in-memory) session.
-        handle.autosave();
+        handle.save_project(None);
+        refresh_projects(&app);
         app.global::<AppState>().set_launch_visible(true);
     }
 }
@@ -679,41 +676,23 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // --- project lifecycle: optional save + autosave-backed swaps ---------
+    // --- project lifecycle: app-owned drafts, auto-saved -----------------
 
-    // Save / Save As (Cmd/Ctrl+S / +Shift+S, File menu) stays available for
-    // writing the project to a chosen `.cutlass` file, but it's no longer
-    // required — autosave keeps every edit safe. A plain save on a session
-    // that already has a file goes straight to the worker; Save As — and the
-    // first save — pick a path first. The worker republishes the projection
-    // on success, which clears the title bar's dirty dot.
+    // Cmd/Ctrl+S has no separate "save" in the draft model — every edit is
+    // already auto-saved. Keep the shortcut as an explicit "flush now" so the
+    // habit still works and a draft about to close is written immediately;
+    // the `save-as` argument is ignored (there are no user files to save as).
     let save_handle = preview_worker.handle();
-    let app_weak = app.as_weak();
-    editor.on_on_save_requested(move |save_as| {
-        let Some(app) = app_weak.upgrade() else {
-            return;
-        };
-        let editor = app.global::<EditorStore>();
-        if !save_as && editor.get_project_has_path() {
-            save_handle.save_project(None);
-            return;
-        }
-        let save_handle = save_handle.clone();
-        let default_stem = editor.get_project_file_name().to_string();
-        let task = slint::spawn_local(async move {
-            if let Some(path) = pick_save_path(default_stem).await {
-                save_handle.save_project(Some(path));
-            }
-        });
-        if let Err(e) = task {
-            tracing::error!("failed to open save dialog: {e}");
-        }
+    editor.on_on_save_requested(move |_save_as| {
+        save_handle.save_project(None);
     });
 
-    // Open / New (Cmd/Ctrl+O / +N) — autosave the outgoing session, then swap.
+    // Open file… (Open card / Cmd+O / File ▸ Open file…): import an external
+    // `.cutlass` into a new draft. New (New card / Cmd+N / File ▸ New): a
+    // fresh draft. Both flush the outgoing draft before swapping.
     let open_handle = preview_worker.handle();
     editor.on_on_open_requested(move || {
-        change_session(&open_handle, SessionChange::Open);
+        change_session(&open_handle, SessionChange::Import);
     });
 
     let new_handle = preview_worker.handle();
@@ -721,26 +700,40 @@ fn main() -> Result<(), slint::PlatformError> {
         change_session(&new_handle, SessionChange::New);
     });
 
-    // Open Recent / launch screen list — a known path, no picker; same
-    // autosave-then-swap. A file deleted since the list was read fails like
-    // any open (session-error dialog).
-    let recent_handle = preview_worker.handle();
-    editor.on_on_open_recent_requested(move |path| {
+    // Launch gallery card → open that draft by its project path.
+    let open_draft_handle = preview_worker.handle();
+    editor.on_on_open_project_requested(move |path| {
         change_session(
-            &recent_handle,
-            SessionChange::OpenPath(std::path::PathBuf::from(path.as_str())),
+            &open_draft_handle,
+            SessionChange::OpenDraft(std::path::PathBuf::from(path.as_str())),
         );
     });
 
-    // Seed the MRU list (File menu, welcome panel) from disk; the worker
-    // republishes it after every successful save/open.
-    editor.set_recent_projects(slint::ModelRc::new(slint::VecModel::from(recent::to_rows(
-        &recent::read(&recent::default_path()),
-    ))));
+    // Launch gallery → delete a draft (its whole directory), then refresh.
+    let delete_app = app.as_weak();
+    editor.on_on_delete_project_requested(move |path| {
+        drafts::delete(std::path::Path::new(path.as_str()));
+        if let Some(app) = delete_app.upgrade() {
+            refresh_projects(&app);
+        }
+    });
+
+    // Title-bar rename → one undoable edit on the worker; the next auto-save
+    // writes the new name into the draft's project file and meta sidecar.
+    let rename_handle = preview_worker.handle();
+    editor.on_on_rename_project(move |name| {
+        let name = name.trim().to_string();
+        if !name.is_empty() {
+            rename_handle.rename_project(name);
+        }
+    });
+
+    // Seed the launch gallery from the draft store.
+    refresh_projects(&app);
 
     // Window close — the title-bar ✕ and the OS close request both go through
-    // the context-aware close: from the editor it returns to the launch
-    // screen (work already autosaved), from the launch screen it quits.
+    // the context-aware close: from the editor it flushes the draft and
+    // returns to the launch gallery, from the gallery it quits.
     let close_handle = preview_worker.handle();
     let app_weak = app.as_weak();
     app.global::<WindowBackend>().on_close(move || {
@@ -752,82 +745,6 @@ fn main() -> Result<(), slint::PlatformError> {
     app.window().on_close_requested(move || {
         request_close(&app_weak, &close_handle);
         slint::CloseRequestResponse::KeepWindowShown
-    });
-
-    // --- autosave & crash recovery (Phase 4) ------------------------------
-
-    // Periodic sweep: the worker snapshots dirty sessions to the sidecar
-    // slot (never the user's file) and cleans stale slots up. The cadence is
-    // user-configurable (Settings ▸ General), so the timer is restartable —
-    // `apply_autosave` (re)starts or stops it, called once now and again from
-    // the settings save handler. Lives until `run()` returns.
-    let autosave_timer = std::rc::Rc::new(slint::Timer::default());
-    let autosave_handle = preview_worker.handle();
-    let apply_autosave: std::rc::Rc<dyn Fn(bool, u64)> = {
-        let timer = autosave_timer.clone();
-        std::rc::Rc::new(move |enabled: bool, interval_secs: u64| {
-            if enabled {
-                let handle = autosave_handle.clone();
-                timer.start(
-                    slint::TimerMode::Repeated,
-                    std::time::Duration::from_secs(
-                        interval_secs.max(cutlass_settings::MIN_AUTOSAVE_INTERVAL_SECS),
-                    ),
-                    move || handle.autosave(),
-                );
-            } else {
-                timer.stop();
-            }
-        })
-    };
-    apply_autosave(
-        app_settings.general.autosave_enabled,
-        app_settings.general.autosave_interval_secs,
-    );
-
-    // Launch offer: a leftover slot means the previous session never got to
-    // clean up (a crash — clean exits remove their slots or date them older
-    // than the saved file). Delayed a beat so the window is up before the
-    // dialog sheets over it; "Restore" loads the snapshot bound to the real
-    // file, "Discard" deletes it, dismissing keeps it for next launch.
-    let restore_handle = preview_worker.handle();
-    slint::Timer::single_shot(std::time::Duration::from_millis(300), move || {
-        let Some(candidate) = autosave::newest_candidate(&autosave::default_dir()) else {
-            return;
-        };
-        let task = slint::spawn_local(async move {
-            let name = candidate
-                .source
-                .as_deref()
-                .and_then(|p| p.file_stem())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "an unsaved project".to_owned());
-            let choice = rfd::AsyncMessageDialog::new()
-                .set_level(rfd::MessageLevel::Warning)
-                .set_title("Restore unsaved work?")
-                .set_description(format!(
-                    "Cutlass didn't shut down cleanly, and unsaved work for \
-                     \u{201c}{name}\u{201d} was recovered. Restore it?"
-                ))
-                .set_buttons(rfd::MessageButtons::OkCancelCustom(
-                    "Restore".to_owned(),
-                    "Discard".to_owned(),
-                ))
-                .show()
-                .await;
-            match choice {
-                rfd::MessageDialogResult::Custom(label) if label == "Restore" => {
-                    restore_handle.restore_autosave(candidate.autosave, candidate.source);
-                }
-                rfd::MessageDialogResult::Custom(label) if label == "Discard" => {
-                    autosave::discard(&candidate.autosave);
-                }
-                _ => {} // dismissed: leave the slot; offer again next launch
-            }
-        });
-        if let Err(e) = task {
-            tracing::error!("failed to offer autosave recovery: {e}");
-        }
     });
 
     // --- export (title bar → dialog → engine thread → export thread) -----
@@ -902,8 +819,6 @@ fn main() -> Result<(), slint::PlatformError> {
             .unwrap_or_default()
             .into(),
     );
-    settings_backend.set_autosave_enabled(app_settings.general.autosave_enabled);
-    settings_backend.set_autosave_interval_secs(app_settings.general.autosave_interval_secs as i32);
     settings_backend.set_cache_budget_gb(app_settings.cache.budget_mb as f32 / 1024.0);
     settings_backend.set_cache_dir_effective(effective_cache_dir.display().to_string().into());
     app.global::<AppStore>()
@@ -915,7 +830,6 @@ fn main() -> Result<(), slint::PlatformError> {
     {
         let app_weak = app.as_weak();
         let config_path = config_path.clone();
-        let apply_autosave = apply_autosave.clone();
         settings_backend.on_save(move || {
             let Some(app) = app_weak.upgrade() else {
                 return;
@@ -928,16 +842,12 @@ fn main() -> Result<(), slint::PlatformError> {
             s.ai.api_key_env = non_empty(&sb.get_ai_api_key_env());
             s.appearance.theme =
                 cutlass_settings::ThemeChoice::from_index(app.global::<AppStore>().get_theme_id());
-            s.general.autosave_enabled = sb.get_autosave_enabled();
-            s.general.autosave_interval_secs = (sb.get_autosave_interval_secs().max(0) as u64)
-                .max(cutlass_settings::MIN_AUTOSAVE_INTERVAL_SECS);
             s.cache.budget_mb = (sb.get_cache_budget_gb().max(0.0) * 1024.0).round() as u64;
 
             if let Err(e) = cutlass_settings::save(&config_path, &s) {
                 tracing::error!("failed to save settings: {e}");
                 return;
             }
-            apply_autosave(s.general.autosave_enabled, s.general.autosave_interval_secs);
             // The agent re-reads config per prompt, but refresh its panel's
             // configured state now so the chat box appears the moment a
             // provider is filled in.

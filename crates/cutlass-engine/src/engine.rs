@@ -237,30 +237,6 @@ impl Engine {
         self.saved_revision = self.revision;
     }
 
-    /// Replace the session from an autosave snapshot, binding it to the
-    /// file it stands in for (crash recovery). Loads tolerantly (missing
-    /// media entries are kept, like `Load`), points `project_path` at
-    /// `bind_to` — the user's file, **not** the autosave — and marks the
-    /// session dirty: the restored content is by definition not what's on
-    /// disk at `bind_to`, so the first Cmd+S writes it back there.
-    pub fn restore_session(
-        &mut self,
-        autosave: &std::path::Path,
-        bind_to: Option<PathBuf>,
-    ) -> Result<(), EngineError> {
-        let loaded = Project::load_from_file(autosave)?;
-        crate::action::project::relink_media_cache(&self.cache, &loaded, false)?;
-        self.project = loaded;
-        self.history.clear();
-        self.decoder_pool.clear();
-        self.transform_override = None;
-        self.generator_override = None;
-        self.project_path = bind_to;
-        self.saved_revision = self.revision;
-        self.revision += 1;
-        Ok(())
-    }
-
     /// Drop decoders for clips that just left the timeline. Run after every
     /// mutation that can remove a clip (edit, undo, redo, rollback): the
     /// decoder pool keys by [`ClipId`] and otherwise holds decoders — and the

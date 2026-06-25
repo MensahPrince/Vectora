@@ -16,9 +16,9 @@
 //! | cache | `%LOCALAPPDATA%`  | `~/Library/Caches`             | `~/.cache`             |
 //! | data  | `%APPDATA%`       | `~/Library/Application Support` | `~/.local/share`      |
 //!
-//! Callers create the directories lazily (`FrameCache::new`, the autosave
-//! sweep, and `recent::note` all `create_dir_all` their target), so these
-//! functions only compute paths.
+//! Callers create the directories lazily (`FrameCache::new` and the draft
+//! store both `create_dir_all` their target), so these functions only compute
+//! paths.
 
 use std::path::PathBuf;
 
@@ -32,7 +32,7 @@ pub fn cache_dir() -> PathBuf {
 }
 
 /// Writable **data** root for things the user would miss if they vanished:
-/// autosave snapshots and the recent-projects list (`<os-data>/Cutlass`).
+/// the app-owned project drafts (`<os-data>/Cutlass`, see [`crate::drafts`]).
 pub fn data_dir() -> PathBuf {
     app_root(dirs::data_dir())
 }
