@@ -13,6 +13,15 @@ struct TimelineView: View {
     @State private var scrollPhase: ScrollPhase = .idle
     /// seconds-per-point captured when a pinch begins.
     @State private var pinchBase: Double?
+    /// Live long-press drag-to-reorder on the main track.
+    @State private var reorder: ReorderDrag?
+
+    private struct ReorderDrag: Equatable {
+        var clipID: UUID
+        var fromIndex: Int
+        var translation: CGFloat = 0
+        var insertionIndex: Int
+    }
 
     private static let rowSpacing: CGFloat = 5
     private static let rulerHeight: CGFloat = 18
@@ -240,8 +249,12 @@ struct TimelineView: View {
     }
 
     private var track: some View {
-        HStack(spacing: 0) {
-            ForEach(state.clips) { clip in
+        let widths = state.clips.map { CGFloat($0.length * pointsPerSecond) }
+
+        return HStack(spacing: 0) {
+            ForEach(Array(state.clips.enumerated()), id: \.element.id) { index, clip in
+                let isLifted = reorder?.clipID == clip.id
+
                 ClipView(
                     clip: clip,
                     pointsPerSecond: pointsPerSecond,
@@ -252,6 +265,15 @@ struct TimelineView: View {
                     },
                     onTrimEnd: { state.endGesture() }
                 )
+                .scaleEffect(isLifted ? 1.07 : 1)
+                .shadow(color: .black.opacity(isLifted ? 0.55 : 0), radius: 10, y: 3)
+                .offset(x: reorderOffset(index: index, clip: clip, widths: widths))
+                .animation(
+                    isLifted ? nil : .easeOut(duration: 0.18),
+                    value: reorder?.insertionIndex
+                )
+                .zIndex(isLifted ? 10 : 0)
+                .gesture(reorderGesture(clip: clip, index: index, widths: widths))
             }
 
             Button(action: onAddMedia) {
@@ -267,6 +289,69 @@ struct TimelineView: View {
             .buttonStyle(.plain)
             .padding(.leading, state.isEmpty ? 0 : 4)
         }
+        .sensoryFeedback(.impact(weight: .medium), trigger: reorder != nil)
+    }
+
+    // MARK: Drag to reorder
+
+    /// Long-press lifts a main-track clip; horizontal drag slides an
+    /// insertion gap through the neighbors; release commits the move.
+    private func reorderGesture(clip: MockClip, index: Int, widths: [CGFloat]) -> some Gesture {
+        LongPressGesture(minimumDuration: 0.3, maximumDistance: 30)
+            .sequenced(before: DragGesture(minimumDistance: 0))
+            .onChanged { value in
+                guard case .second(true, let drag) = value else { return }
+                state.isPlaying = false
+                var current = reorder ?? ReorderDrag(clipID: clip.id, fromIndex: index, insertionIndex: index)
+                current.translation = drag?.translation.width ?? 0
+                current.insertionIndex = insertionIndex(
+                    fromIndex: index,
+                    translation: current.translation,
+                    widths: widths
+                )
+                reorder = current
+            }
+            .onEnded { value in
+                defer { reorder = nil }
+                guard case .second(true, _) = value, let final = reorder else { return }
+                state.moveClip(fromIndex: final.fromIndex, toIndex: final.insertionIndex)
+            }
+    }
+
+    /// Where the dragged clip would land: how many other clips' centers lie
+    /// left of the dragged clip's current center.
+    private func insertionIndex(fromIndex: Int, translation: CGFloat, widths: [CGFloat]) -> Int {
+        let leading = widths.prefix(fromIndex).reduce(0, +)
+        let draggedCenter = leading + widths[fromIndex] / 2 + translation
+
+        var slot = 0
+        var x: CGFloat = 0
+        for (index, width) in widths.enumerated() {
+            if index != fromIndex, x + width / 2 < draggedCenter {
+                slot += 1
+            }
+            x += width
+        }
+        return slot
+    }
+
+    /// Offsets that visualize the removal + insertion gap while dragging.
+    private func reorderOffset(index: Int, clip: MockClip, widths: [CGFloat]) -> CGFloat {
+        guard let reorder, widths.indices.contains(reorder.fromIndex) else { return 0 }
+        if reorder.clipID == clip.id {
+            return reorder.translation
+        }
+
+        let draggedWidth = widths[reorder.fromIndex]
+        let postRemovalIndex = index > reorder.fromIndex ? index - 1 : index
+        var offset: CGFloat = 0
+        if index > reorder.fromIndex {
+            offset -= draggedWidth
+        }
+        if postRemovalIndex >= reorder.insertionIndex {
+            offset += draggedWidth
+        }
+        return offset
     }
 
     /// Small boundary buttons between adjacent main-track clips; accent when
@@ -274,7 +359,7 @@ struct TimelineView: View {
     /// don't fight the trim handles.
     @ViewBuilder
     private var transitionBoundaries: some View {
-        if state.clips.count > 1, state.selectedClip == nil {
+        if state.clips.count > 1, state.selectedClip == nil, reorder == nil {
             ForEach(state.clips.dropLast()) { clip in
                 let isSet = clip.transitionAfter != nil
                 let boundaryX = (state.startTime(of: clip.id) + clip.length) * pointsPerSecond
