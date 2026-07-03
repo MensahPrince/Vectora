@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/cutlass-core",
     "crates/cutlass-decoder",
     "crates/cutlass-compositor",
     "crates/cutlass-models",
