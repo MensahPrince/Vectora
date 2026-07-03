@@ -12,6 +12,12 @@ struct EditorView: View {
     @State private var activePanel: EditorPanel?
     @State private var exportPresented = false
     @State private var fullscreenPreview = false
+    /// User-chosen timeline height (via the grab bar); nil = fit content.
+    @State private var timelineUserHeight: CGFloat?
+    /// The timeline's rendered (clamped) height, the anchor for new drags.
+    @State private var timelineRenderedHeight: CGFloat = TimelineView.minHeight
+    /// Anchor captured when a grab-bar drag begins.
+    @State private var timelineHeightAnchor: CGFloat?
 
     var body: some View {
         VStack(spacing: 0) {
@@ -36,6 +42,8 @@ struct EditorView: View {
             }
 
             if !fullscreenPreview {
+                timelineHeightHandle
+
                 TransportControls(
                     state: state,
                     canUndo: state.canUndo,
@@ -47,9 +55,15 @@ struct EditorView: View {
 
                 TimelineView(
                     state: state,
+                    userHeight: timelineUserHeight,
                     onAddMedia: onAddMedia,
                     onTransitionTap: { id in openPanel(.transition(after: id)) }
                 )
+                .onGeometryChange(for: CGFloat.self) { proxy in
+                    proxy.size.height
+                } action: { height in
+                    timelineRenderedHeight = height
+                }
 
                 bottomArea
             }
@@ -63,6 +77,32 @@ struct EditorView: View {
         .sheet(isPresented: $exportPresented) {
             ExportSheet(duration: state.duration)
         }
+    }
+
+    // MARK: Timeline height handle
+
+    /// Slim grab strip between the preview and the transport row: drag up to
+    /// expand the timeline's lane stack, down to collapse toward just the
+    /// ruler and main track. Global coordinate space keeps the translation
+    /// finger-based while the strip itself moves with the resizing layout.
+    private var timelineHeightHandle: some View {
+        Capsule()
+            .fill(Theme.textTertiary.opacity(0.85))
+            .frame(width: 40, height: 4.5)
+            .frame(maxWidth: .infinity)
+            .frame(height: 16)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                    .onChanged { value in
+                        let anchor = timelineHeightAnchor ?? timelineRenderedHeight
+                        timelineHeightAnchor = anchor
+                        timelineUserHeight = max(anchor - value.translation.height, TimelineView.minHeight)
+                    }
+                    .onEnded { _ in
+                        timelineHeightAnchor = nil
+                    }
+            )
     }
 
     // MARK: Fullscreen preview
