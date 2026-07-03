@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::Map;
 use crate::clip::{
     Clip, ClipParam, ClipSource, ClipTransform, CropRect, Generator, ParamValue, Replaceable,
+    SlotMedia,
 };
 use crate::effects::EffectInstance;
 use crate::error::ModelError;
@@ -299,12 +300,51 @@ impl Project {
     /// Mark (or, with `None`, unmark) a clip as a CapCut-style replaceable
     /// template slot. The marker is metadata only — it does not change what
     /// renders — and is what [`Template`](crate::Template) scans to build its
-    /// list of fillable slots. Errors if the clip is unknown.
+    /// list of fillable slots.
+    ///
+    /// Marking validates eagerly (mirroring [`set_text_editable`]
+    /// (Self::set_text_editable)) so authoring mistakes surface here, not at
+    /// apply time with a misleading error: the clip must be a media clip
+    /// (generated content cannot be refilled), and the slot's `accepts` must
+    /// match the lane — visual restrictions belong on video tracks,
+    /// [`SlotMedia::AudioOnly`] on audio tracks. Errors if the clip is
+    /// unknown. Unmarking never fails for known clips.
     pub fn set_replaceable(
         &mut self,
         clip_id: ClipId,
         replaceable: Option<Replaceable>,
     ) -> Result<(), ModelError> {
+        if let Some(marker) = &replaceable {
+            let track_id = self
+                .timeline
+                .track_of(clip_id)
+                .ok_or(ModelError::UnknownClip(clip_id))?;
+            let kind = self
+                .timeline
+                .track(track_id)
+                .ok_or(ModelError::UnknownTrack(track_id))?
+                .kind;
+            let clip = self
+                .timeline
+                .clip(clip_id)
+                .ok_or(ModelError::UnknownClip(clip_id))?;
+            if clip.media().is_none() {
+                return Err(ModelError::InvalidParam(
+                    "replaceable slots apply only to media clips".into(),
+                ));
+            }
+            let want = if marker.accepts == SlotMedia::AudioOnly {
+                TrackKind::Audio
+            } else {
+                TrackKind::Video
+            };
+            if kind != want {
+                return Err(ModelError::InvalidParam(format!(
+                    "a {:?} slot cannot sit on a {kind:?} track",
+                    marker.accepts
+                )));
+            }
+        }
         self.timeline
             .clip_mut(clip_id)
             .ok_or(ModelError::UnknownClip(clip_id))?

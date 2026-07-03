@@ -1342,10 +1342,6 @@ pub struct Replaceable {
     /// Media-type restriction for this slot.
     #[serde(default)]
     pub accepts: SlotMedia,
-    /// Optional cap on the source duration a fill may draw (CapCut's per-clip
-    /// "maximum duration" gear option), at the slot clip's timeline rate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub max_duration: Option<RationalTime>,
     /// Optional author hint shown on the placeholder ("Your clip here"); also
     /// surfaced to the AI agent when auto-filling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1353,12 +1349,11 @@ pub struct Replaceable {
 }
 
 impl Replaceable {
-    /// A slot at `order` accepting any visual media, with no duration cap.
+    /// A slot at `order` accepting any visual media.
     pub fn new(order: u32) -> Self {
         Self {
             order,
             accepts: SlotMedia::Any,
-            max_duration: None,
             label: None,
         }
     }
@@ -1366,12 +1361,6 @@ impl Replaceable {
     /// Restrict the media type this slot accepts.
     pub fn with_accepts(mut self, accepts: SlotMedia) -> Self {
         self.accepts = accepts;
-        self
-    }
-
-    /// Cap the source duration a fill may draw.
-    pub fn with_max_duration(mut self, max: RationalTime) -> Self {
-        self.max_duration = Some(max);
         self
     }
 
@@ -1815,7 +1804,7 @@ impl Clip {
 
     /// Exclusive timeline end.
     pub fn end(&self) -> Result<RationalTime, ModelError> {
-        Ok(self.timeline.end()?)
+        self.timeline.end().map_err(Into::into)
     }
 
     /// The media this clip references, or `None` for generated content.

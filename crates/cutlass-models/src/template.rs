@@ -204,13 +204,9 @@ impl Template {
 
     /// How many visual slots a user must fill.
     pub fn slot_count(&self) -> usize {
-        self.replaceable_clips()
-            .filter(|clip| {
-                clip.replaceable
-                    .as_ref()
-                    .is_some_and(|r| r.accepts != SlotMedia::AudioOnly)
-            })
-            .count()
+        // One definition of "slot": whatever `slots()` lists (cold path, so
+        // the sort it performs costs nothing that matters).
+        self.slots().len()
     }
 
     /// The swappable music/soundtrack clip, if the author marked one
@@ -249,18 +245,34 @@ impl Template {
     /// are preserved.
     ///
     /// Supplying fewer picks than slots is allowed: the remaining slots keep
-    /// their sample media, exactly like a CapCut template preview. Each pick is
-    /// validated against the slot's media-type restriction and — for non-image
-    /// media — that enough source exists to cover the slot's locked duration
-    /// from the chosen in-point.
+    /// their sample media, exactly like a CapCut template preview. Supplying
+    /// *more* picks than slots is refused ([`ModelError::TooManyPicks`]) —
+    /// silently dropping extras would hide an off-by-one in the caller (the
+    /// AI agent fills templates too). Each pick is validated against the
+    /// slot's media-type restriction and — for non-image media — that enough
+    /// source exists to cover the slot's locked duration from the chosen
+    /// in-point.
+    ///
+    /// The output keeps its `replaceable` / `text_editable` markers, matching
+    /// CapCut: a filled template stays re-editable (re-pick a slot, re-word a
+    /// title), and the markers are render-inert metadata. Saved results are
+    /// therefore ordinary projects that still carry their template chrome.
     pub fn apply(&self, picks: &[Pick]) -> Result<Project, ModelError> {
+        let slots = self.slots();
+        if picks.len() > slots.len() {
+            return Err(ModelError::TooManyPicks {
+                given: picks.len(),
+                slots: slots.len(),
+            });
+        }
+
         let mut out = self.project.clone();
         out.id = ProjectId::next();
         let tl_rate = out.timeline().frame_rate;
 
         // Resolve every slot up front (immutable borrow of the template) before
         // mutating the cloned output, so the slot ids and geometry are stable.
-        for (slot, pick) in self.slots().into_iter().zip(picks.iter()) {
+        for (slot, pick) in slots.into_iter().zip(picks.iter()) {
             let accepts = slot
                 .replaceable
                 .as_ref()
@@ -310,41 +322,81 @@ impl Template {
 
     /// Deserialize a template from a `.cutlasst` JSON file. Files that are not
     /// templates, or that are newer than this build, are refused.
+    ///
+    /// Mirrors the project loader's order (see `persist.rs`): the schema is
+    /// read and validated *before* the strict typed parse — a future-version
+    /// file whose shape changed is refused as
+    /// [`ModelError::UnsupportedProjectSchema`], never half-parsed into a
+    /// confusing [`ModelError::InvalidProjectFile`] — and the embedded
+    /// project document is migrated up to the current shape first
+    /// (`.cutlasst` versions in lockstep with the project schema).
     pub fn load_from_file(path: &Path) -> Result<Template, ModelError> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| ModelError::InvalidProjectFile(e.to_string()))?;
-        let template: Template = serde_json::from_str(&text)
+        let mut doc: serde_json::Value = serde_json::from_str(&text)
             .map_err(|e| ModelError::InvalidProjectFile(e.to_string()))?;
-        if template.schema.kind != TEMPLATE_SCHEMA_KIND
-            || template.schema.version < 1
-            || template.schema.version > PROJECT_SCHEMA_VERSION
+
+        let schema = crate::persist::read_schema(&doc)?;
+        if schema.kind != TEMPLATE_SCHEMA_KIND
+            || schema.version < 1
+            || schema.version > PROJECT_SCHEMA_VERSION
         {
             return Err(ModelError::UnsupportedProjectSchema {
-                found: template.schema.clone(),
+                found: schema,
                 expected: Self::current_schema(),
             });
         }
+        // The saver stamps the whole document (outer schema) with the version
+        // that describes the embedded project's shape, so migrate that
+        // document from the outer version before the strict parse.
+        if let Some(project) = doc.get_mut("project") {
+            crate::persist::migrate_document(project, schema.version);
+        }
+
+        let mut template: Template = serde_json::from_value(doc)
+            .map_err(|e| ModelError::InvalidProjectFile(e.to_string()))?;
+        // Keep the file's original schema as provenance; the writer re-stamps
+        // the current version on save (mirroring the project loader).
+        template.schema = schema;
         Ok(template)
     }
 }
 
 /// The source window a fill draws for `slot`: the slot's *locked* timeline
-/// duration, scaled by the slot's base speed and resampled into the chosen
+/// duration, scaled by the slot's base speed and converted into the chosen
 /// media's rate, starting at `source_in` (default 0). For non-image media the
 /// window must lie within the source; images repeat one frame for any length.
+///
+/// The duration conversion **rounds up** (one exact rational ceiling, not
+/// truncate-then-round-nearest): a fill must never under-cover its slot, or
+/// the last timeline frame would read past the source window. Slots that are
+/// speed-ramped or reversed are refused — sizing their window needs the
+/// curve integral, and v1 rejects the pick rather than mis-windowing it.
 fn slot_source(
     slot: &Clip,
     tl_rate: Rational,
     source_in: Option<RationalTime>,
     media: &MediaSource,
 ) -> Result<TimeRange, ModelError> {
-    let tl_dur = slot.timeline.duration.value;
+    if slot.reversed || slot.has_speed_curve() {
+        return Err(ModelError::SlotRetimeUnsupported { slot: slot.id });
+    }
+
+    // source_ticks = tl_dur ticks × (tl.den/tl.num) s/tick × speed × media
+    // rate — assembled as a single i128 fraction and ceiled.
+    let tl_dur = i128::from(slot.timeline.duration.value);
     let speed = slot.speed;
-    let den = i128::from(speed.den).max(1);
-    let src_ticks_tl = (i128::from(tl_dur) * i128::from(speed.num) / den) as i64;
-    let src_dur = resample(RationalTime::new(src_ticks_tl, tl_rate), media.frame_rate)
-        .value
-        .max(1);
+    let numer = tl_dur
+        * i128::from(tl_rate.den)
+        * i128::from(speed.num)
+        * i128::from(media.frame_rate.num);
+    let denom = i128::from(tl_rate.num)
+        * i128::from(speed.den)
+        * i128::from(media.frame_rate.den);
+    // Positive by construction: durations, speeds, and rates are validated
+    // positive at their entry points.
+    let src_dur = (numer.div_euclid(denom) + i128::from(numer.rem_euclid(denom) != 0)).max(1) as i64;
+
     let start = match source_in {
         Some(rt) => resample(rt, media.frame_rate).value,
         None => 0,
@@ -507,9 +559,47 @@ mod tests {
         let path = dir.path().join("not.cutlasst");
         let project = Project::new("plain", R24);
         project.save_to_file(&path).unwrap();
+        // The kind check runs before the typed parse, so the refusal is the
+        // schema error, deterministically — not a shape-dependent parse error.
         assert!(matches!(
             Template::load_from_file(&path),
-            Err(ModelError::InvalidProjectFile(_)) | Err(ModelError::UnsupportedProjectSchema { .. })
+            Err(ModelError::UnsupportedProjectSchema { .. })
         ));
+    }
+
+    #[test]
+    fn load_refuses_future_version_before_parsing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.cutlasst");
+        // The body is garbage a strict parse would reject; a future-version
+        // file must be refused by the schema check, never half-parsed.
+        std::fs::write(
+            &path,
+            r#"{"schema":{"version":99,"kind":"cutlass.template"},"project":5}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            Template::load_from_file(&path),
+            Err(ModelError::UnsupportedProjectSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn load_migrates_older_template_versions() {
+        let (template, _, _) = sample_template();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.cutlasst");
+        template.save_to_file(&path).unwrap();
+        // Rewind the document to v1: the loader must walk the project
+        // migration chain over the embedded document (v1 -> v2 is
+        // shape-identical) and keep the file's version as provenance.
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        doc["schema"]["version"] = serde_json::json!(1);
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+
+        let loaded = Template::load_from_file(&path).unwrap();
+        assert_eq!(loaded.schema.version, 1);
+        assert_eq!(loaded.slot_count(), template.slot_count());
     }
 }

@@ -78,3 +78,42 @@ Unlike the decoder crate, this crate was evolved, not replaced:
 
 Well-designed and well-tested. Items 1–4 are cheap to fix now and expensive after `.cutlasst`
 files ship; item 5 needs either enforcement or an explicit guard.
+
+## Addendum (2026-07-03): all findings resolved
+
+Same-day follow-up; every fix landed before any `.cutlasst` file exists in the wild.
+
+- **Finding 1 (`max_duration` dead code): dropped.** Slot durations are locked, so a per-fill
+  source cap has no defined semantics; the field, its builder, and its serialization are gone
+  rather than frozen into the format. (Recoverable later as an additive optional field if a
+  real consumer appears.)
+- **Finding 2 (`NotReplaceable` never constructed): removed.** The fill-by-id API it
+  anticipated never materialized; `apply` fills by order and errors carry the slot id.
+- **Finding 3 (`set_replaceable` validated nothing): fixed.** Marking now validates eagerly,
+  mirroring `set_text_editable`: the clip must be a media clip (generated content cannot be
+  refilled), and `accepts` must match the lane — visual restrictions on video tracks,
+  `AudioOnly` on audio tracks — surfacing authoring mistakes as `InvalidParam` at mark time
+  instead of `IncompatibleTrackKind` at apply time. Unmarking never fails for known clips.
+  Test: `set_replaceable_validates_at_mark_time`.
+- **Finding 4 (template loader parse-then-check, no migration): fixed.** `load_from_file` now
+  mirrors the project loader's order: read the schema from the raw document, refuse wrong
+  kinds and future versions as `UnsupportedProjectSchema` *before* the strict typed parse,
+  then run `persist.rs`'s migration chain over the embedded project document (`.cutlasst`
+  versions in lockstep with `PROJECT_SCHEMA_VERSION`) and keep the file's version as
+  provenance. `read_schema`/`migrate_document` are shared (`pub(crate)`) rather than
+  reimplemented. Tests: `load_refuses_future_version_before_parsing` (garbage body, v99 —
+  proves the ordering), `load_migrates_older_template_versions`, and the tightened
+  `load_rejects_non_template_document`.
+- **Finding 5 (`slot_source` vs speed curves / reverse / rounding): fixed.** Speed-ramped or
+  reversed slots are refused with the new `SlotRetimeUnsupported` error (v1 policy: reject
+  beats mis-windowing; sizing them needs the curve integral). The duration conversion is now
+  a single exact i128 rational **ceiling** (was truncate-then-round-nearest), so a
+  mismatched-rate fill can never under-cover its slot by the old half-frame. Tests:
+  `apply_refuses_reversed_and_speed_ramped_slots`, `cross_rate_fill_rounds_source_window_up`
+  (24 fps slot, 30 fps media: 31.25 ticks must become 32, and 31-frame media is refused).
+
+Minor items: extra picks are now refused (`TooManyPicks { given, slots }` — catches agent
+off-by-ones; fewer picks still previews with sample media; test `apply_rejects_extra_picks`);
+`slot_count()` is defined as `slots().len()` (one definition of "slot"); marker retention
+after `apply` is documented on the method (CapCut re-editable-after-fill semantics —
+intentional, results carry template chrome); `Clip::end()` uses `map_err(Into::into)`.

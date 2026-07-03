@@ -7,7 +7,7 @@ use common::*;
 use cutlass_models::{
     ClipSource, ClipTransform, Generator, MediaId, MediaSource, ModelError, Pick, Project,
     Rational, Replaceable, SlotMedia, Template, TemplateCategory, TemplateMeta, TimeRange,
-    TrackKind,
+    TrackKind, speed_preset,
 };
 
 const MS_RATE: Rational = Rational::new(1000, 1);
@@ -212,6 +212,129 @@ fn apply_rejects_media_type_mismatch() {
         matches!(err, ModelError::SlotMediaMismatch { slot, .. } if slot == intro.image_slot),
         "got {err:?}"
     );
+}
+
+#[test]
+fn apply_rejects_extra_picks() {
+    let intro = intro_template();
+    // Four picks for a 3-slot template: refused, not silently truncated —
+    // the AI agent fills templates too, and this catches its off-by-ones.
+    let err = intro
+        .template
+        .apply(&[
+            video_pick("a.mp4", 120),
+            video_pick("b.mp4", 120),
+            image_pick("c.png"),
+            video_pick("extra.mp4", 120),
+        ])
+        .unwrap_err();
+    assert!(
+        matches!(err, ModelError::TooManyPicks { given: 4, slots: 3 }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn apply_refuses_reversed_and_speed_ramped_slots() {
+    // Sizing a retimed slot's source window needs the curve integral; v1
+    // refuses the pick instead of mis-windowing it.
+    let mut p = Project::new("Reversed", FPS_24);
+    let m = p.add_media(sample_media(FPS_24, 240));
+    let v = p.add_track(TrackKind::Video, "V1");
+    let slot = p.add_clip(v, m, tr(0, 24), rt(0)).unwrap();
+    p.set_clip_speed(slot, Rational::new(1, 1), true).unwrap();
+    p.set_replaceable(slot, Some(Replaceable::new(0))).unwrap();
+    let t = Template::from_project(p, TemplateMeta::new("Reversed"));
+    let err = t.apply(&[video_pick("a.mp4", 120)]).unwrap_err();
+    assert!(
+        matches!(err, ModelError::SlotRetimeUnsupported { slot: s } if s == slot),
+        "got {err:?}"
+    );
+
+    let mut p = Project::new("Ramped", FPS_24);
+    let m = p.add_media(sample_media(FPS_24, 240));
+    let v = p.add_track(TrackKind::Video, "V1");
+    let slot = p.add_clip(v, m, tr(0, 24), rt(0)).unwrap();
+    p.set_clip_speed_curve(slot, Some(speed_preset("montage").unwrap()))
+        .unwrap();
+    p.set_replaceable(slot, Some(Replaceable::new(0))).unwrap();
+    let t = Template::from_project(p, TemplateMeta::new("Ramped"));
+    let err = t.apply(&[video_pick("a.mp4", 120)]).unwrap_err();
+    assert!(
+        matches!(err, ModelError::SlotRetimeUnsupported { .. }),
+        "got {err:?}"
+    );
+}
+
+#[test]
+fn cross_rate_fill_rounds_source_window_up() {
+    let mut p = Project::new("OddLen", FPS_24);
+    let m = p.add_media(sample_media(FPS_24, 240));
+    let v = p.add_track(TrackKind::Video, "V1");
+    // 25 ticks at 24fps has no exact 30fps equivalent (31.25 ticks).
+    let slot = p.add_clip(v, m, tr(0, 25), rt(0)).unwrap();
+    p.set_replaceable(slot, Some(Replaceable::new(0))).unwrap();
+    let t = Template::from_project(p, TemplateMeta::new("OddLen"));
+
+    let r30 = Rational::new(30, 1);
+    // Rounding to nearest (31) would under-cover the slot; the window must
+    // round up to 32 so the last timeline frame still has source to read.
+    let out = t
+        .apply(&[Pick::new(MediaSource::new("m.mp4", 1920, 1080, r30, 32, true))])
+        .unwrap();
+    match &out.clip(slot).unwrap().content {
+        ClipSource::Media { source, .. } => assert_eq!(source.duration.value, 32),
+        other => panic!("unexpected: {other:?}"),
+    }
+    // Exactly-31-frame media is refused rather than silently short.
+    let err = t
+        .apply(&[Pick::new(MediaSource::new("short.mp4", 1920, 1080, r30, 31, true))])
+        .unwrap_err();
+    assert!(matches!(err, ModelError::SlotDurationUnmet { .. }), "got {err:?}");
+}
+
+#[test]
+fn set_replaceable_validates_at_mark_time() {
+    let mut p = Project::new("Marks", FPS_24);
+    let m = p.add_media(sample_media(FPS_24, 240));
+    let music_m = p.add_media(MediaSource::new("beat.mp3", 0, 0, MS_RATE, 30_000, true));
+    let v = p.add_track(TrackKind::Video, "V1");
+    let t = p.add_track(TrackKind::Text, "T1");
+    let a = p.add_track(TrackKind::Audio, "A1");
+    let video_clip = p.add_clip(v, m, tr(0, 24), rt(0)).unwrap();
+    let title = p.add_generated(t, Generator::text("hi"), tr(0, 24)).unwrap();
+    let audio_clip = p
+        .add_clip(a, music_m, TimeRange::at_rate(0, 1000, MS_RATE), rt(0))
+        .unwrap();
+
+    // Generated content can never be refilled: refused when marked, not at
+    // apply time with a track error.
+    assert!(matches!(
+        p.set_replaceable(title, Some(Replaceable::new(0))),
+        Err(ModelError::InvalidParam(_))
+    ));
+    // The accepts restriction must match the lane.
+    assert!(matches!(
+        p.set_replaceable(
+            video_clip,
+            Some(Replaceable::new(0).with_accepts(SlotMedia::AudioOnly))
+        ),
+        Err(ModelError::InvalidParam(_))
+    ));
+    assert!(matches!(
+        p.set_replaceable(audio_clip, Some(Replaceable::new(0))),
+        Err(ModelError::InvalidParam(_))
+    ));
+
+    // Valid markings work; unmarking is always allowed.
+    p.set_replaceable(video_clip, Some(Replaceable::new(0)))
+        .unwrap();
+    p.set_replaceable(
+        audio_clip,
+        Some(Replaceable::new(1).with_accepts(SlotMedia::AudioOnly)),
+    )
+    .unwrap();
+    p.set_replaceable(video_clip, None).unwrap();
 }
 
 #[test]

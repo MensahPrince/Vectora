@@ -60,9 +60,6 @@ pub enum ModelError {
     TimeOverflow,
 
     // --- templates --------------------------------------------------------
-    #[error("clip {0} is not a replaceable template slot")]
-    NotReplaceable(ClipId),
-
     #[error("template slot {slot} accepts {accepts:?} but {found:?} media was supplied")]
     SlotMediaMismatch {
         slot: ClipId,
@@ -72,6 +69,12 @@ pub enum ModelError {
 
     #[error("media supplied for template slot {slot} cannot cover its locked duration")]
     SlotDurationUnmet { slot: ClipId },
+
+    #[error("template slot {slot} is speed-ramped or reversed; filling it is not supported")]
+    SlotRetimeUnsupported { slot: ClipId },
+
+    #[error("{given} picks supplied for a template with {slots} fill slots")]
+    TooManyPicks { given: usize, slots: usize },
 }
 
 /// Bridge the shared `cutlass-core` time errors into [`ModelError`] so model
