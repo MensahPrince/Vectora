@@ -12,17 +12,45 @@ struct PreviewCanvas: View {
 
             if let clip = state.clip(at: state.playhead) {
                 canvasBackground(for: clip)
+            }
 
+            frameContent
+                .aspectRatio(state.aspect.ratio, contentMode: .fit)
+                .clipShape(RoundedRectangle(cornerRadius: 4))
+                .padding(.vertical, 10)
+        }
+        .clipped()
+    }
+
+    /// The letterboxed project frame: footage (when the playhead is over the
+    /// main track) plus overlay clips and the active-effect badge.
+    private var frameContent: some View {
+        ZStack {
+            if let clip = state.clip(at: state.playhead) {
                 MockArtView(art: clip.art, symbolSize: 64)
-                    .aspectRatio(state.aspect.ratio, contentMode: .fit)
-                    .clipShape(RoundedRectangle(cornerRadius: 4))
-                    .padding(.vertical, 10)
                     .opacity(clip.opacity)
             } else if state.background.kind == .color {
                 state.background.color
+            } else {
+                Color.black.opacity(0.6)
             }
         }
-        .clipped()
+        .overlay { PreviewOverlayLayer(state: state) }
+        .overlay(alignment: .topLeading) { effectBadge }
+    }
+
+    @ViewBuilder
+    private var effectBadge: some View {
+        let active = state.effects(at: state.playhead)
+        if let effect = active.last {
+            Label(effect.displayLabel, systemImage: "sparkles")
+                .font(.caption2.weight(.medium))
+                .foregroundStyle(.white.opacity(0.9))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(.black.opacity(0.45), in: Capsule())
+                .padding(8)
+        }
     }
 
     @ViewBuilder

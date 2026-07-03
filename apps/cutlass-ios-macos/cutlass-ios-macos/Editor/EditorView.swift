@@ -112,6 +112,20 @@ struct EditorView: View {
             AspectPanel(state: state)
         case .background:
             BackgroundPanel(state: state)
+        case .text(let editing):
+            TextPanel(state: state, editingID: editing)
+        case .stickers:
+            StickersPanel(state: state)
+        case .effects:
+            EffectsPanel(state: state)
+        case .filters:
+            FiltersPanel(state: state)
+        case .adjust:
+            AdjustPanel(state: state)
+        case .audio:
+            AudioPanel(state: state)
+        case .captions:
+            CaptionsPanel(state: state, onGenerated: { closePanel(apply: true) })
         default:
             // Remaining panels land in the following slices.
             Text("Coming soon")
