@@ -16,7 +16,12 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 cutlass-core = { path = "../cutlass-core" }
+cutlass-decoder = { path = "../cutlass-decoder" }
 cutlass-models = { path = "../cutlass-models" }
 cutlass-render = { path = "../cutlass-render" }
 numpy = "0.29.0"
-pyo3 = { version = "0.29.0", features = ["extension-module"] }
+pyo3 = { version = "0.29.0" }
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]

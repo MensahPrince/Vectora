@@ -285,6 +285,7 @@ name = "cutlass-py"
 version = "0.5.3-alpha.0"
 dependencies = [
  "cutlass-core",
+ "cutlass-decoder",
  "cutlass-models",
  "cutlass-render",
  "numpy",
