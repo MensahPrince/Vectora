@@ -1,5 +1,8 @@
 /target
 /dist
+# Demo outputs (cutlass-cli, cutlass-render's export_demo example).
+/cutlass-demo.png
+/cutlass-demo.mp4
 local-assets/
 .env
 .DS_Store

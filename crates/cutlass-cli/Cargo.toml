@@ -1,0 +1,13 @@
+[package]
+name = "cutlass-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line demos for Cutlass: composite layers on a headless GPU and write the canvas to an image file."
+
+[dependencies]
+cutlass-compositor = { path = "../cutlass-compositor" }
+cutlass-text = { path = "../cutlass-text" }
+png = "0.17"
