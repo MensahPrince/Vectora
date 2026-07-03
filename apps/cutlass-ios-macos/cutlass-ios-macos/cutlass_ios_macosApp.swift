@@ -11,7 +11,7 @@ import SwiftUI
 struct cutlass_ios_macosApp: App {
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
         }
     }
 }
