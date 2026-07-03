@@ -24,11 +24,11 @@ enum MockData {
     // MARK: Home
 
     static let projects: [MockProject] = [
-        MockProject(dateLabel: "Jun 25, 2026 (2)", duration: 94, art: night),
-        MockProject(dateLabel: "Jun 25, 2026 (1)", duration: 4, art: forest),
-        MockProject(dateLabel: "Jun 24, 2026 (1)", duration: 4, art: interview),
-        MockProject(dateLabel: "Jun 24, 2026", duration: 42, art: city),
-        MockProject(dateLabel: "Jun 22, 2026", duration: 128, art: ocean),
+        MockProject(name: "Night drive", dateLabel: "Jun 25, 2026 (2)", duration: 94, art: night),
+        MockProject(name: "Forest walk", dateLabel: "Jun 25, 2026 (1)", duration: 4, art: forest),
+        MockProject(name: "Interview cut", dateLabel: "Jun 24, 2026 (1)", duration: 4, art: interview),
+        MockProject(name: "City b-roll", dateLabel: "Jun 24, 2026", duration: 42, art: city),
+        MockProject(name: "Ocean day", dateLabel: "Jun 22, 2026", duration: 128, art: ocean),
     ]
 
     static let templateSections: [MockTemplateSection] = [

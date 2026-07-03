@@ -20,6 +20,7 @@ nonisolated struct MockArt: Hashable {
 /// A saved project card on the home screen.
 nonisolated struct MockProject: Identifiable, Hashable {
     var id = UUID()
+    var name: String
     var dateLabel: String
     var duration: TimeInterval
     var art: MockArt

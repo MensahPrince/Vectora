@@ -4,6 +4,7 @@ import SwiftUI
 /// "Lifestyle", ...).
 struct TemplateSection: View {
     var section: MockTemplateSection
+    var onSelect: (MockTemplate) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -17,7 +18,12 @@ struct TemplateSection: View {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
                     ForEach(section.templates) { template in
-                        TemplateCard(template: template)
+                        Button {
+                            onSelect(template)
+                        } label: {
+                            TemplateCard(template: template)
+                        }
+                        .buttonStyle(.plain)
                     }
                 }
             }

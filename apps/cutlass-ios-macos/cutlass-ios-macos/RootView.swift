@@ -60,6 +60,11 @@ struct RootView: View {
                     onBlankProject: {
                         editorState.startProject(with: [])
                         screen = .editor
+                    },
+                    onOpenProject: { _ in
+                        // Mock "reopen": seed the editor with library media.
+                        editorState.startProject(with: Array(MockData.libraryItems.prefix(4)))
+                        screen = .editor
                     }
                 )
             case .editor:

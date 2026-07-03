@@ -3,6 +3,7 @@ import SwiftUI
 /// A recent-project card in the horizontally scrolling Projects row.
 struct ProjectCard: View {
     var project: MockProject
+    var onMenu: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -14,18 +15,28 @@ struct ProjectCard: View {
                         .padding(6)
                 }
                 .overlay(alignment: .bottomTrailing) {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(.white)
-                        .frame(width: 22, height: 22)
-                        .background(.black.opacity(0.45), in: Circle())
-                        .padding(6)
+                    Button(action: onMenu) {
+                        Image(systemName: "ellipsis")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundStyle(.white)
+                            .frame(width: 22, height: 22)
+                            .background(.black.opacity(0.45), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .padding(6)
                 }
 
-            Text(project.dateLabel)
-                .font(.caption)
-                .foregroundStyle(Theme.textSecondary)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(project.name)
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                Text(project.dateLabel)
+                    .font(.caption2)
+                    .foregroundStyle(Theme.textSecondary)
+            }
         }
+        .frame(width: 138, alignment: .leading)
     }
 }
 
