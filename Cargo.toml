@@ -9,6 +9,7 @@ members = [
     "crates/cutlass-commands",
     "crates/cutlass-render",
     "crates/cutlass-encoder",
+    "crates/cutlass-engine",
 ]
 resolver = "3"
 

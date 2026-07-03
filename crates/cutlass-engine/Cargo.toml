@@ -1,0 +1,27 @@
+[package]
+name = "cutlass-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cutlass editing engine: structured commands with inverse undo/redo over the project timeline."
+# The copied-in benches/example target the old CPU/cache pipeline; keep them on
+# disk but out of the build until ported to the render pipeline.
+autobenches = false
+autoexamples = false
+
+[dependencies]
+cutlass-core = { path = "../cutlass-core" }
+cutlass-commands = { path = "../cutlass-commands" }
+cutlass-decoder = { path = "../cutlass-decoder" }
+cutlass-models = { path = "../cutlass-models" }
+cutlass-render = { path = "../cutlass-render" }
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Apple-only: synthesize a real mp4 in tests so native import/probe is exercised
+# without a checked-in fixture.
+cutlass-encoder = { path = "../cutlass-encoder" }
+tempfile = "3"
