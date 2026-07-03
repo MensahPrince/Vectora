@@ -15,6 +15,10 @@ struct TimelineView: View {
     @State private var pinchBase: Double?
     /// Live long-press drag-to-reorder on the main track.
     @State private var reorder: ReorderDrag?
+    /// User-chosen timeline height (from the grab bar); nil = fit content.
+    @State private var userHeight: CGFloat?
+    /// Height captured when a grab-bar drag begins.
+    @State private var heightAnchor: CGFloat?
 
     private struct ReorderDrag: Equatable {
         var clipID: UUID
@@ -47,6 +51,9 @@ struct TimelineView: View {
         packLaneRows(state.audioClips, maxRows: 2, start: \.start, length: \.length)
     }
 
+    /// Compact height: ruler + main track only.
+    private static let minHeight: CGFloat = 118
+
     var body: some View {
         let effects = packedEffects
         let overlays = packedOverlays
@@ -54,15 +61,22 @@ struct TimelineView: View {
         let effectRows = effects.map { $0.row + 1 }.max() ?? 0
         let overlayRows = overlays.map { $0.row + 1 }.max() ?? 0
         let audioRows = audio.map { $0.row + 1 }.max() ?? 0
+        let naturalHeight = timelineHeight(effectRows: effectRows, overlayRows: overlayRows, audioRows: audioRows)
+        let displayHeight = min(max(userHeight ?? naturalHeight, Self.minHeight), max(naturalHeight, Self.minHeight))
+        let needsVerticalScroll = naturalHeight > displayHeight + 1
 
         GeometryReader { geometry in
             let halfWidth = geometry.size.width / 2
             let contentWidth = max(0, state.duration * pointsPerSecond)
 
             ZStack(alignment: .top) {
-                laneBackground(effectRows: effectRows, overlayRows: overlayRows, audioRows: audioRows)
+                // The fixed bands can't track vertical scrolling, so they
+                // only render while the stack fits.
+                if !needsVerticalScroll {
+                    laneBackground(effectRows: effectRows, overlayRows: overlayRows, audioRows: audioRows)
+                }
 
-                ScrollView(.horizontal, showsIndicators: false) {
+                ScrollView(needsVerticalScroll ? [.horizontal, .vertical] : .horizontal, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: Self.rowSpacing) {
                         TimeRuler(duration: state.duration, pointsPerSecond: pointsPerSecond)
                             .frame(width: contentWidth, height: Self.rulerHeight, alignment: .leading)
@@ -122,6 +136,7 @@ struct TimelineView: View {
                 playheadLine
                 readout
                 magnetToggle
+                heightGrabBar(naturalHeight: naturalHeight, currentHeight: displayHeight)
             }
             // Tapping anything that isn't a clip clears the selection.
             .onTapGesture { state.selection = nil }
@@ -139,9 +154,34 @@ struct TimelineView: View {
                 syncScrollToPlayhead(force: true)
             }
         }
-        .frame(height: timelineHeight(effectRows: effectRows, overlayRows: overlayRows, audioRows: audioRows))
+        .frame(height: displayHeight)
         .background(Theme.timelineBed)
         .clipped()
+    }
+
+    /// Grab bar on the timeline's top edge: drag up/down to resize between
+    /// compact (main track only) and the full lane stack.
+    private func heightGrabBar(naturalHeight: CGFloat, currentHeight: CGFloat) -> some View {
+        Capsule()
+            .fill(Theme.textTertiary.opacity(0.9))
+            .frame(width: 40, height: 4.5)
+            .frame(width: 140, height: 18)
+            .contentShape(Rectangle())
+            .highPriorityGesture(
+                DragGesture(minimumDistance: 2)
+                    .onChanged { value in
+                        let anchor = heightAnchor ?? currentHeight
+                        heightAnchor = anchor
+                        userHeight = min(
+                            max(anchor - value.translation.height, Self.minHeight),
+                            max(naturalHeight, Self.minHeight)
+                        )
+                    }
+                    .onEnded { _ in
+                        heightAnchor = nil
+                    }
+            )
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
     private func timelineHeight(effectRows: Int, overlayRows: Int, audioRows: Int) -> CGFloat {

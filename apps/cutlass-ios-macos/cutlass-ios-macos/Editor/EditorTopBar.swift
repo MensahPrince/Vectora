@@ -5,6 +5,7 @@ import SwiftUI
 struct EditorTopBar: View {
     var exportEnabled: Bool
     var onHome: () -> Void
+    var onFullscreen: () -> Void = {}
     var onExport: () -> Void
 
     var body: some View {
@@ -16,9 +17,12 @@ struct EditorTopBar: View {
             }
             .buttonStyle(.plain)
 
-            Image(systemName: "arrow.up.left.and.arrow.down.right")
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(.white)
+            Button(action: onFullscreen) {
+                Image(systemName: "arrow.up.left.and.arrow.down.right")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(.white)
+            }
+            .buttonStyle(.plain)
 
             Image(systemName: "rectangle.portrait.on.rectangle.portrait")
                 .font(.system(size: 16, weight: .medium))

@@ -11,37 +11,48 @@ struct EditorView: View {
 
     @State private var activePanel: EditorPanel?
     @State private var exportPresented = false
+    @State private var fullscreenPreview = false
 
     var body: some View {
         VStack(spacing: 0) {
-            EditorTopBar(
-                exportEnabled: !state.isEmpty,
-                onHome: onHome,
-                onExport: { exportPresented = true }
-            )
+            if !fullscreenPreview {
+                EditorTopBar(
+                    exportEnabled: !state.isEmpty,
+                    onHome: onHome,
+                    onFullscreen: { toggleFullscreen() },
+                    onExport: { exportPresented = true }
+                )
+            }
 
             PreviewCanvas(
                 state: state,
                 onEditText: { id in openPanel(.text(editing: id, tab: 0)) }
             )
             .frame(maxHeight: .infinity)
+            .overlay(alignment: .topTrailing) {
+                if fullscreenPreview {
+                    fullscreenChrome
+                }
+            }
 
-            TransportControls(
-                state: state,
-                canUndo: state.canUndo,
-                canRedo: state.canRedo,
-                onSplit: { state.splitAtPlayhead() },
-                onUndo: { state.undo() },
-                onRedo: { state.redo() }
-            )
+            if !fullscreenPreview {
+                TransportControls(
+                    state: state,
+                    canUndo: state.canUndo,
+                    canRedo: state.canRedo,
+                    onSplit: { state.splitAtPlayhead() },
+                    onUndo: { state.undo() },
+                    onRedo: { state.redo() }
+                )
 
-            TimelineView(
-                state: state,
-                onAddMedia: onAddMedia,
-                onTransitionTap: { id in openPanel(.transition(after: id)) }
-            )
+                TimelineView(
+                    state: state,
+                    onAddMedia: onAddMedia,
+                    onTransitionTap: { id in openPanel(.transition(after: id)) }
+                )
 
-            bottomArea
+                bottomArea
+            }
         }
         .background(Theme.background)
         .onChange(of: state.selection) {
@@ -52,6 +63,42 @@ struct EditorView: View {
         .sheet(isPresented: $exportPresented) {
             ExportStubSheet(duration: state.duration)
         }
+    }
+
+    // MARK: Fullscreen preview
+
+    private func toggleFullscreen() {
+        withAnimation(.snappy(duration: 0.25)) {
+            fullscreenPreview.toggle()
+        }
+    }
+
+    /// Minimal floating controls shown while the editor chrome is hidden.
+    private var fullscreenChrome: some View {
+        HStack(spacing: 14) {
+            Button {
+                state.isPlaying.toggle()
+            } label: {
+                Image(systemName: state.isPlaying ? "pause.fill" : "play.fill")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 36, height: 36)
+                    .background(.black.opacity(0.55), in: Circle())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                toggleFullscreen()
+            } label: {
+                Image(systemName: "arrow.down.right.and.arrow.up.left")
+                    .font(.system(size: 15, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .frame(width: 36, height: 36)
+                    .background(.black.opacity(0.55), in: Circle())
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(14)
     }
 
     // MARK: Bottom area (toolbars <-> panels)
