@@ -146,6 +146,9 @@ final class EditorState {
     }
 
     private func pushUndoSnapshot() {
+        // While a panel session is open the session snapshot owns undo; ops
+        // triggered from inside the panel fold into one step on Apply.
+        guard panelSnapshot == nil else { return }
         undoStack.append(snapshot)
         if undoStack.count > 50 {
             undoStack.removeFirst()

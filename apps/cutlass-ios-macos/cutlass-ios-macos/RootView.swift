@@ -13,6 +13,7 @@ struct RootView: View {
         case newProject
         case appendToTimeline
         case replaceSelectedClip
+        case addOverlay
     }
 
     @State private var screen: Screen = .home
@@ -69,6 +70,7 @@ struct RootView: View {
                         screen = .home
                     },
                     onAddMedia: { pickerIntent = .appendToTimeline },
+                    onAddOverlay: { pickerIntent = .addOverlay },
                     onReplaceMedia: { pickerIntent = .replaceSelectedClip }
                 )
             }
@@ -91,6 +93,10 @@ struct RootView: View {
                 case .replaceSelectedClip:
                     if let item = items.first {
                         editorState.replaceSelected(with: item)
+                    }
+                case .addOverlay:
+                    if let item = items.first {
+                        editorState.addPip(from: item)
                     }
                 case .newProject, nil:
                     editorState.startProject(with: items)

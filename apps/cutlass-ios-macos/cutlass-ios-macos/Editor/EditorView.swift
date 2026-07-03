@@ -1,13 +1,15 @@
 import SwiftUI
 
-/// The editor screen: top chrome, preview, transport, timeline bed, and the
-/// context-sensitive bottom toolbar.
+/// The editor screen: top chrome, preview, transport, timeline, and a bottom
+/// area that swaps between toolbars and property panels.
 struct EditorView: View {
     var state: EditorState
     var onHome: () -> Void
     var onAddMedia: () -> Void
+    var onAddOverlay: () -> Void
     var onReplaceMedia: () -> Void
 
+    @State private var activePanel: EditorPanel?
     @State private var exportPresented = false
 
     var body: some View {
@@ -32,21 +34,91 @@ struct EditorView: View {
 
             TimelineView(state: state, onAddMedia: onAddMedia)
 
-            if state.selectedClip != nil {
-                ClipToolbar(
-                    onAdd: onAddMedia,
-                    onSplit: { state.splitAtPlayhead() },
-                    onDelete: { state.deleteSelected() },
-                    onDuplicate: { state.duplicateSelected() },
-                    onReplace: onReplaceMedia
-                )
-            } else {
-                MediaToolbar(onAddMedia: onAddMedia)
-            }
+            bottomArea
         }
         .background(Theme.background)
         .sheet(isPresented: $exportPresented) {
             ExportStubSheet(duration: state.duration)
+        }
+    }
+
+    // MARK: Bottom area (toolbars <-> panels)
+
+    @ViewBuilder
+    private var bottomArea: some View {
+        if let panel = activePanel {
+            PanelSheet(
+                title: panel.title,
+                showsCancel: panelShowsCancel(panel),
+                onCancel: { closePanel(apply: false) },
+                onApply: { closePanel(apply: true) }
+            ) {
+                panelContent(panel)
+            }
+            .transition(.move(edge: .bottom).combined(with: .opacity))
+        } else if state.selectedClip != nil {
+            ClipToolbar(
+                onAdd: onAddMedia,
+                onSplit: { state.splitAtPlayhead() },
+                onDelete: { state.deleteSelected() },
+                onDuplicate: { state.duplicateSelected() },
+                onReplace: onReplaceMedia
+            )
+        } else {
+            MediaToolbar(
+                onAddMedia: onAddMedia,
+                onAddOverlay: onAddOverlay,
+                onOpenPanel: { openPanel($0) }
+            )
+        }
+    }
+
+    func openPanel(_ panel: EditorPanel) {
+        if activePanel != nil {
+            state.commitPanelSession()
+        }
+        state.beginPanelSession()
+        withAnimation(.easeOut(duration: 0.18)) {
+            activePanel = panel
+        }
+    }
+
+    private func closePanel(apply: Bool) {
+        if apply {
+            state.commitPanelSession()
+        } else {
+            state.cancelPanelSession()
+        }
+        withAnimation(.easeOut(duration: 0.15)) {
+            activePanel = nil
+        }
+    }
+
+    /// Picker-style panels add content instantly; hiding X avoids implying
+    /// their additions can be reverted from the header.
+    private func panelShowsCancel(_ panel: EditorPanel) -> Bool {
+        switch panel {
+        case .stickers, .effects, .audio, .captions:
+            return false
+        default:
+            return true
+        }
+    }
+
+    @ViewBuilder
+    private func panelContent(_ panel: EditorPanel) -> some View {
+        switch panel {
+        case .aspect:
+            AspectPanel(state: state)
+        case .background:
+            BackgroundPanel(state: state)
+        default:
+            // Remaining panels land in the following slices.
+            Text("Coming soon")
+                .font(.footnote)
+                .foregroundStyle(Theme.textTertiary)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 30)
         }
     }
 }
@@ -90,5 +162,5 @@ private struct ExportStubSheet: View {
 #Preview {
     let state = EditorState()
     let _ = state.startProject(with: Array(MockData.libraryItems.prefix(3)))
-    return EditorView(state: state, onHome: {}, onAddMedia: {}, onReplaceMedia: {})
+    return EditorView(state: state, onHome: {}, onAddMedia: {}, onAddOverlay: {}, onReplaceMedia: {})
 }
