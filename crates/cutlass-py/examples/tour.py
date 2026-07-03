@@ -2,26 +2,33 @@
 """
 End-to-end tour mirroring api-design.md.
 
-Requires sample media on disk; paths below are placeholders — edit before running.
+Requires sample media under the repo-root local-assets/ directory.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from cutlass import Project, Solid, Text
 
-# --- configure media paths ---------------------------------------------------
-BEACH = "footage/beach.mp4"
-DRONE = "footage/drone.mp4"
-MUSIC = "audio/theme.mp3"
-OUT = "trailer.mp4"
+# Repo root: examples/ → cutlass-py/ → crates/ → cutlass-mobile-support/
+REPO_ROOT = Path(__file__).resolve().parents[3]
+ASSETS = REPO_ROOT / "local-assets"
+OUT_DIR = Path(__file__).resolve().parent
+
+# --- configure media paths (under repo-root local-assets/) -------------------
+BEACH = ASSETS / "16078825_3840_2160_60fps.mp4"
+DRONE = ASSETS / "16080325_3840_2160_60fps.mp4"
+MUSIC = ASSETS / "baby.mp3"
+OUT = OUT_DIR / "trailer.mp4"
 
 
 def main() -> None:
     p = Project("trailer", fps=30, canvas="16:9", background="#101018")
 
-    beach = p.import_media(BEACH)
-    drone = p.import_media(DRONE)
-    music = p.import_media(MUSIC)
+    beach = p.import_media(str(BEACH))
+    drone = p.import_media(str(DRONE))
+    music = p.import_media(str(MUSIC))
 
     main_v = p.add_track("video", name="Main")
     titles = p.add_track("text", name="Titles")
@@ -51,8 +58,8 @@ def main() -> None:
         print(track.name, [c.start for c in track])
 
     _ = p.get_frame(2.0)
-    p.export(OUT)
-    p.save("trailer.cutlass")
+    p.export(str(OUT))
+    p.save(str(OUT_DIR / "trailer.cutlass"))
     print("wrote", OUT)
 
 
