@@ -7,6 +7,7 @@
 //! `AVAssetWriterInputPixelBufferAdaptor` at its presentation time, and the
 //! writer encodes + muxes to the output `.mp4`.
 
+use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::path::Path;
 use std::ptr::{self, NonNull};
@@ -41,6 +42,14 @@ const AAC_BIT_RATE: i32 = 128_000;
 
 /// An H.264 (+ optional AAC) → mp4 encoder backed by AVFoundation /
 /// VideoToolbox.
+///
+/// With both a video and an audio input, `AVAssetWriter` gates each input's
+/// readiness on its ideal interleaving pattern: it will hold the video input
+/// not-ready while it waits for audio it hasn't received (and vice versa), and
+/// appending to a not-ready input raises an ObjC exception. Since both inputs
+/// are driven synchronously from one thread, blocking on readiness would
+/// deadlock — so pushes land in per-track queues and [`Self::pump`] appends
+/// to whichever input is ready.
 pub struct AvfEncoder {
     writer: Retained<AVAssetWriter>,
     input: Retained<AVAssetWriterInput>,
@@ -52,6 +61,9 @@ pub struct AvfEncoder {
     /// LPCM source format description for [`push_audio`](Self::push_audio),
     /// built once on first use (the writer encodes this to AAC).
     audio_format: Option<CFRetained<CMFormatDescription>>,
+    /// Frames/blocks pushed but not yet accepted by their writer input.
+    pending_video: VecDeque<(CFRetained<CVPixelBuffer>, CMTime)>,
+    pending_audio: VecDeque<CFRetained<CMSampleBuffer>>,
     started: bool,
     finished: bool,
 }
@@ -134,6 +146,8 @@ impl AvfEncoder {
             audio_input,
             audio: config.audio,
             audio_format: None,
+            pending_video: VecDeque::new(),
+            pending_audio: VecDeque::new(),
             started: false,
             finished: false,
         })
@@ -285,27 +299,89 @@ impl AvfEncoder {
             .unwrap_or_else(|| context.to_string());
         EncodeError::Encode(format!("{context}: {detail}"))
     }
+
+    /// Append queued media to every input that reports ready. Returns whether
+    /// anything was accepted.
+    fn pump_once(&mut self) -> Result<bool, EncodeError> {
+        let mut progressed = false;
+        while !self.pending_video.is_empty() && unsafe { self.input.isReadyForMoreMediaData() } {
+            let (pb, pts) = self.pending_video.front().expect("non-empty");
+            let adaptor = &self.adaptor;
+            let ok = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+                adaptor.appendPixelBuffer_withPresentationTime(pb, *pts)
+            }))
+            .map_err(|ex| EncodeError::Encode(format!("appendPixelBuffer raised: {ex:?}")))?;
+            if !ok {
+                return Err(self.writer_error("appendPixelBuffer failed"));
+            }
+            self.pending_video.pop_front();
+            progressed = true;
+        }
+        if let Some(audio_input) = &self.audio_input {
+            while !self.pending_audio.is_empty()
+                && unsafe { audio_input.isReadyForMoreMediaData() }
+            {
+                let sbuf = self.pending_audio.front().expect("non-empty");
+                let ok = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
+                    audio_input.appendSampleBuffer(sbuf)
+                }))
+                .map_err(|ex| {
+                    EncodeError::Encode(format!("appendSampleBuffer raised: {ex:?}"))
+                })?;
+                if !ok {
+                    return Err(self.writer_error("appendSampleBuffer (audio) failed"));
+                }
+                self.pending_audio.pop_front();
+                progressed = true;
+            }
+        }
+        Ok(progressed)
+    }
+
+    /// Pump until the backlog is at most `max_backlog` items, sleeping between
+    /// attempts. Errors if the writer fails or nothing moves for ~10 s.
+    fn pump_until(&mut self, max_backlog: usize) -> Result<(), EncodeError> {
+        let mut stalled_ms = 0u32;
+        loop {
+            let progressed = self.pump_once()?;
+            if self.pending_video.len() + self.pending_audio.len() <= max_backlog {
+                return Ok(());
+            }
+            if unsafe { self.writer.status() } == AVAssetWriterStatus::Failed {
+                return Err(self.writer_error("writer failed"));
+            }
+            if progressed {
+                stalled_ms = 0;
+            } else {
+                if stalled_ms >= 10_000 {
+                    return Err(EncodeError::Encode(
+                        "encoder made no progress for 10s".into(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                stalled_ms += 1;
+            }
+        }
+    }
 }
+
+/// Hard cap on queued-but-unaccepted items (video frames + audio blocks): a
+/// safety valve so a wedged writer surfaces an error instead of exhausting
+/// memory. The writer's interleaving window keeps the steady-state backlog to
+/// roughly a second of media, far below this.
+const MAX_PENDING: usize = 600;
 
 impl VideoEncoder for AvfEncoder {
     fn push(&mut self, frame: &VideoFrame) -> Result<(), EncodeError> {
         self.ensure_started()?;
         let pb = self.make_pixel_buffer(frame)?;
-
-        // Non-realtime input becomes ready almost immediately; bound the wait so
-        // a wedged encoder can't hang the export.
-        let mut spins = 0;
-        while !unsafe { self.input.isReadyForMoreMediaData() } {
-            if spins >= 2000 {
-                return Err(EncodeError::Encode("encoder input never became ready".into()));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            spins += 1;
-        }
-
         let pts = rational_to_cmtime(frame.pts);
-        if !unsafe { self.adaptor.appendPixelBuffer_withPresentationTime(&pb, pts) } {
-            return Err(self.writer_error("appendPixelBuffer failed"));
+        self.pending_video.push_back((pb, pts));
+        // Opportunistic drain only: blocking here could deadlock, because the
+        // writer may be waiting for audio that the caller pushes after us.
+        self.pump_once()?;
+        if self.pending_video.len() + self.pending_audio.len() > MAX_PENDING {
+            self.pump_until(MAX_PENDING)?;
         }
         Ok(())
     }
@@ -331,20 +407,6 @@ impl VideoEncoder for AvfEncoder {
         let num_frames = samples.len() / channels;
         let bytes_per_frame = channels * 4;
         let byte_len = samples.len() * 4;
-
-        let audio_input = self.audio_input.as_ref().expect("audio input present");
-
-        // Non-realtime input becomes ready almost immediately; bound the wait.
-        let mut spins = 0;
-        while !unsafe { audio_input.isReadyForMoreMediaData() } {
-            if spins >= 2000 {
-                return Err(EncodeError::Encode(
-                    "audio encoder input never became ready".into(),
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(1));
-            spins += 1;
-        }
 
         // Block buffer: allocate, then copy the interleaved f32 in.
         let mut block_ptr: *mut CMBlockBuffer = ptr::null_mut();
@@ -408,8 +470,10 @@ impl VideoEncoder for AvfEncoder {
         let sbuf: CFRetained<CMSampleBuffer> = unsafe { CFRetained::from_raw(sbuf) };
         drop(block); // the sample buffer retains it now
 
-        if !unsafe { audio_input.appendSampleBuffer(&sbuf) } {
-            return Err(self.writer_error("appendSampleBuffer (audio) failed"));
+        self.pending_audio.push_back(sbuf);
+        self.pump_once()?;
+        if self.pending_video.len() + self.pending_audio.len() > MAX_PENDING {
+            self.pump_until(MAX_PENDING)?;
         }
         Ok(())
     }
@@ -421,9 +485,41 @@ impl VideoEncoder for AvfEncoder {
         // Start a (possibly empty) session so finishWriting yields a valid file
         // even when no frames were pushed.
         self.ensure_started()?;
-        unsafe { self.input.markAsFinished() };
-        if let Some(audio_input) = &self.audio_input {
-            unsafe { audio_input.markAsFinished() };
+        // Drain both queues, marking each input finished the moment its queue
+        // empties: the writer can hold one input not-ready while it waits for
+        // more data on the *other*, and only end-of-stream releases it.
+        let mut video_done = false;
+        let mut audio_done = false;
+        let mut stalled_ms = 0u32;
+        while !(video_done && audio_done) {
+            let progressed = self.pump_once()?;
+            if !video_done && self.pending_video.is_empty() {
+                unsafe { self.input.markAsFinished() };
+                video_done = true;
+            }
+            if !audio_done && self.pending_audio.is_empty() {
+                if let Some(audio_input) = &self.audio_input {
+                    unsafe { audio_input.markAsFinished() };
+                }
+                audio_done = true;
+            }
+            if video_done && audio_done {
+                break;
+            }
+            if unsafe { self.writer.status() } == AVAssetWriterStatus::Failed {
+                return Err(self.writer_error("writer failed"));
+            }
+            if progressed {
+                stalled_ms = 0;
+            } else {
+                if stalled_ms >= 10_000 {
+                    return Err(EncodeError::Encode(
+                        "encoder made no progress draining for 10s".into(),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                stalled_ms += 1;
+            }
         }
         #[allow(deprecated)] // synchronous finishWriting is fine on an export worker.
         let ok = unsafe { self.writer.finishWriting() };
