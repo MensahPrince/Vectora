@@ -12,6 +12,27 @@ struct RootView: View {
     @State private var pickerPresented = false
     @State private var editorClips: [MockClip] = []
 
+    /// Dev shortcut: `-startScreen picker|editor` (e.g. via `simctl launch`)
+    /// jumps straight to a screen so states deep in the flow are easy to
+    /// reach while iterating on the mock UI.
+    init() {
+        let arguments = ProcessInfo.processInfo.arguments
+        guard let flag = arguments.firstIndex(of: "-startScreen"),
+              arguments.indices.contains(flag + 1)
+        else { return }
+
+        switch arguments[flag + 1] {
+        case "picker":
+            _pickerPresented = State(initialValue: true)
+        case "editor":
+            let items = MockData.libraryItems.prefix(4)
+            _editorClips = State(initialValue: items.map(MockClip.init(from:)))
+            _screen = State(initialValue: .editor)
+        default:
+            break
+        }
+    }
+
     var body: some View {
         ZStack {
             Theme.background.ignoresSafeArea()
