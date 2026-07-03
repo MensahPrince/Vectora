@@ -7,6 +7,7 @@ import SwiftUI
 struct TimelineView: View {
     var state: EditorState
     var onAddMedia: () -> Void
+    var onTransitionTap: (UUID) -> Void = { _ in }
 
     @State private var scrollPosition = ScrollPosition(edge: .leading)
     @State private var scrollPhase: ScrollPhase = .idle
@@ -69,7 +70,10 @@ struct TimelineView: View {
                             )
                         }
 
-                        track
+                        ZStack(alignment: .leading) {
+                            track
+                            transitionBoundaries
+                        }
 
                         if overlayRows == 0 {
                             Color.clear.frame(height: Self.emptyLaneHeight)
@@ -262,6 +266,35 @@ struct TimelineView: View {
             }
             .buttonStyle(.plain)
             .padding(.leading, state.isEmpty ? 0 : 4)
+        }
+    }
+
+    /// Small boundary buttons between adjacent main-track clips; accent when
+    /// a transition is set. Hidden while a main clip is selected so they
+    /// don't fight the trim handles.
+    @ViewBuilder
+    private var transitionBoundaries: some View {
+        if state.clips.count > 1, state.selectedClip == nil {
+            ForEach(state.clips.dropLast()) { clip in
+                let isSet = clip.transitionAfter != nil
+                let boundaryX = (state.startTime(of: clip.id) + clip.length) * pointsPerSecond
+
+                Button {
+                    onTransitionTap(clip.id)
+                } label: {
+                    RoundedRectangle(cornerRadius: 5, style: .continuous)
+                        .fill(isSet ? Theme.accent : .white)
+                        .frame(width: 20, height: 20)
+                        .overlay {
+                            Image(systemName: "arrow.left.arrow.right")
+                                .font(.system(size: 8, weight: .heavy))
+                                .foregroundStyle(isSet ? .white : .black)
+                        }
+                        .shadow(color: .black.opacity(0.4), radius: 2)
+                }
+                .buttonStyle(.plain)
+                .offset(x: boundaryX - 10)
+            }
         }
     }
 

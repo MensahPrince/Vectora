@@ -552,6 +552,15 @@ final class EditorState {
         clips[index].transitionAfter = transition
     }
 
+    /// Stamps the same transition on every interior boundary.
+    func applyTransitionToAll(_ transition: MockTransition?) {
+        guard clips.count > 1 else { return }
+        pushUndoSnapshot()
+        for index in clips.indices.dropLast() {
+            clips[index].transitionAfter = transition
+        }
+    }
+
     /// Stamps or removes a keyframe on the selected main clip at the playhead.
     func toggleKeyframeAtPlayhead() {
         guard case .main(let id) = selection,

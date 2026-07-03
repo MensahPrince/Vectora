@@ -35,7 +35,11 @@ struct EditorView: View {
                 onRedo: { state.redo() }
             )
 
-            TimelineView(state: state, onAddMedia: onAddMedia)
+            TimelineView(
+                state: state,
+                onAddMedia: onAddMedia,
+                onTransitionTap: { id in openPanel(.transition(after: id)) }
+            )
 
             bottomArea
         }
@@ -224,13 +228,8 @@ struct EditorView: View {
             ChromaPanel(state: state)
         case .clipStabilize:
             StabilizePanel(state: state)
-        default:
-            // Transitions land in the next slice.
-            Text("Coming soon")
-                .font(.footnote)
-                .foregroundStyle(Theme.textTertiary)
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 30)
+        case .transition(let afterID):
+            TransitionPanel(state: state, afterClipID: afterID)
         }
     }
 }
