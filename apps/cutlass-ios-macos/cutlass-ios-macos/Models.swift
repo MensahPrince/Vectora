@@ -56,7 +56,25 @@ nonisolated struct MockMediaItem: Identifiable, Hashable {
     }
 }
 
-/// A clip on the (single, sequential) timeline track.
+/// Mock color-grade values edited in the Adjust panel.
+nonisolated struct AdjustValues: Hashable {
+    var brightness: Double = 0
+    var contrast: Double = 0
+    var saturation: Double = 0
+    var exposure: Double = 0
+    var temperature: Double = 0
+
+    var isNeutral: Bool { self == AdjustValues() }
+}
+
+/// A transition applied at the boundary after a main-track clip.
+nonisolated struct MockTransition: Hashable {
+    var style: String
+    var duration: TimeInterval = 0.5
+}
+
+/// A clip on the main (sequential) video track, plus every mock style value
+/// the property panels can edit.
 nonisolated struct MockClip: Identifiable, Hashable {
     /// Still images can be stretched up to this long.
     static let photoMaxDuration: TimeInterval = 30
@@ -72,6 +90,32 @@ nonisolated struct MockClip: Identifiable, Hashable {
     /// Trimmed length shown on the timeline.
     var length: TimeInterval
     var hasAudio: Bool
+    /// Freeze-frame segments render as stills and carry no audio.
+    var isFreeze = false
+
+    // MARK: Mock style values (design-only; wired to panels)
+
+    /// 0...2, 1 = 100%. Zero shows a mute badge on the clip.
+    var volume: Double = 1
+    /// 0.1...10, 1 = normal. Changing it rescales `length`.
+    var speed: Double = 1
+    var speedCurve: String?
+    var opacity: Double = 1
+    var filterName: String?
+    var filterIntensity: Double = 0.8
+    var adjust = AdjustValues()
+    var animationIn: String?
+    var animationOut: String?
+    var animationCombo: String?
+    var maskName: String?
+    /// 0 = chroma key off.
+    var chromaStrength: Double = 0
+    var chromaShadow: Double = 0
+    var stabilizeLevel: String?
+    var isReversed = false
+    /// Keyframe times local to the clip (seconds from its leading edge).
+    var keyframes: [TimeInterval] = []
+    var transitionAfter: MockTransition?
 
     init(from item: MockMediaItem) {
         art = item.art
@@ -86,6 +130,170 @@ nonisolated struct MockClip: Identifiable, Hashable {
             hasAudio = true
         }
     }
+}
+
+/// A clip on a floating lane below/above the main track: text, sticker, or
+/// picture-in-picture. Position is a normalized canvas center.
+nonisolated struct MockOverlayClip: Identifiable, Hashable {
+    enum Kind: Hashable {
+        case text
+        case sticker
+        case pip
+    }
+
+    var id = UUID()
+    var kind: Kind
+    var start: TimeInterval
+    var length: TimeInterval
+
+    // Text
+    var text = ""
+    var fontName = "Default"
+    var textColor: Color = .white
+    var textEffect: String?
+    var animation: String?
+
+    // Sticker
+    var symbol: String?
+
+    // Picture-in-picture
+    var art: MockArt?
+    var sourceDuration: TimeInterval?
+    var volume: Double = 1
+
+    // Canvas placement (normalized 0...1 center within the frame)
+    var posX: Double = 0.5
+    var posY: Double = 0.5
+    var scale: Double = 1
+    var rotationDegrees: Double = 0
+
+    var displayLabel: String {
+        switch kind {
+        case .text: return text.isEmpty ? "Text" : text
+        case .sticker: return "Sticker"
+        case .pip: return "Overlay"
+        }
+    }
+}
+
+/// A full-width bar on the effects lane: an effect, filter, or adjust layer
+/// applied over a time range.
+nonisolated struct MockEffectClip: Identifiable, Hashable {
+    enum Kind: Hashable {
+        case effect
+        case filter
+        case adjust
+    }
+
+    var id = UUID()
+    var kind: Kind
+    var name: String
+    var start: TimeInterval
+    var length: TimeInterval
+    var intensity: Double = 0.8
+
+    var displayLabel: String {
+        switch kind {
+        case .effect: return name
+        case .filter: return "Filter: \(name)"
+        case .adjust: return "Adjust"
+        }
+    }
+}
+
+/// A clip on the audio lane.
+nonisolated struct MockAudioClip: Identifiable, Hashable {
+    enum Kind: Hashable {
+        case music
+        case soundFX
+        case voiceover
+        case extracted
+    }
+
+    var id = UUID()
+    var kind: Kind
+    var title: String
+    var start: TimeInterval
+    var length: TimeInterval
+    var sourceDuration: TimeInterval
+    var volume: Double = 1
+    var fadeIn: TimeInterval = 0
+    var fadeOut: TimeInterval = 0
+    var waveSeed = Int.random(in: 0..<10_000)
+
+    var symbol: String {
+        switch kind {
+        case .music: return "music.note"
+        case .soundFX: return "waveform"
+        case .voiceover: return "mic.fill"
+        case .extracted: return "arrow.turn.down.right"
+        }
+    }
+}
+
+/// A mock song / sound effect row in the audio browser.
+nonisolated struct MockSong: Identifiable, Hashable {
+    var id = UUID()
+    var title: String
+    var artist: String
+    var duration: TimeInterval
+}
+
+/// Canvas aspect ratio presets (mirrors CanvasSettings in cutlass-models).
+nonisolated enum AspectRatio: String, CaseIterable, Hashable {
+    case original = "Original"
+    case wide = "16:9"
+    case vertical = "9:16"
+    case square = "1:1"
+    case portrait = "4:5"
+    case classic = "3:4"
+    case cinema = "21:9"
+
+    /// width / height. `original` follows the mock footage (9:16).
+    var ratio: CGFloat {
+        switch self {
+        case .original, .vertical: return 9.0 / 16.0
+        case .wide: return 16.0 / 9.0
+        case .square: return 1
+        case .portrait: return 4.0 / 5.0
+        case .classic: return 3.0 / 4.0
+        case .cinema: return 21.0 / 9.0
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .original: return "sparkles.rectangle.stack"
+        case .wide: return "rectangle"
+        case .vertical: return "rectangle.portrait"
+        case .square: return "square"
+        case .portrait: return "rectangle.portrait"
+        case .classic: return "rectangle.portrait"
+        case .cinema: return "pano"
+        }
+    }
+}
+
+/// What fills the canvas behind pillarboxed footage.
+nonisolated struct CanvasBackground: Hashable {
+    enum Kind: Hashable {
+        case blur
+        case color
+    }
+
+    var kind: Kind = .blur
+    /// 0...1, used when kind == .blur.
+    var blurStrength: Double = 0.55
+    /// Used when kind == .color.
+    var color: Color = .black
+}
+
+/// Unified timeline selection across every lane.
+nonisolated enum TimelineSelection: Hashable {
+    case main(UUID)
+    case overlay(UUID)
+    case effect(UUID)
+    case audio(UUID)
 }
 
 nonisolated extension TimeInterval {
