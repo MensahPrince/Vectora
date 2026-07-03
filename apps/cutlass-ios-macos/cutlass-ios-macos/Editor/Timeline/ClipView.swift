@@ -173,9 +173,12 @@ struct ClipView: View {
                     .frame(width: 3, height: 16)
             }
             // minimumDistance 0 claims the touch immediately so the
-            // surrounding ScrollView can't steal horizontal drags.
+            // surrounding ScrollView can't steal horizontal drags. Global
+            // coordinate space keeps the translation finger-based: the handle
+            // itself moves as the clip resizes, so local-space deltas would
+            // oscillate (visible as flicker).
             .highPriorityGesture(
-                DragGesture(minimumDistance: 0)
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
                     .onChanged { value in
                         let anchor = trimAnchor ?? clip
                         trimAnchor = anchor

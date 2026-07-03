@@ -169,8 +169,10 @@ struct LaneClipView: View {
                     .fill(.black.opacity(0.55))
                     .frame(width: 2.5, height: 12)
             }
+            // Global coordinate space: the handle moves with the edge it
+            // trims, so local-space translations would feed back and flicker.
             .highPriorityGesture(
-                DragGesture(minimumDistance: 0)
+                DragGesture(minimumDistance: 0, coordinateSpace: .global)
                     .onChanged { value in
                         let anchor = self.anchor ?? (start, length)
                         self.anchor = anchor
@@ -184,9 +186,11 @@ struct LaneClipView: View {
     }
 
     /// Selected lane clips drag horizontally to a new start time; the drag
-    /// claims the touch so the timeline doesn't scroll underneath.
+    /// claims the touch so the timeline doesn't scroll underneath. Global
+    /// coordinate space because the clip offsets under the finger as it
+    /// moves — local deltas would oscillate.
     private var moveGesture: some Gesture {
-        DragGesture(minimumDistance: 6)
+        DragGesture(minimumDistance: 6, coordinateSpace: .global)
             .onChanged { value in
                 let anchor = self.anchor ?? (start, length)
                 self.anchor = anchor

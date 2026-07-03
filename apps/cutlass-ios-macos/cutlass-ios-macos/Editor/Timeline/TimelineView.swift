@@ -342,8 +342,10 @@ struct TimelineView: View {
     /// Long-press lifts a main-track clip; horizontal drag slides an
     /// insertion gap through the neighbors; release commits the move.
     private func reorderGesture(clip: MockClip, index: Int, widths: [CGFloat]) -> some Gesture {
+        // Global coordinate space: the lifted clip follows the finger, so a
+        // local-space translation would feed back on itself.
         LongPressGesture(minimumDuration: 0.3, maximumDistance: 30)
-            .sequenced(before: DragGesture(minimumDistance: 0))
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
             .onChanged { value in
                 guard case .second(true, let drag) = value else { return }
                 state.isPlaying = false
