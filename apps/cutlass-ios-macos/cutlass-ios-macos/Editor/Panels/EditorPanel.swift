@@ -6,7 +6,7 @@ nonisolated enum EditorPanel: Hashable {
     // Root toolbar
     case aspect
     case background
-    case text(editing: UUID?)
+    case text(editing: UUID?, tab: Int = 0)
     case stickers
     case effects
     case filters
@@ -34,11 +34,21 @@ nonisolated enum EditorPanel: Hashable {
     // Clip boundary
     case transition(after: UUID)
 
+    /// Panels that edit the selected clip close when the selection clears.
+    var requiresSelection: Bool {
+        switch self {
+        case .aspect, .background, .stickers, .effects, .filters, .adjust, .audio, .captions, .transition:
+            return false
+        default:
+            return true
+        }
+    }
+
     var title: String {
         switch self {
         case .aspect: return "Aspect ratio"
         case .background: return "Background"
-        case .text(let editing): return editing == nil ? "Add text" : "Edit text"
+        case .text(let editing, _): return editing == nil ? "Add text" : "Edit text"
         case .stickers: return "Stickers"
         case .effects: return "Effects"
         case .filters: return "Filters"

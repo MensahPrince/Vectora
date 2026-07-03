@@ -8,8 +8,14 @@ struct TextPanel: View {
     /// nil = panel was opened to create a new text clip.
     var editingID: UUID?
 
-    @State private var tab = 0
+    @State private var tab: Int
     @FocusState private var keyboardFocused: Bool
+
+    init(state: EditorState, editingID: UUID?, initialTab: Int = 0) {
+        self.state = state
+        self.editingID = editingID
+        _tab = State(initialValue: initialTab)
+    }
 
     var body: some View {
         VStack(spacing: 8) {

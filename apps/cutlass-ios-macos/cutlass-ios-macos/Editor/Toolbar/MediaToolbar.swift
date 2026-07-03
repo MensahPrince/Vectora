@@ -12,7 +12,7 @@ struct MediaToolbar: View {
             HStack(spacing: 26) {
                 item("photo.badge.plus", "Videos\nand images", action: onAddMedia)
                 item("waveform.badge.plus", "Music\nand audio") { onOpenPanel(.audio) }
-                item("textformat", "Titles\nand captions") { onOpenPanel(.text(editing: nil)) }
+                item("textformat", "Titles\nand captions") { onOpenPanel(.text(editing: nil, tab: 0)) }
                 item("face.smiling", "Stickers") { onOpenPanel(.stickers) }
                 item("square.on.square.badge.person.crop", "Overlay", action: onAddOverlay)
                 item("sparkles", "Effects") { onOpenPanel(.effects) }

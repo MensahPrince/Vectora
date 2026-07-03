@@ -37,6 +37,11 @@ struct EditorView: View {
             bottomArea
         }
         .background(Theme.background)
+        .onChange(of: state.selection) {
+            if state.selection == nil, let panel = activePanel, panel.requiresSelection {
+                closePanel(apply: true)
+            }
+        }
         .sheet(isPresented: $exportPresented) {
             ExportStubSheet(duration: state.duration)
         }
@@ -56,21 +61,68 @@ struct EditorView: View {
                 panelContent(panel)
             }
             .transition(.move(edge: .bottom).combined(with: .opacity))
-        } else if state.selectedClip != nil {
-            ClipToolbar(
-                onAdd: onAddMedia,
-                onSplit: { state.splitAtPlayhead() },
-                onDelete: { state.deleteSelected() },
-                onDuplicate: { state.duplicateSelected() },
-                onReplace: onReplaceMedia
-            )
         } else {
-            MediaToolbar(
-                onAddMedia: onAddMedia,
-                onAddOverlay: onAddOverlay,
-                onOpenPanel: { openPanel($0) }
-            )
+            switch state.selection {
+            case .main:
+                ClipToolbar(
+                    onAdd: onAddMedia,
+                    onSplit: { state.splitAtPlayhead() },
+                    onDelete: { state.deleteSelected() },
+                    onDuplicate: { state.duplicateSelected() },
+                    onReplace: onReplaceMedia
+                )
+            case .overlay(let id):
+                LaneToolbar(actions: overlayActions(for: id))
+            case .effect:
+                LaneToolbar(actions: commonLaneActions)
+            case .audio:
+                LaneToolbar(actions: audioActions)
+            case nil:
+                MediaToolbar(
+                    onAddMedia: onAddMedia,
+                    onAddOverlay: onAddOverlay,
+                    onOpenPanel: { openPanel($0) }
+                )
+            }
         }
+    }
+
+    // MARK: Per-kind lane toolbar actions
+
+    /// Split / duplicate / delete, shared by every lane kind.
+    private var commonLaneActions: [ToolbarAction] {
+        [
+            ToolbarAction(symbol: "scissors", label: "Split") { state.splitAtPlayhead() },
+            ToolbarAction(symbol: "plus.square.on.square", label: "Duplicate") { state.duplicateSelected() },
+            ToolbarAction(symbol: "trash", label: "Delete") { state.deleteSelected() },
+        ]
+    }
+
+    private func overlayActions(for id: UUID) -> [ToolbarAction] {
+        guard let overlay = state.overlayClips.first(where: { $0.id == id }) else { return [] }
+        switch overlay.kind {
+        case .text:
+            return [
+                ToolbarAction(symbol: "pencil", label: "Edit") { openPanel(.text(editing: id, tab: 0)) },
+                ToolbarAction(symbol: "textformat", label: "Font") { openPanel(.text(editing: id, tab: 1)) },
+                ToolbarAction(symbol: "paintbrush", label: "Style") { openPanel(.text(editing: id, tab: 2)) },
+                ToolbarAction(symbol: "sparkles.rectangle.stack", label: "Animation") { openPanel(.text(editing: id, tab: 3)) },
+            ] + commonLaneActions
+        case .sticker:
+            return commonLaneActions
+        case .pip:
+            return [
+                ToolbarAction(symbol: "rectangle.2.swap", label: "Replace", action: onReplaceMedia),
+                ToolbarAction(symbol: "speaker.wave.2", label: "Volume") { openPanel(.overlayVolume) },
+            ] + commonLaneActions
+        }
+    }
+
+    private var audioActions: [ToolbarAction] {
+        [
+            ToolbarAction(symbol: "speaker.wave.2", label: "Volume") { openPanel(.audioVolume) },
+            ToolbarAction(symbol: "point.bottomleft.forward.to.point.topright.scurvepath", label: "Fade") { openPanel(.audioFade) },
+        ] + commonLaneActions
     }
 
     func openPanel(_ panel: EditorPanel) {
@@ -112,8 +164,8 @@ struct EditorView: View {
             AspectPanel(state: state)
         case .background:
             BackgroundPanel(state: state)
-        case .text(let editing):
-            TextPanel(state: state, editingID: editing)
+        case .text(let editing, let tab):
+            TextPanel(state: state, editingID: editing, initialTab: tab)
         case .stickers:
             StickersPanel(state: state)
         case .effects:
@@ -126,6 +178,12 @@ struct EditorView: View {
             AudioPanel(state: state)
         case .captions:
             CaptionsPanel(state: state, onGenerated: { closePanel(apply: true) })
+        case .overlayVolume:
+            OverlayVolumePanel(state: state)
+        case .audioVolume:
+            AudioVolumePanel(state: state)
+        case .audioFade:
+            AudioFadePanel(state: state)
         default:
             // Remaining panels land in the following slices.
             Text("Coming soon")

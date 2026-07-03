@@ -708,29 +708,36 @@ final class EditorState {
         }
     }
 
-    func trimOverlay(_ id: UUID, edge: TrimEdge, anchor: MockOverlayClip, by delta: TimeInterval) {
-        guard let index = overlayClips.firstIndex(where: { $0.id == id }) else { return }
+    /// Applies a trim drag to a lane clip, anchored at the range captured
+    /// when the gesture began. PiP and audio clips clamp to their source.
+    func trimLaneClip(
+        _ target: TimelineSelection,
+        edge: TrimEdge,
+        anchorStart: TimeInterval,
+        anchorLength: TimeInterval,
+        by delta: TimeInterval
+    ) {
         beginGestureIfNeeded()
-        let limit = anchor.kind == .pip ? anchor.sourceDuration : nil
-        let range = trimmedRange(edge: edge, start: anchor.start, length: anchor.length, delta: delta, maxLength: limit)
-        overlayClips[index].start = range.start
-        overlayClips[index].length = range.length
-    }
-
-    func trimEffect(_ id: UUID, edge: TrimEdge, anchor: MockEffectClip, by delta: TimeInterval) {
-        guard let index = effectClips.firstIndex(where: { $0.id == id }) else { return }
-        beginGestureIfNeeded()
-        let range = trimmedRange(edge: edge, start: anchor.start, length: anchor.length, delta: delta, maxLength: nil)
-        effectClips[index].start = range.start
-        effectClips[index].length = range.length
-    }
-
-    func trimAudio(_ id: UUID, edge: TrimEdge, anchor: MockAudioClip, by delta: TimeInterval) {
-        guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
-        beginGestureIfNeeded()
-        let range = trimmedRange(edge: edge, start: anchor.start, length: anchor.length, delta: delta, maxLength: anchor.sourceDuration)
-        audioClips[index].start = range.start
-        audioClips[index].length = range.length
+        switch target {
+        case .overlay(let id):
+            guard let index = overlayClips.firstIndex(where: { $0.id == id }) else { return }
+            let limit = overlayClips[index].kind == .pip ? overlayClips[index].sourceDuration : nil
+            let range = trimmedRange(edge: edge, start: anchorStart, length: anchorLength, delta: delta, maxLength: limit)
+            overlayClips[index].start = range.start
+            overlayClips[index].length = range.length
+        case .effect(let id):
+            guard let index = effectClips.firstIndex(where: { $0.id == id }) else { return }
+            let range = trimmedRange(edge: edge, start: anchorStart, length: anchorLength, delta: delta, maxLength: nil)
+            effectClips[index].start = range.start
+            effectClips[index].length = range.length
+        case .audio(let id):
+            guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
+            let range = trimmedRange(edge: edge, start: anchorStart, length: anchorLength, delta: delta, maxLength: audioClips[index].sourceDuration)
+            audioClips[index].start = range.start
+            audioClips[index].length = range.length
+        case .main:
+            break
+        }
     }
 
     /// Horizontal drag of a lane clip to a new start time.

@@ -42,13 +42,91 @@ struct ClipView: View {
                     .frame(width: 1)
             }
         }
+        .overlay(alignment: .bottomLeading) { badges }
+        .overlay { keyframeDiamonds }
         .overlay {
             if isSelected {
                 selectionChrome
             }
         }
+        .overlay(alignment: .top) {
+            if isSelected {
+                durationBubble
+            }
+        }
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
+    }
+
+    // MARK: Status badges (speed / mute / reverse / freeze / filter)
+
+    private var badges: some View {
+        HStack(spacing: 3) {
+            if clip.isFreeze {
+                badge(symbol: "snowflake")
+            }
+            if clip.speed != 1 {
+                badge(text: String(format: clip.speed < 1 ? "%.1fx" : "%gx", clip.speed))
+            }
+            if clip.hasAudio, clip.volume == 0 {
+                badge(symbol: "speaker.slash.fill")
+            }
+            if clip.isReversed {
+                badge(symbol: "arrow.uturn.backward")
+            }
+            if clip.filterName != nil {
+                badge(symbol: "camera.filters")
+            }
+        }
+        .padding(4)
+        .allowsHitTesting(false)
+    }
+
+    private func badge(text: String? = nil, symbol: String? = nil) -> some View {
+        HStack(spacing: 0) {
+            if let text {
+                Text(text)
+                    .font(.system(size: 8.5, weight: .bold).monospacedDigit())
+            }
+            if let symbol {
+                Image(systemName: symbol)
+                    .font(.system(size: 8, weight: .bold))
+            }
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 4)
+        .padding(.vertical, 2)
+        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 3))
+    }
+
+    /// Keyframe markers stamped by the transport diamond, at their local
+    /// times along the clip.
+    @ViewBuilder
+    private var keyframeDiamonds: some View {
+        if !clip.keyframes.isEmpty {
+            ZStack(alignment: .leading) {
+                ForEach(clip.keyframes, id: \.self) { time in
+                    Image(systemName: "diamond.fill")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.white)
+                        .shadow(color: .black.opacity(0.6), radius: 1.5)
+                        .offset(x: time * pointsPerSecond - 4)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .allowsHitTesting(false)
+        }
+    }
+
+    private var durationBubble: some View {
+        Text(String(format: "%.1fs", clip.length))
+            .font(.system(size: 9, weight: .semibold).monospacedDigit())
+            .foregroundStyle(.black)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1.5)
+            .background(.white, in: Capsule())
+            .offset(y: -9)
+            .allowsHitTesting(false)
     }
 
     private func thumbnailStrip(height: CGFloat) -> some View {
