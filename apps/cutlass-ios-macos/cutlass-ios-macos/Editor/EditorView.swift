@@ -21,7 +21,14 @@ struct EditorView: View {
             PreviewCanvas(state: state)
                 .frame(maxHeight: .infinity)
 
-            TransportControls(state: state, onSplit: { state.splitAtPlayhead() })
+            TransportControls(
+                state: state,
+                canUndo: state.canUndo,
+                canRedo: state.canRedo,
+                onSplit: { state.splitAtPlayhead() },
+                onUndo: { state.undo() },
+                onRedo: { state.redo() }
+            )
 
             TimelineView(state: state, onAddMedia: onAddMedia)
 

@@ -64,7 +64,10 @@ struct RootView: View {
             case .editor:
                 EditorView(
                     state: editorState,
-                    onHome: { screen = .home },
+                    onHome: {
+                        editorState.isPlaying = false
+                        screen = .home
+                    },
                     onAddMedia: { pickerIntent = .appendToTimeline },
                     onReplaceMedia: { pickerIntent = .replaceSelectedClip }
                 )
