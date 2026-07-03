@@ -67,13 +67,7 @@ struct EditorView: View {
         } else {
             switch state.selection {
             case .main:
-                ClipToolbar(
-                    onAdd: onAddMedia,
-                    onSplit: { state.splitAtPlayhead() },
-                    onDelete: { state.deleteSelected() },
-                    onDuplicate: { state.duplicateSelected() },
-                    onReplace: onReplaceMedia
-                )
+                ClipToolbar(onAdd: onAddMedia, actions: mainClipActions)
             case .overlay(let id):
                 LaneToolbar(actions: overlayActions(for: id))
             case .effect:
@@ -91,6 +85,29 @@ struct EditorView: View {
     }
 
     // MARK: Per-kind lane toolbar actions
+
+    /// The full CapCut-style operation strip for a selected main clip.
+    private var mainClipActions: [ToolbarAction] {
+        [
+            ToolbarAction(symbol: "scissors", label: "Split") { state.splitAtPlayhead() },
+            ToolbarAction(symbol: "speedometer", label: "Speed") { openPanel(.clipSpeed) },
+            ToolbarAction(symbol: "speaker.wave.2", label: "Volume") { openPanel(.clipVolume) },
+            ToolbarAction(symbol: "sparkles.rectangle.stack", label: "Animation") { openPanel(.clipAnimation) },
+            ToolbarAction(symbol: "camera.filters", label: "Filters") { openPanel(.clipFilter) },
+            ToolbarAction(symbol: "slider.horizontal.3", label: "Adjust") { openPanel(.clipAdjust) },
+            ToolbarAction(symbol: "circle.righthalf.filled", label: "Opacity") { openPanel(.clipOpacity) },
+            ToolbarAction(symbol: "crop", label: "Crop") { openPanel(.clipCrop) },
+            ToolbarAction(symbol: "circle.dashed", label: "Mask") { openPanel(.clipMask) },
+            ToolbarAction(symbol: "drop", label: "Chroma") { openPanel(.clipChroma) },
+            ToolbarAction(symbol: "gyroscope", label: "Stabilize") { openPanel(.clipStabilize) },
+            ToolbarAction(symbol: "arrow.uturn.backward.circle", label: "Reverse") { state.reverseSelected() },
+            ToolbarAction(symbol: "snowflake", label: "Freeze") { state.freezeFrame() },
+            ToolbarAction(symbol: "waveform.badge.plus", label: "Extract\naudio") { state.extractAudio() },
+            ToolbarAction(symbol: "plus.square.on.square", label: "Duplicate") { state.duplicateSelected() },
+            ToolbarAction(symbol: "rectangle.2.swap", label: "Replace", action: onReplaceMedia),
+            ToolbarAction(symbol: "trash", label: "Delete") { state.deleteSelected() },
+        ]
+    }
 
     /// Split / duplicate / delete, shared by every lane kind.
     private var commonLaneActions: [ToolbarAction] {
@@ -187,8 +204,28 @@ struct EditorView: View {
             AudioVolumePanel(state: state)
         case .audioFade:
             AudioFadePanel(state: state)
+        case .clipVolume:
+            ClipVolumePanel(state: state)
+        case .clipSpeed:
+            SpeedPanel(state: state)
+        case .clipAnimation:
+            ClipAnimationPanel(state: state)
+        case .clipFilter:
+            ClipFilterPanel(state: state)
+        case .clipAdjust:
+            ClipAdjustPanel(state: state)
+        case .clipOpacity:
+            OpacityPanel(state: state)
+        case .clipCrop:
+            CropPanel(state: state)
+        case .clipMask:
+            MaskPanel(state: state)
+        case .clipChroma:
+            ChromaPanel(state: state)
+        case .clipStabilize:
+            StabilizePanel(state: state)
         default:
-            // Remaining panels land in the following slices.
+            // Transitions land in the next slice.
             Text("Coming soon")
                 .font(.footnote)
                 .foregroundStyle(Theme.textTertiary)

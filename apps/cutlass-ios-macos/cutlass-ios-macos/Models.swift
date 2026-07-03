@@ -108,9 +108,11 @@ nonisolated struct MockClip: Identifiable, Hashable {
     var animationOut: String?
     var animationCombo: String?
     var maskName: String?
+    var cropPreset: String?
     /// 0 = chroma key off.
     var chromaStrength: Double = 0
     var chromaShadow: Double = 0
+    var chromaColor: Color?
     var stabilizeLevel: String?
     var isReversed = false
     /// Keyframe times local to the clip (seconds from its leading edge).

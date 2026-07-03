@@ -10,11 +10,31 @@ struct TransportControls: View {
     var onUndo: () -> Void = {}
     var onRedo: () -> Void = {}
 
+    /// The playhead sits on a keyframe of the selected clip (within tolerance).
+    private var keyframeActive: Bool {
+        guard let clip = state.selectedClip else { return false }
+        let local = state.playhead - state.startTime(of: clip.id)
+        return clip.keyframes.contains { abs($0 - local) < 0.15 }
+    }
+
     var body: some View {
         HStack(spacing: 0) {
             HStack(spacing: 24) {
                 iconButton("arrow.right.and.line.vertical.and.arrow.left", enabled: !state.isEmpty, action: onSplit)
-                iconButton("diamond", enabled: !state.isEmpty) {}
+                Button {
+                    state.toggleKeyframeAtPlayhead()
+                } label: {
+                    Image(systemName: keyframeActive ? "diamond.fill" : "diamond")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundStyle(
+                            state.selectedClip == nil
+                                ? Theme.textTertiary
+                                : keyframeActive ? Theme.accent : .white
+                        )
+                        .frame(width: 30, height: 30)
+                }
+                .buttonStyle(.plain)
+                .disabled(state.selectedClip == nil)
             }
 
             Spacer()
