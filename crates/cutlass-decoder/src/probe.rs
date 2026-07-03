@@ -49,15 +49,40 @@ impl MediaProbe {
     }
 }
 
+/// Tick rate for audio-only sources, which have no frame cadence of their
+/// own. Millisecond ticks keep duration math exact (matches the model's
+/// still-image convention).
+const AUDIO_TICK_RATE: Rational = Rational::new(1000, 1);
+
 /// Probe `path` with the platform-native decoder.
 ///
 /// Opens the source (demux + codec setup) far enough to read its
 /// [`SourceInfo`], then drops the decoder, and separately checks for an audio
-/// track. Returns [`DecodeError::Unsupported`] on platforms without a native
-/// decoder.
+/// track. Sources without a video stream (music/voiceover files) fall back to
+/// an audio-only probe: zero dimensions, millisecond ticks, and the audio
+/// track's duration. Returns [`DecodeError::Unsupported`] on platforms
+/// without a native decoder.
 pub fn probe(path: &Path) -> Result<MediaProbe, DecodeError> {
-    let decoder = open(path)?;
+    let decoder = match open(path) {
+        Ok(decoder) => decoder,
+        Err(video_err) => {
+            return audio_only_probe(path).ok_or(video_err);
+        }
+    };
     Ok(MediaProbe::from_info(decoder.info(), has_audio_track(path)))
+}
+
+/// Probe for sources with no decodable video stream. `Some` iff the demuxer
+/// finds an audio track with a reported duration.
+fn audio_only_probe(path: &Path) -> Option<MediaProbe> {
+    let duration = audio_track_duration(path)?;
+    Some(MediaProbe {
+        width: 0,
+        height: 0,
+        frame_rate: AUDIO_TICK_RATE,
+        frame_count: resample(duration, AUDIO_TICK_RATE).value.max(0),
+        has_audio: true,
+    })
 }
 
 #[cfg(target_vendor = "apple")]
@@ -106,4 +131,17 @@ fn has_audio_track(path: &Path) -> bool {
 #[cfg(not(any(target_vendor = "apple", target_os = "windows", target_os = "android")))]
 fn has_audio_track(_path: &Path) -> bool {
     false
+}
+
+/// Duration of the first audio track, for the audio-only fallback probe.
+/// `None` when the platform can't report one (the fallback then propagates
+/// the original video-open error).
+#[cfg(target_vendor = "apple")]
+fn audio_track_duration(path: &Path) -> Option<cutlass_core::RationalTime> {
+    crate::apple::audio_track_duration(path)
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn audio_track_duration(_path: &Path) -> Option<cutlass_core::RationalTime> {
+    None
 }

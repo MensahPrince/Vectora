@@ -312,17 +312,25 @@ fn first_video_track(asset: &AVURLAsset) -> Option<Retained<AVAssetTrack>> {
 /// Whether the asset at `path` carries at least one audio track. Used by the
 /// probe to set [`crate::MediaProbe::has_audio`]; `false` on any error.
 pub(crate) fn has_audio_track(path: &Path) -> bool {
-    let Some(path_str) = path.to_str() else {
-        return false;
-    };
+    first_audio_track(path).is_some()
+}
+
+/// Duration of the first audio track at `path`, for probing sources with no
+/// video stream (music/voiceover files). `None` when there is no audio track
+/// or the container reports no duration.
+pub(crate) fn audio_track_duration(path: &Path) -> Option<RationalTime> {
+    let track = first_audio_track(path)?;
+    cmtime_to_rational(unsafe { track.timeRange() }.duration)
+}
+
+fn first_audio_track(path: &Path) -> Option<Retained<AVAssetTrack>> {
+    let path_str = path.to_str()?;
     let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
     let asset = unsafe { AVURLAsset::initWithURL_options(AVURLAsset::alloc(), &url, None) };
-    let Some(media_audio) = (unsafe { AVMediaTypeAudio }) else {
-        return false;
-    };
+    let media_audio = unsafe { AVMediaTypeAudio }?;
     #[allow(deprecated)]
     let tracks = unsafe { asset.tracksWithMediaType(media_audio) };
-    tracks.firstObject().is_some()
+    tracks.firstObject()
 }
 
 /// Output settings asking the reader for decoded pixel buffers in one of our
