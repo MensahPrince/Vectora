@@ -11,7 +11,9 @@ enum MockData {
     static let food = MockArt(top: Color(hex: 0xFBBF24), bottom: Color(hex: 0x92400E), symbol: "fork.knife")
     static let podcast = MockArt(top: Color(hex: 0x8B5CF6), bottom: Color(hex: 0x4C1D95), symbol: "mic.fill")
     static let city = MockArt(top: Color(hex: 0x64748B), bottom: Color(hex: 0x0F172A), symbol: "building.2.fill")
-    static let screen = MockArt(top: Color(hex: 0x475569), bottom: Color(hex: 0x1E293B), symbol: "qrcode")
+    // Not "qrcode": the iOS 26 simulator rejects that glyph and spams
+    // CoreUI "No symbol named 'qrcode'" logs on every render.
+    static let screen = MockArt(top: Color(hex: 0x475569), bottom: Color(hex: 0x1E293B), symbol: "display")
     static let coffee = MockArt(top: Color(hex: 0xA16207), bottom: Color(hex: 0x451A03), symbol: "cup.and.saucer.fill")
     static let forest = MockArt(top: Color(hex: 0x22C55E), bottom: Color(hex: 0x14532D), symbol: "leaf.fill")
     static let flowers = MockArt(top: Color(hex: 0xFB7185), bottom: Color(hex: 0x9F1239), symbol: "camera.macro")

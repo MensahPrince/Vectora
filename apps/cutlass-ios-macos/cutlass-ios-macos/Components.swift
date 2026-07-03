@@ -10,8 +10,10 @@ struct MockArtView: View {
         ZStack {
             art.gradient
             if let symbol = art.symbol {
+                // Clamp: a zero point size makes CoreUI's glyph lookup fail
+                // and log for every draw.
                 Image(systemName: symbol)
-                    .font(.system(size: symbolSize, weight: .medium))
+                    .font(.system(size: max(1, symbolSize), weight: .medium))
                     .foregroundStyle(.white.opacity(0.35))
             }
         }
