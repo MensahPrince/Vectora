@@ -24,3 +24,5 @@ proxy/
 librry/
 run.sh
 venv/
+crates/cutlass-py/.venv/
+crates/cutlass-py/examples/trailer.mp4
