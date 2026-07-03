@@ -1,0 +1,12 @@
+[package]
+name = "cutlass-shapes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Vector shape generator for Cutlass: parametric SDF shapes evaluated on the GPU, pen-tool bezier paths rasterized on the CPU, and the shared geometry (bounds, hit-testing) both need."
+
+[dependencies]
+cutlass-core = { path = "../cutlass-core" }
+tiny-skia = "0.11"
