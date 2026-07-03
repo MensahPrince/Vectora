@@ -3,6 +3,14 @@
 # Demo outputs (cutlass-cli, cutlass-render's export_demo example).
 /cutlass-demo.png
 /cutlass-demo.mp4
+# Xcode / Swift Package Manager user state and build output.
+xcuserdata/
+.build/
+# Prebuilt Rust FFI bundle for the Swift package (158MB of static libs);
+# rebuild with scripts/build-ios-xcframework.sh.
+apps/cutlass-ios-macos/CutlassMobile/CutlassMobileFFI.xcframework/
+# IDE metadata (Android Studio / IntelliJ).
+.idea/
 local-assets/
 .env
 .DS_Store
