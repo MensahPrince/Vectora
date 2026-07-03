@@ -13,6 +13,10 @@ members = [
     "crates/cutlass-cli",
     "crates/cutlass-mobile",
 ]
+# cutlass-py is a PyO3 cdylib shipped to PyPI on its own (maturin). Kept out of
+# the default workspace build so `cargo build --workspace` and the mobile
+# cross-compiles never pull Python/pyo3. Build it from its own directory.
+exclude = ["crates/cutlass-py"]
 resolver = "3"
 
 [workspace.package]

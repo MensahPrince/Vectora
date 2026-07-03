@@ -1,5 +1,7 @@
 /target
 /dist
+# cutlass-py is excluded from the workspace, so it gets its own target dir.
+/crates/cutlass-py/target/
 # Demo outputs (cutlass-cli, cutlass-render's export_demo example).
 /cutlass-demo.png
 /cutlass-demo.mp4
