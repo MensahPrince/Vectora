@@ -22,9 +22,7 @@ struct EditorView: View {
 
             TransportControls(state: state)
 
-            // Placeholder bed; the scrubbable timeline lands next.
-            Theme.timelineBed
-                .frame(height: 210)
+            TimelineView(state: state, onAddMedia: onAddMedia)
 
             MediaToolbar(onAddMedia: onAddMedia)
         }
