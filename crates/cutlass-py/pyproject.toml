@@ -21,6 +21,8 @@ dependencies = ["numpy>=1.21"]
 Repository = "https://github.com/1mrnewton/cutlass"
 
 # Build the `cutlass` extension module from this crate. The Rust library name
-# (`cutlass`) is the import name; the version is read from Cargo.toml.
+# (`cutlass`) is the import name; the version is read from Cargo.toml. The
+# adjacent `cutlass.pyi` stub ships in the wheel next to the module.
 [tool.maturin]
 module-name = "cutlass"
+include = ["cutlass.pyi"]
