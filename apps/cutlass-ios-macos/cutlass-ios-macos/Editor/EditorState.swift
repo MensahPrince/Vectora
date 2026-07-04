@@ -141,8 +141,17 @@ final class EditorState {
     /// Refresh deferred because a live gesture owns the arrays right now.
     @ObservationIgnored private var deferredRefresh: UiState?
     /// On-disk media home for the current project (picker copies, freeze
-    /// stills). Fresh per session until the project store lands (Phase H).
+    /// stills). `mediaStore.projectID` is the project's identity in the
+    /// `ProjectStore` — auto-saves land in that directory.
     @ObservationIgnored private(set) var mediaStore = ProjectMediaStore(projectID: UUID())
+    /// Card name written with every auto-save (renames happen in Home,
+    /// which owns the store while the editor is closed).
+    @ObservationIgnored private var projectName = ProjectStore.defaultName()
+    /// Debounced engine-save after the last landed edit.
+    @ObservationIgnored private var saveTask: Task<Void, Never>?
+    /// Off for seeded dev/UI-test sessions so runs don't accumulate saved
+    /// projects in the store.
+    @ObservationIgnored var autoSaveEnabled = true
 
     init() {
         createSession()
@@ -307,6 +316,9 @@ final class EditorState {
         canUndo = projection.canUndo
         canRedo = projection.canRedo
         canvasSize = projection.canvasSize
+        if state.dirty {
+            scheduleAutoSave()
+        }
         if panelBaseline == nil {
             aspect = projection.aspect
             if background.kind == .color, let color = projection.canvasBackground {
@@ -890,6 +902,46 @@ final class EditorState {
         }
     }
 
+    /// Restore a saved project: load `project.cutlass`, then relink every
+    /// media entry onto this project's own `media/` copy (paths in the file
+    /// may point at a duplicated-from project or a container that moved
+    /// across app installs — the media directory is the durable home).
+    func openProject(_ entry: ProjectStore.Entry) {
+        isPlaying = false
+        resetSession()
+        mediaStore = ProjectMediaStore(projectID: entry.id)
+        projectName = entry.name
+
+        let file = entry.projectFile.path
+        let mediaDirectory = mediaStore.mediaDirectory
+        enqueue { [weak self] session in
+            try await session.apply(.load(path: file))
+
+            // Relink pass: any media whose file lives in `media/` (by name)
+            // rebinds there; files honestly elsewhere (in-place imports on
+            // this machine) stay put.
+            let state = try await session.uiState()
+            var seen = Set<UInt64>()
+            for lane in state.lanes {
+                for clip in lane.clips {
+                    guard let media = clip.media, let path = clip.path,
+                        seen.insert(media).inserted
+                    else { continue }
+                    let local = mediaDirectory.appendingPathComponent(
+                        (path as NSString).lastPathComponent)
+                    if local.path != path,
+                        FileManager.default.fileExists(atPath: local.path)
+                    {
+                        try? await session.apply(.relinkMedia(media: media, path: local.path))
+                    }
+                }
+            }
+
+            let refreshed = try await session.uiState()
+            self?.applyRefresh(refreshed)
+        }
+    }
+
     func appendMedia(_ urls: [URL]) {
         let paths = urls.map { mediaStore.adopt($0).path }
         guard !paths.isEmpty else { return }
@@ -911,6 +963,57 @@ final class EditorState {
         while seen != opCounter {
             seen = opCounter
             await opChain?.value
+        }
+    }
+
+    // MARK: Auto-save
+
+    /// Save shortly after the last landed edit: one debounced write covers a
+    /// burst (drag commits, grouped panel edits) instead of thrashing disk.
+    private func scheduleAutoSave() {
+        guard autoSaveEnabled else { return }
+        saveTask?.cancel()
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(1))
+            guard !Task.isCancelled else { return }
+            self?.saveProject()
+        }
+    }
+
+    /// Flush any pending debounce immediately (leaving the editor).
+    func flushSave() {
+        guard saveTask != nil else { return }
+        saveTask?.cancel()
+        saveTask = nil
+        saveProject()
+    }
+
+    /// Persist the project: engine save to `project.cutlass`, card metadata,
+    /// and a frame-0 thumbnail. Ordered after every already-queued op, but
+    /// deliberately *not* generation-guarded like edits are: the session is
+    /// captured strongly so a save in flight across a project switch still
+    /// completes against the old session.
+    private func saveProject() {
+        guard let session else { return }
+        saveTask = nil
+        let id = mediaStore.projectID
+        let name = projectName
+        let duration = duration
+        let previous = opChain
+        opCounter += 1
+        opChain = Task { @MainActor in
+            await previous?.value
+            do {
+                try await session.apply(.save(path: ProjectStore.projectFile(for: id).path))
+                ProjectStore.writeMeta(id: id, name: name, durationSeconds: duration)
+                if let thumb = await session.renderFrame(
+                    atSeconds: 0, maxWidth: 480, maxHeight: 480)
+                {
+                    ProjectStore.writeThumbnail(id: id, image: thumb)
+                }
+            } catch {
+                print("cutlass: auto-save failed: \(error)")
+            }
         }
     }
 

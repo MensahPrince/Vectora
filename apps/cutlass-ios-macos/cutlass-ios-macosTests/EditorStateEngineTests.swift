@@ -590,4 +590,73 @@ struct EditorStateEngineTests {
         await #expect(throws: CutlassError.self) { try await job.wait() }
         #expect(!FileManager.default.fileExists(atPath: job.outputPath))
     }
+
+    // MARK: Persistence (Phase H)
+
+    @Test func flushedSaveRoundTripsThroughTheStore() async throws {
+        let state = await makeProject([shortVideo])
+        let id = state.mediaStore.projectID
+        defer { ProjectStore.delete(id: id) }
+
+        state.flushSave()
+        await state.waitForEngine()
+
+        // The store now lists the project with real card metadata.
+        let entry = try #require(ProjectStore.entry(for: id))
+        #expect(near(entry.durationSeconds, 4))
+        #expect(FileManager.default.fileExists(atPath: entry.thumbnailFile.path))
+        #expect(ProjectStore.list().contains { $0.id == id })
+
+        // A fresh editor restores the session from the file.
+        let reopened = EditorState()
+        reopened.openProject(entry)
+        await reopened.waitForEngine()
+        #expect(reopened.clips.count == 1)
+        #expect(near(reopened.clips[0].length, 4))
+        #expect(reopened.mediaStore.projectID == id)
+        #expect(!reopened.canUndo, "loading starts a fresh history")
+    }
+
+    @Test func editsAutoSaveWithoutAnExplicitFlush() async throws {
+        let state = await makeProject([shortVideo])
+        let id = state.mediaStore.projectID
+        defer { ProjectStore.delete(id: id) }
+
+        // The append scheduled a debounced save; give it its second plus
+        // engine time, no flush call.
+        try await Task.sleep(for: .milliseconds(1400))
+        await state.waitForEngine()
+
+        #expect(
+            FileManager.default.fileExists(atPath: ProjectStore.projectFile(for: id).path),
+            "the debounced auto-save wrote project.cutlass")
+    }
+
+    @Test func duplicatedProjectsRelinkOntoTheirOwnMediaCopies() async throws {
+        let state = await makeProject([shortVideo])
+        let id = state.mediaStore.projectID
+        state.flushSave()
+        await state.waitForEngine()
+        defer { ProjectStore.delete(id: id) }
+
+        let copy = try #require(ProjectStore.duplicate(id: id))
+        defer { ProjectStore.delete(id: copy.id) }
+        #expect(copy.name.hasSuffix("copy"))
+
+        // Deleting the original before opening the copy proves the relink:
+        // the file the duplicate's project.cutlass references is gone, so
+        // only its own media/ copy can back the clip.
+        ProjectStore.delete(id: id)
+
+        let reopened = EditorState()
+        reopened.openProject(copy)
+        await reopened.waitForEngine()
+        #expect(reopened.clips.count == 1)
+        let mediaPath = try #require(reopened.clips[0].mediaPath)
+        #expect(mediaPath.hasPrefix(ProjectStore.directory(for: copy.id).path))
+
+        // The relinked media decodes: frame renders are non-nil.
+        let frame = await reopened.renderPreviewFrame(atSeconds: 1, maxWidth: 160, maxHeight: 160)
+        #expect(frame != nil)
+    }
 }
