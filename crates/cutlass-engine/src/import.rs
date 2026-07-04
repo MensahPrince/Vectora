@@ -20,14 +20,20 @@ use crate::error::EngineError;
 /// probing so the pool stores a stable absolute path.
 pub fn import_media(path: &Path) -> Result<MediaSource, EngineError> {
     let probed = probe(path)?;
-    let media = MediaSource::new(
-        path,
-        probed.width,
-        probed.height,
-        probed.frame_rate,
-        probed.frame_count,
-        probed.has_audio,
-    );
+    // Stills carry no timebase of their own: the pool applies the model's
+    // convention (millisecond ticks, 5s default placement length).
+    let media = if probed.is_image {
+        MediaSource::image(path, probed.width, probed.height)
+    } else {
+        MediaSource::new(
+            path,
+            probed.width,
+            probed.height,
+            probed.frame_rate,
+            probed.frame_count,
+            probed.has_audio,
+        )
+    };
 
     debug!(
         path = %path.display(),

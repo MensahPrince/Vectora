@@ -12,7 +12,7 @@ use numpy::{IntoPyArray, PyArray3};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 
-use crate::convert::{is_still_extension, parse_color, parse_track_kind, rate_from_fps, time_at};
+use crate::convert::{parse_color, parse_track_kind, rate_from_fps, time_at};
 use crate::errors::{media_err, model_err, render_err, CutlassError};
 use crate::media::Media;
 use crate::track::Track;
@@ -65,11 +65,6 @@ impl Project {
 
     fn import_media(mut slf: PyRefMut<'_, Self>, py: Python, path: &str) -> PyResult<Media> {
         let path_buf = PathBuf::from(path);
-        if is_still_extension(&path_buf) {
-            return Err(media_err(
-                "still images are not supported yet (no still decoder in the renderer)",
-            ));
-        }
         let canonical = path_buf
             .canonicalize()
             .map_err(|e| media_err(format!("{path}: {e}")))?;
@@ -80,14 +75,18 @@ impl Project {
         if probed.width == 0 && probed.height == 0 && !probed.has_audio {
             return Err(media_err(format!("{path}: no video or audio stream")));
         }
-        let media = MediaSource::new(
-            &canonical,
-            probed.width,
-            probed.height,
-            probed.frame_rate.reduced(),
-            probed.frame_count,
-            probed.has_audio,
-        );
+        let media = if probed.is_image {
+            MediaSource::image(&canonical, probed.width, probed.height)
+        } else {
+            MediaSource::new(
+                &canonical,
+                probed.width,
+                probed.height,
+                probed.frame_rate.reduced(),
+                probed.frame_count,
+                probed.has_audio,
+            )
+        };
         let id = slf.model.add_media(media);
         Ok(Media::new(slf.into_pyobject(py)?.unbind(), id))
     }

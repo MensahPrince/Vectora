@@ -193,18 +193,6 @@ pub fn parse_easing(obj: &Bound<'_, PyAny>) -> PyResult<Easing> {
     ))
 }
 
-/// Whether `path` looks like a still image (v1 import rejects these).
-pub fn is_still_extension(path: &std::path::Path) -> bool {
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|ext| {
-            matches!(
-                ext.to_ascii_lowercase().as_str(),
-                "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "heic" | "heif" | "tif" | "tiff"
-            )
-        })
-}
-
 /// Extract `(time, value[, easing])` keyframe pairs from a Python list.
 pub fn parse_keyframe_pairs(
     _py: Python,
@@ -352,11 +340,4 @@ mod tests {
         assert!(parse_color_str("chartreuse").is_err());
     }
 
-    #[test]
-    fn still_extension_detection() {
-        assert!(is_still_extension(Path::new("photo.PNG")));
-        assert!(is_still_extension(Path::new("scan.tiff")));
-        assert!(!is_still_extension(Path::new("clip.mp4")));
-        assert!(!is_still_extension(Path::new("noext")));
-    }
 }

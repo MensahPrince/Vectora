@@ -26,3 +26,6 @@ tracing.workspace = true
 # without a checked-in fixture.
 cutlass-encoder = { path = "../cutlass-encoder" }
 tempfile = "3"
+# Still-import tests write their own PNG fixture (same codec the decoder's
+# portable path reads).
+png = "0.17"
