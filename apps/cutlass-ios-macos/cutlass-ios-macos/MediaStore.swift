@@ -27,19 +27,49 @@ nonisolated struct ProjectMediaStore {
             "freeze-\(UUID().uuidString.prefix(8)).png")
     }
 
-    /// Claim a file for this project: staged picks *move* into the media
-    /// directory (same volume, a rename); anything else — bundled fixtures,
-    /// files already in place — imports where it lies.
+    /// Claim a file for this project so the project directory is
+    /// self-contained (duplicates and reopens relink against `media/`):
+    /// staged picks *move* in (same volume, a rename), bundled fixtures
+    /// *copy* in (the bundle path changes across installs), and anything
+    /// already inside the media directory imports where it lies.
     func adopt(_ url: URL) -> URL {
-        guard url.path.hasPrefix(Self.incomingDirectory.path) else { return url }
-        let destination = mediaDirectory.appendingPathComponent(url.lastPathComponent)
+        let staged = url.path.hasPrefix(Self.incomingDirectory.path)
+        let bundled = url.path.hasPrefix(Bundle.main.bundlePath)
+        guard staged || bundled else { return url }
+
         do {
-            try FileManager.default.moveItem(at: url, to: destination)
+            if staged {
+                // Staged names may collide across picks; keep both files.
+                let destination = uniqueDestination(for: url.lastPathComponent)
+                try FileManager.default.moveItem(at: url, to: destination)
+                return destination
+            }
+            // Fixtures are immutable: the same name is the same bytes, so
+            // repeated picks share one copy.
+            let destination = mediaDirectory.appendingPathComponent(url.lastPathComponent)
+            if !FileManager.default.fileExists(atPath: destination.path) {
+                try FileManager.default.copyItem(at: url, to: destination)
+            }
             return destination
         } catch {
             print("cutlass: media adopt failed, importing in place: \(error)")
             return url
         }
+    }
+
+    /// First free file name for `name` in the media directory (`a.mp4`,
+    /// `a-2.mp4`, …): repeated picks of the same source stay distinct files.
+    private func uniqueDestination(for name: String) -> URL {
+        let base = (name as NSString).deletingPathExtension
+        let ext = (name as NSString).pathExtension
+        var candidate = mediaDirectory.appendingPathComponent(name)
+        var counter = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let numbered = ext.isEmpty ? "\(base)-\(counter)" : "\(base)-\(counter).\(ext)"
+            candidate = mediaDirectory.appendingPathComponent(numbered)
+            counter += 1
+        }
+        return candidate
     }
 
     private static var documents: URL {
