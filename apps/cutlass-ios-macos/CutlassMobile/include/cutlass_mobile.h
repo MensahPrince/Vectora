@@ -229,4 +229,41 @@ CutlassImage cutlass_thumbnailer_thumb(CutlassThumbnailer *handle, double second
 /* Release a thumbnailer handle. NULL is a no-op. */
 void cutlass_thumbnailer_close(CutlassThumbnailer *handle);
 
+/*
+ * Realtime audio playback.
+ *
+ * `cutlass_session_audio_open` snapshots the session's project and returns a
+ * pull reader of the timeline's mixed audio (every audible clip summed, with
+ * volume/fades applied) as interleaved stereo f32 at 48 kHz. Later edits
+ * never affect an open reader — watch the session revision and reopen at the
+ * playhead on change, same as seeking.
+ *
+ * Reads block while sources decode: pull from a feeder thread into a ring
+ * buffer and let the audio render callback only copy. Serialize calls per
+ * handle; readers are independent of each other and of the session.
+ */
+typedef struct CutlassAudioReader CutlassAudioReader;
+
+/* Sample rate (Hz) and interleaved channel count of every read block. */
+uint32_t cutlass_audio_rate(void);
+uint32_t cutlass_audio_channels(void);
+
+/*
+ * Open a mixed-audio reader at `start_seconds` (clamped into the timeline).
+ * NULL when the session is NULL or the timeline has no audible clips. Free
+ * with `cutlass_audio_close`.
+ */
+CutlassAudioReader *cutlass_session_audio_open(CutlassSession *session, double start_seconds);
+
+/*
+ * Pull up to `max_frames` interleaved stereo sample frames into `out`
+ * (`max_frames * 2` floats), advancing the reader. Returns the number of
+ * frames written: 0 at the end of the timeline, -1 after a decode failure
+ * (sticky).
+ */
+intptr_t cutlass_audio_read(CutlassAudioReader *handle, float *out, size_t max_frames);
+
+/* Release a reader handle. NULL is a no-op. */
+void cutlass_audio_close(CutlassAudioReader *handle);
+
 #endif /* CUTLASS_MOBILE_H */

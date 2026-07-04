@@ -133,6 +133,17 @@ public actor CutlassSession {
             cutlass_session_render_fit(handle, seconds, UInt32(maxWidth), UInt32(maxHeight)))
     }
 
+    // MARK: Audio
+
+    /// A pull reader of the timeline's mixed audio, opened on a snapshot of
+    /// the current project at `seconds`. Later edits never affect it — watch
+    /// `revision()` and reopen at the playhead on change, same as seeking.
+    /// `nil` when the timeline has no audible clips.
+    public func openAudioReader(atSeconds seconds: Double) -> AudioReader? {
+        guard let reader = cutlass_session_audio_open(handle, seconds) else { return nil }
+        return AudioReader(handle: reader)
+    }
+
     // MARK: Export
 
     /// Start exporting the current project to `path` (H.264/AAC mp4 on Apple)
@@ -257,6 +268,39 @@ public final class ExportJob: @unchecked Sendable {
             throw CutlassError(kind: kind, message: message)
         }
         throw CutlassError.protocolError("malformed export verdict")
+    }
+}
+
+/// A pull reader of the timeline's mixed audio: every audible clip summed
+/// with volume/fades applied, as interleaved stereo `f32` at 48 kHz, decoded
+/// from a project snapshot.
+///
+/// Reads block while sources decode — pull from a feeder task into a ring
+/// buffer and let the audio render callback only copy. Not internally
+/// synchronized: one consumer at a time (the feeder), like `ExportJob`.
+public final class AudioReader: @unchecked Sendable {
+    /// Sample rate of every read, in Hz.
+    public static let sampleRate = Double(cutlass_audio_rate())
+    /// Interleaved channels per sample frame.
+    public static let channelCount = Int(cutlass_audio_channels())
+
+    private let handle: OpaquePointer
+
+    init(handle: OpaquePointer) {
+        self.handle = handle
+    }
+
+    deinit {
+        cutlass_audio_close(handle)
+    }
+
+    /// Fill `out` (holding `maxFrames * channelCount` floats) with up to
+    /// `maxFrames` sample frames, advancing the reader. Returns the frames
+    /// written — 0 at the end of the timeline — or `nil` after a decode
+    /// failure (sticky; reopen to retry).
+    public func read(into out: UnsafeMutablePointer<Float>, maxFrames: Int) -> Int? {
+        let got = cutlass_audio_read(handle, out, maxFrames)
+        return got < 0 ? nil : Int(got)
     }
 }
 

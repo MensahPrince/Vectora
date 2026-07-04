@@ -214,4 +214,67 @@ final class SessionTests: XCTestCase {
         XCTAssertLessThanOrEqual(thumb.width, 120)
         XCTAssertLessThanOrEqual(thumb.height, 90)
     }
+
+    func testAudioReaderPullsMixedPCMFromASnapshot() async throws {
+        let wav = try Self.makeConstantWav()
+        defer { try? FileManager.default.removeItem(at: wav) }
+
+        let session = try makeSession()
+        _ = try await session.run(.addAudio(path: wav.path, atSeconds: 0))
+
+        XCTAssertEqual(AudioReader.sampleRate, 48_000)
+        XCTAssertEqual(AudioReader.channelCount, 2)
+
+        let opened = await session.openAudioReader(atSeconds: 0.5)
+        let reader = try XCTUnwrap(opened, "an audible timeline opens a reader")
+        var block = [Float](repeating: 0, count: 4800 * 2)
+        let frames = block.withUnsafeMutableBufferPointer { buffer in
+            reader.read(into: buffer.baseAddress!, maxFrames: 4800)
+        }
+        XCTAssertEqual(frames, 4800)
+        // The fixture is flat: left +0.5, right −0.25 on every frame.
+        for frame in stride(from: 0, to: block.count, by: 2) {
+            XCTAssertEqual(block[frame], 0.5, accuracy: 0.02)
+            XCTAssertEqual(block[frame + 1], -0.25, accuracy: 0.02)
+        }
+    }
+
+    func testSilentTimelineOpensNoAudioReader() async throws {
+        let session = try makeSession()
+        try await addSolid(session)
+        let reader = await session.openAudioReader(atSeconds: 0)
+        XCTAssertNil(reader, "solids carry no audio — nothing to play")
+    }
+
+    /// A 2-second stereo PCM16 WAV at 48 kHz: left = +0.5, right = −0.25.
+    private static func makeConstantWav() throws -> URL {
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cutlass-audio-\(UUID().uuidString).wav")
+        let rate: UInt32 = 48_000
+        let frames: UInt32 = 2 * rate
+        let dataLength = frames * 4
+
+        var bytes = Data()
+        func append<T: FixedWidthInteger>(_ value: T) {
+            withUnsafeBytes(of: value.littleEndian) { bytes.append(contentsOf: $0) }
+        }
+        bytes.append(contentsOf: Array("RIFF".utf8))
+        append(36 + dataLength)
+        bytes.append(contentsOf: Array("WAVEfmt ".utf8))
+        append(UInt32(16))
+        append(UInt16(1)) // PCM
+        append(UInt16(2)) // stereo
+        append(rate)
+        append(rate * 4) // byte rate
+        append(UInt16(4)) // block align
+        append(UInt16(16)) // bits per sample
+        bytes.append(contentsOf: Array("data".utf8))
+        append(dataLength)
+        for _ in 0..<frames {
+            append(Int16(16384)) // +0.5
+            append(Int16(-8192)) // −0.25
+        }
+        try bytes.write(to: url)
+        return url
+    }
 }
