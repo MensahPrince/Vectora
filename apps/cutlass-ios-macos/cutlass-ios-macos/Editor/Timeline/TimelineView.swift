@@ -392,7 +392,7 @@ struct TimelineView: View {
             onLiftEnd: { location in
                 defer { laneLift = nil }
                 guard clip.kind == .pip, let location, mainDropTarget(globalY: location.y) else { return }
-                state.convertOverlayToMainClip(clip.id, at: timeAt(globalX: location.x))
+                state.moveLaneClipToMain(clip.id, at: timeAt(globalX: location.x))
                 conversionPulse += 1
             }
         )
@@ -604,7 +604,7 @@ struct TimelineView: View {
                 defer { reorder = nil }
                 guard case .second(true, _) = value, let final = reorder else { return }
                 if final.overOverlayBand {
-                    state.convertMainClipToOverlay(final.clipID, at: timeAt(globalX: final.location.x))
+                    state.moveMainClipToLane(final.clipID, at: timeAt(globalX: final.location.x))
                     conversionPulse += 1
                 } else {
                     state.moveClip(fromIndex: final.fromIndex, toIndex: final.insertionIndex)

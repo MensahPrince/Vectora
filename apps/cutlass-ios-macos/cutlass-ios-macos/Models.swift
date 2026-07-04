@@ -74,6 +74,26 @@ nonisolated struct MockTransition: Hashable {
     var duration: TimeInterval = 0.5
 }
 
+/// One row of the timeline's ordered lane stack (top to bottom). Mirrors the
+/// desktop `Track`/`TrackKind` rules: a lane holds one content kind, clips on
+/// a lane never overlap, audio lanes are pinned to the bottom (audio floor),
+/// and every other lane stacks freely around the main track.
+nonisolated struct MockLane: Identifiable, Hashable {
+    enum Kind: Hashable {
+        case video
+        case text
+        case sticker
+        case effect
+        case audio
+    }
+
+    var id = UUID()
+    var kind: Kind
+    /// The magnetic sequential track new media appends to; exactly one lane
+    /// has this set and it can never be removed.
+    var isMain = false
+}
+
 /// A clip on the main (sequential) video track, plus every mock style value
 /// the property panels can edit.
 nonisolated struct MockClip: Identifiable, Hashable {
@@ -155,8 +175,19 @@ nonisolated struct MockOverlayClip: Identifiable, Hashable {
 
     var id = UUID()
     var kind: Kind
+    /// The lane (row) this clip lives on; always a lane of `laneKind`.
+    var laneID = UUID()
     var start: TimeInterval
     var length: TimeInterval
+
+    /// Which lane kind can host this clip (desktop `accepts_content`).
+    var laneKind: MockLane.Kind {
+        switch kind {
+        case .text: return .text
+        case .sticker: return .sticker
+        case .pip: return .video
+        }
+    }
 
     // Text
     var text = ""
@@ -202,6 +233,8 @@ nonisolated struct MockEffectClip: Identifiable, Hashable {
 
     var id = UUID()
     var kind: Kind
+    /// The effect lane (row) this bar lives on.
+    var laneID = UUID()
     var name: String
     var start: TimeInterval
     var length: TimeInterval
@@ -227,6 +260,9 @@ nonisolated struct MockAudioClip: Identifiable, Hashable {
 
     var id = UUID()
     var kind: Kind
+    /// The audio lane (row) this clip lives on; audio lanes stay at the
+    /// bottom of the stack (audio floor).
+    var laneID = UUID()
     var title: String
     var start: TimeInterval
     var length: TimeInterval

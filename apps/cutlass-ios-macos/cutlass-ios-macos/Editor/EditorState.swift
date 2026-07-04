@@ -3,6 +3,7 @@ import SwiftUI
 /// One undoable state of the whole mock timeline.
 nonisolated struct TimelineSnapshot: Equatable {
     var clips: [MockClip] = []
+    var lanes: [MockLane] = [MockLane(kind: .video, isMain: true)]
     var overlays: [MockOverlayClip] = []
     var effects: [MockEffectClip] = []
     var audios: [MockAudioClip] = []
@@ -10,12 +11,49 @@ nonisolated struct TimelineSnapshot: Equatable {
     var background = CanvasBackground()
 }
 
-/// In-memory state for the mock editor: a sequential main video track plus
-/// free-floating overlay (text/sticker/PiP), effect, and audio lanes.
+/// What a timeline drag is carrying: a clip lifted off the main track or a
+/// free-floating lane clip.
+nonisolated enum DragContent: Equatable {
+    case main(UUID)
+    case lane(TimelineSelection)
+}
+
+/// Where a live drag would land if released right now. One resolution per
+/// drag frame drives the landing ghost, the snap guide, the tooltip, and the
+/// release commit, so the preview can never disagree with the drop (ported
+/// from the desktop `resolve_clip_drag`).
+nonisolated struct DragResolution: Equatable {
+    enum Landing: Equatable {
+        /// A free span on an existing lane.
+        case land(laneID: UUID, start: TimeInterval)
+        /// A new lane inserted at this row of the lane stack (hovering a
+        /// foreign kind, a conflicting span, or outside the stack).
+        case newLane(row: Int, start: TimeInterval)
+        /// Magnetic insertion between main-track clips; commit shifts later
+        /// clips right. The caret renders at `caretTime` in current space.
+        case mainInsert(index: Int, caretTime: TimeInterval)
+    }
+
+    var landing: Landing
+    /// Lane kind of the dragged content (styles the ghost / new lane).
+    var kind: MockLane.Kind
+    var length: TimeInterval
+    /// Vertical guide line while a magnet candidate is engaged.
+    var snapTime: TimeInterval?
+    /// Releasing here recreates the current arrangement; commit skips it.
+    var isNoop = false
+}
+
+/// In-memory state for the mock editor: an ordered lane stack (desktop
+/// rules: one content kind per lane, no same-lane overlap, audio pinned to
+/// the bottom) around a sequential magnetic main track.
 /// All edits are pure array/state manipulation; nothing touches the engine.
 @Observable
 final class EditorState {
     var clips: [MockClip] = []
+    /// The lane stack, top row first. Exactly one lane `isMain` (the
+    /// sequential track backed by `clips`); audio lanes always sit last.
+    var lanes: [MockLane] = [MockLane(kind: .video, isMain: true)]
     var overlayClips: [MockOverlayClip] = []
     var effectClips: [MockEffectClip] = []
     var audioClips: [MockAudioClip] = []
@@ -129,12 +167,361 @@ final class EditorState {
         effectClips.filter { time >= $0.start && time < $0.start + $0.length }
     }
 
+    // MARK: Lane stack
+
+    /// Row index of the main track in the lane stack.
+    var mainLaneRow: Int {
+        lanes.firstIndex(where: \.isMain) ?? 0
+    }
+
+    /// Row index of the first audio lane (== the audio floor); `lanes.count`
+    /// when there is none.
+    var audioFloorRow: Int {
+        lanes.firstIndex(where: { $0.kind == .audio }) ?? lanes.count
+    }
+
+    /// Time spans of every clip on a lane, excluding one clip id.
+    private func spans(on laneID: UUID, excluding excluded: UUID? = nil) -> [(start: TimeInterval, end: TimeInterval)] {
+        var result: [(start: TimeInterval, end: TimeInterval)] = []
+        for clip in overlayClips where clip.laneID == laneID && clip.id != excluded {
+            result.append((clip.start, clip.start + clip.length))
+        }
+        for clip in effectClips where clip.laneID == laneID && clip.id != excluded {
+            result.append((clip.start, clip.start + clip.length))
+        }
+        for clip in audioClips where clip.laneID == laneID && clip.id != excluded {
+            result.append((clip.start, clip.start + clip.length))
+        }
+        return result
+    }
+
+    /// Whether `[start, start+length)` overlaps no clip on the lane
+    /// (touching edges are fine, mirroring the engine's overlap rule).
+    func spanIsFree(on laneID: UUID, start: TimeInterval, length: TimeInterval, excluding excluded: UUID? = nil) -> Bool {
+        let end = start + length
+        let epsilon = 0.001
+        return !spans(on: laneID, excluding: excluded).contains { span in
+            start < span.end - epsilon && span.start < end - epsilon
+        }
+    }
+
+    /// Audio floor invariant (desktop `enforce_audio_floor`): every audio
+    /// lane sinks below every visual lane, both groups keeping their order.
+    private func enforceAudioFloor() {
+        let visual = lanes.filter { $0.kind != .audio }
+        let audio = lanes.filter { $0.kind == .audio }
+        let ordered = visual + audio
+        if ordered.map(\.id) != lanes.map(\.id) {
+            lanes = ordered
+        }
+    }
+
+    /// Drops lanes that no longer host any clip (the main track always
+    /// stays, even when empty).
+    private func pruneEmptyLanes() {
+        lanes.removeAll { lane in
+            !lane.isMain && lane.kind != .audio && spans(on: lane.id).isEmpty
+        }
+        // Audio lanes prune too, but only ever from the bottom block.
+        lanes.removeAll { lane in
+            lane.kind == .audio && spans(on: lane.id).isEmpty
+        }
+    }
+
+    /// A lane of `kind` whose span at [start, start+length) is free —
+    /// `preferred` first, then top-to-bottom — or a brand-new lane inserted
+    /// at the kind's default row (video above main, generated kinds just
+    /// above the audio floor, audio at the very bottom).
+    @discardableResult
+    func hostLane(for kind: MockLane.Kind, start: TimeInterval, length: TimeInterval, preferred: UUID? = nil) -> UUID {
+        if let preferred,
+           let lane = lanes.first(where: { $0.id == preferred }),
+           !lane.isMain, lane.kind == kind,
+           spanIsFree(on: lane.id, start: start, length: length) {
+            return lane.id
+        }
+        if let lane = lanes.first(where: { !$0.isMain && $0.kind == kind && spanIsFree(on: $0.id, start: start, length: length) }) {
+            return lane.id
+        }
+        let lane = MockLane(kind: kind)
+        let row: Int
+        switch kind {
+        case .video: row = mainLaneRow
+        case .audio: row = lanes.count
+        case .text, .sticker, .effect: row = audioFloorRow
+        }
+        lanes.insert(lane, at: min(row, lanes.count))
+        enforceAudioFloor()
+        return lane.id
+    }
+
+    // MARK: Drag resolution (ported from the desktop resolve_clip_drag)
+
+    /// (kind, length, origin lane id or nil for main, origin start) of the
+    /// dragged content; nil when the ids are stale.
+    private func dragProfile(of content: DragContent) -> (kind: MockLane.Kind, length: TimeInterval, laneID: UUID?, start: TimeInterval, clipID: UUID)? {
+        switch content {
+        case .main(let id):
+            guard let clip = clips.first(where: { $0.id == id }) else { return nil }
+            return (.video, clip.length, nil, startTime(of: id), id)
+        case .lane(.overlay(let id)):
+            guard let clip = overlayClips.first(where: { $0.id == id }) else { return nil }
+            return (clip.laneKind, clip.length, clip.laneID, clip.start, id)
+        case .lane(.effect(let id)):
+            guard let clip = effectClips.first(where: { $0.id == id }) else { return nil }
+            return (.effect, clip.length, clip.laneID, clip.start, id)
+        case .lane(.audio(let id)):
+            guard let clip = audioClips.first(where: { $0.id == id }) else { return nil }
+            return (.audio, clip.length, clip.laneID, clip.start, id)
+        case .lane(.main):
+            return nil
+        }
+    }
+
+    /// Resolves where a drag would land if released right now.
+    ///
+    /// - `desiredStart`: the floater's leading edge in timeline seconds.
+    /// - `hoverRow`: lane-stack row under the finger; may be out of range
+    ///   (above the first or below the last row).
+    ///
+    /// Policy (desktop `snap.rs`): the main row takes video insertions
+    /// between clips; a same-kind lane with a free span lands there (magnet
+    /// pulling both edges, and a snap that *causes* a conflict is dropped in
+    /// favor of the free unsnapped spot); everything else — foreign kind,
+    /// conflicting span, out of range — resolves to a new lane at the row,
+    /// clamped so nothing but audio ever enters the audio floor.
+    func resolveDrag(content: DragContent, desiredStart: TimeInterval, hoverRow: Int) -> DragResolution? {
+        guard let profile = dragProfile(of: content) else { return nil }
+        let desired = max(0, desiredStart)
+
+        // Main-track magnet: a video clip over the main row inserts between
+        // clips (midpoint rule); the commit opens the hole.
+        if profile.kind == .video, lanes.indices.contains(hoverRow), lanes[hoverRow].isMain {
+            var excludedIndex: Int?
+            if case .main(let id) = content {
+                excludedIndex = clips.firstIndex(where: { $0.id == id })
+            }
+            let insertion = mainInsertion(desired: desired, excludingIndex: excludedIndex)
+            return DragResolution(
+                landing: .mainInsert(index: insertion.index, caretTime: insertion.caretTime),
+                kind: profile.kind,
+                length: profile.length,
+                snapTime: nil,
+                isNoop: insertion.noop
+            )
+        }
+
+        let exclusion: TimelineSelection? = {
+            if case .lane(let selection) = content { return selection }
+            return nil
+        }()
+        let candidates = laneSnapCandidates(excluding: exclusion)
+        let snap = snappedDragStart(desired: desired, length: profile.length, candidates: candidates)
+
+        if lanes.indices.contains(hoverRow) {
+            let lane = lanes[hoverRow]
+            if lane.kind == profile.kind, !lane.isMain {
+                let sameSpot = lane.id == profile.laneID && abs(snap.start - profile.start) < 0.001
+                if spanIsFree(on: lane.id, start: snap.start, length: profile.length, excluding: profile.clipID) {
+                    return DragResolution(
+                        landing: .land(laneID: lane.id, start: snap.start),
+                        kind: profile.kind,
+                        length: profile.length,
+                        snapTime: snap.snapTime,
+                        isNoop: sameSpot
+                    )
+                }
+                // The snap pulled us into a conflict the raw position doesn't
+                // have — prefer landing free without the magnet.
+                if snap.snapTime != nil, snap.start != desired,
+                   spanIsFree(on: lane.id, start: desired, length: profile.length, excluding: profile.clipID) {
+                    return DragResolution(
+                        landing: .land(laneID: lane.id, start: desired),
+                        kind: profile.kind,
+                        length: profile.length,
+                        snapTime: nil,
+                        isNoop: lane.id == profile.laneID && abs(desired - profile.start) < 0.001
+                    )
+                }
+            }
+        }
+
+        // Foreign kind, conflicting span, or outside the stack: a new lane
+        // inserted at the hovered row, clamped around the audio floor.
+        let row: Int
+        if profile.kind == .audio {
+            row = min(max(hoverRow, audioFloorRow), lanes.count)
+        } else {
+            row = min(max(hoverRow, 0), audioFloorRow)
+        }
+        return DragResolution(
+            landing: .newLane(row: row, start: snap.start),
+            kind: profile.kind,
+            length: profile.length,
+            snapTime: snap.snapTime
+        )
+    }
+
+    /// Applies a drag resolution on release: one undo step, no-ops skipped.
+    func commitDrag(content: DragContent, resolution: DragResolution) {
+        guard !resolution.isNoop, dragProfile(of: content) != nil else { return }
+        pushUndoSnapshot()
+
+        switch resolution.landing {
+        case .land(let laneID, let start):
+            place(content, onLane: laneID, at: start)
+        case .newLane(let row, let start):
+            let lane = MockLane(kind: resolution.kind)
+            lanes.insert(lane, at: min(max(row, 0), lanes.count))
+            enforceAudioFloor()
+            place(content, onLane: lane.id, at: start)
+        case .mainInsert(let index, _):
+            insertIntoMain(content, at: index)
+        }
+
+        pruneEmptyLanes()
+        clampPlayhead()
+    }
+
+    /// Moves the dragged content onto an existing lane at `start`. Main-track
+    /// clips leave the sequential track and become free video-lane clips,
+    /// keeping their look and audio (no identity change).
+    private func place(_ content: DragContent, onLane laneID: UUID, at start: TimeInterval) {
+        switch content {
+        case .main(let id):
+            guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
+            let clip = clips.remove(at: index)
+            var lifted = MockOverlayClip(kind: .pip, laneID: laneID, start: max(0, start), length: clip.length)
+            lifted.art = clip.art
+            lifted.sourceDuration = clip.sourceDuration
+            lifted.pipHasAudio = clip.hasAudio
+            lifted.volume = clip.volume
+            // Full-frame: leaving the main track must not shrink the clip.
+            lifted.scale = 1
+            lifted.posX = 0.5
+            lifted.posY = 0.5
+            overlayClips.append(lifted)
+            selection = .overlay(lifted.id)
+        case .lane(.overlay(let id)):
+            guard let index = overlayClips.firstIndex(where: { $0.id == id }) else { return }
+            overlayClips[index].laneID = laneID
+            overlayClips[index].start = max(0, start)
+        case .lane(.effect(let id)):
+            guard let index = effectClips.firstIndex(where: { $0.id == id }) else { return }
+            effectClips[index].laneID = laneID
+            effectClips[index].start = max(0, start)
+        case .lane(.audio(let id)):
+            guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
+            audioClips[index].laneID = laneID
+            audioClips[index].start = max(0, start)
+        case .lane(.main):
+            break
+        }
+    }
+
+    /// Inserts the dragged content into the main track at `index` (already in
+    /// post-removal space for reorders).
+    private func insertIntoMain(_ content: DragContent, at index: Int) {
+        switch content {
+        case .main(let id):
+            guard let from = clips.firstIndex(where: { $0.id == id }) else { return }
+            let clip = clips.remove(at: from)
+            clips.insert(clip, at: min(max(index, 0), clips.count))
+        case .lane(.overlay(let id)):
+            guard let overlayIndex = overlayClips.firstIndex(where: { $0.id == id }),
+                  overlayClips[overlayIndex].kind == .pip,
+                  let art = overlayClips[overlayIndex].art
+            else { return }
+            let overlay = overlayClips.remove(at: overlayIndex)
+            let clip = MockClip(
+                art: art,
+                sourceDuration: overlay.sourceDuration ?? overlay.length,
+                length: overlay.length,
+                hasAudio: overlay.pipHasAudio
+            )
+            clips.insert(clip, at: min(max(index, 0), clips.count))
+            selection = .main(clip.id)
+        case .lane:
+            break
+        }
+    }
+
+    /// An insertion slot on the gapless main track for content whose left
+    /// edge sits at `desired`: before the first clip whose midpoint lies
+    /// right of it (crossing a clip's middle flips the caret to its other
+    /// side), else after the last clip.
+    struct MainInsertion {
+        /// Array insertion index, in post-removal space for reorders.
+        var index: Int
+        /// Caret position in the track's current visual space.
+        var caretTime: TimeInterval
+        /// The slot is exactly where the excluded clip already sits.
+        var noop: Bool
+    }
+
+    func mainInsertion(desired: TimeInterval, excludingIndex: Int? = nil) -> MainInsertion {
+        var spans: [(start: TimeInterval, end: TimeInterval)] = []
+        var excludedStart: TimeInterval?
+        var boundary: TimeInterval = 0
+        for (position, clip) in clips.enumerated() {
+            let start = boundary
+            boundary += clip.length
+            if position == excludingIndex {
+                excludedStart = start
+            } else {
+                spans.append((start, boundary))
+            }
+        }
+
+        let index = spans.firstIndex { desired < ($0.start + $0.end) / 2 } ?? spans.count
+        let noop = excludingIndex.map { $0 == index } ?? false
+
+        let caretTime: TimeInterval
+        if noop, let excludedStart {
+            caretTime = excludedStart
+        } else if index < spans.count {
+            caretTime = spans[index].start
+        } else {
+            caretTime = spans.last?.end ?? 0
+        }
+        return MainInsertion(index: index, caretTime: caretTime, noop: noop)
+    }
+
+    /// Both edges of the dragged span magnet to the nearest candidate; the
+    /// closest edge wins. A snap clamped away (below t=0) drops its guide.
+    private func snappedDragStart(
+        desired: TimeInterval,
+        length: TimeInterval,
+        candidates: [TimeInterval]
+    ) -> (start: TimeInterval, snapTime: TimeInterval?) {
+        guard magnetEnabled else { return (desired, nil) }
+        let threshold = 8 * secondsPerPoint
+        let end = desired + length
+        var best: (distance: TimeInterval, start: TimeInterval, line: TimeInterval)?
+
+        for candidate in candidates {
+            let leading = abs(candidate - desired)
+            if leading <= threshold, best.map({ leading < $0.distance }) ?? true {
+                best = (leading, candidate, candidate)
+            }
+            let trailing = abs(candidate - end)
+            if trailing <= threshold, best.map({ trailing < $0.distance }) ?? true {
+                best = (trailing, candidate - length, candidate)
+            }
+        }
+
+        guard let best else { return (desired, nil) }
+        let start = max(0, best.start)
+        return (start, start == best.start ? best.line : nil)
+    }
+
     // MARK: Snapshots
 
     private var snapshot: TimelineSnapshot {
         get {
             TimelineSnapshot(
                 clips: clips,
+                lanes: lanes,
                 overlays: overlayClips,
                 effects: effectClips,
                 audios: audioClips,
@@ -144,6 +531,7 @@ final class EditorState {
         }
         set {
             clips = newValue.clips
+            lanes = newValue.lanes
             overlayClips = newValue.overlays
             effectClips = newValue.effects
             audioClips = newValue.audios
@@ -321,7 +709,8 @@ final class EditorState {
     @discardableResult
     func addTextClip(text: String = "") -> UUID {
         pushUndoSnapshot()
-        var clip = MockOverlayClip(kind: .text, start: insertionTime, length: 3)
+        let start = insertionTime
+        var clip = MockOverlayClip(kind: .text, laneID: hostLane(for: .text, start: start, length: 3), start: start, length: 3)
         clip.text = text
         clip.posY = 0.62
         overlayClips.append(clip)
@@ -332,7 +721,8 @@ final class EditorState {
     @discardableResult
     func addSticker(symbol: String) -> UUID {
         pushUndoSnapshot()
-        var clip = MockOverlayClip(kind: .sticker, start: insertionTime, length: 3)
+        let start = insertionTime
+        var clip = MockOverlayClip(kind: .sticker, laneID: hostLane(for: .sticker, start: start, length: 3), start: start, length: 3)
         clip.symbol = symbol
         clip.posY = 0.35
         overlayClips.append(clip)
@@ -344,7 +734,8 @@ final class EditorState {
     func addPip(from item: MockMediaItem) -> UUID {
         pushUndoSnapshot()
         let length = item.videoDuration ?? MockClip.photoDefaultDuration
-        var clip = MockOverlayClip(kind: .pip, start: insertionTime, length: length)
+        let start = insertionTime
+        var clip = MockOverlayClip(kind: .pip, laneID: hostLane(for: .video, start: start, length: length), start: start, length: length)
         clip.art = item.art
         clip.sourceDuration = item.videoDuration ?? MockClip.photoMaxDuration
         clip.pipHasAudio = item.videoDuration != nil
@@ -358,7 +749,8 @@ final class EditorState {
     @discardableResult
     func addEffectClip(name: String, kind: MockEffectClip.Kind) -> UUID {
         pushUndoSnapshot()
-        let clip = MockEffectClip(kind: kind, name: name, start: insertionTime, length: 3)
+        let start = insertionTime
+        let clip = MockEffectClip(kind: kind, laneID: hostLane(for: .effect, start: start, length: 3), name: name, start: start, length: 3)
         effectClips.append(clip)
         selection = .effect(clip.id)
         return clip.id
@@ -367,10 +759,12 @@ final class EditorState {
     @discardableResult
     func addAudio(kind: MockAudioClip.Kind, title: String, duration: TimeInterval) -> UUID {
         pushUndoSnapshot()
+        let start = insertionTime
         let clip = MockAudioClip(
             kind: kind,
+            laneID: hostLane(for: .audio, start: start, length: duration),
             title: title,
-            start: insertionTime,
+            start: start,
             length: duration,
             sourceDuration: duration
         )
@@ -397,70 +791,34 @@ final class EditorState {
         clips.insert(clip, at: toIndex)
     }
 
-    // MARK: Cross-lane conversions (drag a clip onto another lane)
+    // MARK: Cross-lane moves (drag a clip onto another lane)
 
-    /// Pulls a clip off the main track and re-creates it as a PiP overlay
-    /// starting at `start` (snap-aware, clamped to the timeline).
-    func convertMainClipToOverlay(_ id: UUID, at start: TimeInterval) {
-        guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
+    /// Pulls a clip off the main track onto a free video lane at `start`
+    /// (snap-aware). It stays a full-frame video clip — same art, audio, and
+    /// scale — just free-floating now.
+    func moveMainClipToLane(_ id: UUID, at start: TimeInterval) {
+        guard clips.contains(where: { $0.id == id }) else { return }
         pushUndoSnapshot()
 
-        let clip = clips.remove(at: index)
         var dropStart = max(0, start)
         if let snapped = snapTime(near: dropStart, candidates: laneSnapCandidates(excluding: nil)) {
             dropStart = max(0, snapped)
         }
-        var overlay = MockOverlayClip(
-            kind: .pip,
-            start: dropStart,
-            length: clip.length
-        )
-        overlay.art = clip.art
-        overlay.sourceDuration = clip.sourceDuration
-        overlay.pipHasAudio = clip.hasAudio
-        overlay.volume = clip.volume
-        overlay.scale = 0.5
-        overlay.posY = 0.32
-        overlayClips.append(overlay)
-        selection = .overlay(overlay.id)
+        guard let profile = dragProfile(of: .main(id)) else { return }
+        let laneID = hostLane(for: .video, start: dropStart, length: profile.length)
+        place(.main(id), onLane: laneID, at: dropStart)
+        pruneEmptyLanes()
         clampPlayhead()
     }
 
-    /// Drops a PiP overlay into the main track at the boundary nearest
-    /// `time`; other overlay kinds have no main-track equivalent.
-    func convertOverlayToMainClip(_ id: UUID, at time: TimeInterval) {
-        guard let index = overlayClips.firstIndex(where: { $0.id == id }),
-              overlayClips[index].kind == .pip,
-              let art = overlayClips[index].art
-        else { return }
+    /// Drops a video-lane clip into the main track at the midpoint-rule
+    /// insertion slot nearest `time`.
+    func moveLaneClipToMain(_ id: UUID, at time: TimeInterval) {
+        guard let clip = overlayClips.first(where: { $0.id == id }), clip.kind == .pip else { return }
         pushUndoSnapshot()
-
-        let overlay = overlayClips.remove(at: index)
-        let clip = MockClip(
-            art: art,
-            sourceDuration: overlay.sourceDuration ?? overlay.length,
-            length: overlay.length,
-            hasAudio: overlay.pipHasAudio
-        )
-        clips.insert(clip, at: mainInsertionIndex(nearest: time))
-        selection = .main(clip.id)
+        insertIntoMain(.lane(.overlay(id)), at: mainInsertion(desired: time).index)
+        pruneEmptyLanes()
         clampPlayhead()
-    }
-
-    /// Index of the main-track boundary closest to `time`.
-    private func mainInsertionIndex(nearest time: TimeInterval) -> Int {
-        var boundary: TimeInterval = 0
-        var bestIndex = 0
-        var bestDistance = abs(time)
-        for (index, clip) in clips.enumerated() {
-            boundary += clip.length
-            let distance = abs(time - boundary)
-            if distance < bestDistance {
-                bestDistance = distance
-                bestIndex = index + 1
-            }
-        }
-        return bestIndex
     }
 
     /// Splits whatever is selected at the playhead; with no selection, splits
@@ -557,6 +915,7 @@ final class EditorState {
             return
         }
         selection = nil
+        pruneEmptyLanes()
         clampPlayhead()
     }
 
@@ -576,6 +935,7 @@ final class EditorState {
             var copy = overlayClips[index]
             copy.id = UUID()
             copy.start += copy.length
+            copy.laneID = hostLane(for: copy.laneKind, start: copy.start, length: copy.length, preferred: copy.laneID)
             overlayClips.append(copy)
             selection = .overlay(copy.id)
         case .effect(let id):
@@ -584,6 +944,7 @@ final class EditorState {
             var copy = effectClips[index]
             copy.id = UUID()
             copy.start += copy.length
+            copy.laneID = hostLane(for: .effect, start: copy.start, length: copy.length, preferred: copy.laneID)
             effectClips.append(copy)
             selection = .effect(copy.id)
         case .audio(let id):
@@ -592,6 +953,7 @@ final class EditorState {
             var copy = audioClips[index]
             copy.id = UUID()
             copy.start += copy.length
+            copy.laneID = hostLane(for: .audio, start: copy.start, length: copy.length, preferred: copy.laneID)
             copy.waveSeed = Int.random(in: 0..<10_000)
             audioClips.append(copy)
             selection = .audio(copy.id)
@@ -716,10 +1078,12 @@ final class EditorState {
 
         pushUndoSnapshot()
         let clip = clips[index]
+        let start = startTime(of: id)
         let extracted = MockAudioClip(
             kind: .extracted,
+            laneID: hostLane(for: .audio, start: start, length: clip.length),
             title: "Extracted audio",
-            start: startTime(of: id),
+            start: start,
             length: clip.length,
             sourceDuration: clip.length
         )
@@ -853,9 +1217,25 @@ final class EditorState {
         clips[index] = clip
     }
 
+    /// The lane and clip id behind a lane-clip selection (nil for main).
+    private func laneAddress(of target: TimelineSelection) -> (laneID: UUID, clipID: UUID)? {
+        switch target {
+        case .overlay(let id):
+            return overlayClips.first(where: { $0.id == id }).map { ($0.laneID, id) }
+        case .effect(let id):
+            return effectClips.first(where: { $0.id == id }).map { ($0.laneID, id) }
+        case .audio(let id):
+            return audioClips.first(where: { $0.id == id }).map { ($0.laneID, id) }
+        case .main:
+            return nil
+        }
+    }
+
     /// Shared trim math for free-floating lane clips: leading trims move the
-    /// start (end pinned), trailing trims change the length. Both edges
-    /// snap to timeline landmarks when the magnet is on.
+    /// start (end pinned), trailing trims change the length. Edges clamp to
+    /// the lane's neighbor clips so a trim can never create an overlap, and
+    /// snap to timeline landmarks when the magnet is on — a snap the clamp
+    /// rejects is dropped rather than shown lying.
     private func trimmedRange(
         target: TimelineSelection,
         edge: TrimEdge,
@@ -865,10 +1245,25 @@ final class EditorState {
         maxLength: TimeInterval?
     ) -> (start: TimeInterval, length: TimeInterval) {
         let candidates = laneSnapCandidates(excluding: target)
+        let end = start + length
+
+        // Nearest same-lane neighbors around the anchored range.
+        var previousEnd: TimeInterval = 0
+        var nextStart: TimeInterval = .greatestFiniteMagnitude
+        if let address = laneAddress(of: target) {
+            for span in spans(on: address.laneID, excluding: address.clipID) {
+                if span.end <= start + 0.001 {
+                    previousEnd = max(previousEnd, span.end)
+                }
+                if span.start >= end - 0.001 {
+                    nextStart = min(nextStart, span.start)
+                }
+            }
+        }
+
         switch edge {
         case .leading:
-            let end = start + length
-            let minStart = max(0, maxLength.map { end - $0 } ?? 0)
+            let minStart = max(previousEnd, max(0, maxLength.map { end - $0 } ?? 0))
             let maxStart = end - MockClip.minDuration
             var newStart = min(max(start + delta, minStart), maxStart)
             if let snapped = snapTime(near: newStart, candidates: candidates),
@@ -880,13 +1275,11 @@ final class EditorState {
             }
             return (newStart, end - newStart)
         case .trailing:
-            var newLength = max(length + delta, MockClip.minDuration)
-            if let maxLength {
-                newLength = min(newLength, maxLength)
-            }
+            let lengthCap = min(maxLength ?? .greatestFiniteMagnitude, nextStart - start)
+            var newLength = min(max(length + delta, MockClip.minDuration), lengthCap)
             if let snapped = snapTime(near: start + newLength, candidates: candidates),
                snapped - start >= MockClip.minDuration,
-               snapped - start <= maxLength ?? .greatestFiniteMagnitude {
+               snapped - start <= lengthCap {
                 newLength = snapped - start
                 activeSnapTime = snapped
             } else {
