@@ -1158,6 +1158,8 @@ name = "cutlass-commands"
 version = "0.5.3-alpha.0"
 dependencies = [
  "cutlass-models",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 
@@ -1236,6 +1238,7 @@ dependencies = [
  "cutlass-encoder",
  "cutlass-models",
  "cutlass-render",
+ "serde",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

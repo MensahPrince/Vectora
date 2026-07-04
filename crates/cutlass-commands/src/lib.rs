@@ -6,7 +6,13 @@
 mod command;
 
 pub use command::{Command, EditCommand, EditOutcome, ProjectCommand, TemplatePick};
-pub use cutlass_models::{ClipId, Generator, MediaId, RationalTime, TimeRange, TrackId};
+// Every model type a command field carries, so callers (shell FFI, the AI
+// agent, tests) can build any command from this crate alone.
+pub use cutlass_models::{
+    CanvasAspect, ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, MarkerColor,
+    MarkerId, MediaId, Param, ParamValue, Rational, RationalTime, Replaceable, TemplateMeta,
+    TimeRange, TrackId, TrackKind,
+};
 
 use tracing::info;
 

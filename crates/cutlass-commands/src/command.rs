@@ -2,6 +2,15 @@
 //!
 //! UI gestures and the AI agent both emit these values; the engine applies them
 //! against project/timeline state with undo/redo.
+//!
+//! ## Wire format
+//!
+//! Every command (de)serializes as a single-level JSON object discriminated by
+//! a `"type"` field holding the variant name — `{"type": "SplitClip", "clip":
+//! 5, "at": …}`. [`Command`] itself is untagged: project and edit variant
+//! names never collide, so the same flat object shape serves both (the shells'
+//! FFI protocol and the future AI-agent stream speak this format). The
+//! `tests/wire_format.rs` goldens lock it.
 
 use std::path::PathBuf;
 
@@ -10,20 +19,23 @@ use cutlass_models::{
     MarkerId, MediaId, Param, ParamValue, Rational, RationalTime, Replaceable, TemplateMeta,
     TimeRange, TrackId, TrackKind,
 };
+use serde::{Deserialize, Serialize};
 
 /// One media choice for [`ProjectCommand::ApplyTemplate`], in slot order: a
 /// file to probe (like `Import`) and an optional in-point into it. `None`
 /// starts from the beginning, matching CapCut ("takes from the start of the
 /// clip"); the slot's locked timeline duration decides how much source is
 /// drawn.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TemplatePick {
     pub path: PathBuf,
+    #[serde(default)]
     pub source_in: Option<RationalTime>,
 }
 
 /// A project-level action (media pool, not timeline placement).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum ProjectCommand {
     /// Register a file in the media pool.
     Import { path: PathBuf },
@@ -66,7 +78,8 @@ pub enum ProjectCommand {
 }
 
 /// A single structured edit against the timeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum EditCommand {
     /// Add a track to the timeline stack.
     AddTrack {
@@ -344,14 +357,23 @@ pub enum EditCommand {
 }
 
 /// Top-level command surface: media registration or a timeline edit.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Untagged on the wire: the flat `{"type": …}` object of the inner enums is
+/// the whole format (variant names are disjoint across the two sets), so
+/// callers never spell the project/edit split in JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum Command {
     Project(ProjectCommand),
     Edit(EditCommand),
 }
 
 /// What an applied edit produced, for callers to act on (e.g. select the new clip).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Adjacently tagged on the wire (`{"type": "Created", "id": 7}`): every
+/// payload is a single entity id, and the unit variant carries none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id")]
 pub enum EditOutcome {
     Created(ClipId),
     CreatedTrack(TrackId),
