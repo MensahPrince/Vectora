@@ -98,7 +98,7 @@ struct PreviewCanvas: View {
 
     private var renderStamp: RenderStamp {
         RenderStamp(
-            seconds: state.playhead,
+            seconds: quantizedPlayhead,
             revision: state.appliedRevision,
             size: frameSize,
             scale: displayScale,
@@ -106,10 +106,18 @@ struct PreviewCanvas: View {
         )
     }
 
+    /// Playhead snapped to the timeline frame grid: wall-clock playback ticks
+    /// (~16 ms) land inside the same 30fps frame about half the time, and the
+    /// engine would render an identical image for each. Quantizing lets those
+    /// requests dedupe in `PreviewFeed`.
+    private var quantizedPlayhead: TimeInterval {
+        PreviewFeed.quantize(seconds: state.playhead, fps: state.timelineFPS)
+    }
+
     private func requestFrame() {
         guard !state.isEmpty else { return }
         state.preview.request(
-            seconds: state.playhead,
+            seconds: quantizedPlayhead,
             revision: state.appliedRevision,
             viewSize: frameSize,
             displayScale: displayScale

@@ -726,6 +726,49 @@ struct EditorStateEngineTests {
         #expect(log.seconds.count == 1, "an unchanged (time, revision, size) never re-renders")
     }
 
+    // MARK: Frame-grid quantization
+
+    @Test func quantizeSnapsSecondsToTheFrameGrid() {
+        // Wall-clock ticks inside the same 30fps frame collapse to one value…
+        let a = PreviewFeed.quantize(seconds: 0.500, fps: 30)
+        let b = PreviewFeed.quantize(seconds: 0.512, fps: 30)
+        #expect(a == b)
+        // …and the next frame is a distinct grid point.
+        let c = PreviewFeed.quantize(seconds: 0.517, fps: 30)
+        #expect(c != a)
+        #expect(near(c, 16.0 / 30.0, tolerance: 1e-9))
+
+        // Degenerate rates pass through; negative times clamp like the engine.
+        #expect(PreviewFeed.quantize(seconds: 1.23, fps: 0) == 1.23)
+        #expect(PreviewFeed.quantize(seconds: -0.4, fps: 30) == 0)
+    }
+
+    @Test func quantizedRequestsDedupeSameFrameTicks() async throws {
+        let log = RenderLog()
+        let feed = PreviewFeed { seconds, _, _ in
+            log.seconds.append(seconds)
+            return Self.tinyImage()
+        }
+
+        // Simulated 16 ms playback ticks quantized to the 30fps grid, the way
+        // PreviewCanvas issues them: two wall ticks per frame, so half the
+        // requests match the delivered frame and are skipped.
+        for tick in 0..<8 {
+            let raw = Double(tick) * 0.016
+            feed.request(
+                seconds: PreviewFeed.quantize(seconds: raw, fps: 30), revision: 1,
+                viewSize: CGSize(width: 200, height: 400), displayScale: 2)
+            await feed.settle()
+        }
+
+        #expect(log.seconds == [0, 1.0 / 30.0, 2.0 / 30.0, 3.0 / 30.0])
+    }
+
+    @Test func timelineFPSCarriesFromTheEngine() async throws {
+        let state = await makeProject([shortVideo])
+        #expect(state.timelineFPS == 30, "sessions open at 30fps; ui_state carries it through")
+    }
+
     private static func tinyImage() -> CGImage? {
         let context = CGContext(
             data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,

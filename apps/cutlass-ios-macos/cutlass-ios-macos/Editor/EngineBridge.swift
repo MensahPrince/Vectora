@@ -131,6 +131,8 @@ nonisolated struct EngineProjection {
     var canvasBackground: Color?
     /// Resolved composite size in pixels (the engine's render target).
     var canvasSize: CGSize?
+    /// Timeline frame rate — the grid `render_fit` snaps to.
+    var fps: Double = 30
     var canUndo = false
     var canRedo = false
     var revision: UInt64 = 0
@@ -150,6 +152,9 @@ nonisolated enum EngineBridge {
         result.canUndo = state.canUndo
         result.canRedo = state.canRedo
         result.revision = state.revision
+        if state.fps.doubleValue > 0 {
+            result.fps = state.fps.doubleValue
+        }
         result.aspect = AspectRatio.from(wireName: state.canvas.aspect)
         result.canvasBackground = color(state.canvas.background)
         result.canvasSize = CGSize(

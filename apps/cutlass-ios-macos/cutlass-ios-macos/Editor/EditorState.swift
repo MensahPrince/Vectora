@@ -77,6 +77,7 @@ final class EditorState {
     var isPlaying = false {
         didSet {
             guard oldValue != isPlaying else { return }
+            preview.isPlaying = isPlaying
             if isPlaying {
                 startPlayback()
             } else {
@@ -107,6 +108,9 @@ final class EditorState {
     /// The engine's resolved composite size in pixels (nil before the first
     /// refresh). Gives `.original` its real footage aspect.
     private(set) var canvasSize: CGSize?
+    /// Timeline frame rate from the engine (the grid `render_fit` snaps to);
+    /// preview requests quantize to it so same-frame ticks dedupe.
+    private(set) var timelineFPS: Double = 30
 
     /// Engine frames for the preview canvas (drop-newest-wins; see
     /// `PreviewFeed`). Lazy so the callback can capture `self` weakly.
@@ -325,6 +329,7 @@ final class EditorState {
         canUndo = projection.canUndo
         canRedo = projection.canRedo
         canvasSize = projection.canvasSize
+        timelineFPS = projection.fps
         if state.dirty {
             scheduleAutoSave()
         }
@@ -1034,6 +1039,7 @@ final class EditorState {
         clipLaneKinds = [:]
         appliedRevision = 0
         canvasSize = nil
+        timelineFPS = 30
         preview.reset()
         deferredRefresh = nil
         panelBaseline = nil

@@ -36,6 +36,12 @@ final class PreviewFeed {
     @ObservationIgnored private var delivered: Request?
     @ObservationIgnored private var pump: Task<Void, Never>?
 
+    /// Whether the transport is playing. Playback budgets a render per
+    /// timeline frame (~33 ms at 30fps), so the quality ladder drops a tier
+    /// on sustained overruns that scrubbing would tolerate — cadence beats
+    /// sharpness while content is in motion.
+    @ObservationIgnored var isPlaying = false
+
     /// Fraction of the view's pixel size each tier requests, sharpest first.
     private static let qualityLadder: [Double] = [1.0, 0.7, 0.5]
     /// Hard cap on the long side: preview readback is CPU-bound and anything
@@ -43,6 +49,8 @@ final class PreviewFeed {
     private static let maxLongSide = 1440.0
     /// EMA above this drops a tier; below `raiseBelowMillis` climbs back.
     private static let dropAboveMillis = 45.0
+    /// Tighter drop threshold while playing: just inside the 30fps budget.
+    private static let playbackDropAboveMillis = 30.0
     private static let raiseBelowMillis = 18.0
     @ObservationIgnored private var qualityTier = 0
     @ObservationIgnored private var lastTierChange = ContinuousClock.now
@@ -53,6 +61,15 @@ final class PreviewFeed {
 
     init(render: @escaping @MainActor (Double, Int, Int) async -> CGImage?) {
         self.render = render
+    }
+
+    /// Snap `seconds` to the timeline frame grid. The engine rounds to the
+    /// nearest frame anyway (`frame_tick`), so two requests inside the same
+    /// frame are the same render — quantizing makes them compare equal and
+    /// dedupe instead of re-rendering an identical frame every playhead tick.
+    nonisolated static func quantize(seconds: Double, fps: Double) -> Double {
+        guard fps > 0 else { return seconds }
+        return (max(seconds, 0) * fps).rounded() / fps
     }
 
     /// Ask for the frame at `seconds` sized for `viewSize`. Cheap to call on
@@ -137,7 +154,8 @@ final class PreviewFeed {
 
         let now = ContinuousClock.now
         guard lastTierChange.duration(to: now) > .milliseconds(800) else { return }
-        if averageRenderMillis > Self.dropAboveMillis, qualityTier < Self.qualityLadder.count - 1 {
+        let dropAbove = isPlaying ? Self.playbackDropAboveMillis : Self.dropAboveMillis
+        if averageRenderMillis > dropAbove, qualityTier < Self.qualityLadder.count - 1 {
             qualityTier += 1
             lastTierChange = now
         } else if averageRenderMillis < Self.raiseBelowMillis, qualityTier > 0 {
