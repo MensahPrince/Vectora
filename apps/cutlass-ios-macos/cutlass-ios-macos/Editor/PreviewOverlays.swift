@@ -5,6 +5,11 @@ import SwiftUI
 /// move, corner buttons to delete/duplicate, and a grip that scale-rotates.
 struct PreviewOverlayLayer: View {
     var state: EditorState
+    /// Whether an engine frame is on screen underneath. The engine already
+    /// composites PiP video/stills into it, so their SwiftUI bodies become
+    /// transparent hit areas; text and stickers (not composited yet) keep
+    /// drawing here.
+    var engineRendered = false
     var onEditText: (UUID) -> Void = { _ in }
 
     var body: some View {
@@ -14,6 +19,7 @@ struct PreviewOverlayLayer: View {
                     state: state,
                     clip: overlay,
                     frameSize: geo.size,
+                    engineRendered: engineRendered,
                     onEditText: onEditText
                 )
             }
@@ -28,6 +34,7 @@ private struct ManipulableOverlay: View {
     var state: EditorState
     var clip: MockOverlayClip
     var frameSize: CGSize
+    var engineRendered = false
     var onEditText: (UUID) -> Void
 
     /// (posX, posY) captured when a move drag starts.
@@ -40,8 +47,9 @@ private struct ManipulableOverlay: View {
     }
 
     var body: some View {
-        OverlayContentView(clip: clip, frameSize: frameSize)
+        OverlayContentView(clip: clip, frameSize: frameSize, engineRendered: engineRendered)
             .padding(9)
+            .contentShape(Rectangle())
             .overlay {
                 if isSelected {
                     manipulationChrome
@@ -187,6 +195,9 @@ private struct ManipulableOverlay: View {
 struct OverlayContentView: View {
     var clip: MockOverlayClip
     var frameSize: CGSize
+    /// With an engine frame underneath, PiP pixels come from the engine's
+    /// composite; the SwiftUI body is just the gesture hit area then.
+    var engineRendered = false
 
     var body: some View {
         switch clip.kind {
@@ -198,7 +209,10 @@ struct OverlayContentView: View {
                 .foregroundStyle(.white)
                 .shadow(color: .black.opacity(0.35), radius: 4, y: 2)
         case .pip:
-            if let art = clip.art {
+            if engineRendered {
+                Color.clear
+                    .frame(width: frameSize.width * 0.52, height: frameSize.width * 0.39)
+            } else if let art = clip.art {
                 MockArtView(art: art, symbolSize: 22)
                     .frame(width: frameSize.width * 0.52, height: frameSize.width * 0.39)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))

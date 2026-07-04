@@ -100,6 +100,20 @@ final class EditorState {
     private(set) var canUndo = false
     private(set) var canRedo = false
 
+    /// Revision of the engine state the arrays currently mirror. Observable
+    /// so the preview re-renders after every landed edit.
+    private(set) var appliedRevision: UInt64 = 0
+    /// The engine's resolved composite size in pixels (nil before the first
+    /// refresh). Gives `.original` its real footage aspect.
+    private(set) var canvasSize: CGSize?
+
+    /// Engine frames for the preview canvas (drop-newest-wins; see
+    /// `PreviewFeed`). Lazy so the callback can capture `self` weakly.
+    @ObservationIgnored private(set) lazy var preview = PreviewFeed {
+        [weak self] seconds, maxWidth, maxHeight in
+        await self?.renderPreviewFrame(atSeconds: seconds, maxWidth: maxWidth, maxHeight: maxHeight)
+    }
+
     private var playbackTask: Task<Void, Never>?
 
     // MARK: Engine session plumbing
@@ -117,8 +131,6 @@ final class EditorState {
     @ObservationIgnored private var idMap = EngineIDMap()
     /// Engine clip id -> hosting lane kind (from the last refresh).
     @ObservationIgnored private var clipLaneKinds: [UInt64: MockLane.Kind] = [:]
-    /// Revision of the last applied refresh; older snapshots are dropped.
-    @ObservationIgnored private var appliedRevision: UInt64 = 0
     /// Refresh deferred because a live gesture owns the arrays right now.
     @ObservationIgnored private var deferredRefresh: UiState?
     /// On-disk media home for the current project (picker copies, freeze
@@ -282,6 +294,7 @@ final class EditorState {
         clipLaneKinds = projection.clipLane
         canUndo = projection.canUndo
         canRedo = projection.canRedo
+        canvasSize = projection.canvasSize
         if panelBaseline == nil {
             aspect = projection.aspect
             if background.kind == .color, let color = projection.canvasBackground {
@@ -895,6 +908,8 @@ final class EditorState {
         idMap = EngineIDMap()
         clipLaneKinds = [:]
         appliedRevision = 0
+        canvasSize = nil
+        preview.reset()
         deferredRefresh = nil
         panelBaseline = nil
         panelEngineOps = 0
@@ -912,6 +927,20 @@ final class EditorState {
         canRedo = false
         playhead = 0
         selection = nil
+    }
+
+    // MARK: Preview rendering
+
+    /// One engine frame sized to fit the given box. Goes straight to the
+    /// session actor — never through the op chain — so scrub renders can't
+    /// pile up behind edits (they still serialize with them on the actor).
+    /// nil while the session is still coming up or on a render failure.
+    func renderPreviewFrame(atSeconds seconds: Double, maxWidth: Int, maxHeight: Int) async
+        -> CGImage?
+    {
+        guard let session else { return nil }
+        return await session.renderFrame(
+            atSeconds: seconds, maxWidth: maxWidth, maxHeight: maxHeight)
     }
 
     // MARK: Transport

@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Testing
 
@@ -10,6 +11,7 @@ import Testing
 /// Media comes from the bundled fixtures (`demo1.mp4` 4s, `demo2.mp4` 6s,
 /// `photo.png` still, `tone.m4a` 8s) — the same files the picker's Samples
 /// tab offers.
+@MainActor
 struct EditorStateEngineTests {
     /// 4-second video (`demo1.mp4`) and 6-second video (`demo2.mp4`).
     private var shortVideo: URL { FixtureLibrary.shortVideo! }
@@ -473,5 +475,91 @@ struct EditorStateEngineTests {
         let overlay = try #require(state.overlayClips.first { $0.id == id })
         #expect(near(overlay.posX, 0.7))
         #expect(near(overlay.posY, 0.4))
+    }
+
+    // MARK: Preview rendering (Phase F)
+
+    @Test func previewRendersEngineFramesFitToTheBox() async throws {
+        let state = await makeProject([shortVideo])
+
+        let frame = try #require(
+            await state.renderPreviewFrame(atSeconds: 0.5, maxWidth: 320, maxHeight: 640))
+        #expect(frame.width <= 320 && frame.height <= 640)
+        #expect(frame.width > 0 && frame.height > 0)
+
+        // The refresh reported the resolved canvas; the fit frame keeps its
+        // aspect (demo1.mp4 is 640x360 → auto canvas is 16:9).
+        let canvas = try #require(state.canvasSize)
+        let canvasAspect = canvas.width / canvas.height
+        let frameAspect = Double(frame.width) / Double(frame.height)
+        #expect(abs(canvasAspect - frameAspect) < 0.05)
+        #expect(state.appliedRevision > 0, "refreshes stamp the observable revision")
+
+        // Perf checkpoint (plan Phase F): a 30-position scrub burst at
+        // preview size, sequential decode. Printed, not asserted — the hard
+        // bound would be flaky across machines; regressions show up in the
+        // logged number and the feed's quality ladder.
+        let start = ContinuousClock.now
+        for tick in 1...30 {
+            _ = await state.renderPreviewFrame(
+                atSeconds: Double(tick) / 10, maxWidth: 640, maxHeight: 360)
+        }
+        let elapsed = start.duration(to: .now)
+        let perFrame = Double(elapsed.components.seconds) * 1000 / 30
+            + Double(elapsed.components.attoseconds) / 1e15 / 30
+        print("cutlass-perf: render_fit(640x360) averaged \(perFrame) ms/frame over 30 frames")
+    }
+
+    /// Mutable capture box for feed-callback assertions.
+    private final class RenderLog {
+        var seconds: [Double] = []
+    }
+
+    @Test func previewFeedDropsIntermediateScrubPositions() async throws {
+        let log = RenderLog()
+        let feed = PreviewFeed { seconds, _, _ in
+            log.seconds.append(seconds)
+            try? await Task.sleep(for: .milliseconds(20))
+            return Self.tinyImage()
+        }
+
+        // A scrub burst: 30 positions, yielding between ticks so the pump is
+        // mid-render while new requests arrive.
+        for tick in 0..<30 {
+            feed.request(
+                seconds: Double(tick), revision: 1,
+                viewSize: CGSize(width: 200, height: 400), displayScale: 2)
+            await Task.yield()
+        }
+        await feed.settle()
+
+        #expect(feed.image != nil)
+        #expect(log.seconds.last == 29, "the preview converges on the newest position")
+        #expect(log.seconds.count < 30, "intermediate positions are dropped, not queued")
+    }
+
+    @Test func previewFeedSkipsRequestsIdenticalToTheDeliveredFrame() async throws {
+        let log = RenderLog()
+        let feed = PreviewFeed { seconds, _, _ in
+            log.seconds.append(seconds)
+            return Self.tinyImage()
+        }
+
+        for _ in 0..<3 {
+            feed.request(
+                seconds: 1, revision: 7,
+                viewSize: CGSize(width: 200, height: 400), displayScale: 2)
+            await feed.settle()
+        }
+
+        #expect(log.seconds.count == 1, "an unchanged (time, revision, size) never re-renders")
+    }
+
+    private static func tinyImage() -> CGImage? {
+        let context = CGContext(
+            data: nil, width: 2, height: 2, bitsPerComponent: 8, bytesPerRow: 8,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
+        return context?.makeImage()
     }
 }

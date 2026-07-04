@@ -129,6 +129,8 @@ nonisolated struct EngineProjection {
     var audios: [MockAudioClip] = []
     var aspect: AspectRatio = .original
     var canvasBackground: Color?
+    /// Resolved composite size in pixels (the engine's render target).
+    var canvasSize: CGSize?
     var canUndo = false
     var canRedo = false
     var revision: UInt64 = 0
@@ -150,6 +152,8 @@ nonisolated enum EngineBridge {
         result.revision = state.revision
         result.aspect = AspectRatio.from(wireName: state.canvas.aspect)
         result.canvasBackground = color(state.canvas.background)
+        result.canvasSize = CGSize(
+            width: CGFloat(state.canvas.width), height: CGFloat(state.canvas.height))
 
         // Old items are matched by engine id, falling back to UUID so a
         // placeholder created optimistically in Swift (engineID nil until the
