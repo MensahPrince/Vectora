@@ -178,6 +178,21 @@ impl Engine {
         Ok(self.renderer.render_frame(&self.project, time)?)
     }
 
+    /// [`get_frame`](Self::get_frame) scaled to fit within
+    /// `max_width`×`max_height` (aspect preserved, never upscaled) — what an
+    /// interactive preview should request so scrubbing pays for view-sized
+    /// pixels instead of the full canvas.
+    pub fn get_frame_fit(
+        &mut self,
+        time: RationalTime,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<RgbaImage, EngineError> {
+        Ok(self
+            .renderer
+            .render_frame_fit(&self.project, time, max_width, max_height)?)
+    }
+
     pub fn undo(&mut self) -> bool {
         debug_assert!(!self.history.in_group(), "undo inside an open history group");
         let Some(action) = self.history.pop_undo() else {
