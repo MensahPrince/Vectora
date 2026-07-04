@@ -1,3 +1,4 @@
+import CutlassMobile
 import SwiftUI
 
 /// Sticker picker: categorized grid of symbol "stickers"; each tap drops one
@@ -89,14 +90,25 @@ struct FiltersPanel: View {
         VStack(spacing: 4) {
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
-                    ForEach(MockData.filters, id: \.self) { filter in
+                    ForEach(Catalogs.shared.filters) { filter in
+                        let selected =
+                            state.selectedEffect?.kind == .filter
+                            && state.selectedEffect?.filterID == filter.id
                         PresetTile(
-                            name: filter,
-                            isSelected: state.selectedEffect?.kind == .filter && state.selectedEffect?.name == filter,
-                            art: MockData.tileArt(for: filter),
+                            name: filter.label,
+                            isSelected: selected,
+                            art: MockData.tileArt(for: filter.label),
                             symbol: nil
                         ) {
-                            state.addEffectClip(name: filter, kind: .filter)
+                            // Retint the selected bar, or drop a new one.
+                            if state.selectedEffect?.kind == .filter {
+                                state.updateSelectedEffect {
+                                    $0.filterID = filter.id
+                                    $0.name = filter.label
+                                }
+                            } else {
+                                state.addFilterClip(id: filter.id, label: filter.label)
+                            }
                         }
                     }
                 }
@@ -111,20 +123,27 @@ struct FiltersPanel: View {
     }
 }
 
-/// Root-level Adjust: drops an adjust layer at the playhead and shows the
-/// parameter sliders (design-only values).
+/// Root-level Adjust: drops an adjust layer at the playhead and edits its
+/// grade (persisted on the bar clip via `SetClipAdjustments` on Apply).
 struct AdjustPanel: View {
     var state: EditorState
 
-    @State private var values = AdjustValues()
+    private func binding(_ keyPath: WritableKeyPath<AdjustValues, Double>) -> Binding<Double> {
+        Binding(
+            get: { state.selectedEffect?.adjust[keyPath: keyPath] ?? 0 },
+            set: { newValue in
+                state.updateSelectedEffect { $0.adjust[keyPath: keyPath] = newValue }
+            }
+        )
+    }
 
     var body: some View {
         VStack(spacing: 0) {
-            PanelSlider(label: "Brightness", value: $values.brightness, range: -1...1, format: Self.signedPercent)
-            PanelSlider(label: "Contrast", value: $values.contrast, range: -1...1, format: Self.signedPercent)
-            PanelSlider(label: "Saturation", value: $values.saturation, range: -1...1, format: Self.signedPercent)
-            PanelSlider(label: "Exposure", value: $values.exposure, range: -1...1, format: Self.signedPercent)
-            PanelSlider(label: "Temperature", value: $values.temperature, range: -1...1, format: Self.signedPercent)
+            PanelSlider(label: "Brightness", value: binding(\.brightness), range: -1...1, format: Self.signedPercent)
+            PanelSlider(label: "Contrast", value: binding(\.contrast), range: -1...1, format: Self.signedPercent)
+            PanelSlider(label: "Saturation", value: binding(\.saturation), range: -1...1, format: Self.signedPercent)
+            PanelSlider(label: "Exposure", value: binding(\.exposure), range: -1...1, format: Self.signedPercent)
+            PanelSlider(label: "Temperature", value: binding(\.temperature), range: -1...1, format: Self.signedPercent)
         }
         .onAppear {
             if state.selectedEffect?.kind != .adjust {

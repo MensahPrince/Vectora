@@ -1,3 +1,4 @@
+import CutlassMobile
 import SwiftUI
 
 /// Volume for the selected main-track clip (0 shows the mute badge).
@@ -50,17 +51,22 @@ struct SpeedPanel: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
-                    ForEach(MockData.speedCurves, id: \.self) { curve in
-                        let selected = (state.selectedClip?.speedCurve ?? "Constant") == curve
+                    PresetTile(
+                        name: "Constant",
+                        isSelected: state.selectedClip?.speedCurve == nil,
+                        art: nil,
+                        symbol: "minus"
+                    ) {
+                        state.updateSelectedClip { $0.speedCurve = nil }
+                    }
+                    ForEach(Catalogs.shared.speedPresets) { preset in
                         PresetTile(
-                            name: curve,
-                            isSelected: selected,
+                            name: preset.label,
+                            isSelected: state.selectedClip?.speedCurve == preset.id,
                             art: nil,
-                            symbol: curve == "Constant" ? "minus" : "point.topleft.down.to.point.bottomright.curvepath"
+                            symbol: "point.topleft.down.to.point.bottomright.curvepath"
                         ) {
-                            state.updateSelectedClip {
-                                $0.speedCurve = curve == "Constant" ? nil : curve
-                            }
+                            state.updateSelectedClip { $0.speedCurve = preset.id }
                         }
                     }
                 }
@@ -83,22 +89,9 @@ struct ClipAnimationPanel: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
-                    ForEach(options, id: \.self) { name in
-                        let selected = current == name || (current == nil && name == "None")
-                        Button {
-                            select(name)
-                        } label: {
-                            Text(name)
-                                .font(.footnote.weight(selected ? .semibold : .regular))
-                                .foregroundStyle(selected ? .white : Theme.textSecondary)
-                                .padding(.horizontal, 14)
-                                .padding(.vertical, 8)
-                                .background(
-                                    selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.surfaceElevated),
-                                    in: Capsule()
-                                )
-                        }
-                        .buttonStyle(.plain)
+                    chip(label: "None", id: nil)
+                    ForEach(options) { preset in
+                        chip(label: preset.label, id: preset.id)
                     }
                 }
                 .padding(.horizontal, 16)
@@ -107,12 +100,34 @@ struct ClipAnimationPanel: View {
         }
     }
 
-    private var options: [String] {
-        switch tab {
-        case 0: return MockData.animationsIn
-        case 1: return MockData.animationsOut
-        default: return MockData.animationsCombo
+    private func chip(label: String, id: String?) -> some View {
+        let selected = current == id
+        return Button {
+            select(id)
+        } label: {
+            Text(label)
+                .font(.footnote.weight(selected ? .semibold : .regular))
+                .foregroundStyle(selected ? .white : Theme.textSecondary)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(
+                    selected ? AnyShapeStyle(Theme.accent) : AnyShapeStyle(Theme.surfaceElevated),
+                    in: Capsule()
+                )
         }
+        .buttonStyle(.plain)
+    }
+
+    private var slot: String {
+        switch tab {
+        case 0: return "in"
+        case 1: return "out"
+        default: return "combo"
+        }
+    }
+
+    private var options: [AnimationCatalogEntry] {
+        Catalogs.shared.animations(slot: slot, includeTextOnly: false)
     }
 
     private var current: String? {
@@ -123,20 +138,20 @@ struct ClipAnimationPanel: View {
         }
     }
 
-    /// Combo animations replace in/out and vice versa, like CapCut.
-    private func select(_ name: String) {
-        let value = name == "None" ? nil : name
+    /// Combo animations replace in/out and vice versa, like CapCut (the
+    /// engine enforces the same rule on commit).
+    private func select(_ id: String?) {
         state.updateSelectedClip { clip in
             switch tab {
             case 0:
-                clip.animationIn = value
-                if value != nil { clip.animationCombo = nil }
+                clip.animationIn = id
+                if id != nil { clip.animationCombo = nil }
             case 1:
-                clip.animationOut = value
-                if value != nil { clip.animationCombo = nil }
+                clip.animationOut = id
+                if id != nil { clip.animationCombo = nil }
             default:
-                clip.animationCombo = value
-                if value != nil {
+                clip.animationCombo = id
+                if id != nil {
                     clip.animationIn = nil
                     clip.animationOut = nil
                 }
@@ -168,14 +183,14 @@ struct ClipFilterPanel: View {
                     ) {
                         state.updateSelectedClip { $0.filterName = nil }
                     }
-                    ForEach(MockData.filters, id: \.self) { filter in
+                    ForEach(Catalogs.shared.filters) { filter in
                         PresetTile(
-                            name: filter,
-                            isSelected: state.selectedClip?.filterName == filter,
-                            art: MockData.tileArt(for: filter),
+                            name: filter.label,
+                            isSelected: state.selectedClip?.filterName == filter.id,
+                            art: MockData.tileArt(for: filter.label),
                             symbol: nil
                         ) {
-                            state.updateSelectedClip { $0.filterName = filter }
+                            state.updateSelectedClip { $0.filterName = filter.id }
                         }
                     }
                 }
@@ -258,20 +273,30 @@ struct CropPanel: View {
 struct MaskPanel: View {
     var state: EditorState
 
+    private static let symbols: [String: String] = [
+        "linear": "rectangle.split.1x2", "mirror": "rectangle.split.3x1",
+        "circle": "circle", "rectangle": "rectangle", "heart": "heart", "star": "star",
+    ]
+
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 14) {
-                ForEach(MockData.masks, id: \.self) { mask in
-                    let selected = (state.selectedClip?.maskName ?? "None") == mask
+                PresetTile(
+                    name: "None",
+                    isSelected: state.selectedClip?.maskName == nil,
+                    art: nil,
+                    symbol: "slash.circle"
+                ) {
+                    state.updateSelectedClip { $0.maskName = nil }
+                }
+                ForEach(Catalogs.shared.masks) { mask in
                     PresetTile(
-                        name: mask,
-                        isSelected: selected,
+                        name: mask.label,
+                        isSelected: state.selectedClip?.maskName == mask.id,
                         art: nil,
-                        symbol: MockData.maskSymbols[mask] ?? "circle"
+                        symbol: Self.symbols[mask.id] ?? "circle"
                     ) {
-                        state.updateSelectedClip {
-                            $0.maskName = mask == "None" ? nil : mask
-                        }
+                        state.updateSelectedClip { $0.maskName = mask.id }
                     }
                 }
             }
@@ -345,17 +370,22 @@ struct StabilizePanel: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            ForEach(MockData.stabilizeLevels, id: \.self) { level in
-                let selected = (state.selectedClip?.stabilizeLevel ?? "None") == level
+            PresetTile(
+                name: "None",
+                isSelected: state.selectedClip?.stabilizeLevel == nil,
+                art: nil,
+                symbol: "slash.circle"
+            ) {
+                state.updateSelectedClip { $0.stabilizeLevel = nil }
+            }
+            ForEach(Catalogs.shared.stabilizeLevels) { level in
                 PresetTile(
-                    name: level,
-                    isSelected: selected,
+                    name: level.label,
+                    isSelected: state.selectedClip?.stabilizeLevel == level.id,
                     art: nil,
-                    symbol: level == "None" ? "slash.circle" : "gyroscope"
+                    symbol: "gyroscope"
                 ) {
-                    state.updateSelectedClip {
-                        $0.stabilizeLevel = level == "None" ? nil : level
-                    }
+                    state.updateSelectedClip { $0.stabilizeLevel = level.id }
                 }
             }
         }

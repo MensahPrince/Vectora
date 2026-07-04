@@ -1,6 +1,7 @@
 import CoreGraphics
 import CutlassMobile
 import Foundation
+import SwiftUI
 import Testing
 
 @testable import cutlass_ios_macos
@@ -460,6 +461,175 @@ struct EditorStateEngineTests {
         #expect(near(overlay.posY, 0.75))
         #expect(near(overlay.scale, 1.5))
         #expect(near(overlay.opacity, 0.5))
+    }
+
+    // MARK: Look panels (mask / chroma / stabilize / filter / adjust / animation)
+
+    @Test func panelLookCommitsPersistTheClipStyle() async throws {
+        let state = await makeProject([video])
+        state.selection = .main(state.clips[0].id)
+
+        state.beginPanelSession()
+        state.updateSelectedClip {
+            $0.maskName = "circle"
+            $0.chromaColor = .green
+            $0.chromaStrength = 0.6
+            $0.stabilizeLevel = "smooth"
+            $0.filterName = "vivid"
+            $0.filterIntensity = 0.5
+            $0.adjust.brightness = 0.25
+            $0.animationIn = "fade_in"
+        }
+        state.commitPanelSession()
+        await state.waitForEngine()
+
+        // Every value below was re-projected from the engine's ui_state.
+        #expect(state.engineOpFailures.isEmpty, "\(state.engineOpFailures)")
+        let clip = state.clips[0]
+        #expect(clip.maskName == "circle")
+        #expect(clip.chromaColor != nil)
+        #expect(near(clip.chromaStrength, 0.6))
+        #expect(clip.stabilizeLevel == "smooth")
+        #expect(clip.filterName == "vivid")
+        #expect(near(clip.filterIntensity, 0.5))
+        #expect(near(clip.adjust.brightness, 0.25))
+        #expect(clip.animationIn == "fade_in")
+
+        // Each look property is its own engine undo step.
+        state.undo()
+        await state.waitForEngine()
+        #expect(state.clips[0].animationIn == nil, "undo peels the last look edit")
+        #expect(state.clips[0].filterName == "vivid", "earlier edits survive")
+    }
+
+    @Test func panelLookCancelNeverReachesTheEngine() async throws {
+        let state = await makeProject([video])
+        state.selection = .main(state.clips[0].id)
+        let undoBefore = state.canUndo
+
+        state.beginPanelSession()
+        state.updateSelectedClip {
+            $0.filterName = "noir"
+            $0.maskName = "heart"
+        }
+        state.cancelPanelSession()
+        await state.waitForEngine()
+
+        #expect(state.clips[0].filterName == nil)
+        #expect(state.clips[0].maskName == nil)
+        #expect(state.canUndo == undoBefore, "no engine history entries")
+    }
+
+    @Test func panelComboAnimationEvictsTheEntrance() async throws {
+        let state = await makeProject([video])
+        state.selection = .main(state.clips[0].id)
+
+        state.beginPanelSession()
+        state.updateSelectedClip { $0.animationIn = "zoom_in" }
+        state.commitPanelSession()
+        await state.waitForEngine()
+        #expect(state.clips[0].animationIn == "zoom_in")
+
+        // The panel clears in/out locally when a combo is picked; the engine
+        // enforces the same eviction on commit.
+        state.beginPanelSession()
+        state.updateSelectedClip {
+            $0.animationCombo = "pulse"
+            $0.animationIn = nil
+        }
+        state.commitPanelSession()
+        await state.waitForEngine()
+        #expect(state.clips[0].animationCombo == "pulse")
+        #expect(state.clips[0].animationIn == nil)
+    }
+
+    @Test func panelSpeedPresetCommitsAndClears() async throws {
+        let state = await makeProject([video])
+        state.selection = .main(state.clips[0].id)
+        let plainLength = state.clips[0].length
+
+        state.beginPanelSession()
+        state.updateSelectedClip { $0.speedCurve = "montage" }
+        state.commitPanelSession()
+        await state.waitForEngine()
+        #expect(state.clips[0].speedCurve == "montage", "curve matches the catalog preset")
+        #expect(state.clips[0].length != plainLength, "the curve integral retimes the clip")
+
+        state.beginPanelSession()
+        state.updateSelectedClip { $0.speedCurve = nil }
+        state.commitPanelSession()
+        await state.waitForEngine()
+        #expect(state.clips[0].speedCurve == nil)
+        #expect(near(state.clips[0].length, plainLength), "constant speed restores the length")
+    }
+
+    @Test func panelTextEffectRoundTripsThroughTheStyle() async throws {
+        let state = await makeProject([shortVideo])
+        let id = state.addTextClip(text: "Neon title")
+        await state.waitForEngine()
+        state.selection = .overlay(id)
+
+        state.beginPanelSession()
+        state.updateSelectedOverlay {
+            $0.textEffect = "neon"
+            $0.animation = "typewriter"
+        }
+        state.commitPanelSession()
+        await state.waitForEngine()
+
+        let overlay = try #require(state.overlayClips.first { $0.id == id })
+        #expect(overlay.textEffect == "neon", "preset id baked into the engine style")
+        #expect(overlay.animation == "typewriter", "text-only combo persisted")
+
+        // The values came from the engine, not a stale local array: undo
+        // strips them, redo restores them.
+        state.undo()
+        state.undo()
+        await state.waitForEngine()
+        let plain = try #require(state.overlayClips.first { $0.id == id })
+        #expect(plain.textEffect == nil)
+        #expect(plain.animation == nil)
+        state.redo()
+        state.redo()
+        await state.waitForEngine()
+        let restored = try #require(state.overlayClips.first { $0.id == id })
+        #expect(restored.textEffect == "neon")
+        #expect(restored.animation == "typewriter")
+    }
+
+    @Test func panelAdjustBarPersistsItsGrade() async throws {
+        let state = await makeProject([shortVideo])
+        state.addEffectClip(name: "Adjust", kind: .adjust)
+        await state.waitForEngine()
+
+        state.beginPanelSession()
+        state.updateSelectedEffect { $0.adjust.exposure = 0.4 }
+        state.commitPanelSession()
+        await state.waitForEngine()
+
+        let bar = try #require(state.effectClips.first)
+        #expect(bar.kind == .adjust)
+        #expect(near(bar.adjust.exposure, 0.4), "the AdjustPanel gap: sliders now persist")
+    }
+
+    @Test func filterBarDropAppliesTheCatalogFilter() async throws {
+        let state = await makeProject([shortVideo])
+        state.addFilterClip(id: "noir", label: "Noir")
+        await state.waitForEngine()
+
+        let bar = try #require(state.effectClips.first)
+        #expect(bar.kind == .filter)
+        #expect(bar.filterID == "noir", "filter id landed on the engine bar clip")
+        #expect(bar.name == "Noir", "label resolves from the catalog")
+    }
+
+    @Test func audioPicksCarryTheirRole() async throws {
+        let state = await makeProject([shortVideo])
+        state.addAudio(kind: .voiceover, title: "VO", duration: 3)
+        await state.waitForEngine()
+
+        let audio = try #require(state.audioClips.first)
+        #expect(audio.kind == .voiceover, "role round-trips through the engine tag")
     }
 
     // MARK: Gesture transforms

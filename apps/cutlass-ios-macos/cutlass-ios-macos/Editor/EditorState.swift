@@ -131,6 +131,10 @@ final class EditorState {
     /// session check it and drop their results.
     @ObservationIgnored private var sessionGeneration = 0
     /// FIFO chain serializing engine ops so refreshes apply in issue order.
+    /// Engine rejections observed on the op chain (diagnosis surface: tests
+    /// assert it stays empty; the UI treats rejections as silent snap-backs).
+    @ObservationIgnored private(set) var engineOpFailures: [String] = []
+
     @ObservationIgnored private var opChain: Task<Void, Never>?
     /// Bumps per enqueued op; `waitForEngine` uses it to detect a moved tail.
     @ObservationIgnored private var opCounter = 0
@@ -213,6 +217,7 @@ final class EditorState {
                 // Engine rejection: state is unchanged in Rust; re-project so
                 // any optimistic local mutation snaps back to the truth.
                 print("cutlass: engine op failed: \(error)")
+                self.engineOpFailures.append("\(error)")
                 if let state = try? await session.uiState(),
                     self.sessionGeneration == generation
                 {
@@ -241,7 +246,10 @@ final class EditorState {
     /// the engine clip adopts the placeholder's UUID so views (and the
     /// selection) holding it never see an identity swap. A rejected create
     /// removes its placeholder (nobody will ever confirm it).
-    private func runCreateIntent(_ intent: Intent, placeholder: UUID) {
+    private func runCreateIntent(
+        _ intent: Intent, placeholder: UUID,
+        onResult: (@MainActor (IntentResult) -> Void)? = nil
+    ) {
         enqueue { [weak self] session in
             let result: IntentResult
             do {
@@ -257,6 +265,7 @@ final class EditorState {
             let state = try await session.uiState()
             self.noteEngineOpDuringPanel()
             self.applyRefresh(state)
+            onResult?(result)
         }
     }
 
@@ -1248,8 +1257,8 @@ final class EditorState {
     }
 
     /// Send every engine-mapped change between the panel baseline and the
-    /// current local state as intents (the mock-only styling fields stay
-    /// local until their models land in Phase I).
+    /// current local state as intents/commands — structure, audio, canvas,
+    /// and the persisted look (mask/chroma/filter/adjust/animations/…).
     private func commitPanelDiff(from baseline: TimelineSnapshot) {
         // Canvas.
         let backgroundColorChanged =
@@ -1260,21 +1269,26 @@ final class EditorState {
             runCommand(.setCanvas(aspect: aspect.wireName, background: rgba))
         }
 
-        // Selected main clip.
+        // Selected main clip. A clip missing from the baseline (created
+        // mid-session) diffs against itself: nothing to send.
+        // (`before?.x ?? clip.x` would be wrong here: optional chaining
+        // flattens, so for Optional fields a nil baseline value collapses to
+        // the current one and nil -> set transitions never diff.)
         if let clip = selectedClip, let engineID = clip.engineID {
-            let before = baseline.clips.first { $0.id == clip.id }
-            if clip.speed != before?.speed ?? clip.speed
-                || clip.isReversed != before?.isReversed ?? clip.isReversed
-            {
+            let before = baseline.clips.first { $0.id == clip.id } ?? clip
+            if clip.speed != before.speed || clip.isReversed != before.isReversed {
                 runIntent(.setSpeed(clip: engineID, speed: clip.speed, reversed: clip.isReversed))
             }
-            if clip.volume != before?.volume ?? clip.volume {
+            if clip.speedCurve != before.speedCurve {
+                runIntent(.setSpeedPreset(clip: engineID, preset: clip.speedCurve))
+            }
+            if clip.volume != before.volume {
                 runIntent(
                     .setAudio(
                         clip: engineID, volume: Float(clip.volume),
                         fadeInSeconds: clip.fadeIn, fadeOutSeconds: clip.fadeOut))
             }
-            if clip.opacity != before?.opacity ?? clip.opacity {
+            if clip.opacity != before.opacity {
                 runIntent(
                     .setTransform(
                         clip: engineID,
@@ -1283,30 +1297,43 @@ final class EditorState {
                         rotationDegrees: Float(clip.rotationDegrees),
                         opacity: Float(clip.opacity)))
             }
+            commitLookDiff(clip, before: before, engineID: engineID)
         }
 
         // Selected overlay (text content/style, PiP volume, placement).
+        // An overlay missing from the baseline was created mid-session: its
+        // create-intent carried only the initial content, so text and
+        // animation always commit for it.
         if let overlay = selectedOverlay, let engineID = overlay.engineID {
-            let before = baseline.overlays.first { $0.id == overlay.id }
+            let baselineOverlay = baseline.overlays.first { $0.id == overlay.id }
+            let before = baselineOverlay ?? overlay
+            let isNew = baselineOverlay == nil
             if overlay.kind == .text,
-                overlay.text != before?.text ?? overlay.text
-                    || overlay.fontName != before?.fontName ?? overlay.fontName
-                    || overlay.textColor != before?.textColor ?? overlay.textColor
+                isNew
+                    || overlay.text != before.text
+                    || overlay.fontName != before.fontName
+                    || overlay.textColor != before.textColor
+                    || overlay.textEffect != before.textEffect
             {
                 var style = TextStyle()
                 style.font = overlay.fontName == "Default" ? "" : overlay.fontName
                 style.fill = overlay.textColor.engineRGBA
+                style.effectPreset = overlay.textEffect
                 runCommand(.setGenerator(clip: engineID, generator: .text(content: overlay.text, style: style)))
             }
-            if overlay.kind == .pip, overlay.volume != before?.volume ?? overlay.volume {
+            if overlay.kind == .text, isNew ? overlay.animation != nil : overlay.animation != before.animation {
+                runCommand(
+                    .setClipAnimation(clip: engineID, slot: "combo", animationID: overlay.animation))
+            }
+            if overlay.kind == .pip, overlay.volume != before.volume {
                 runIntent(.setAudio(clip: engineID, volume: Float(overlay.volume)))
             }
             let placementChanged =
-                before == nil
-                || overlay.posX != before!.posX || overlay.posY != before!.posY
-                || overlay.scale != before!.scale
-                || overlay.rotationDegrees != before!.rotationDegrees
-                || overlay.opacity != before!.opacity
+                baselineOverlay == nil
+                || overlay.posX != before.posX || overlay.posY != before.posY
+                || overlay.scale != before.scale
+                || overlay.rotationDegrees != before.rotationDegrees
+                || overlay.opacity != before.opacity
             if placementChanged {
                 runIntent(
                     .setTransform(
@@ -1318,18 +1345,84 @@ final class EditorState {
             }
         }
 
+        // Selected effect-lane bar (filter choice, adjust sliders).
+        if let bar = selectedEffect, let engineID = bar.engineID {
+            let before = baseline.effects.first { $0.id == bar.id } ?? bar
+            if bar.kind == .filter,
+                bar.filterID != before.filterID || bar.intensity != before.intensity
+            {
+                let filter = bar.filterID.map { UiFilter(id: $0, intensity: Float(bar.intensity)) }
+                runCommand(.setClipFilter(clip: engineID, filter: filter))
+            }
+            if bar.kind == .adjust, bar.adjust != before.adjust {
+                runCommand(.setClipAdjustments(clip: engineID, adjust: bar.adjust.wire))
+            }
+        }
+
         // Selected audio clip (volume + fades).
         if let audio = selectedAudio, let engineID = audio.engineID {
-            let before = baseline.audios.first { $0.id == audio.id }
-            if audio.volume != before?.volume ?? audio.volume
-                || audio.fadeIn != before?.fadeIn ?? audio.fadeIn
-                || audio.fadeOut != before?.fadeOut ?? audio.fadeOut
+            let before = baseline.audios.first { $0.id == audio.id } ?? audio
+            if audio.volume != before.volume
+                || audio.fadeIn != before.fadeIn
+                || audio.fadeOut != before.fadeOut
             {
                 runIntent(
                     .setAudio(
                         clip: engineID, volume: Float(audio.volume),
                         fadeInSeconds: audio.fadeIn, fadeOutSeconds: audio.fadeOut))
             }
+        }
+    }
+
+    /// The Phase I look fields of the selected main clip, one command per
+    /// changed property (each is its own engine undo step).
+    private func commitLookDiff(_ clip: MockClip, before: MockClip, engineID: UInt64) {
+        if clip.maskName != before.maskName {
+            runCommand(
+                .setClipMask(clip: engineID, mask: clip.maskName.map { UiMask(kind: $0) }))
+        }
+        let chromaChanged =
+            clip.chromaColor != before.chromaColor
+            || clip.chromaStrength != before.chromaStrength
+            || clip.chromaShadow != before.chromaShadow
+        if chromaChanged {
+            let chroma = clip.chromaColor.map {
+                UiChromaKey(
+                    rgb: $0.engineRGB,
+                    strength: Float(clip.chromaStrength),
+                    shadow: Float(clip.chromaShadow))
+            }
+            runCommand(.setClipChroma(clip: engineID, chroma: chroma))
+        }
+        if clip.stabilizeLevel != before.stabilizeLevel {
+            runCommand(.setClipStabilize(clip: engineID, level: clip.stabilizeLevel))
+        }
+        if clip.filterName != before.filterName || clip.filterIntensity != before.filterIntensity {
+            let filter = clip.filterName.map {
+                UiFilter(id: $0, intensity: Float(clip.filterIntensity))
+            }
+            runCommand(.setClipFilter(clip: engineID, filter: filter))
+        }
+        if clip.adjust != before.adjust {
+            runCommand(.setClipAdjustments(clip: engineID, adjust: clip.adjust.wire))
+        }
+        // Animations: a combo excludes in/out and vice versa (engine rule).
+        // Send sets for changed slots; send clears only where the engine's
+        // eviction won't already produce them.
+        let slots: [(slot: String, now: String?, then: String?)] = [
+            ("in", clip.animationIn, before.animationIn),
+            ("out", clip.animationOut, before.animationOut),
+            ("combo", clip.animationCombo, before.animationCombo),
+        ]
+        let comboSet = slots[2].now != slots[2].then && slots[2].now != nil
+        let sideSet = slots[0...1].contains { $0.now != $0.then && $0.now != nil }
+        for entry in slots where entry.now != entry.then {
+            if entry.now == nil {
+                let evicted = entry.slot == "combo" ? sideSet : comboSet
+                if evicted { continue }
+            }
+            runCommand(
+                .setClipAnimation(clip: engineID, slot: entry.slot, animationID: entry.now))
         }
     }
 
@@ -1433,6 +1526,25 @@ final class EditorState {
         return clip.id
     }
 
+    /// Drop a filter bar already tinted with a catalog filter: the create and
+    /// the `SetClipFilter` land back to back once the engine confirms.
+    @discardableResult
+    func addFilterClip(id filterID: String, label: String) -> UUID {
+        let start = insertionTime
+        var clip = MockEffectClip(
+            kind: .filter, laneID: hostLane(for: .effect, start: start, length: 3),
+            name: label, start: start, length: 3)
+        clip.filterID = filterID
+        effectClips.append(clip)
+        selection = .effect(clip.id)
+        runCreateIntent(.addEffect(kind: "filter", atSeconds: start), placeholder: clip.id) {
+            [weak self] result in
+            guard let engineID = result.clip else { return }
+            self?.runCommand(.setClipFilter(clip: engineID, filter: UiFilter(id: filterID)))
+        }
+        return clip.id
+    }
+
     @discardableResult
     func addAudio(kind: MockAudioClip.Kind, title: String, duration: TimeInterval) -> UUID {
         let start = insertionTime
@@ -1447,7 +1559,9 @@ final class EditorState {
         audioClips.append(clip)
         selection = .audio(clip.id)
         if let url = FixtureLibrary.audio {
-            runCreateIntent(.addAudio(path: url.path, atSeconds: start), placeholder: clip.id)
+            runCreateIntent(
+                .addAudio(path: url.path, atSeconds: start, role: kind.roleID),
+                placeholder: clip.id)
         }
         return clip.id
     }

@@ -1,3 +1,4 @@
+import CutlassMobile
 import SwiftUI
 
 /// Tabbed text tool: keyboard input, fonts, style (color + effect), and
@@ -119,12 +120,13 @@ struct TextPanel: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 10) {
-                    ForEach(MockData.textEffects, id: \.self) { effect in
-                        let selected = (state.selectedOverlay?.textEffect ?? "None") == effect
-                        chip(effect, selected: selected) {
-                            state.updateSelectedOverlay {
-                                $0.textEffect = effect == "None" ? nil : effect
-                            }
+                    chip("None", selected: state.selectedOverlay?.textEffect == nil) {
+                        state.updateSelectedOverlay { $0.textEffect = nil }
+                    }
+                    ForEach(Catalogs.shared.textEffects) { effect in
+                        let selected = state.selectedOverlay?.textEffect == effect.id
+                        chip(effect.label, selected: selected) {
+                            state.updateSelectedOverlay { $0.textEffect = effect.id }
                         }
                     }
                 }
@@ -133,15 +135,18 @@ struct TextPanel: View {
         }
     }
 
+    /// Text animations are the catalog's text-only combo presets.
     private var animationTab: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 10) {
-                ForEach(MockData.textAnimations, id: \.self) { animation in
-                    let selected = (state.selectedOverlay?.animation ?? "None") == animation
-                    chip(animation, selected: selected) {
-                        state.updateSelectedOverlay {
-                            $0.animation = animation == "None" ? nil : animation
-                        }
+                chip("None", selected: state.selectedOverlay?.animation == nil) {
+                    state.updateSelectedOverlay { $0.animation = nil }
+                }
+                let presets = Catalogs.shared.animations.filter { $0.textOnly }
+                ForEach(presets) { animation in
+                    let selected = state.selectedOverlay?.animation == animation.id
+                    chip(animation.label, selected: selected) {
+                        state.updateSelectedOverlay { $0.animation = animation.id }
                     }
                 }
             }
@@ -209,7 +214,7 @@ struct CaptionsPanel: View {
                 let id = state.addTextClip(text: "This is your auto caption")
                 state.selection = .overlay(id)
                 state.updateSelectedOverlay {
-                    $0.textEffect = "Outline"
+                    $0.textEffect = "outline"
                     $0.posY = 0.8
                 }
                 onGenerated()

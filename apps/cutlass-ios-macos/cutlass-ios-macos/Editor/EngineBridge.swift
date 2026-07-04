@@ -4,10 +4,10 @@ import SwiftUI
 // Projection of the engine's `ui_state` tree into the view-model types the
 // editor views already render (`MockClip`, `MockLane`, …).
 //
-// The Rust side owns all editing logic and lane policy; this file only
-// reshapes its presentation state and carries over the styling fields the
-// model doesn't persist yet (sticker symbols, filter names, …) so panel
-// picks survive refreshes until Phase I lands them in the model.
+// The Rust side owns all editing logic, lane policy, and the persisted look
+// (masks, filters, animations, …); this file only reshapes its presentation
+// state. The few fields still carried across refreshes locally (sticker
+// symbols, crop presets) are sketches the model doesn't persist yet.
 
 // MARK: - Engine id <-> SwiftUI identity
 
@@ -259,20 +259,24 @@ nonisolated enum EngineBridge {
             )
         }
 
+        // Look fields come straight off the wire (engine-persisted).
+        result.filterName = clip.filter?.id
+        result.filterIntensity = Double(clip.filter?.intensity ?? 0.8)
+        result.adjust = AdjustValues(clip.adjustments)
+        result.animationIn = clip.animationIn
+        result.animationOut = clip.animationOut
+        result.animationCombo = clip.animationCombo
+        result.maskName = clip.mask?.kind
+        if let chroma = clip.chromaKey {
+            result.chromaColor = color(chroma.rgb)
+            result.chromaStrength = Double(chroma.strength)
+            result.chromaShadow = Double(chroma.shadow)
+        }
+        result.stabilizeLevel = clip.stabilize
+        result.speedCurve = clip.speedPreset
         if let old {
-            result.filterName = old.filterName
-            result.filterIntensity = old.filterIntensity
-            result.adjust = old.adjust
-            result.animationIn = old.animationIn
-            result.animationOut = old.animationOut
-            result.animationCombo = old.animationCombo
-            result.maskName = old.maskName
+            // Crop presets stay a local sketch until the model grows them.
             result.cropPreset = old.cropPreset
-            result.chromaStrength = old.chromaStrength
-            result.chromaShadow = old.chromaShadow
-            result.chromaColor = old.chromaColor
-            result.stabilizeLevel = old.stabilizeLevel
-            result.speedCurve = old.speedCurve
         }
         return result
     }
@@ -295,9 +299,10 @@ nonisolated enum EngineBridge {
         if let style = clip.textStyle {
             result.textColor = color(style.fill)
             result.fontName = style.font.isEmpty ? "Default" : style.font
+            result.textEffect = style.effectPreset
         }
-        result.textEffect = old?.textEffect
-        result.animation = old?.animation
+        // The text panel writes text-only combo presets.
+        result.animation = clip.animationCombo
         return result
     }
 
@@ -322,19 +327,30 @@ nonisolated enum EngineBridge {
         var result = MockEffectClip(
             kind: kind,
             laneID: laneID,
-            name: old?.name ?? clip.label.capitalized,
+            name: filterLabel(clip.filter?.id) ?? old?.name ?? clip.label.capitalized,
             start: clip.startSeconds,
             length: clip.lengthSeconds
         )
         result.id = uuid
         result.engineID = clip.id
-        result.intensity = old?.intensity ?? 0.8
+        result.filterID = clip.filter?.id
+        result.intensity = clip.filter.map { Double($0.intensity) } ?? old?.intensity ?? 0.8
+        result.adjust = AdjustValues(clip.adjustments)
         return result
     }
 
+    private static func filterLabel(_ id: String?) -> String? {
+        guard let id else { return nil }
+        return Catalogs.shared.filters.first { $0.id == id }?.label
+    }
+
     private static func audioClip(_ clip: UiClip, uuid: UUID, laneID: UUID, old: MockAudioClip?) -> MockAudioClip {
+        let kind =
+            MockAudioClip.Kind(roleID: clip.audioRole)
+            ?? old?.kind
+            ?? (clip.link != nil ? .extracted : .music)
         var result = MockAudioClip(
-            kind: old?.kind ?? (clip.link != nil ? .extracted : .music),
+            kind: kind,
             laneID: laneID,
             title: old?.title ?? clip.label,
             start: clip.startSeconds,

@@ -1,7 +1,10 @@
+import CutlassMobile
 import SwiftUI
 
-// Mock-only data model for the UI build: no engine, no FFI, no real media.
-// Every "thumbnail" is a gradient plus an SF Symbol stand-in.
+// View-model types the editor renders: projections of the engine's ui_state
+// (see EngineBridge) plus optimistic placeholders during FFI round trips.
+// Preset-bearing fields (filters, masks, animations, …) store the Rust
+// catalog *ids*; labels come from `Catalogs.shared`.
 //
 // The target defaults to MainActor isolation; these are plain value types
 // used from anywhere, so they opt out.
@@ -57,6 +60,25 @@ nonisolated struct AdjustValues: Hashable {
     var temperature: Double = 0
 
     var isNeutral: Bool { self == AdjustValues() }
+
+    init() {}
+
+    /// From the engine's wire shape.
+    init(_ wire: UiAdjust) {
+        brightness = Double(wire.brightness)
+        contrast = Double(wire.contrast)
+        saturation = Double(wire.saturation)
+        exposure = Double(wire.exposure)
+        temperature = Double(wire.temperature)
+    }
+
+    /// To the engine's wire shape (`SetClipAdjustments`).
+    var wire: UiAdjust {
+        UiAdjust(
+            brightness: Float(brightness), contrast: Float(contrast),
+            saturation: Float(saturation), exposure: Float(exposure),
+            temperature: Float(temperature))
+    }
 }
 
 /// A transition applied at the boundary after a main-track clip.
@@ -125,6 +147,7 @@ nonisolated struct MockClip: Identifiable, Hashable {
     var fadeOut: TimeInterval = 0
     /// 0.1...10, 1 = normal. Changing it rescales `length`.
     var speed: Double = 1
+    /// Speed-preset catalog id (nil = constant speed).
     var speedCurve: String?
     var opacity: Double = 1
     /// Canvas placement (engine transform; main clips are usually full-frame
@@ -133,18 +156,22 @@ nonisolated struct MockClip: Identifiable, Hashable {
     var posY: Double = 0.5
     var scale: Double = 1
     var rotationDegrees: Double = 0
+    /// Filter catalog id (nil = no filter).
     var filterName: String?
     var filterIntensity: Double = 0.8
     var adjust = AdjustValues()
+    /// Animation catalog ids per slot (a combo excludes in/out).
     var animationIn: String?
     var animationOut: String?
     var animationCombo: String?
+    /// Mask catalog id (nil = no mask).
     var maskName: String?
     var cropPreset: String?
-    /// 0 = chroma key off.
+    /// Chroma key is on iff `chromaColor` is set.
     var chromaStrength: Double = 0
     var chromaShadow: Double = 0
     var chromaColor: Color?
+    /// Stabilize level id: `recommended | smooth | max_smooth`.
     var stabilizeLevel: String?
     var isReversed = false
     /// Keyframe times local to the clip (seconds from its leading edge).
@@ -192,7 +219,9 @@ nonisolated struct MockOverlayClip: Identifiable, Hashable {
     var text = ""
     var fontName = "Default"
     var textColor: Color = .white
+    /// Text-effect preset catalog id (nil = plain).
     var textEffect: String?
+    /// Text animation catalog id (a text-only combo preset).
     var animation: String?
 
     // Sticker
@@ -247,6 +276,10 @@ nonisolated struct MockEffectClip: Identifiable, Hashable {
     var start: TimeInterval
     var length: TimeInterval
     var intensity: Double = 0.8
+    /// Filter bars: the applied filter catalog id.
+    var filterID: String?
+    /// Adjust bars: the grade this layer applies.
+    var adjust = AdjustValues()
 
     var displayLabel: String {
         switch kind {
@@ -264,6 +297,27 @@ nonisolated struct MockAudioClip: Identifiable, Hashable {
         case soundFX
         case voiceover
         case extracted
+
+        /// Engine `AudioRole` id.
+        var roleID: String {
+            switch self {
+            case .music: return "music"
+            case .soundFX: return "sfx"
+            case .voiceover: return "voiceover"
+            case .extracted: return "extracted"
+            }
+        }
+
+        /// From an engine `AudioRole` id (nil for untagged clips).
+        init?(roleID: String?) {
+            switch roleID {
+            case "music": self = .music
+            case "sfx": self = .soundFX
+            case "voiceover": self = .voiceover
+            case "extracted": self = .extracted
+            default: return nil
+            }
+        }
     }
 
     var id = UUID()
