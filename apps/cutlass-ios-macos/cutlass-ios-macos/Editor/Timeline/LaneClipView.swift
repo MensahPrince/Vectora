@@ -55,7 +55,9 @@ struct LaneClipView: View {
             }
             .contentShape(Rectangle())
             .onTapGesture(perform: onTap)
-            .highPriorityGesture(isSelected ? moveGesture : nil)
+            // The .none mask matters: even a nil optional gesture installs a
+            // recognizer that can stall other gestures in the hierarchy.
+            .highPriorityGesture(moveGesture, including: isSelected ? .all : .none)
             .offset(x: start * pointsPerSecond)
     }
 

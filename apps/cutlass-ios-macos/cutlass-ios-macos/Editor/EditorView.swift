@@ -92,6 +92,7 @@ struct EditorView: View {
             .frame(maxWidth: .infinity)
             .frame(height: 16)
             .contentShape(Rectangle())
+            .accessibilityIdentifier("timelineHeightHandle")
             .gesture(
                 DragGesture(minimumDistance: 2, coordinateSpace: .global)
                     .onChanged { value in

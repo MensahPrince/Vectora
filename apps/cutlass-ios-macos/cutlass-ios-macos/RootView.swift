@@ -44,6 +44,17 @@ struct RootView: View {
             state.startProject(with: Array(MockData.libraryItems.prefix(4)))
             _editorState = State(initialValue: state)
             _screen = State(initialValue: .editor)
+        case "editorLanes":
+            // Editor with every lane populated (effects, overlay, audio),
+            // used by UI tests to exercise each timeline row.
+            let state = EditorState()
+            state.startProject(with: Array(MockData.libraryItems.prefix(4)))
+            state.addSticker(symbol: "heart.fill")
+            state.addEffectClip(name: "Blur", kind: .effect)
+            state.addAudio(kind: .music, title: "Slow Morning", duration: 30)
+            state.selection = nil
+            _editorState = State(initialValue: state)
+            _screen = State(initialValue: .editor)
         default:
             break
         }

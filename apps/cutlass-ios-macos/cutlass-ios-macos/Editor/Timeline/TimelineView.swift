@@ -12,12 +12,22 @@ struct TimelineView: View {
     var onAddMedia: () -> Void
     var onTransitionTap: (UUID) -> Void = { _ in }
 
-    @State private var scrollPosition = ScrollPosition(edge: .leading)
-    @State private var scrollPhase: ScrollPhase = .idle
     /// seconds-per-point captured when a pinch begins.
     @State private var pinchBase: Double?
     /// Live long-press drag-to-reorder on the main track.
     @State private var reorder: ReorderDrag?
+    /// How far the lane stack is panned up inside its viewport.
+    @State private var laneOffset: CGFloat = 0
+    /// Playhead + lane offset captured when a timeline pan begins.
+    @State private var panAnchor: (playhead: TimeInterval, lane: CGFloat)?
+    /// Direction lock for the live pan, decided from the first translation.
+    @State private var panMode: PanMode?
+    /// Post-flick momentum; cancelled by any new touch or playback.
+    @State private var decayTask: Task<Void, Never>?
+
+    private enum PanMode {
+        case scrub, lanes
+    }
 
     private struct ReorderDrag: Equatable {
         var clipID: UUID
@@ -31,10 +41,6 @@ struct TimelineView: View {
     private static let emptyLaneHeight: CGFloat = 20
 
     private var pointsPerSecond: Double { 1 / state.secondsPerPoint }
-
-    private var isUserScrolling: Bool {
-        scrollPhase == .tracking || scrollPhase == .interacting || scrollPhase == .decelerating
-    }
 
     // MARK: Lane packing (recomputed per render; tiny n)
 
@@ -66,14 +72,25 @@ struct TimelineView: View {
         GeometryReader { geometry in
             let halfWidth = geometry.size.width / 2
             let contentWidth = max(0, state.duration * pointsPerSecond)
+            let lanesViewport = max(displayHeight - Self.rulerHeight - Self.rowSpacing, 40)
+            let lanesNatural = naturalHeight - Self.rulerHeight - Self.rowSpacing
+            let maxLaneOffset = max(0, lanesNatural - lanesViewport)
+            let effectiveLaneOffset = min(laneOffset, maxLaneOffset)
 
             ZStack(alignment: .top) {
-                ScrollView([.horizontal, .vertical], showsIndicators: false) {
-                    VStack(alignment: .leading, spacing: Self.rowSpacing) {
-                        TimeRuler(duration: state.duration, pointsPerSecond: pointsPerSecond)
-                            .frame(width: contentWidth, height: Self.rulerHeight, alignment: .leading)
-                            .clipped()
+                // Not a ScrollView: the content offsets by -playhead so the
+                // fixed center line IS the playhead, and one drag gesture on
+                // the whole surface owns panning (horizontal = scrub,
+                // vertical = lane browse). UIScrollView's pan recognizer
+                // raced the clip gestures and silently dropped pans that
+                // started on clips, which is why scrubbing only worked from
+                // the ruler.
+                VStack(alignment: .leading, spacing: Self.rowSpacing) {
+                    TimeRuler(duration: state.duration, pointsPerSecond: pointsPerSecond)
+                        .frame(width: contentWidth, height: Self.rulerHeight, alignment: .leading)
+                        .clipped()
 
+                    VStack(alignment: .leading, spacing: Self.rowSpacing) {
                         if effectRows == 0 {
                             Color.clear.frame(height: Self.emptyLaneHeight)
                         } else {
@@ -110,50 +127,62 @@ struct TimelineView: View {
                             )
                         }
                     }
-                    .overlay(alignment: .topLeading) { snapGuide }
-                    .padding(.horizontal, halfWidth)
-                    // Bands live in the scroll content so they track vertical
-                    // scrolling instead of popping between fixed and scrolled.
+                    // Bands pan with the lane stack so they always line up
+                    // with their rows.
                     .background(alignment: .top) {
                         laneBackground(effectRows: effectRows, overlayRows: overlayRows, audioRows: audioRows)
                     }
+                    .offset(y: -effectiveLaneOffset)
+                    .frame(height: lanesViewport, alignment: .topLeading)
+                    .clipped()
                 }
-                .scrollBounceBehavior(.basedOnSize, axes: [.vertical])
-                .scrollPosition($scrollPosition)
-                .onScrollGeometryChange(for: CGFloat.self) { scrollGeometry in
-                    scrollGeometry.contentOffset.x
-                } action: { _, offset in
-                    guard isUserScrolling else { return }
-                    state.isPlaying = false
-                    state.playhead = min(max(0, offset * state.secondsPerPoint), state.duration)
-                }
-                .onScrollPhaseChange { _, newPhase in
-                    scrollPhase = newPhase
-                }
+                .overlay(alignment: .topLeading) { snapGuide }
+                .frame(width: max(contentWidth, 1), alignment: .topLeading)
+                .offset(x: halfWidth - state.playhead * pointsPerSecond)
 
                 playheadLine
                 readout
                 magnetToggle
             }
+            .frame(width: geometry.size.width, height: displayHeight, alignment: .top)
+            .clipped()
+            .contentShape(Rectangle())
             // Tapping anything that isn't a clip clears the selection.
             .onTapGesture { state.selection = nil }
+            .gesture(timelinePanGesture(maxLaneOffset: maxLaneOffset))
             .simultaneousGesture(pinchToZoom)
             .sensoryFeedback(.impact(weight: .light), trigger: state.activeSnapTime) { _, newValue in
                 newValue != nil
-            }
-            .onChange(of: state.playhead) {
-                syncScrollToPlayhead()
-            }
-            .onChange(of: state.secondsPerPoint) {
-                syncScrollToPlayhead(force: true)
-            }
-            .onAppear {
-                syncScrollToPlayhead(force: true)
             }
         }
         .frame(height: displayHeight)
         .background(Theme.timelineBed)
         .clipped()
+        .accessibilityElement(children: .contain)
+        .accessibilityIdentifier("timeline")
+        .onChange(of: displayHeight) { _, newHeight in
+            keepMainTrackVisible(displayHeight: newHeight, effectRows: effectRows, naturalHeight: naturalHeight)
+        }
+        .onDisappear { decayTask?.cancel() }
+    }
+
+    /// As the grab bar resizes the timeline, nudge the lane pan by the
+    /// minimum needed to keep the main track fully inside the viewport, so
+    /// collapsing always lands focused on the track (CapCut behavior). The
+    /// user can still pan away afterwards.
+    private func keepMainTrackVisible(displayHeight: CGFloat, effectRows: Int, naturalHeight: CGFloat) {
+        let viewport = max(displayHeight - Self.rulerHeight - Self.rowSpacing, 40)
+        let maxOffset = max(0, naturalHeight - Self.rulerHeight - Self.rowSpacing - viewport)
+        let effectsBlock = effectRows == 0
+            ? Self.emptyLaneHeight
+            : CGFloat(effectRows) * LaneClipView.height + CGFloat(effectRows - 1) * Self.rowSpacing
+        let trackTop = effectsBlock + Self.rowSpacing
+        let trackBottom = trackTop + ClipView.height
+
+        var target = min(max(0, laneOffset), maxOffset)
+        if target > trackTop { target = trackTop }
+        if target < trackBottom - viewport { target = trackBottom - viewport }
+        laneOffset = min(max(0, target), maxOffset)
     }
 
     private func timelineHeight(effectRows: Int, overlayRows: Int, audioRows: Int) -> CGFloat {
@@ -309,14 +338,83 @@ struct TimelineView: View {
         .sensoryFeedback(.impact(weight: .medium), trigger: reorder != nil)
     }
 
+    // MARK: Timeline pan (scrub / lane browse)
+
+    /// One direction-locked drag for the whole timeline surface: horizontal
+    /// pans scrub (translation -> playhead, with flick momentum), vertical
+    /// pans browse the lane stack inside its clipped viewport.
+    private func timelinePanGesture(maxLaneOffset: CGFloat) -> some Gesture {
+        DragGesture(minimumDistance: 10, coordinateSpace: .global)
+            .onChanged { value in
+                if panAnchor == nil {
+                    decayTask?.cancel()
+                    state.isPlaying = false
+                    panAnchor = (state.playhead, laneOffset)
+                    panMode = abs(value.translation.height) > abs(value.translation.width)
+                        ? .lanes
+                        : .scrub
+                }
+                guard let anchor = panAnchor else { return }
+
+                switch panMode {
+                case .scrub:
+                    let time = anchor.playhead - value.translation.width * state.secondsPerPoint
+                    state.playhead = min(max(0, time), state.duration)
+                case .lanes:
+                    laneOffset = min(max(0, anchor.lane - value.translation.height), maxLaneOffset)
+                case nil:
+                    break
+                }
+            }
+            .onEnded { value in
+                let mode = panMode
+                panAnchor = nil
+                panMode = nil
+                guard mode == .scrub else { return }
+
+                // Flick momentum: glide through the distance UIKit predicts
+                // beyond the finger-tracked translation, decaying to a stop.
+                let extra = value.predictedEndTranslation.width - value.translation.width
+                startScrubDecay(distance: -extra * state.secondsPerPoint)
+            }
+    }
+
+    /// Advances the playhead over `distance` seconds with an ease-out decay,
+    /// keeping the model truthful frame by frame (readout ticks, snapping
+    /// stays live). Cancelled by any new pan or playback.
+    private func startScrubDecay(distance: TimeInterval) {
+        guard abs(distance) > 0.05 else { return }
+        decayTask?.cancel()
+        decayTask = Task { @MainActor in
+            let duration: TimeInterval = 0.55
+            let start = ContinuousClock.now
+            var lastProgress: Double = 0
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(16))
+                if Task.isCancelled || state.isPlaying { return }
+                let elapsed = min((ContinuousClock.now - start) / .seconds(duration), 1)
+                // Ease-out cubic: fast start, glides to rest.
+                let progress = 1 - pow(1 - elapsed, 3)
+                let step = (progress - lastProgress) * distance
+                lastProgress = progress
+                state.playhead = min(max(0, state.playhead + step), state.duration)
+                if elapsed >= 1 || state.playhead == 0 || state.playhead == state.duration {
+                    return
+                }
+            }
+        }
+    }
+
     // MARK: Drag to reorder
 
     /// Long-press lifts a main-track clip; horizontal drag slides an
     /// insertion gap through the neighbors; release commits the move.
     private func reorderGesture(clip: MockClip, index: Int, widths: [CGFloat]) -> some Gesture {
         // Global coordinate space: the lifted clip follows the finger, so a
-        // local-space translation would feed back on itself.
-        LongPressGesture(minimumDuration: 0.3, maximumDistance: 30)
+        // local-space translation would feed back on itself. The tight
+        // maximumDistance matters: anything looser swallows slow-starting
+        // scrub pans and the timeline "stops scrolling" from the tracks.
+        LongPressGesture(minimumDuration: 0.35, maximumDistance: 12)
             .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
             .onChanged { value in
                 guard case .second(true, let drag) = value else { return }
@@ -403,11 +501,9 @@ struct TimelineView: View {
     }
 
     /// Full-width dim bands behind the scrolling rows, mirroring the actual
-    /// lane layout.
+    /// lane layout (ruler excluded; it sits above the lane scroll view).
     private func laneBackground(effectRows: Int, overlayRows: Int, audioRows: Int) -> some View {
         VStack(spacing: Self.rowSpacing) {
-            Color.clear.frame(height: Self.rulerHeight)
-
             if effectRows == 0 {
                 Rectangle().fill(Theme.trackEmpty.opacity(0.55)).frame(height: Self.emptyLaneHeight)
             } else {
@@ -492,6 +588,8 @@ struct TimelineView: View {
         .frame(maxWidth: .infinity, alignment: .trailing)
         .padding(.trailing, 8)
         .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("playheadReadout")
     }
 
     // MARK: Gestures and sync
@@ -508,13 +606,6 @@ struct TimelineView: View {
             .onEnded { _ in
                 pinchBase = nil
             }
-    }
-
-    /// Keeps the scroll offset in lockstep with the playhead whenever the
-    /// change didn't originate from the user's finger.
-    private func syncScrollToPlayhead(force: Bool = false) {
-        guard force || !isUserScrolling else { return }
-        scrollPosition.scrollTo(x: state.playhead * pointsPerSecond)
     }
 }
 
