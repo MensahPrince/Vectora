@@ -13,6 +13,7 @@ xcuserdata/
 # Prebuilt Rust FFI bundle for the Swift package (158MB of static libs);
 # rebuild with scripts/build-ios-xcframework.sh.
 apps/cutlass-ios-macos/CutlassMobile/CutlassMobileFFI.xcframework/
+apps/cutlass-android/app/src/main/jniLibs/
 # IDE metadata (Android Studio / IntelliJ).
 .idea/
 local-assets/
