@@ -159,7 +159,12 @@ final class EditorState {
 
     /// Overlay clips visible at a timeline position (text, stickers, PiP).
     func overlays(at time: TimeInterval) -> [MockOverlayClip] {
-        overlayClips.filter { time >= $0.start && time < $0.start + $0.length }
+        // Composite by lane order: bottom rows draw first, the top row wins
+        // (desktop z = row order). Callers render the array in order.
+        let rowOf = Dictionary(uniqueKeysWithValues: lanes.enumerated().map { ($0.element.id, $0.offset) })
+        return overlayClips
+            .filter { time >= $0.start && time < $0.start + $0.length }
+            .sorted { (rowOf[$0.laneID] ?? .max) > (rowOf[$1.laneID] ?? .max) }
     }
 
     /// Effect bars active at a timeline position.
@@ -362,9 +367,17 @@ final class EditorState {
         )
     }
 
+    /// Captures the pre-drag snapshot for a commit-on-release gesture.
+    func beginDragGesture() {
+        beginGestureIfNeeded()
+    }
+
     /// Applies a drag resolution on release: one undo step, no-ops skipped.
     func commitDrag(content: DragContent, resolution: DragResolution) {
-        guard !resolution.isNoop, dragProfile(of: content) != nil else { return }
+        guard !resolution.isNoop, dragProfile(of: content) != nil else {
+            endGesture()
+            return
+        }
         pushUndoSnapshot()
 
         switch resolution.landing {
@@ -380,6 +393,7 @@ final class EditorState {
         }
 
         pruneEmptyLanes()
+        activeSnapTime = nil
         clampPlayhead()
     }
 
