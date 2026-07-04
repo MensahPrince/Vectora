@@ -39,7 +39,9 @@ use cutlass_compositor::{
     CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement, RgbaImage,
 };
 use cutlass_decoder::OutputMode;
-use cutlass_models::{Generator, MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind};
+use cutlass_models::{
+    Generator, MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind,
+};
 use cutlass_render::Renderer;
 
 /// Render the built-in demo scene at `width`×`height`. `None` if the dimensions
@@ -551,7 +553,9 @@ mod android_jni {
     /// `com.scytheralpha.cutlass_android.CutlassNative.renderDemo(width, height)`.
     /// Returns `width * height` ARGB_8888 pixels, or an empty array on failure.
     #[unsafe(no_mangle)]
-    pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_renderDemo<'local>(
+    pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_renderDemo<
+        'local,
+    >(
         env: JNIEnv<'local>,
         _class: JClass<'local>,
         width: jint,

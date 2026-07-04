@@ -285,6 +285,90 @@ fn lifting_a_main_clip_to_a_lane_closes_the_hole() {
 }
 
 #[test]
+fn freeze_splits_the_clip_around_a_three_second_still() {
+    let media = temp_media_clip();
+    let media_str = media.to_str().expect("utf8 path");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let png = dir.path().join("freeze.png");
+    let png_str = png.to_str().expect("utf8 path");
+
+    let session = cutlass_session_new(30, 1);
+    assert!(!session.is_null());
+
+    let appended = intent(
+        session,
+        serde_json::json!({"intent": "append_main", "paths": [media_str]}),
+    );
+    let clip = appended["ok"]["clips"][0].as_u64().expect("clip id");
+
+    // Freeze mid-clip: split at 1s, drop a 3s still in the gap.
+    let frozen = intent(
+        session,
+        serde_json::json!({"intent": "freeze", "clip": clip, "seconds": 1.0, "png_path": png_str}),
+    );
+    assert!(frozen["ok"]["clip"].is_u64(), "unexpected: {frozen}");
+    assert!(frozen["ok"]["split"].is_u64(), "mid-clip freeze splits");
+    assert!(png.exists(), "the frozen frame lands on disk");
+
+    let main = lane_clips(session, "video");
+    assert_eq!(main.len(), 3, "left half + still + right half");
+    assert_eq!(main[0]["start_seconds"], 0.0);
+    assert_eq!(main[0]["length_seconds"], 1.0);
+    assert_eq!(main[1]["kind"], "image");
+    assert_eq!(main[1]["is_image"], true);
+    assert_eq!(main[1]["start_seconds"], 1.0);
+    assert_eq!(main[1]["length_seconds"], 3.0);
+    assert_eq!(main[2]["start_seconds"], 4.0);
+    assert_eq!(main[2]["length_seconds"], 1.0);
+
+    // The whole choreography is one undo step.
+    unsafe { assert!(cutlass_session_undo(session)) };
+    let main = lane_clips(session, "video");
+    assert_eq!(main.len(), 1);
+    assert_eq!(main[0]["length_seconds"], 2.0);
+
+    unsafe { cutlass_session_close(session) };
+    let _ = std::fs::remove_file(&media);
+}
+
+#[test]
+fn freeze_at_the_clip_edge_inserts_without_splitting() {
+    let media = temp_media_clip();
+    let media_str = media.to_str().expect("utf8 path");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let png = dir.path().join("edge.png");
+    let png_str = png.to_str().expect("utf8 path");
+
+    let session = cutlass_session_new(30, 1);
+    assert!(!session.is_null());
+
+    let appended = intent(
+        session,
+        serde_json::json!({"intent": "append_main", "paths": [media_str]}),
+    );
+    let clip = appended["ok"]["clips"][0].as_u64().expect("clip id");
+
+    let frozen = intent(
+        session,
+        serde_json::json!({
+            "intent": "freeze", "clip": clip, "seconds": 0.0,
+            "png_path": png_str, "duration_seconds": 1.0,
+        }),
+    );
+    assert!(frozen["ok"]["split"].is_null(), "edge freeze never splits");
+
+    let main = lane_clips(session, "video");
+    assert_eq!(main.len(), 2, "still slots in ahead of the clip");
+    assert_eq!(main[0]["kind"], "image");
+    assert_eq!(main[0]["length_seconds"], 1.0);
+    assert_eq!(main[1]["start_seconds"], 1.0);
+    assert_eq!(main[1]["length_seconds"], 2.0);
+
+    unsafe { cutlass_session_close(session) };
+    let _ = std::fs::remove_file(&media);
+}
+
+#[test]
 fn save_then_open_restores_the_project() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("roundtrip.cutlass");

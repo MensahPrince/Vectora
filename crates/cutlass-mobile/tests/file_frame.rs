@@ -58,15 +58,16 @@ fn decodes_exported_clip_through_ffi() {
     let path_str = path.to_str().expect("utf-8 path");
 
     // SAFETY: `path_str` bytes live for the call; the returned image is freed below.
-    let image = unsafe {
-        cutlass_render_file_frame(path_str.as_ptr(), path_str.len(), 320, 240)
-    };
+    let image = unsafe { cutlass_render_file_frame(path_str.as_ptr(), path_str.len(), 320, 240) };
     let _ = std::fs::remove_file(&path);
 
     assert!(!image.data.is_null(), "decode/composite produced no frame");
     // 16:9 source fit into 320x240 -> 320x180.
     assert!(image.width <= 320 && image.height <= 240);
-    assert_eq!(image.len, (image.width as usize) * (image.height as usize) * 4);
+    assert_eq!(
+        image.len,
+        (image.width as usize) * (image.height as usize) * 4
+    );
 
     // SAFETY: `image` came straight from the FFI and is freed exactly once.
     let pixels = unsafe { std::slice::from_raw_parts(image.data, image.len) };

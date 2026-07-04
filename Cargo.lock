@@ -1264,6 +1264,7 @@ dependencies = [
  "cutlass-render",
  "jni 0.21.1",
  "log",
+ "png 0.17.16",
  "serde",
  "serde_json",
  "tempfile",

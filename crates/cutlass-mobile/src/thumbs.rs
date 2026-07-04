@@ -37,17 +37,24 @@ impl CutlassThumbnailer {
                 return None;
             }
         };
-        let frame_rate = probe.frame_rate;
-        let frames = probe.frame_count.max(1);
+        let source = if probe.is_image {
+            // One cached frame for any slot: the still convention gives the
+            // filmstrip a nominal 5s window so slot spacing math stays sane.
+            MediaSource::image(path, probe.width, probe.height)
+        } else {
+            MediaSource::new(
+                path,
+                probe.width,
+                probe.height,
+                probe.frame_rate,
+                probe.frame_count.max(1),
+                probe.has_audio,
+            )
+        };
+        let frame_rate = source.frame_rate;
+        let frames = source.duration.value.max(1);
         let mut project = Project::new("thumbnailer", frame_rate);
-        let media = project.add_media(MediaSource::new(
-            path,
-            probe.width,
-            probe.height,
-            frame_rate,
-            frames,
-            probe.has_audio,
-        ));
+        let media = project.add_media(source);
         let track = project.add_track(TrackKind::Video, "Media");
         if let Err(e) = project.add_clip(
             track,

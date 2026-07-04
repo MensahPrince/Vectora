@@ -22,6 +22,7 @@ cutlass-engine = { path = "../cutlass-engine" }
 cutlass-models = { path = "../cutlass-models" }
 cutlass-render = { path = "../cutlass-render" }
 log = "0.4"
+png = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 

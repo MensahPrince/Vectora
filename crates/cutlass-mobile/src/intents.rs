@@ -133,6 +133,18 @@ pub enum Intent {
     /// CapCut "extract audio": place the clip's audio on an audio lane,
     /// linked to the original (whose own lane goes silent via linkage).
     ExtractAudio { clip: ClipId },
+    /// CapCut "freeze": extract the main-track clip's frame under the
+    /// playhead, write it to `png_path`, import it as a still, and
+    /// ripple-insert it at the playhead (splitting the clip when mid-clip).
+    Freeze {
+        clip: ClipId,
+        seconds: f64,
+        /// Destination for the extracted frame — the shell owns media
+        /// placement (project media dir), Rust owns the pixels.
+        png_path: PathBuf,
+        #[serde(default = "default_freeze_seconds")]
+        duration_seconds: f64,
+    },
     /// Retime a media clip. `speed` is the positive rate multiplier.
     SetSpeed {
         clip: ClipId,
@@ -178,6 +190,10 @@ pub enum Intent {
 }
 
 fn default_overlay_seconds() -> f64 {
+    3.0
+}
+
+fn default_freeze_seconds() -> f64 {
     3.0
 }
 
@@ -253,6 +269,14 @@ pub fn run(engine: &mut Engine, intent: Intent) -> Result<serde_json::Value, Eng
         Intent::Duplicate { clip } => grouped(engine, |e| duplicate(e, clip)),
         Intent::ReplaceMedia { clip, path } => grouped(engine, |e| replace_media(e, clip, &path)),
         Intent::ExtractAudio { clip } => grouped(engine, |e| extract_audio(e, clip)),
+        Intent::Freeze {
+            clip,
+            seconds,
+            png_path,
+            duration_seconds,
+        } => grouped(engine, |e| {
+            freeze(e, clip, seconds, &png_path, duration_seconds)
+        }),
         Intent::SetSpeed {
             clip,
             speed,
@@ -1101,6 +1125,147 @@ fn extract_audio(engine: &mut Engine, clip: ClipId) -> Result<serde_json::Value,
         clips: vec![clip, audio_clip],
     }))?;
     Ok(serde_json::json!({ "clip": audio_clip.raw(), "track": lane.raw() }))
+}
+
+fn freeze(
+    engine: &mut Engine,
+    clip: ClipId,
+    seconds: f64,
+    png_path: &std::path::Path,
+    duration_seconds: f64,
+) -> Result<serde_json::Value, EngineError> {
+    let rate = engine.project().timeline().frame_rate;
+    let (track, snapshot) = require_main_clip(engine.project(), clip)?;
+    let ClipSource::Media { media, .. } = snapshot.content else {
+        return Err(invalid("freeze frame targets a media clip"));
+    };
+    let entry = engine
+        .project()
+        .media(media)
+        .ok_or(ModelError::UnknownMedia(media))?
+        .clone();
+    if entry.is_image {
+        return Err(invalid("clip is already a still"));
+    }
+
+    // Which source frame sits under the playhead (speed/reverse honoured)?
+    // Edge hits clamp to the nearest interior frame so a freeze at a cut
+    // boundary still has content to freeze.
+    let s = snapshot.timeline.start.value;
+    let d = snapshot.timeline.duration.value;
+    let local = (frame_tick(seconds, rate) - s).clamp(0, d);
+    let probe_tick = s + local.min(d - 1);
+    let source_time = snapshot
+        .source_time_at(RationalTime::new(probe_tick, rate))?
+        .ok_or_else(|| invalid("playhead is outside the clip"))?;
+
+    // Extract the frame at native size before touching the timeline, so a
+    // decode failure leaves no half-applied edit behind.
+    let frame = render_media_frame(&entry, source_time)?;
+    write_freeze_png(png_path, &frame)?;
+    let still = apply_imported(engine, png_path)?;
+    let still_window = engine
+        .project()
+        .media(still)
+        .ok_or(ModelError::UnknownMedia(still))?
+        .duration
+        .value;
+
+    // Mid-clip freezes split first; edge hits insert flush at the boundary.
+    let mut split = None;
+    let insert_at = if local == 0 {
+        s
+    } else if local >= d {
+        s + d
+    } else {
+        split = Some(apply_created(
+            engine,
+            EditCommand::SplitClip {
+                clip,
+                at: RationalTime::new(s + local, rate),
+            },
+        )?);
+        s + local
+    };
+
+    let len = frame_tick(duration_seconds.max(0.1), cutlass_models::STILL_TICK_RATE)
+        .clamp(1, still_window);
+    let freeze_clip = apply_created(
+        engine,
+        EditCommand::RippleInsert {
+            track,
+            media: still,
+            source: TimeRange::at_rate(0, len, cutlass_models::STILL_TICK_RATE),
+            at: RationalTime::new(insert_at, rate),
+        },
+    )?;
+
+    // The still inherits the source clip's look at the frozen instant:
+    // framing flattens to a constant, the effect chain carries by id.
+    let pose = snapshot.transform.sample(local);
+    if !pose.is_identity() {
+        engine.apply(Command::Edit(EditCommand::SetClipTransform {
+            clip: freeze_clip,
+            transform: pose,
+            at: None,
+        }))?;
+    }
+    for effect in &snapshot.effects {
+        engine.apply(Command::Edit(EditCommand::AddEffect {
+            clip: freeze_clip,
+            effect_id: effect.effect_id.clone(),
+        }))?;
+    }
+
+    Ok(serde_json::json!({
+        "clip": freeze_clip.raw(),
+        "media": still.raw(),
+        "split": split.map(|c| c.raw()),
+    }))
+}
+
+/// Render one frame of `media` at native size through the normal
+/// resolve/render path (a scratch single-clip project, the thumbnailer
+/// trick), so orientation and aspect handling can never drift from preview.
+fn render_media_frame(
+    media: &cutlass_models::MediaSource,
+    source_time: RationalTime,
+) -> Result<cutlass_core::RgbaImage, EngineError> {
+    let rate = media.frame_rate;
+    let frames = media.duration.value.max(1);
+    let mut scratch = Project::new("freeze", rate);
+    let id = scratch.add_media(media.clone());
+    let track = scratch.add_track(TrackKind::Video, "Media");
+    scratch.add_clip(
+        track,
+        id,
+        TimeRange::at_rate(0, frames, rate),
+        RationalTime::new(0, rate),
+    )?;
+    let mut renderer = cutlass_render::Renderer::new_headless()?;
+    let tick = source_time.value.clamp(0, frames - 1);
+    Ok(renderer.render_frame(&scratch, RationalTime::new(tick, rate))?)
+}
+
+/// Write a tightly-packed RGBA8 frame as an 8-bit PNG.
+fn write_freeze_png(
+    path: &std::path::Path,
+    image: &cutlass_core::RgbaImage,
+) -> Result<(), EngineError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let file = std::fs::File::create(path)?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), image.width, image.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| EngineError::Import(format!("freeze png: {e}")))?;
+    writer
+        .write_image_data(&image.pixels)
+        .map_err(|e| EngineError::Import(format!("freeze png: {e}")))?;
+    Ok(())
 }
 
 // --- property intents -----------------------------------------------------------
