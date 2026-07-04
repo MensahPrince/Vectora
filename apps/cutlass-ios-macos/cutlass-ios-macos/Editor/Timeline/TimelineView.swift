@@ -77,7 +77,10 @@ struct TimelineView: View {
             let maxLaneOffset = max(0, lanesNatural - lanesViewport)
             let effectiveLaneOffset = min(laneOffset, maxLaneOffset)
 
-            ZStack(alignment: .top) {
+            // topLeading matters: .top would horizontally CENTER the
+            // wider-than-viewport content before the -playhead offset
+            // applies, silently shifting visual time away from the model.
+            ZStack(alignment: .topLeading) {
                 // Not a ScrollView: the content offsets by -playhead so the
                 // fixed center line IS the playhead, and one drag gesture on
                 // the whole surface owns panning (horizontal = scrub,
@@ -139,13 +142,15 @@ struct TimelineView: View {
                 .overlay(alignment: .topLeading) { snapGuide }
                 .frame(width: max(contentWidth, 1), alignment: .topLeading)
                 .offset(x: halfWidth - state.playhead * pointsPerSecond)
-
-                playheadLine
-                readout
-                magnetToggle
             }
-            .frame(width: geometry.size.width, height: displayHeight, alignment: .top)
+            .frame(width: geometry.size.width, height: displayHeight, alignment: .topLeading)
             .clipped()
+            // Chrome sits outside the wide content ZStack: inside it these
+            // flexible views would size to the full content width and land
+            // offscreen; as overlays they pin to the visible viewport.
+            .overlay { playheadLine }
+            .overlay(alignment: .top) { readout }
+            .overlay(alignment: .bottomTrailing) { magnetToggle }
             .contentShape(Rectangle())
             // Tapping anything that isn't a clip clears the selection.
             .onTapGesture { state.selection = nil }
