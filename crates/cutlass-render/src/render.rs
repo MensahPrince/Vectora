@@ -34,6 +34,11 @@ pub struct Renderer {
     /// stateful (seek + walk), so keeping them warm makes sequential export and
     /// nearby scrubbing cheap.
     decoders: HashMap<MediaId, Box<dyn VideoDecoder>>,
+    /// Decode-once cache for still images: one straight-alpha RGBA bitmap per
+    /// media source, reused for every frame the still is on screen. Bounded by
+    /// the project's still count, with each entry capped at
+    /// [`cutlass_decoder::image::MAX_DECODE_DIMENSION`] on the long side.
+    stills: HashMap<MediaId, RgbaImage>,
     /// Preferred decoder output mode. Apple starts in [`OutputMode::Gpu`] so
     /// hardware-decoded `CVPixelBuffer`s import into the compositor with no CPU
     /// copy; if a produced surface can't be imported (e.g. 10-bit/HDR), the
@@ -54,6 +59,7 @@ impl Renderer {
             text: TextRenderer::new(),
             paths: PathRaster::new(),
             decoders: HashMap::new(),
+            stills: HashMap::new(),
             decode_mode: default_decode_mode(),
         })
     }
@@ -181,6 +187,15 @@ impl Renderer {
                         uv: layer.uv,
                     });
                 }
+                LayerSource::Still { media } => {
+                    self.ensure_still(project, *media)?;
+                    let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                    realized.push(Realized::Still {
+                        media: *media,
+                        placement: place(size),
+                        uv: layer.uv,
+                    });
+                }
                 LayerSource::Shape {
                     params,
                     fill,
@@ -246,6 +261,12 @@ impl Renderer {
                     placement,
                     uv,
                 } => CompositeLayer::frame(frame, *placement).with_uv(*uv),
+                // `ensure_still` populated the cache in the first pass.
+                Realized::Still {
+                    media,
+                    placement,
+                    uv,
+                } => CompositeLayer::rgba(&self.stills[media], *placement).with_uv(*uv),
                 Realized::Sdf { shape, placement } => CompositeLayer::sdf(*shape, *placement),
             })
             .collect();
@@ -277,12 +298,30 @@ impl Renderer {
                 time: source_time,
             })
     }
+
+    /// Decode `media`'s single still frame into the cache on first use.
+    fn ensure_still(&mut self, project: &Project, media: MediaId) -> Result<(), RenderError> {
+        if self.stills.contains_key(&media) {
+            return Ok(());
+        }
+        let src = project.media(media).ok_or(RenderError::MissingMedia(media))?;
+        let image = cutlass_decoder::decode_image(src.path())?;
+        self.stills.insert(media, image);
+        Ok(())
+    }
 }
 
 /// An owned, decoded/rasterized layer kept alive while the compositor borrows it.
 enum Realized {
     Frame {
         frame: VideoFrame,
+        placement: LayerPlacement,
+        uv: [f32; 4],
+    },
+    /// A still image already decoded into the renderer's cache; the composite
+    /// pass borrows the pixels from there instead of cloning them per frame.
+    Still {
+        media: MediaId,
         placement: LayerPlacement,
         uv: [f32; 4],
     },

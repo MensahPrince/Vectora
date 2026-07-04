@@ -8,14 +8,15 @@
 //!
 //! ## Coverage (v1)
 //!
-//! - **Media**: video sources (aspect-fit into the canvas, then scaled).
+//! - **Media**: video sources and still images (both aspect-fit into the
+//!   canvas, then scaled; stills place one cached frame for the clip's whole
+//!   extent).
 //! - **Generators**: text, solid fills, and every shape kind — parametric
 //!   shapes resolve to sampled SDF layers (animated geometry/colors are
 //!   sampled per instant here, evaluated on the GPU), pen paths to CPU-raster
 //!   layers.
-//! - **Deferred**: still images (no still decoder yet), stickers, effects,
-//!   filters, and adjustment layers are skipped (they produce no layer)
-//!   rather than rendered wrong.
+//! - **Deferred**: stickers, effects, filters, and adjustment layers are
+//!   skipped (they produce no layer) rather than rendered wrong.
 
 use cutlass_core::{RationalTime, resample};
 use cutlass_models::{
@@ -142,11 +143,22 @@ fn resolve_clip(
             let Some(src) = project.media(*media) else {
                 return Ok(None);
             };
-            if src.kind() != MediaKind::Video {
-                return Ok(None);
-            }
-            let Some(source_time) = clip.source_time_at(t)? else {
-                return Ok(None);
+            // Both picture kinds aspect-fit into the canvas at their probed
+            // size; audio-only media places nothing.
+            let source = match src.kind() {
+                MediaKind::Video => {
+                    let Some(source_time) = clip.source_time_at(t)? else {
+                        return Ok(None);
+                    };
+                    LayerSource::Media {
+                        media: *media,
+                        source_time,
+                    }
+                }
+                // One frame for the clip's whole extent: no source time, and
+                // retime/reverse are irrelevant by construction.
+                MediaKind::Image => LayerSource::Still { media: *media },
+                MediaKind::Audio => return Ok(None),
             };
             let fit = fit_scale(src.width as f32, src.height as f32, cw, ch);
             let size = SizeSpec::Fixed([
@@ -154,10 +166,7 @@ fn resolve_clip(
                 src.height as f32 * fit * xf.scale,
             ]);
             Ok(Some(SceneLayer {
-                source: LayerSource::Media {
-                    media: *media,
-                    source_time,
-                },
+                source,
                 center,
                 size,
                 rotation,
@@ -645,6 +654,51 @@ mod tests {
             other => panic!("expected fixed size, got {other:?}"),
         }
         approx(layer.opacity, 0.5);
+    }
+
+    #[test]
+    fn image_clip_resolves_to_an_aspect_fit_still_layer() {
+        let mut project = Project::new("p", FPS_24);
+        // 800×600 still on the default 1920×1080 canvas: fit = 1.8.
+        let media = project.add_media(MediaSource::image("/photos/pic.png", 800, 600));
+        let window = project.media(media).unwrap().full_range();
+        let track = project.add_track(TrackKind::Video, "V1");
+        project.add_clip(track, media, window, rt(0)).unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        let layer = &scene.layers[0];
+        assert_eq!(layer.source, LayerSource::Still { media });
+        approx2(layer.center, [960.0, 540.0]);
+        match layer.size {
+            SizeSpec::Fixed(size) => approx2(size, [1440.0, 1080.0]),
+            other => panic!("expected fixed size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn still_layer_ignores_retiming_and_covers_the_whole_clip() {
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(MediaSource::image("/photos/pic.png", 1920, 1080));
+        let window = project.media(media).unwrap().full_range();
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, window, rt(0)).unwrap();
+        // Reverse would make a video clip walk its source backward; a still
+        // must keep producing its one frame at every covered tick.
+        project
+            .set_clip_speed(clip, Rational::new(1, 1), true)
+            .unwrap();
+        let duration = project.timeline().duration().value;
+        assert!(duration > 0);
+
+        for t in [0, duration / 2, duration - 1] {
+            let scene = resolve(&project, rt(t)).unwrap();
+            assert_eq!(scene.layers.len(), 1, "tick {t}");
+            assert_eq!(scene.layers[0].source, LayerSource::Still { media });
+        }
+        // Past the clip: nothing.
+        let scene = resolve(&project, rt(duration)).unwrap();
+        assert!(scene.layers.is_empty());
     }
 
     #[test]

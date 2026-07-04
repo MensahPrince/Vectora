@@ -70,7 +70,10 @@ impl Scene {
                 // Path strokes live in path-local pixels folded into the
                 // raster, so scaling the raster factor scales them too.
                 LayerSource::PathShape { raster_scale, .. } => *raster_scale *= factor,
-                LayerSource::Media { .. } | LayerSource::Text { .. } | LayerSource::Solid(_) => {}
+                LayerSource::Media { .. }
+                | LayerSource::Still { .. }
+                | LayerSource::Text { .. }
+                | LayerSource::Solid(_) => {}
             }
         }
     }
@@ -156,6 +159,9 @@ pub enum LayerSource {
         media: MediaId,
         source_time: RationalTime,
     },
+    /// A still image: decode `media`'s single frame once (the renderer
+    /// caches it) and place it for the clip's whole extent.
+    Still { media: MediaId },
     /// A rasterized text run.
     Text { content: String, style: TextStyle },
     /// A solid RGBA fill across the placed quad.
