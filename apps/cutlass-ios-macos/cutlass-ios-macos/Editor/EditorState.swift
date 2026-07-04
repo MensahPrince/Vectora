@@ -1,6 +1,8 @@
+import CutlassMobile
 import SwiftUI
 
-/// One undoable state of the whole mock timeline.
+/// One snapshot of the timeline projection (used as the panel-session
+/// baseline for cancel/diff, and by gesture bookkeeping).
 nonisolated struct TimelineSnapshot: Equatable {
     var clips: [MockClip] = []
     var lanes: [MockLane] = [MockLane(kind: .video, isMain: true)]
@@ -44,10 +46,19 @@ nonisolated struct DragResolution: Equatable {
     var isNoop = false
 }
 
-/// In-memory state for the mock editor: an ordered lane stack (desktop
-/// rules: one content kind per lane, no same-lane overlap, audio pinned to
-/// the bottom) around a sequential magnetic main track.
-/// All edits are pure array/state manipulation; nothing touches the engine.
+/// Editor state riding the Rust engine.
+///
+/// The engine (`CutlassSession`) owns the project, all edit validation, and
+/// the undo history. This class holds a *projection* of the engine's
+/// `ui_state` in the same view-model arrays the views always rendered, plus
+/// pure-UI state (playhead, selection, zoom).
+///
+/// Mutations follow two shapes:
+/// - **Taps** (split, delete, add text, …) send an intent to the engine and
+///   re-project from `ui_state` when it answers (~ms).
+/// - **Continuous gestures** (trims, drags) mutate the local arrays live for
+///   a 60fps preview, then commit one intent on release — the engine's answer
+///   snaps the projection to the truth (commit-on-release, same as desktop).
 @Observable
 final class EditorState {
     var clips: [MockClip] = []
@@ -85,12 +96,49 @@ final class EditorState {
     /// guide line + snap haptic); nil when not snapped.
     var activeSnapTime: TimeInterval?
 
-    private var undoStack: [TimelineSnapshot] = []
-    private var redoStack: [TimelineSnapshot] = []
+    /// Engine history flags (from the last `ui_state` refresh).
+    private(set) var canUndo = false
+    private(set) var canRedo = false
+
     private var playbackTask: Task<Void, Never>?
 
-    var canUndo: Bool { !undoStack.isEmpty }
-    var canRedo: Bool { !redoStack.isEmpty }
+    // MARK: Engine session plumbing
+
+    /// The engine session; nil only before the first project starts.
+    @ObservationIgnored private var session: CutlassSession?
+    /// Bumps when the session is replaced; in-flight ops from the old
+    /// session check it and drop their results.
+    @ObservationIgnored private var sessionGeneration = 0
+    /// FIFO chain serializing engine ops so refreshes apply in issue order.
+    @ObservationIgnored private var opChain: Task<Void, Never>?
+    /// Engine id -> stable SwiftUI identity.
+    @ObservationIgnored private var idMap = EngineIDMap()
+    /// Engine clip id -> hosting lane kind (from the last refresh).
+    @ObservationIgnored private var clipLaneKinds: [UInt64: MockLane.Kind] = [:]
+    /// Revision of the last applied refresh; older snapshots are dropped.
+    @ObservationIgnored private var appliedRevision: UInt64 = 0
+    /// Refresh deferred because a live gesture owns the arrays right now.
+    @ObservationIgnored private var deferredRefresh: UiState?
+
+    init() {
+        createSession()
+    }
+
+    /// Bring up a fresh engine session at the head of the op chain. GPU/
+    /// renderer init happens off the main thread; ops enqueued meanwhile run
+    /// after it in FIFO order.
+    private func createSession() {
+        sessionGeneration += 1
+        let generation = sessionGeneration
+        session = nil
+        opChain = Task { @MainActor [weak self] in
+            let created = await Task.detached(priority: .userInitiated) {
+                CutlassSession.create()
+            }.value
+            guard let self, self.sessionGeneration == generation else { return }
+            self.session = created
+        }
+    }
 
     var isEmpty: Bool {
         clips.isEmpty && overlayClips.isEmpty && effectClips.isEmpty && audioClips.isEmpty
@@ -108,6 +156,184 @@ final class EditorState {
         for clip in effectClips { end = max(end, clip.start + clip.length) }
         for clip in audioClips { end = max(end, clip.start + clip.length) }
         return end
+    }
+
+    // MARK: Engine op pipeline
+
+    /// Append an engine op to the FIFO chain. `body` runs on the main actor,
+    /// awaits the session actor for the engine work, and applies the refresh.
+    /// The session resolves when the op *runs* (session creation is itself
+    /// the head of the chain).
+    private func enqueue(_ body: @escaping @MainActor (CutlassSession) async throws -> Void) {
+        let generation = sessionGeneration
+        let previous = opChain
+        opChain = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, self.sessionGeneration == generation,
+                let session = self.session
+            else { return }
+            do {
+                try await body(session)
+            } catch {
+                // Engine rejection: state is unchanged in Rust; re-project so
+                // any optimistic local mutation snaps back to the truth.
+                print("cutlass: engine op failed: \(error)")
+                if let state = try? await session.uiState(),
+                    self.sessionGeneration == generation
+                {
+                    self.applyRefresh(state)
+                }
+            }
+        }
+    }
+
+    /// Run one intent, refresh, then hand the result to `onResult` (invoked
+    /// after the refresh so created entities are already projected).
+    private func runIntent(
+        _ intent: Intent, onResult: (@MainActor (IntentResult) -> Void)? = nil
+    ) {
+        enqueue { [weak self] session in
+            let result = try await session.run(intent)
+            let state = try await session.uiState()
+            guard let self else { return }
+            self.noteEngineOpDuringPanel()
+            self.applyRefresh(state)
+            onResult?(result)
+        }
+    }
+
+    /// Run a create-intent whose optimistic placeholder is already on screen:
+    /// the engine clip adopts the placeholder's UUID so views (and the
+    /// selection) holding it never see an identity swap.
+    private func runCreateIntent(_ intent: Intent, placeholder: UUID) {
+        enqueue { [weak self] session in
+            let result = try await session.run(intent)
+            guard let self else { return }
+            if let clip = result.clip {
+                self.idMap.adopted[clip] = placeholder
+            }
+            let state = try await session.uiState()
+            self.noteEngineOpDuringPanel()
+            self.applyRefresh(state)
+        }
+    }
+
+    /// Apply one raw wire command + refresh.
+    private func runCommand(_ command: Command) {
+        enqueue { [weak self] session in
+            try await session.apply(command)
+            let state = try await session.uiState()
+            guard let self else { return }
+            self.noteEngineOpDuringPanel()
+            self.applyRefresh(state)
+        }
+    }
+
+    /// Re-project the arrays from a `ui_state` snapshot. Deferred while a
+    /// live gesture owns the arrays; stale snapshots are dropped.
+    private func applyRefresh(_ state: UiState) {
+        guard state.revision >= appliedRevision else { return }
+        if liveGesture != nil || dragInProgress {
+            deferredRefresh = state
+            return
+        }
+        appliedRevision = state.revision
+        let projection = EngineBridge.project(state, previous: currentProjection(), ids: idMap)
+
+        var newClips = projection.clips
+        var newOverlays = projection.overlays
+        var newEffects = projection.effects
+        var newAudios = projection.audios
+        // While a panel session edits the selected clip, its local (not yet
+        // committed) values win over the engine's — commit sends the diff.
+        if panelBaseline != nil, let selection {
+            preserveLocal(selection, in: &newClips, &newOverlays, &newEffects, &newAudios)
+        }
+
+        clips = newClips
+        lanes = projection.lanes
+        overlayClips = newOverlays
+        effectClips = newEffects
+        audioClips = newAudios
+        clipLaneKinds = projection.clipLane
+        canUndo = projection.canUndo
+        canRedo = projection.canRedo
+        if panelBaseline == nil {
+            aspect = projection.aspect
+            if background.kind == .color, let color = projection.canvasBackground {
+                background.color = color
+            }
+        }
+        reconcileSelection()
+        clampPlayhead()
+    }
+
+    private func currentProjection() -> EngineProjection {
+        var projection = EngineProjection()
+        projection.clips = clips
+        projection.overlays = overlayClips
+        projection.effects = effectClips
+        projection.audios = audioClips
+        return projection
+    }
+
+    /// Copy the selected item's local struct over the freshly projected one
+    /// (keeping the projection's identity fields).
+    private func preserveLocal(
+        _ selection: TimelineSelection,
+        in clips: inout [MockClip], _ overlays: inout [MockOverlayClip],
+        _ effects: inout [MockEffectClip], _ audios: inout [MockAudioClip]
+    ) {
+        switch selection {
+        case .main(let id):
+            guard let local = self.clips.first(where: { $0.id == id }),
+                let index = clips.firstIndex(where: { $0.id == id })
+            else { return }
+            var kept = local
+            kept.engineID = clips[index].engineID
+            clips[index] = kept
+        case .overlay(let id):
+            guard let local = overlayClips.first(where: { $0.id == id }),
+                let index = overlays.firstIndex(where: { $0.id == id })
+            else { return }
+            var kept = local
+            kept.engineID = overlays[index].engineID
+            kept.laneID = overlays[index].laneID
+            overlays[index] = kept
+        case .effect(let id):
+            guard let local = effectClips.first(where: { $0.id == id }),
+                let index = effects.firstIndex(where: { $0.id == id })
+            else { return }
+            var kept = local
+            kept.engineID = effects[index].engineID
+            kept.laneID = effects[index].laneID
+            effects[index] = kept
+        case .audio(let id):
+            guard let local = audioClips.first(where: { $0.id == id }),
+                let index = audios.firstIndex(where: { $0.id == id })
+            else { return }
+            var kept = local
+            kept.engineID = audios[index].engineID
+            kept.laneID = audios[index].laneID
+            audios[index] = kept
+        }
+    }
+
+    private func flushDeferredRefresh() {
+        guard let state = deferredRefresh else { return }
+        deferredRefresh = nil
+        applyRefresh(state)
+    }
+
+    /// The engine id behind a selection (nil for optimistic placeholders the
+    /// engine hasn't confirmed yet).
+    private func engineID(of target: TimelineSelection) -> UInt64? {
+        switch target {
+        case .main(let id): clips.first { $0.id == id }?.engineID
+        case .overlay(let id): overlayClips.first { $0.id == id }?.engineID
+        case .effect(let id): effectClips.first { $0.id == id }?.engineID
+        case .audio(let id): audioClips.first { $0.id == id }?.engineID
+        }
     }
 
     // MARK: Selection accessors
@@ -222,7 +448,8 @@ final class EditorState {
     }
 
     /// Drops lanes that no longer host any clip (the main track always
-    /// stays, even when empty).
+    /// stays, even when empty). Only used for optimistic gesture previews;
+    /// the engine refresh is the real pruner.
     private func pruneEmptyLanes() {
         lanes.removeAll { lane in
             !lane.isMain && lane.kind != .audio && spans(on: lane.id).isEmpty
@@ -236,7 +463,8 @@ final class EditorState {
     /// A lane of `kind` whose span at [start, start+length) is free —
     /// `preferred` first, then top-to-bottom — or a brand-new lane inserted
     /// at the kind's default row (video above main, generated kinds just
-    /// above the audio floor, audio at the very bottom).
+    /// above the audio floor, audio at the very bottom). Mirrors the engine's
+    /// `host_lane_plan`; used for optimistic placeholders.
     @discardableResult
     func hostLane(for kind: MockLane.Kind, start: TimeInterval, length: TimeInterval, preferred: UUID? = nil) -> UUID {
         if let preferred,
@@ -367,45 +595,76 @@ final class EditorState {
         )
     }
 
-    /// Captures the pre-drag snapshot for a commit-on-release gesture.
+    /// Marks the start of a commit-on-release drag (defers engine refreshes
+    /// so they can't stomp the floater's source arrays mid-drag).
     func beginDragGesture() {
-        beginGestureIfNeeded()
+        dragInProgress = true
     }
 
-    /// Applies a drag resolution on release: one undo step, no-ops skipped.
+    /// Whether a cross-lane drag currently owns the arrays.
+    @ObservationIgnored private var dragInProgress = false
+
+    /// Applies a drag resolution on release: optimistic local placement for
+    /// instant feedback, then one engine intent (`move_lane` /
+    /// `insert_into_main`) whose refresh snaps to the truth.
     func commitDrag(content: DragContent, resolution: DragResolution) {
-        guard !resolution.isNoop, dragProfile(of: content) != nil else {
-            endGesture()
+        activeSnapTime = nil
+        defer {
+            dragInProgress = false
+            flushDeferredRefresh()
+        }
+        guard !resolution.isNoop, let profile = dragProfile(of: content) else {
+            clampPlayhead()
             return
         }
-        pushUndoSnapshot()
+        let draggedEngineID = engineID(of: dragSelection(of: content))
 
         switch resolution.landing {
         case .land(let laneID, let start):
+            let laneEngineID = lanes.first(where: { $0.id == laneID })?.engineID
             place(content, onLane: laneID, at: start)
+            if let draggedEngineID {
+                runIntent(.moveLane(clip: draggedEngineID, track: laneEngineID, startSeconds: max(0, start)))
+            }
         case .newLane(let row, let start):
             let lane = MockLane(kind: resolution.kind)
             lanes.insert(lane, at: min(max(row, 0), lanes.count))
             enforceAudioFloor()
             place(content, onLane: lane.id, at: start)
+            if let draggedEngineID {
+                runIntent(.moveLane(clip: draggedEngineID, track: nil, startSeconds: max(0, start)))
+            }
         case .mainInsert(let index, _):
             insertIntoMain(content, at: index)
+            if let draggedEngineID {
+                runIntent(.insertIntoMain(clip: draggedEngineID, index: index))
+            }
         }
 
         pruneEmptyLanes()
-        activeSnapTime = nil
         clampPlayhead()
+        _ = profile
     }
 
-    /// Moves the dragged content onto an existing lane at `start`. Main-track
-    /// clips leave the sequential track and become free video-lane clips,
-    /// keeping their look and audio (no identity change).
+    private func dragSelection(of content: DragContent) -> TimelineSelection {
+        switch content {
+        case .main(let id): .main(id)
+        case .lane(let selection): selection
+        }
+    }
+
+    /// Moves the dragged content onto an existing lane at `start`
+    /// (optimistic placement — the engine's `move_lane` is the commit).
+    /// Main-track clips leave the sequential track and become free
+    /// video-lane clips, keeping their identity, look, and audio.
     private func place(_ content: DragContent, onLane laneID: UUID, at start: TimeInterval) {
         switch content {
         case .main(let id):
             guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
             let clip = clips.remove(at: index)
             var lifted = MockOverlayClip(kind: .pip, laneID: laneID, start: max(0, start), length: clip.length)
+            lifted.id = clip.id
+            lifted.engineID = clip.engineID
             lifted.art = clip.art
             lifted.sourceDuration = clip.sourceDuration
             lifted.pipHasAudio = clip.hasAudio
@@ -433,8 +692,8 @@ final class EditorState {
         }
     }
 
-    /// Inserts the dragged content into the main track at `index` (already in
-    /// post-removal space for reorders).
+    /// Optimistically inserts the dragged content into the main track at
+    /// `index` (already in post-removal space for reorders).
     private func insertIntoMain(_ content: DragContent, at index: Int) {
         switch content {
         case .main(let id):
@@ -447,12 +706,14 @@ final class EditorState {
                   let art = overlayClips[overlayIndex].art
             else { return }
             let overlay = overlayClips.remove(at: overlayIndex)
-            let clip = MockClip(
+            var clip = MockClip(
                 art: art,
                 sourceDuration: overlay.sourceDuration ?? overlay.length,
                 length: overlay.length,
                 hasAudio: overlay.pipHasAudio
             )
+            clip.id = overlay.id
+            clip.engineID = overlay.engineID
             clips.insert(clip, at: min(max(index, 0), clips.count))
             selection = .main(clip.id)
         case .lane:
@@ -529,66 +790,55 @@ final class EditorState {
         return (start, start == best.start ? best.line : nil)
     }
 
-    // MARK: Snapshots
-
-    private var snapshot: TimelineSnapshot {
-        get {
-            TimelineSnapshot(
-                clips: clips,
-                lanes: lanes,
-                overlays: overlayClips,
-                effects: effectClips,
-                audios: audioClips,
-                aspect: aspect,
-                background: background
-            )
-        }
-        set {
-            clips = newValue.clips
-            lanes = newValue.lanes
-            overlayClips = newValue.overlays
-            effectClips = newValue.effects
-            audioClips = newValue.audios
-            aspect = newValue.aspect
-            background = newValue.background
-        }
-    }
-
-    private func pushUndoSnapshot() {
-        // While a panel session is open the session snapshot owns undo; ops
-        // triggered from inside the panel fold into one step on Apply.
-        guard panelSnapshot == nil else { return }
-        if let anchor = gestureSnapshot {
-            // An op landing mid-gesture (cross-lane drop after a lift-move):
-            // the gesture anchor is the truthful "before", and consuming it
-            // folds the move + op into one undo step (endGesture then has
-            // nothing left to push).
-            undoStack.append(anchor)
-            gestureSnapshot = nil
-        } else {
-            undoStack.append(snapshot)
-        }
-        if undoStack.count > 50 {
-            undoStack.removeFirst()
-        }
-        redoStack = []
-    }
-
     // MARK: Project lifecycle
 
+    /// Fresh engine session; media items resolve to their backing files and
+    /// ripple-append onto the main track.
     func startProject(with items: [MockMediaItem]) {
         isPlaying = false
-        snapshot = TimelineSnapshot(clips: items.map(MockClip.init(from:)))
-        playhead = 0
-        selection = nil
-        undoStack = []
-        redoStack = []
+        resetSession()
+        let paths = items.compactMap { FixtureLibrary.url(for: $0)?.path }
+        if !paths.isEmpty {
+            runIntent(.appendMain(paths: paths))
+        }
     }
 
     func appendMedia(_ items: [MockMediaItem]) {
-        guard !items.isEmpty else { return }
-        pushUndoSnapshot()
-        clips.append(contentsOf: items.map(MockClip.init(from:)))
+        let paths = items.compactMap { FixtureLibrary.url(for: $0)?.path }
+        guard !paths.isEmpty else { return }
+        runIntent(.appendMain(paths: paths))
+    }
+
+    /// Queues raw intents in order (UI-test seeding; each refreshes the
+    /// projection when it lands).
+    func seedIntents(_ intents: [Intent]) {
+        for intent in intents {
+            runIntent(intent)
+        }
+    }
+
+    private func resetSession() {
+        createSession()
+        idMap = EngineIDMap()
+        clipLaneKinds = [:]
+        appliedRevision = 0
+        deferredRefresh = nil
+        panelBaseline = nil
+        panelEngineOps = 0
+        liveGesture = nil
+        dragInProgress = false
+
+        clips = []
+        lanes = [MockLane(kind: .video, isMain: true)]
+        overlayClips = []
+        effectClips = []
+        audioClips = []
+        aspect = .original
+        background = CanvasBackground()
+        canUndo = false
+        canRedo = false
+        playhead = 0
+        selection = nil
     }
 
     // MARK: Transport
@@ -622,25 +872,29 @@ final class EditorState {
         }
     }
 
-    // MARK: Undo / redo
+    // MARK: Undo / redo (engine history)
 
     func undo() {
-        guard let previous = undoStack.popLast() else { return }
+        guard canUndo else { return }
         isPlaying = false
-        redoStack.append(snapshot)
-        snapshot = previous
-        reconcileAfterHistoryJump()
+        enqueue { [weak self] session in
+            _ = await session.undo()
+            let state = try await session.uiState()
+            self?.applyRefresh(state)
+        }
     }
 
     func redo() {
-        guard let next = redoStack.popLast() else { return }
+        guard canRedo else { return }
         isPlaying = false
-        undoStack.append(snapshot)
-        snapshot = next
-        reconcileAfterHistoryJump()
+        enqueue { [weak self] session in
+            _ = await session.redo()
+            let state = try await session.uiState()
+            self?.applyRefresh(state)
+        }
     }
 
-    private func reconcileAfterHistoryJump() {
+    private func reconcileSelection() {
         switch selection {
         case .main(let id) where !clips.contains(where: { $0.id == id }),
              .overlay(let id) where !overlayClips.contains(where: { $0.id == id }),
@@ -650,35 +904,163 @@ final class EditorState {
         default:
             break
         }
-        clampPlayhead()
     }
 
     // MARK: Panel edit sessions
 
-    /// Property panels mutate state live so the preview reacts; the session
-    /// snapshot makes Cancel restore and Apply undoable as one step.
-    private var panelSnapshot: TimelineSnapshot?
+    /// Property panels mutate the local projection live so the preview
+    /// reacts; the engine stays untouched until Apply, which sends the diff
+    /// as intents. Cancel restores the baseline (plus undoes any structural
+    /// ops — transition taps, adds — that went to the engine mid-session).
+    @ObservationIgnored private var panelBaseline: TimelineSnapshot?
+    /// Engine history entries recorded while the panel session was open.
+    @ObservationIgnored private var panelEngineOps = 0
+
+    private func noteEngineOpDuringPanel() {
+        if panelBaseline != nil {
+            panelEngineOps += 1
+        }
+    }
 
     func beginPanelSession() {
-        panelSnapshot = snapshot
+        panelBaseline = TimelineSnapshot(
+            clips: clips,
+            lanes: lanes,
+            overlays: overlayClips,
+            effects: effectClips,
+            audios: audioClips,
+            aspect: aspect,
+            background: background
+        )
+        panelEngineOps = 0
     }
 
     func commitPanelSession() {
-        if let before = panelSnapshot, before != snapshot {
-            undoStack.append(before)
-            redoStack = []
-        }
-        panelSnapshot = nil
+        guard let baseline = panelBaseline else { return }
+        panelBaseline = nil
+        panelEngineOps = 0
+        commitPanelDiff(from: baseline)
     }
 
     func cancelPanelSession() {
-        if let before = panelSnapshot {
-            snapshot = before
+        guard let baseline = panelBaseline else { return }
+        panelBaseline = nil
+
+        clips = baseline.clips
+        lanes = baseline.lanes
+        overlayClips = baseline.overlays
+        effectClips = baseline.effects
+        audioClips = baseline.audios
+        aspect = baseline.aspect
+        background = baseline.background
+
+        // Structural ops that already reached the engine mid-session revert
+        // through its history, one undo per recorded op.
+        let ops = panelEngineOps
+        panelEngineOps = 0
+        if ops > 0 {
+            enqueue { [weak self] session in
+                for _ in 0..<ops {
+                    _ = await session.undo()
+                }
+                let state = try await session.uiState()
+                self?.applyRefresh(state)
+            }
         }
-        panelSnapshot = nil
+        reconcileSelection()
+        clampPlayhead()
+    }
+
+    /// Send every engine-mapped change between the panel baseline and the
+    /// current local state as intents (the mock-only styling fields stay
+    /// local until their models land in Phase I).
+    private func commitPanelDiff(from baseline: TimelineSnapshot) {
+        // Canvas.
+        let backgroundColorChanged =
+            background.kind == .color
+            && (baseline.background.color != background.color || baseline.background.kind != .color)
+        if aspect != baseline.aspect || backgroundColorChanged {
+            let rgba = background.kind == .color ? background.color.engineRGB : [0, 0, 0]
+            runCommand(.setCanvas(aspect: aspect.wireName, background: rgba))
+        }
+
+        // Selected main clip.
+        if let clip = selectedClip, let engineID = clip.engineID {
+            let before = baseline.clips.first { $0.id == clip.id }
+            if clip.speed != before?.speed ?? clip.speed
+                || clip.isReversed != before?.isReversed ?? clip.isReversed
+            {
+                runIntent(.setSpeed(clip: engineID, speed: clip.speed, reversed: clip.isReversed))
+            }
+            if clip.volume != before?.volume ?? clip.volume {
+                runIntent(
+                    .setAudio(
+                        clip: engineID, volume: Float(clip.volume),
+                        fadeInSeconds: clip.fadeIn, fadeOutSeconds: clip.fadeOut))
+            }
+            if clip.opacity != before?.opacity ?? clip.opacity {
+                runIntent(
+                    .setTransform(
+                        clip: engineID,
+                        posX: Float(clip.posX), posY: Float(clip.posY),
+                        scale: Float(clip.scale),
+                        rotationDegrees: Float(clip.rotationDegrees),
+                        opacity: Float(clip.opacity)))
+            }
+        }
+
+        // Selected overlay (text content/style, PiP volume, placement).
+        if let overlay = selectedOverlay, let engineID = overlay.engineID {
+            let before = baseline.overlays.first { $0.id == overlay.id }
+            if overlay.kind == .text,
+                overlay.text != before?.text ?? overlay.text
+                    || overlay.fontName != before?.fontName ?? overlay.fontName
+                    || overlay.textColor != before?.textColor ?? overlay.textColor
+            {
+                var style = TextStyle()
+                style.font = overlay.fontName == "Default" ? "" : overlay.fontName
+                style.fill = overlay.textColor.engineRGBA
+                runCommand(.setGenerator(clip: engineID, generator: .text(content: overlay.text, style: style)))
+            }
+            if overlay.kind == .pip, overlay.volume != before?.volume ?? overlay.volume {
+                runIntent(.setAudio(clip: engineID, volume: Float(overlay.volume)))
+            }
+            let placementChanged =
+                before == nil
+                || overlay.posX != before!.posX || overlay.posY != before!.posY
+                || overlay.scale != before!.scale
+                || overlay.rotationDegrees != before!.rotationDegrees
+                || overlay.opacity != before!.opacity
+            if placementChanged {
+                runIntent(
+                    .setTransform(
+                        clip: engineID,
+                        posX: Float(overlay.posX), posY: Float(overlay.posY),
+                        scale: Float(overlay.scale),
+                        rotationDegrees: Float(overlay.rotationDegrees),
+                        opacity: Float(overlay.opacity)))
+            }
+        }
+
+        // Selected audio clip (volume + fades).
+        if let audio = selectedAudio, let engineID = audio.engineID {
+            let before = baseline.audios.first { $0.id == audio.id }
+            if audio.volume != before?.volume ?? audio.volume
+                || audio.fadeIn != before?.fadeIn ?? audio.fadeIn
+                || audio.fadeOut != before?.fadeOut ?? audio.fadeOut
+            {
+                runIntent(
+                    .setAudio(
+                        clip: engineID, volume: Float(audio.volume),
+                        fadeInSeconds: audio.fadeIn, fadeOutSeconds: audio.fadeOut))
+            }
+        }
     }
 
     // MARK: Targeted mutation helpers (used by property panels)
+
+    // These mutate the local projection only; the panel session commit sends
+    // the engine-mapped diff.
 
     func updateSelectedClip(_ mutate: (inout MockClip) -> Void) {
         guard case .main(let id) = selection,
@@ -709,7 +1091,7 @@ final class EditorState {
     }
 
     /// Changing speed rescales the clip's timeline length so the same source
-    /// content plays faster or slower.
+    /// content plays faster or slower (live preview; committed on Apply).
     func setSelectedSpeed(_ newSpeed: Double) {
         updateSelectedClip { clip in
             let content = clip.length * clip.speed
@@ -722,57 +1104,63 @@ final class EditorState {
 
     @discardableResult
     func addTextClip(text: String = "") -> UUID {
-        pushUndoSnapshot()
         let start = insertionTime
         var clip = MockOverlayClip(kind: .text, laneID: hostLane(for: .text, start: start, length: 3), start: start, length: 3)
         clip.text = text
-        clip.posY = 0.62
         overlayClips.append(clip)
         selection = .overlay(clip.id)
+        runCreateIntent(.addText(text: text, atSeconds: start), placeholder: clip.id)
         return clip.id
     }
 
     @discardableResult
     func addSticker(symbol: String) -> UUID {
-        pushUndoSnapshot()
         let start = insertionTime
         var clip = MockOverlayClip(kind: .sticker, laneID: hostLane(for: .sticker, start: start, length: 3), start: start, length: 3)
         clip.symbol = symbol
-        clip.posY = 0.35
         overlayClips.append(clip)
         selection = .overlay(clip.id)
+        runCreateIntent(.addSticker(atSeconds: start), placeholder: clip.id)
         return clip.id
     }
 
     @discardableResult
     func addPip(from item: MockMediaItem) -> UUID {
-        pushUndoSnapshot()
         let length = item.videoDuration ?? MockClip.photoDefaultDuration
         let start = insertionTime
         var clip = MockOverlayClip(kind: .pip, laneID: hostLane(for: .video, start: start, length: length), start: start, length: length)
         clip.art = item.art
         clip.sourceDuration = item.videoDuration ?? MockClip.photoMaxDuration
         clip.pipHasAudio = item.videoDuration != nil
+        // The engine drop pose: half scale, upper half of the canvas.
         clip.scale = 0.5
         clip.posY = 0.32
         overlayClips.append(clip)
         selection = .overlay(clip.id)
+        if let url = FixtureLibrary.url(for: item) {
+            runCreateIntent(.addPip(path: url.path, atSeconds: start), placeholder: clip.id)
+        }
         return clip.id
     }
 
     @discardableResult
     func addEffectClip(name: String, kind: MockEffectClip.Kind) -> UUID {
-        pushUndoSnapshot()
         let start = insertionTime
         let clip = MockEffectClip(kind: kind, laneID: hostLane(for: .effect, start: start, length: 3), name: name, start: start, length: 3)
         effectClips.append(clip)
         selection = .effect(clip.id)
+        let laneKind =
+            switch kind {
+            case .effect: "effect"
+            case .filter: "filter"
+            case .adjust: "adjustment"
+            }
+        runCreateIntent(.addEffect(kind: laneKind, atSeconds: start), placeholder: clip.id)
         return clip.id
     }
 
     @discardableResult
     func addAudio(kind: MockAudioClip.Kind, title: String, duration: TimeInterval) -> UUID {
-        pushUndoSnapshot()
         let start = insertionTime
         let clip = MockAudioClip(
             kind: kind,
@@ -784,6 +1172,9 @@ final class EditorState {
         )
         audioClips.append(clip)
         selection = .audio(clip.id)
+        if let url = FixtureLibrary.audio {
+            runCreateIntent(.addAudio(path: url.path, atSeconds: start), placeholder: clip.id)
+        }
         return clip.id
     }
 
@@ -800,9 +1191,12 @@ final class EditorState {
               clips.indices.contains(toIndex),
               fromIndex != toIndex
         else { return }
-        pushUndoSnapshot()
+        let engineID = clips[fromIndex].engineID
         let clip = clips.remove(at: fromIndex)
         clips.insert(clip, at: toIndex)
+        if let engineID {
+            runIntent(.insertIntoMain(clip: engineID, index: toIndex))
+        }
     }
 
     // MARK: Cross-lane moves (drag a clip onto another lane)
@@ -811,8 +1205,7 @@ final class EditorState {
     /// (snap-aware). It stays a full-frame video clip — same art, audio, and
     /// scale — just free-floating now.
     func moveMainClipToLane(_ id: UUID, at start: TimeInterval) {
-        guard clips.contains(where: { $0.id == id }) else { return }
-        pushUndoSnapshot()
+        guard let clip = clips.first(where: { $0.id == id }) else { return }
 
         var dropStart = max(0, start)
         if let snapped = snapTime(near: dropStart, candidates: laneSnapCandidates(excluding: nil)) {
@@ -820,289 +1213,147 @@ final class EditorState {
         }
         guard let profile = dragProfile(of: .main(id)) else { return }
         let laneID = hostLane(for: .video, start: dropStart, length: profile.length)
+        let laneEngineID = lanes.first(where: { $0.id == laneID })?.engineID
         place(.main(id), onLane: laneID, at: dropStart)
         pruneEmptyLanes()
         clampPlayhead()
+        if let engineID = clip.engineID {
+            runIntent(.moveLane(clip: engineID, track: laneEngineID, startSeconds: dropStart))
+        }
     }
 
     /// Drops a video-lane clip into the main track at the midpoint-rule
     /// insertion slot nearest `time`.
     func moveLaneClipToMain(_ id: UUID, at time: TimeInterval) {
         guard let clip = overlayClips.first(where: { $0.id == id }), clip.kind == .pip else { return }
-        pushUndoSnapshot()
-        insertIntoMain(.lane(.overlay(id)), at: mainInsertion(desired: time).index)
+        let index = mainInsertion(desired: time).index
+        insertIntoMain(.lane(.overlay(id)), at: index)
         pruneEmptyLanes()
         clampPlayhead()
-    }
-
-    /// Splits whatever is selected at the playhead; with no selection, splits
-    /// the main-track clip under the playhead.
-    func splitAtPlayhead() {
-        switch selection {
-        case .overlay(let id):
-            if let index = overlayClips.firstIndex(where: { $0.id == id }),
-               let (left, right) = splitRange(overlayClips[index].start, overlayClips[index].length) {
-                pushUndoSnapshot()
-                overlayClips[index].length = left
-                var second = overlayClips[index]
-                second.id = UUID()
-                second.start = playhead
-                second.length = right
-                overlayClips.insert(second, at: index + 1)
-            }
-        case .effect(let id):
-            if let index = effectClips.firstIndex(where: { $0.id == id }),
-               let (left, right) = splitRange(effectClips[index].start, effectClips[index].length) {
-                pushUndoSnapshot()
-                effectClips[index].length = left
-                var second = effectClips[index]
-                second.id = UUID()
-                second.start = playhead
-                second.length = right
-                effectClips.insert(second, at: index + 1)
-            }
-        case .audio(let id):
-            if let index = audioClips.firstIndex(where: { $0.id == id }),
-               let (left, right) = splitRange(audioClips[index].start, audioClips[index].length) {
-                pushUndoSnapshot()
-                audioClips[index].length = left
-                var second = audioClips[index]
-                second.id = UUID()
-                second.start = playhead
-                second.length = right
-                second.waveSeed = Int.random(in: 0..<10_000)
-                audioClips.insert(second, at: index + 1)
-            }
-        default:
-            splitMainAtPlayhead()
+        if let engineID = clip.engineID {
+            runIntent(.insertIntoMain(clip: engineID, index: index))
         }
     }
 
-    /// Left/right lengths if the playhead splits the range non-degenerately.
-    private func splitRange(_ start: TimeInterval, _ length: TimeInterval) -> (TimeInterval, TimeInterval)? {
-        let local = playhead - start
-        guard local >= MockClip.minDuration, local <= length - MockClip.minDuration else { return nil }
-        return (local, length - local)
-    }
-
-    private func splitMainAtPlayhead() {
-        guard let clip = clip(at: playhead),
-              let index = clips.firstIndex(where: { $0.id == clip.id })
-        else { return }
-
-        let local = playhead - startTime(of: clip.id)
-        guard local >= MockClip.minDuration, local <= clip.length - MockClip.minDuration
-        else { return }
-
-        pushUndoSnapshot()
-
-        var left = clip
-        left.length = local
-        left.transitionAfter = nil
-
-        var right = clip
-        right.id = UUID()
-        right.trimStart = clip.trimStart + local
-        right.length = clip.length - local
-
-        clips.replaceSubrange(index...index, with: [left, right])
-        if selection == .main(clip.id) {
-            selection = .main(left.id)
+    /// Splits whatever is selected at the playhead; with no selection, splits
+    /// the main-track clip under the playhead. The engine validates the
+    /// position (both pieces must stay at least one frame long).
+    func splitAtPlayhead() {
+        let target: TimelineSelection?
+        switch selection {
+        case .overlay, .effect, .audio:
+            target = selection
+        default:
+            target = clip(at: playhead).map { .main($0.id) }
+        }
+        guard let target, let engineID = engineID(of: target) else { return }
+        runIntent(.split(clip: engineID, seconds: playhead)) { [weak self] result in
+            // Keep the left piece selected, like the mock did.
+            guard let self, case .main = target else { return }
+            _ = result
+            self.reconcileSelection()
         }
     }
 
     func deleteSelected() {
-        switch selection {
-        case .main(let id):
-            pushUndoSnapshot()
-            clips.removeAll { $0.id == id }
-        case .overlay(let id):
-            pushUndoSnapshot()
-            overlayClips.removeAll { $0.id == id }
-        case .effect(let id):
-            pushUndoSnapshot()
-            effectClips.removeAll { $0.id == id }
-        case .audio(let id):
-            pushUndoSnapshot()
-            audioClips.removeAll { $0.id == id }
-        case nil:
-            return
-        }
+        guard let target = selection, let engineID = engineID(of: target) else { return }
         selection = nil
-        pruneEmptyLanes()
-        clampPlayhead()
+        if case .main = target {
+            runCommand(.rippleDelete(clip: engineID))
+        } else {
+            runCommand(.removeClip(clip: engineID))
+        }
     }
 
-    /// Inserts a copy of the selected clip right after it (in time for lane
-    /// clips, in order for main-track clips).
+    /// Inserts a copy of the selected clip right after it (ripple on main,
+    /// first free slot on a lane).
     func duplicateSelected() {
-        switch selection {
-        case .main(let id):
-            guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
-            pushUndoSnapshot()
-            var copy = clips[index]
-            copy.id = UUID()
-            clips.insert(copy, at: index + 1)
-        case .overlay(let id):
-            guard let index = overlayClips.firstIndex(where: { $0.id == id }) else { return }
-            pushUndoSnapshot()
-            var copy = overlayClips[index]
-            copy.id = UUID()
-            copy.start += copy.length
-            copy.laneID = hostLane(for: copy.laneKind, start: copy.start, length: copy.length, preferred: copy.laneID)
-            overlayClips.append(copy)
-            selection = .overlay(copy.id)
-        case .effect(let id):
-            guard let index = effectClips.firstIndex(where: { $0.id == id }) else { return }
-            pushUndoSnapshot()
-            var copy = effectClips[index]
-            copy.id = UUID()
-            copy.start += copy.length
-            copy.laneID = hostLane(for: .effect, start: copy.start, length: copy.length, preferred: copy.laneID)
-            effectClips.append(copy)
-            selection = .effect(copy.id)
-        case .audio(let id):
-            guard let index = audioClips.firstIndex(where: { $0.id == id }) else { return }
-            pushUndoSnapshot()
-            var copy = audioClips[index]
-            copy.id = UUID()
-            copy.start += copy.length
-            copy.laneID = hostLane(for: .audio, start: copy.start, length: copy.length, preferred: copy.laneID)
-            copy.waveSeed = Int.random(in: 0..<10_000)
-            audioClips.append(copy)
-            selection = .audio(copy.id)
-        case nil:
-            return
+        guard let target = selection, let engineID = engineID(of: target) else { return }
+        runIntent(.duplicate(clip: engineID)) { [weak self] result in
+            guard let self, let newID = result.clip else { return }
+            let uuid = self.idMap.clip(newID)
+            switch target {
+            case .main: self.selection = .main(uuid)
+            case .overlay: self.selection = .overlay(uuid)
+            case .effect: self.selection = .effect(uuid)
+            case .audio: self.selection = .audio(uuid)
+            }
         }
     }
 
     /// Swaps the selected clip's source for a picked library item, keeping
     /// its slot on the timeline. Works for main clips and PiP overlays.
     func replaceSelected(with item: MockMediaItem) {
-        switch selection {
-        case .main(let id):
-            guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
-            pushUndoSnapshot()
-            let replacement = MockClip(from: item)
-            clips[index] = replacement
-            selection = .main(replacement.id)
-        case .overlay(let id):
-            guard let index = overlayClips.firstIndex(where: { $0.id == id }),
-                  overlayClips[index].kind == .pip
-            else { return }
-            pushUndoSnapshot()
-            overlayClips[index].art = item.art
-            overlayClips[index].sourceDuration = item.videoDuration ?? MockClip.photoMaxDuration
-            overlayClips[index].length = min(
-                overlayClips[index].length,
-                overlayClips[index].sourceDuration ?? .greatestFiniteMagnitude
-            )
+        guard let target = selection, let engineID = engineID(of: target),
+            let url = FixtureLibrary.url(for: item)
+        else { return }
+        switch target {
+        case .main, .overlay:
+            runIntent(.replaceMedia(clip: engineID, path: url.path))
         default:
             return
         }
-        clampPlayhead()
     }
 
     // MARK: Quick ops
 
     func setTransition(after clipID: MockClip.ID, _ transition: MockTransition?) {
-        guard let index = clips.firstIndex(where: { $0.id == clipID }) else { return }
-        pushUndoSnapshot()
+        guard let index = clips.firstIndex(where: { $0.id == clipID }),
+            let engineID = clips[index].engineID
+        else { return }
         clips[index].transitionAfter = transition
+        runIntent(
+            .setTransition(
+                clip: engineID,
+                transitionID: transition.map { TransitionMap.engineID(forStyle: $0.style) ?? "crossfade" },
+                durationSeconds: transition?.duration ?? 0))
     }
 
     /// Stamps the same transition on every interior boundary.
     func applyTransitionToAll(_ transition: MockTransition?) {
         guard clips.count > 1 else { return }
-        pushUndoSnapshot()
         for index in clips.indices.dropLast() {
             clips[index].transitionAfter = transition
+            guard let engineID = clips[index].engineID else { continue }
+            runIntent(
+                .setTransition(
+                    clip: engineID,
+                    transitionID: transition.map { TransitionMap.engineID(forStyle: $0.style) ?? "crossfade" },
+                    durationSeconds: transition?.duration ?? 0))
         }
     }
 
-    /// Stamps or removes a keyframe on the selected main clip at the playhead.
+    /// Stamps or removes a transform keyframe on the selected main clip at
+    /// the playhead (the engine's diamond toggle).
     func toggleKeyframeAtPlayhead() {
         guard case .main(let id) = selection,
-              let index = clips.firstIndex(where: { $0.id == id })
+              let clip = clips.first(where: { $0.id == id }),
+              let engineID = clip.engineID
         else { return }
 
         let local = playhead - startTime(of: id)
-        guard local >= 0, local <= clips[index].length else { return }
-
-        pushUndoSnapshot()
-        if let existing = clips[index].keyframes.firstIndex(where: { abs($0 - local) < 0.15 }) {
-            clips[index].keyframes.remove(at: existing)
-        } else {
-            clips[index].keyframes.append(local)
-            clips[index].keyframes.sort()
-        }
+        guard local >= 0, local <= clip.length else { return }
+        runIntent(.toggleTransformKeyframe(clip: engineID, seconds: playhead))
     }
 
     func reverseSelected() {
-        guard case .main = selection else { return }
-        pushUndoSnapshot()
+        guard case .main = selection, let clip = selectedClip, let engineID = clip.engineID
+        else { return }
         updateSelectedClip { $0.isReversed.toggle() }
+        runIntent(.setSpeed(clip: engineID, speed: clip.speed, reversed: !clip.isReversed))
     }
 
-    /// Inserts a 3-second freeze-frame segment at the playhead inside the
-    /// selected clip (or before/after it when the playhead sits at an edge).
-    func freezeFrame() {
-        guard case .main(let id) = selection,
-              let index = clips.firstIndex(where: { $0.id == id })
-        else { return }
+    /// Freeze frame needs still-image support in the engine; it lands with
+    /// the Phase E stills work. No-op until then.
+    func freezeFrame() {}
 
-        let clip = clips[index]
-        let local = playhead - startTime(of: id)
-        guard local >= -0.001, local <= clip.length + 0.001 else { return }
-
-        pushUndoSnapshot()
-
-        var freeze = clip
-        freeze.id = UUID()
-        freeze.isFreeze = true
-        freeze.hasAudio = false
-        freeze.length = 3
-        freeze.speed = 1
-        freeze.keyframes = []
-        freeze.transitionAfter = nil
-
-        if local < MockClip.minDuration {
-            clips.insert(freeze, at: index)
-        } else if local > clip.length - MockClip.minDuration {
-            clips.insert(freeze, at: index + 1)
-        } else {
-            var left = clip
-            left.length = local
-            left.transitionAfter = nil
-            var right = clip
-            right.id = UUID()
-            right.trimStart = clip.trimStart + local
-            right.length = clip.length - local
-            clips.replaceSubrange(index...index, with: [left, freeze, right])
-        }
-    }
-
-    /// Adds an "extracted audio" lane clip aligned with the selected clip and
-    /// mutes the original.
+    /// CapCut "extract audio": linked audio clip on an audio lane; the
+    /// original's own sound goes silent via the link.
     func extractAudio() {
-        guard case .main(let id) = selection,
-              let index = clips.firstIndex(where: { $0.id == id }),
-              clips[index].hasAudio
+        guard case .main = selection, let clip = selectedClip, clip.hasAudio,
+            let engineID = clip.engineID
         else { return }
-
-        pushUndoSnapshot()
-        let clip = clips[index]
-        let start = startTime(of: id)
-        let extracted = MockAudioClip(
-            kind: .extracted,
-            laneID: hostLane(for: .audio, start: start, length: clip.length),
-            title: "Extracted audio",
-            start: start,
-            length: clip.length,
-            sourceDuration: clip.length
-        )
-        audioClips.append(extracted)
-        clips[index].volume = 0
+        runIntent(.extractAudio(clip: engineID))
     }
 
     // MARK: Snap engine
@@ -1172,31 +1423,90 @@ final class EditorState {
         case trailing
     }
 
-    /// Snapshot taken at the first update of a trim/move gesture; committed
-    /// to the undo stack when the gesture ends.
-    private var gestureSnapshot: TimelineSnapshot?
-
-    private func beginGestureIfNeeded() {
-        if gestureSnapshot == nil {
-            gestureSnapshot = snapshot
-        }
+    /// The continuous gesture currently mutating the local arrays. Live
+    /// updates stay local for 60fps; `endGesture` commits one intent.
+    private enum LiveGesture {
+        case mainTrim(id: UUID, edge: TrimEdge, anchor: MockClip)
+        /// Lane trim or horizontal move: commits final start+length.
+        case laneAdjust(target: TimelineSelection, anchorStart: TimeInterval, anchorLength: TimeInterval)
+        /// Canvas drag / pinch of an overlay: commits the final transform.
+        case overlayTransform(id: UUID)
     }
 
+    @ObservationIgnored private var liveGesture: LiveGesture?
+
+    /// Commit-on-release: sends the gesture's final geometry as one engine
+    /// intent (one undo step), then lets deferred refreshes land.
     func endGesture() {
-        if let before = gestureSnapshot, before != snapshot {
-            undoStack.append(before)
-            redoStack = []
-        }
-        gestureSnapshot = nil
+        let gesture = liveGesture
+        liveGesture = nil
         activeSnapTime = nil
+        defer { flushDeferredRefresh() }
+
+        switch gesture {
+        case nil:
+            break
+        case .mainTrim(let id, let edge, let anchor):
+            guard let clip = clips.first(where: { $0.id == id }), let engineID = clip.engineID
+            else { break }
+            let delta: TimeInterval
+            switch edge {
+            case .leading: delta = clip.trimStart - anchor.trimStart
+            case .trailing: delta = clip.length - anchor.length
+            }
+            guard abs(delta) > 0.0005 else { break }
+            runIntent(
+                .rippleTrimMain(
+                    clip: engineID,
+                    edge: edge == .leading ? "leading" : "trailing",
+                    deltaSeconds: delta))
+        case .laneAdjust(let target, let anchorStart, let anchorLength):
+            guard let geometry = laneGeometry(of: target), let engineID = engineID(of: target)
+            else { break }
+            let moved =
+                abs(geometry.start - anchorStart) > 0.0005
+                || abs(geometry.length - anchorLength) > 0.0005
+            guard moved else { break }
+            runIntent(
+                .trimLane(
+                    clip: engineID,
+                    startSeconds: geometry.start,
+                    lengthSeconds: geometry.length))
+        case .overlayTransform(let id):
+            guard let overlay = overlayClips.first(where: { $0.id == id }),
+                let engineID = overlay.engineID
+            else { break }
+            runIntent(
+                .setTransform(
+                    clip: engineID,
+                    posX: Float(overlay.posX), posY: Float(overlay.posY),
+                    scale: Float(overlay.scale),
+                    rotationDegrees: Float(overlay.rotationDegrees),
+                    opacity: Float(overlay.opacity)))
+        }
         clampPlayhead()
+    }
+
+    private func laneGeometry(of target: TimelineSelection) -> (start: TimeInterval, length: TimeInterval)? {
+        switch target {
+        case .overlay(let id):
+            overlayClips.first(where: { $0.id == id }).map { ($0.start, $0.length) }
+        case .effect(let id):
+            effectClips.first(where: { $0.id == id }).map { ($0.start, $0.length) }
+        case .audio(let id):
+            audioClips.first(where: { $0.id == id }).map { ($0.start, $0.length) }
+        case .main:
+            nil
+        }
     }
 
     /// Applies a trim drag to a main-track clip. `anchor` is the clip as it
     /// was when the drag began, so updates compute from absolute math.
     func trim(_ id: MockClip.ID, edge: TrimEdge, anchor: MockClip, by deltaSeconds: Double) {
         guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
-        beginGestureIfNeeded()
+        if liveGesture == nil {
+            liveGesture = .mainTrim(id: id, edge: edge, anchor: anchor)
+        }
 
         var clip = anchor
         switch edge {
@@ -1312,7 +1622,9 @@ final class EditorState {
         anchorLength: TimeInterval,
         by delta: TimeInterval
     ) {
-        beginGestureIfNeeded()
+        if liveGesture == nil {
+            liveGesture = .laneAdjust(target: target, anchorStart: anchorStart, anchorLength: anchorLength)
+        }
         switch target {
         case .overlay(let id):
             guard let index = overlayClips.firstIndex(where: { $0.id == id }) else { return }
@@ -1339,7 +1651,9 @@ final class EditorState {
     /// snaps to the frame center on each axis.
     func dragOverlay(_ id: UUID, anchorX: Double, anchorY: Double, deltaX: Double, deltaY: Double) {
         guard let index = overlayClips.firstIndex(where: { $0.id == id }) else { return }
-        beginGestureIfNeeded()
+        if liveGesture == nil {
+            liveGesture = .overlayTransform(id: id)
+        }
         var x = min(max(anchorX + deltaX, 0.03), 0.97)
         var y = min(max(anchorY + deltaY, 0.03), 0.97)
         if magnetEnabled {
@@ -1353,7 +1667,9 @@ final class EditorState {
     /// Scale/rotate an overlay from its corner grip.
     func transformOverlay(_ id: UUID, anchorScale: Double, anchorRotation: Double, scaleFactor: Double, rotationDelta: Double) {
         guard let index = overlayClips.firstIndex(where: { $0.id == id }) else { return }
-        beginGestureIfNeeded()
+        if liveGesture == nil {
+            liveGesture = .overlayTransform(id: id)
+        }
         overlayClips[index].scale = min(max(anchorScale * scaleFactor, 0.25), 4)
         overlayClips[index].rotationDegrees = anchorRotation + rotationDelta
     }
@@ -1361,8 +1677,6 @@ final class EditorState {
     /// Horizontal drag of a lane clip to a new start time; either edge can
     /// lock onto a snap candidate.
     func moveLaneClip(_ selectionCase: TimelineSelection, anchorStart: TimeInterval, by delta: TimeInterval) {
-        beginGestureIfNeeded()
-
         let length: TimeInterval
         switch selectionCase {
         case .overlay(let id):
@@ -1376,6 +1690,9 @@ final class EditorState {
             length = clip.length
         case .main:
             return
+        }
+        if liveGesture == nil {
+            liveGesture = .laneAdjust(target: selectionCase, anchorStart: anchorStart, anchorLength: length)
         }
 
         var newStart = max(0, anchorStart + delta)

@@ -1,3 +1,4 @@
+import CutlassMobile
 import SwiftUI
 
 /// Top-level navigation: Home <-> Editor, with the media picker presented as a
@@ -47,16 +48,22 @@ struct RootView: View {
         case "editorLanes":
             // Editor with every lane populated (video PiP above main, sticker,
             // effect, audio at the bottom), used by UI tests to exercise each
-            // timeline row and kind-preserving cross-lane drags.
+            // timeline row and kind-preserving cross-lane drags. Seeded as
+            // real engine intents (FIFO, so times are explicit rather than
+            // playhead-derived).
             let state = EditorState()
             state.startProject(with: Array(MockData.libraryItems.prefix(4)))
-            state.addSticker(symbol: "heart.fill")
-            state.addEffectClip(name: "Blur", kind: .effect)
-            state.addAudio(kind: .music, title: "Slow Morning", duration: 30)
+            state.seedIntents([
+                .addSticker(atSeconds: 0),
+                .addEffect(kind: "effect", atSeconds: 0),
+            ])
+            if let audio = FixtureLibrary.audio {
+                state.seedIntents([.addAudio(path: audio.path, atSeconds: 0)])
+            }
             // Insert past the sticker so the overlay lane stays one row tall.
-            state.playhead = 5
-            state.addPip(from: MockData.libraryItems[5])
-            state.playhead = 0
+            if let pip = FixtureLibrary.photo {
+                state.seedIntents([.addPip(path: pip.path, atSeconds: 5)])
+            }
             state.selection = nil
             _editorState = State(initialValue: state)
             _screen = State(initialValue: .editor)
