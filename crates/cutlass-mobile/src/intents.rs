@@ -798,11 +798,24 @@ fn move_lane(
             ensure_host_lane(engine, kind, range, Some(clip))?
         }
     };
+    // Lifting a clip off the magnetic main track closes the hole it leaves
+    // (later clips slide left), like every ripple edit there.
+    let from_main = Some(current_track) == crate::ui_state::main_track(engine.project())
+        && current_track != target;
     engine.apply(Command::Edit(EditCommand::MoveClip {
         clip,
         to_track: target,
         start: RationalTime::new(start, rate),
     }))?;
+    if from_main {
+        let s = snapshot.timeline.start.value;
+        let d = snapshot.timeline.duration.value;
+        engine.apply(Command::Edit(EditCommand::ShiftClips {
+            track: current_track,
+            from: RationalTime::new(s + d, rate),
+            delta: RationalTime::new(-d, rate),
+        }))?;
+    }
     Ok(serde_json::json!({ "clip": clip.raw(), "track": target.raw() }))
 }
 

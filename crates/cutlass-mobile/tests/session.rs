@@ -206,6 +206,84 @@ fn intents_group_into_one_undo_step() {
     unsafe { cutlass_session_close(session) };
 }
 
+/// Export a 2-second solid mp4 the intents can import as real media.
+fn temp_media_clip() -> std::path::PathBuf {
+    use cutlass_models::{Generator, Project, Rational, TimeRange, TrackKind};
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let path = std::env::temp_dir().join(format!("cutlass_session_media_{nanos}.mp4"));
+
+    let fps = Rational::FPS_30;
+    let mut project = Project::new("fixture", fps);
+    let track = project.add_track(TrackKind::Sticker, "BG");
+    project
+        .add_generated(
+            track,
+            Generator::SolidColor {
+                rgba: [40, 80, 160, 255],
+            },
+            TimeRange::at_rate(0, 60, fps),
+        )
+        .unwrap();
+    let mut renderer = cutlass_render::Renderer::new_headless().expect("headless renderer");
+    cutlass_render::export_to_file(&mut renderer, &project, &path).expect("export fixture");
+    path
+}
+
+#[test]
+fn lifting_a_main_clip_to_a_lane_closes_the_hole() {
+    let media = temp_media_clip();
+    let media_str = media.to_str().expect("utf8 path");
+
+    let session = cutlass_session_new(30, 1);
+    assert!(!session.is_null());
+
+    // Two 2s clips back to back on main.
+    let appended = intent(
+        session,
+        serde_json::json!({"intent": "append_main", "paths": [media_str, media_str]}),
+    );
+    let clips = appended["ok"]["clips"].as_array().expect("clips").clone();
+    assert_eq!(clips.len(), 2, "unexpected: {appended}");
+    let first = clips[0].as_u64().expect("clip id");
+
+    // Lift the first clip onto an overlay lane at t=3.
+    let moved = intent(
+        session,
+        serde_json::json!({"intent": "move_lane", "clip": first, "start_seconds": 3.0}),
+    );
+    assert!(moved["ok"]["track"].is_u64(), "unexpected: {moved}");
+
+    let all = lanes(session);
+    let main = all.iter().find(|l| l["is_main"] == true).expect("main");
+    let main_clips = main["clips"].as_array().expect("clips");
+    assert_eq!(main_clips.len(), 1);
+    assert_eq!(
+        main_clips[0]["start_seconds"], 0.0,
+        "the survivor slides left into the hole"
+    );
+    let overlay = all
+        .iter()
+        .find(|l| l["kind"] == "video" && l["is_main"] == false)
+        .expect("overlay video lane");
+    assert_eq!(overlay["clips"][0]["start_seconds"], 3.0);
+
+    // The lift (move + ripple close) is one undo step.
+    unsafe { assert!(cutlass_session_undo(session)) };
+    let all = lanes(session);
+    let main = all.iter().find(|l| l["is_main"] == true).expect("main");
+    let main_clips = main["clips"].as_array().expect("clips");
+    assert_eq!(main_clips.len(), 2);
+    assert_eq!(main_clips[0]["start_seconds"], 0.0);
+    assert_eq!(main_clips[1]["start_seconds"], 2.0);
+
+    unsafe { cutlass_session_close(session) };
+    let _ = std::fs::remove_file(&media);
+}
+
 #[test]
 fn save_then_open_restores_the_project() {
     let dir = tempfile::tempdir().expect("tempdir");
