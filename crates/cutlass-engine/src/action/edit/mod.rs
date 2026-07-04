@@ -23,6 +23,7 @@ pub mod set_crop;
 pub mod set_denoise;
 pub mod set_effect;
 pub mod set_generator;
+pub mod set_look;
 pub mod set_param;
 pub mod set_pitch;
 pub mod set_speed;

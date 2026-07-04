@@ -2004,3 +2004,197 @@ fn effect_commands_reject_unknown_ids_without_history() {
     assert!(engine.undo());
     assert!(!engine.can_undo());
 }
+
+// --- Phase I look commands ---------------------------------------------------
+
+#[test]
+fn look_commands_undo_redo_roundtrip() {
+    use cutlass_models::{
+        AnimationRef, AnimationSlot, ChromaKey, ColorAdjustments, Filter, Mask, MaskKind,
+        StabilizeLevel,
+    };
+
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = common::add_track(&mut engine, TrackKind::Video, "V1");
+    let clip_id = created(
+        engine
+            .apply(Command::Edit(EditCommand::AddClip {
+                track,
+                media: media_id,
+                source: tr(0, 48),
+                start: rt(0),
+            }))
+            .expect("add"),
+    );
+    let clip = |engine: &cutlass_engine::Engine| engine.project().clip(clip_id).unwrap().clone();
+
+    // Mask, chroma, stabilize, filter, adjust — five history entries.
+    engine
+        .apply(Command::Edit(EditCommand::SetClipMask {
+            clip: clip_id,
+            mask: Some(Mask::new(MaskKind::Heart)),
+        }))
+        .expect("mask");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipChroma {
+            clip: clip_id,
+            chroma: Some(ChromaKey {
+                rgb: [0, 255, 0],
+                strength: 0.7,
+                shadow: 0.1,
+            }),
+        }))
+        .expect("chroma");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipStabilize {
+            clip: clip_id,
+            stabilize: Some(StabilizeLevel::Recommended),
+        }))
+        .expect("stabilize");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipFilter {
+            clip: clip_id,
+            filter: Some(Filter::new("noir")),
+        }))
+        .expect("filter");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipAdjustments {
+            clip: clip_id,
+            adjust: ColorAdjustments {
+                exposure: 0.5,
+                ..Default::default()
+            },
+        }))
+        .expect("adjust");
+
+    let styled = clip(&engine);
+    assert_eq!(styled.mask.unwrap().kind, MaskKind::Heart);
+    assert_eq!(styled.chroma_key.unwrap().rgb, [0, 255, 0]);
+    assert_eq!(styled.stabilize, Some(StabilizeLevel::Recommended));
+    assert_eq!(styled.filter.as_ref().unwrap().id, "noir");
+    assert_eq!(styled.adjust.exposure, 0.5);
+
+    // Undo peels them off one at a time (each is one history entry)…
+    assert!(engine.undo());
+    assert!(clip(&engine).adjust.is_neutral());
+    assert!(engine.undo());
+    assert!(clip(&engine).filter.is_none());
+    assert!(engine.undo());
+    assert!(clip(&engine).stabilize.is_none());
+    assert!(engine.undo());
+    assert!(clip(&engine).chroma_key.is_none());
+    assert!(engine.undo());
+    assert!(clip(&engine).mask.is_none());
+
+    // …and redo brings the whole look back.
+    for _ in 0..5 {
+        assert!(engine.redo());
+    }
+    assert_eq!(clip(&engine), styled);
+
+    // Animations: a combo evicts the entrance in one undoable step.
+    engine
+        .apply(Command::Edit(EditCommand::SetClipAnimation {
+            clip: clip_id,
+            slot: AnimationSlot::In,
+            animation: Some(AnimationRef::new("zoom_in")),
+        }))
+        .expect("animation in");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipAnimation {
+            clip: clip_id,
+            slot: AnimationSlot::Combo,
+            animation: Some(AnimationRef::new("pulse")),
+        }))
+        .expect("animation combo");
+    let c = clip(&engine);
+    assert!(c.animation_in.is_none());
+    assert_eq!(c.animation_combo.as_ref().unwrap().id, "pulse");
+    assert!(engine.undo());
+    let c = clip(&engine);
+    assert_eq!(c.animation_in.as_ref().unwrap().id, "zoom_in");
+    assert!(c.animation_combo.is_none());
+}
+
+#[test]
+fn look_commands_reject_invalid_targets_without_history() {
+    use cutlass_models::{AudioRole, Filter, Mask, MaskKind};
+
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+    let before = engine.project().clip(clip_id).unwrap().clone();
+    let history_before = (engine.can_undo(), engine.can_redo());
+
+    // Generated text: no pixels to mask, no audio lane for a role, unknown
+    // filter ids bounce.
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetClipMask {
+                clip: clip_id,
+                mask: Some(Mask::new(MaskKind::Linear)),
+            }))
+            .is_err()
+    );
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetAudioRole {
+                clip: clip_id,
+                role: Some(AudioRole::Music),
+            }))
+            .is_err()
+    );
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetClipFilter {
+                clip: clip_id,
+                filter: Some(Filter::new("no_such_filter")),
+            }))
+            .is_err()
+    );
+    assert_eq!(engine.project().clip(clip_id).unwrap(), &before);
+    assert_eq!((engine.can_undo(), engine.can_redo()), history_before);
+}
+
+#[test]
+fn set_audio_role_tags_audio_clips_with_undo() {
+    use cutlass_models::AudioRole;
+
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = common::add_track(&mut engine, TrackKind::Audio, "A1");
+    let clip_id = created(
+        engine
+            .apply(Command::Edit(EditCommand::AddClip {
+                track,
+                media: media_id,
+                source: tr(0, 48),
+                start: rt(0),
+            }))
+            .expect("add"),
+    );
+
+    engine
+        .apply(Command::Edit(EditCommand::SetAudioRole {
+            clip: clip_id,
+            role: Some(AudioRole::Extracted),
+        }))
+        .expect("role");
+    assert_eq!(
+        engine.project().clip(clip_id).unwrap().audio_role,
+        Some(AudioRole::Extracted)
+    );
+    assert!(engine.undo());
+    assert!(engine.project().clip(clip_id).unwrap().audio_role.is_none());
+    assert!(engine.redo());
+    assert_eq!(
+        engine.project().clip(clip_id).unwrap().audio_role,
+        Some(AudioRole::Extracted)
+    );
+}

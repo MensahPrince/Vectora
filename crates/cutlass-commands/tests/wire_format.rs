@@ -10,10 +10,11 @@
 use std::path::PathBuf;
 
 use cutlass_commands::{
-    CanvasAspect, ClipId, ClipParam, ClipTransform, Command, CropRect, Easing, EditCommand,
-    EditOutcome, Generator, MarkerColor, MarkerId, MediaId, Param, ParamValue, ProjectCommand,
-    Rational, RationalTime, Replaceable, TemplateMeta, TemplatePick, TimeRange, TrackId,
-    TrackKind,
+    AnimationRef, AnimationSlot, AudioRole, CanvasAspect, ChromaKey, ClipId, ClipParam,
+    ClipTransform, ColorAdjustments, Command, CropRect, Easing, EditCommand, EditOutcome, Filter,
+    Generator, MarkerColor, MarkerId, Mask, MaskKind, MediaId, Param, ParamValue, ProjectCommand,
+    Rational, RationalTime, Replaceable, StabilizeLevel, TemplateMeta, TemplatePick, TimeRange,
+    TrackId, TrackKind,
 };
 use serde_json::{Value, json};
 
@@ -185,6 +186,52 @@ fn edit_samples() -> Vec<EditCommand> {
             clip: clip(4),
             denoise: true,
         },
+        EditCommand::SetClipMask {
+            clip: clip(4),
+            mask: Some(Mask {
+                kind: MaskKind::Circle,
+                feather: 0.5,
+                invert: true,
+            }),
+        },
+        EditCommand::SetClipChroma {
+            clip: clip(4),
+            chroma: Some(ChromaKey {
+                rgb: [0, 255, 0],
+                strength: 0.7,
+                shadow: 0.2,
+            }),
+        },
+        EditCommand::SetClipStabilize {
+            clip: clip(4),
+            stabilize: Some(StabilizeLevel::MaxSmooth),
+        },
+        EditCommand::SetClipFilter {
+            clip: clip(4),
+            filter: Some(Filter {
+                id: "vivid".into(),
+                intensity: 0.6,
+            }),
+        },
+        EditCommand::SetClipAdjustments {
+            clip: clip(4),
+            adjust: ColorAdjustments {
+                brightness: 0.1,
+                contrast: -0.2,
+                saturation: 0.3,
+                exposure: 0.0,
+                temperature: -0.4,
+            },
+        },
+        EditCommand::SetClipAnimation {
+            clip: clip(4),
+            slot: AnimationSlot::In,
+            animation: Some(AnimationRef::new("fade_in")),
+        },
+        EditCommand::SetAudioRole {
+            clip: clip(4),
+            role: Some(AudioRole::Voiceover),
+        },
         EditCommand::AddEffect {
             clip: clip(4),
             effect_id: "gaussian_blur".into(),
@@ -320,6 +367,13 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
         EditCommand::SetClipCrop { .. } => "SetClipCrop",
         EditCommand::SetClipAudio { .. } => "SetClipAudio",
         EditCommand::SetClipDenoise { .. } => "SetClipDenoise",
+        EditCommand::SetClipMask { .. } => "SetClipMask",
+        EditCommand::SetClipChroma { .. } => "SetClipChroma",
+        EditCommand::SetClipStabilize { .. } => "SetClipStabilize",
+        EditCommand::SetClipFilter { .. } => "SetClipFilter",
+        EditCommand::SetClipAdjustments { .. } => "SetClipAdjustments",
+        EditCommand::SetClipAnimation { .. } => "SetClipAnimation",
+        EditCommand::SetAudioRole { .. } => "SetAudioRole",
         EditCommand::AddEffect { .. } => "AddEffect",
         EditCommand::RemoveEffect { .. } => "RemoveEffect",
         EditCommand::SetEffectParam { .. } => "SetEffectParam",
@@ -533,6 +587,110 @@ fn golden_clear_speed_curve_is_null() {
     assert_eq!(
         serde_json::to_value(&cmd).unwrap(),
         json!({"type": "SetSpeedCurve", "clip": 4, "curve": null})
+    );
+}
+
+#[test]
+fn golden_look_commands() {
+    // Snake_case ids on the wire; zero/default sub-fields elided.
+    let mask = Command::Edit(EditCommand::SetClipMask {
+        clip: clip(4),
+        mask: Some(Mask::new(MaskKind::Circle)),
+    });
+    assert_eq!(
+        serde_json::to_value(&mask).unwrap(),
+        json!({"type": "SetClipMask", "clip": 4, "mask": {"kind": "circle"}})
+    );
+
+    let chroma = Command::Edit(EditCommand::SetClipChroma {
+        clip: clip(4),
+        chroma: Some(ChromaKey {
+            rgb: [0, 255, 0],
+            strength: 0.5,
+            shadow: 0.0,
+        }),
+    });
+    assert_eq!(
+        serde_json::to_value(&chroma).unwrap(),
+        json!({
+            "type": "SetClipChroma",
+            "clip": 4,
+            "chroma": {"rgb": [0, 255, 0], "strength": 0.5},
+        })
+    );
+
+    let stabilize = Command::Edit(EditCommand::SetClipStabilize {
+        clip: clip(4),
+        stabilize: Some(StabilizeLevel::MaxSmooth),
+    });
+    assert_eq!(
+        serde_json::to_value(&stabilize).unwrap(),
+        json!({"type": "SetClipStabilize", "clip": 4, "stabilize": "max_smooth"})
+    );
+
+    let filter = Command::Edit(EditCommand::SetClipFilter {
+        clip: clip(4),
+        filter: Some(Filter {
+            id: "vivid".into(),
+            intensity: 0.75,
+        }),
+    });
+    assert_eq!(
+        serde_json::to_value(&filter).unwrap(),
+        json!({
+            "type": "SetClipFilter",
+            "clip": 4,
+            "filter": {"id": "vivid", "intensity": 0.75},
+        })
+    );
+
+    let adjust = Command::Edit(EditCommand::SetClipAdjustments {
+        clip: clip(4),
+        adjust: ColorAdjustments {
+            brightness: 0.25,
+            ..Default::default()
+        },
+    });
+    assert_eq!(
+        serde_json::to_value(&adjust).unwrap(),
+        json!({
+            "type": "SetClipAdjustments",
+            "clip": 4,
+            "adjust": {"brightness": 0.25},
+        })
+    );
+
+    let animation = Command::Edit(EditCommand::SetClipAnimation {
+        clip: clip(4),
+        slot: AnimationSlot::Combo,
+        animation: Some(AnimationRef::new("pulse")),
+    });
+    assert_eq!(
+        serde_json::to_value(&animation).unwrap(),
+        json!({
+            "type": "SetClipAnimation",
+            "clip": 4,
+            "slot": "combo",
+            "animation": {"id": "pulse"},
+        })
+    );
+
+    // Clearing is an explicit null (same convention as SetSpeedCurve).
+    let clear_role = Command::Edit(EditCommand::SetAudioRole {
+        clip: clip(4),
+        role: None,
+    });
+    assert_eq!(
+        serde_json::to_value(&clear_role).unwrap(),
+        json!({"type": "SetAudioRole", "clip": 4, "role": null})
+    );
+    let role = Command::Edit(EditCommand::SetAudioRole {
+        clip: clip(4),
+        role: Some(AudioRole::Sfx),
+    });
+    assert_eq!(
+        serde_json::to_value(&role).unwrap(),
+        json!({"type": "SetAudioRole", "clip": 4, "role": "sfx"})
     );
 }
 

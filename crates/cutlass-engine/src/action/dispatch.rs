@@ -278,6 +278,59 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::SetClipMask { clip, mask } => {
+            let inverse = edit::set_look::set_mask(ctx, clip, mask)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipChroma { clip, chroma } => {
+            let inverse = edit::set_look::set_chroma(ctx, clip, chroma)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipStabilize { clip, stabilize } => {
+            let inverse = edit::set_look::set_stabilize(ctx, clip, stabilize)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipFilter { clip, filter } => {
+            let inverse = edit::set_look::set_filter(ctx, clip, filter)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipAdjustments { clip, adjust } => {
+            let inverse = edit::set_look::set_adjustments(ctx, clip, adjust)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipAnimation {
+            clip,
+            slot,
+            animation,
+        } => {
+            let inverse = edit::set_look::set_animation(ctx, clip, slot, animation)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetAudioRole { clip, role } => {
+            let inverse = edit::set_look::set_audio_role(ctx, clip, role)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
         EditCommand::AddEffect { clip, effect_id } => {
             let inverse = edit::set_effect::add_effect(ctx, clip, &effect_id)?;
             Ok((

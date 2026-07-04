@@ -15,9 +15,10 @@
 use std::path::PathBuf;
 
 use cutlass_models::{
-    CanvasAspect, ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, MarkerColor,
-    MarkerId, MediaId, Param, ParamValue, Rational, RationalTime, Replaceable, TemplateMeta,
-    TimeRange, TrackId, TrackKind,
+    AnimationRef, AnimationSlot, AudioRole, CanvasAspect, ChromaKey, ClipId, ClipParam,
+    ClipTransform, ColorAdjustments, CropRect, Easing, Filter, Generator, MarkerColor, MarkerId,
+    Mask, MediaId, Param, ParamValue, Rational, RationalTime, Replaceable, StabilizeLevel,
+    TemplateMeta, TimeRange, TrackId, TrackKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -229,6 +230,55 @@ pub enum EditCommand {
     /// suppress steady background noise. Rejected on generated clips. The
     /// inverse restores the previous flag.
     SetClipDenoise { clip: ClipId, denoise: bool },
+    /// Set (or with `None` clear) a clip's shaped alpha mask (CapCut mask,
+    /// Phase I). Persisted + validated now, rendered later (documented render
+    /// gap, like stickers). Media-backed visual clips only. The inverse
+    /// restores the previous clip state.
+    SetClipMask { clip: ClipId, mask: Option<Mask> },
+    /// Set (or clear) chroma keying (CapCut chroma key, Phase I;
+    /// render-neutral). Media-backed visual clips only. The inverse restores
+    /// the previous clip state.
+    SetClipChroma {
+        clip: ClipId,
+        chroma: Option<ChromaKey>,
+    },
+    /// Set (or clear) stabilization (CapCut stabilize, Phase I;
+    /// render-neutral). Media-backed *video* clips only — stills have no
+    /// motion. The inverse restores the previous clip state.
+    SetClipStabilize {
+        clip: ClipId,
+        stabilize: Option<StabilizeLevel>,
+    },
+    /// Set (or clear) a color-grade filter preset (CapCut filters, Phase I;
+    /// render-neutral). Any visual clip, including `Generator::Filter` lane
+    /// bars; the id must exist in the filter catalog. The inverse restores
+    /// the previous clip state.
+    SetClipFilter { clip: ClipId, filter: Option<Filter> },
+    /// Set a clip's manual color grade (CapCut adjust, Phase I;
+    /// render-neutral): all five sliders in one shot, neutral values clear.
+    /// Any visual clip, including `Generator::Adjustment` lane bars. The
+    /// inverse restores the previous clip state.
+    SetClipAdjustments {
+        clip: ClipId,
+        adjust: ColorAdjustments,
+    },
+    /// Set (or clear) one animation slot (CapCut animation In / Out / Combo,
+    /// Phase I; render-neutral). The preset must exist in the animation
+    /// catalog and match the slot; CapCut exclusivity (a combo replaces both
+    /// sides and vice versa) is applied by the model. The inverse restores
+    /// the previous clip state.
+    SetClipAnimation {
+        clip: ClipId,
+        slot: AnimationSlot,
+        animation: Option<AnimationRef>,
+    },
+    /// Tag (or untag) what an audio-lane clip *is* (music / sound FX /
+    /// voiceover / extracted, Phase I) — badges and future mixing defaults.
+    /// Audio-track clips only. The inverse restores the previous tag.
+    SetAudioRole {
+        clip: ClipId,
+        role: Option<AudioRole>,
+    },
     /// Append a GPU effect (M4) to a visual clip's chain. `effect_id` must
     /// exist in the effect catalog. The inverse removes it (clip snapshot).
     AddEffect { clip: ClipId, effect_id: String },
