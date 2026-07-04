@@ -20,6 +20,8 @@ struct RootView: View {
     @State private var screen: Screen = .home
     @State private var pickerIntent: PickerIntent?
     @State private var editorState = EditorState()
+    /// `-autoplay` launch flag: start playback once the seeded project lands.
+    private let autoplayOnLaunch: Bool
 
     private var pickerPresented: Binding<Bool> {
         Binding(
@@ -30,9 +32,11 @@ struct RootView: View {
 
     /// Dev shortcut: `-startScreen picker|editor` (e.g. via `simctl launch`)
     /// jumps straight to a screen so states deep in the flow are easy to
-    /// reach while iterating on the mock UI.
+    /// reach while iterating on the mock UI. Add `-autoplay` to press play
+    /// once the seeded timeline lands (audio pipeline smoke).
     init() {
         let arguments = ProcessInfo.processInfo.arguments
+        autoplayOnLaunch = arguments.contains("-autoplay")
         guard let flag = arguments.firstIndex(of: "-startScreen"),
               arguments.indices.contains(flag + 1)
         else { return }
@@ -110,6 +114,11 @@ struct RootView: View {
         #else
         .fullScreenCover(isPresented: pickerPresented) { picker }
         #endif
+        .task {
+            guard autoplayOnLaunch, screen == .editor else { return }
+            await editorState.waitForEngine()
+            editorState.isPlaying = true
+        }
     }
 
     private var picker: some View {

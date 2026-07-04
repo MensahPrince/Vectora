@@ -46,6 +46,7 @@ struct TransportControls: View {
                 iconButton(state.isPlaying ? "pause.fill" : "play.fill", size: 21, enabled: !state.isEmpty) {
                     state.isPlaying.toggle()
                 }
+                .accessibilityIdentifier("playButton")
                 iconButton("forward.frame", enabled: !state.isEmpty) {
                     state.stepFrame(by: 1)
                 }

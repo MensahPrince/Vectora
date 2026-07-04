@@ -82,6 +82,7 @@ final class EditorState {
             } else {
                 playbackTask?.cancel()
                 playbackTask = nil
+                stopPlaybackAudio()
             }
         }
     }
@@ -115,6 +116,12 @@ final class EditorState {
     }
 
     private var playbackTask: Task<Void, Never>?
+
+    /// Mixed timeline audio during playback (ring buffer + AVAudioSourceNode).
+    @ObservationIgnored private let playbackAudio = PlaybackAudio()
+    /// Bumps on every audio start/stop; an in-flight reader-open from a
+    /// stale start aborts instead of hijacking the newer stream.
+    @ObservationIgnored private var audioGeneration = 0
 
     // MARK: Engine session plumbing
 
@@ -271,6 +278,11 @@ final class EditorState {
         if liveGesture != nil || dragInProgress {
             deferredRefresh = state
             return
+        }
+        // The audio reader mixes a project snapshot; an edit landing during
+        // playback means it's stale. Reopen at the current playhead.
+        if isPlaying, state.revision > appliedRevision {
+            startPlaybackAudio()
         }
         appliedRevision = state.revision
         var projection = EngineBridge.project(state, previous: currentProjection(), ids: idMap)
@@ -903,6 +915,7 @@ final class EditorState {
     }
 
     private func resetSession() {
+        stopPlaybackAudio()
         createSession()
         mediaStore = ProjectMediaStore(projectID: UUID())
         idMap = EngineIDMap()
@@ -956,6 +969,7 @@ final class EditorState {
         if playhead >= duration {
             playhead = 0
         }
+        startPlaybackAudio()
         playbackTask = Task { [weak self] in
             guard let self else { return }
             var lastTick = Date.now
@@ -972,6 +986,28 @@ final class EditorState {
                 }
             }
         }
+    }
+
+    /// Open a mixer snapshot at the current playhead and hand it to the audio
+    /// engine. The open goes through the session actor, so audio starts a few
+    /// frames behind video — imperceptible, and it never blocks the UI.
+    private func startPlaybackAudio() {
+        audioGeneration += 1
+        let token = audioGeneration
+        let seconds = playhead
+        Task { [weak self] in
+            guard let self, let session = self.session else { return }
+            let reader = await session.openAudioReader(atSeconds: seconds)
+            guard self.isPlaying, self.audioGeneration == token else { return }
+            if let reader {
+                self.playbackAudio.start(reader: reader)
+            }
+        }
+    }
+
+    private func stopPlaybackAudio() {
+        audioGeneration += 1
+        playbackAudio.stop()
     }
 
     // MARK: Undo / redo (engine history)
