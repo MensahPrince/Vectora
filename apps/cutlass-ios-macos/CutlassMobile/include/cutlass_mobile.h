@@ -161,4 +161,72 @@ double cutlass_session_duration_seconds(const CutlassSession *handle);
 CutlassImage cutlass_session_render_fit(CutlassSession *handle, double seconds,
                                         uint32_t max_width, uint32_t max_height);
 
+/*
+ * Background export job.
+ *
+ * `cutlass_export_start` snapshots the session's project and encodes it to
+ * `path` on a private thread with its own renderer, so the session stays
+ * fully interactive. Poll `progress`/`finished` from anywhere; `cancel` stops
+ * after the frame in flight (the partial file is deleted); `join` blocks and
+ * returns the JSON verdict {"ok":{"frames":n}} or
+ * {"err":{"kind":"cancelled"|"render","message":...}} (idempotent). Always
+ * `join` then `free`. Freeing a running job joins it first — cancel for a
+ * fast teardown.
+ */
+typedef struct CutlassExportJob CutlassExportJob;
+
+/*
+ * `width`/`height` override the output size when both are non-zero (aspect
+ * preserved, letterboxed on mismatch; odd sizes rounded down to even for
+ * H.264). `fps_num`/`fps_den` override the frame rate when both are positive.
+ * Zero keeps the project's native value. NULL when the session/path is
+ * invalid.
+ */
+CutlassExportJob *cutlass_export_start(CutlassSession *session,
+                                       const uint8_t *path_utf8, size_t path_len,
+                                       uint32_t width, uint32_t height,
+                                       int32_t fps_num, int32_t fps_den);
+
+/* Fraction of frames written so far, 0.0..1.0. */
+double cutlass_export_progress(const CutlassExportJob *job);
+
+/* Whether the job's thread has finished (successfully or not). */
+bool cutlass_export_finished(const CutlassExportJob *job);
+
+/* Ask the job to stop after the frame in flight. Idempotent. */
+void cutlass_export_cancel(const CutlassExportJob *job);
+
+/* Block until finished; the JSON verdict. Free with `cutlass_string_free`. */
+char *cutlass_export_join(const CutlassExportJob *job);
+
+/* Release the job handle (joins first if nobody has). NULL is a no-op. */
+void cutlass_export_free(CutlassExportJob *job);
+
+/*
+ * Filmstrip thumbnails.
+ *
+ * A `CutlassThumbnailer` owns a private renderer + decoder cache for one
+ * media file, so filmstrips can render off the session thread. Serialize
+ * calls per handle; different handles are independent.
+ */
+typedef struct CutlassThumbnailer CutlassThumbnailer;
+
+/* Open a thumbnailer for the media file at `path` (`path_len` UTF-8 bytes).
+ * NULL if the file can't be probed or the GPU is unavailable. */
+CutlassThumbnailer *cutlass_thumbnailer_open(const uint8_t *path_utf8, size_t path_len);
+
+/* Media length in seconds (0 for a NULL handle). */
+double cutlass_thumbnailer_duration_seconds(const CutlassThumbnailer *handle);
+
+/*
+ * The frame nearest `seconds`, scaled to fit `max_width` x `max_height`
+ * (never upscaled). `data` is NULL on failure; free non-null results with
+ * `cutlass_image_free`.
+ */
+CutlassImage cutlass_thumbnailer_thumb(CutlassThumbnailer *handle, double seconds,
+                                       uint32_t max_width, uint32_t max_height);
+
+/* Release a thumbnailer handle. NULL is a no-op. */
+void cutlass_thumbnailer_close(CutlassThumbnailer *handle);
+
 #endif /* CUTLASS_MOBILE_H */
