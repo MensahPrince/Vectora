@@ -12,15 +12,22 @@ struct TransitionPanel: View {
         state.clips.first { $0.id == afterClipID }?.transitionAfter
     }
 
+    /// Slider value while dragging (committed as one intent on release).
+    @State private var draftDuration: Double?
+
     private var duration: Binding<Double> {
         Binding(
-            get: { current?.duration ?? 0.5 },
-            set: { newValue in
-                guard var transition = current else { return }
-                transition.duration = newValue
-                state.setTransition(after: afterClipID, transition)
-            }
+            get: { draftDuration ?? current?.duration ?? 0.5 },
+            set: { draftDuration = $0 }
         )
+    }
+
+    private func commitDuration(editing: Bool) {
+        guard !editing, var transition = current, let draft = draftDuration else { return }
+        draftDuration = nil
+        transition.duration = draft
+        state.setTransition(after: afterClipID, transition)
+        appliedToAll = false
     }
 
     var body: some View {
@@ -51,9 +58,13 @@ struct TransitionPanel: View {
                 .padding(.vertical, 6)
             }
 
-            PanelSlider(label: "Duration", value: duration, range: 0.1...2, format: { String(format: "%.1fs", $0) })
-                .disabled(current == nil)
-                .opacity(current == nil ? 0.4 : 1)
+            PanelSlider(
+                label: "Duration", value: duration, range: 0.1...2,
+                format: { String(format: "%.1fs", $0) },
+                onEditingChanged: commitDuration
+            )
+            .disabled(current == nil)
+            .opacity(current == nil ? 0.4 : 1)
 
             Button {
                 state.applyTransitionToAll(current)

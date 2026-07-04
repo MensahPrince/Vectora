@@ -111,6 +111,8 @@ final class EditorState {
     @ObservationIgnored private var sessionGeneration = 0
     /// FIFO chain serializing engine ops so refreshes apply in issue order.
     @ObservationIgnored private var opChain: Task<Void, Never>?
+    /// Bumps per enqueued op; `waitForEngine` uses it to detect a moved tail.
+    @ObservationIgnored private var opCounter = 0
     /// Engine id -> stable SwiftUI identity.
     @ObservationIgnored private var idMap = EngineIDMap()
     /// Engine clip id -> hosting lane kind (from the last refresh).
@@ -131,6 +133,7 @@ final class EditorState {
         sessionGeneration += 1
         let generation = sessionGeneration
         session = nil
+        opCounter += 1
         opChain = Task { @MainActor [weak self] in
             let created = await Task.detached(priority: .userInitiated) {
                 CutlassSession.create()
@@ -167,6 +170,7 @@ final class EditorState {
     private func enqueue(_ body: @escaping @MainActor (CutlassSession) async throws -> Void) {
         let generation = sessionGeneration
         let previous = opChain
+        opCounter += 1
         opChain = Task { @MainActor [weak self] in
             await previous?.value
             guard let self, self.sessionGeneration == generation,
@@ -204,10 +208,17 @@ final class EditorState {
 
     /// Run a create-intent whose optimistic placeholder is already on screen:
     /// the engine clip adopts the placeholder's UUID so views (and the
-    /// selection) holding it never see an identity swap.
+    /// selection) holding it never see an identity swap. A rejected create
+    /// removes its placeholder (nobody will ever confirm it).
     private func runCreateIntent(_ intent: Intent, placeholder: UUID) {
         enqueue { [weak self] session in
-            let result = try await session.run(intent)
+            let result: IntentResult
+            do {
+                result = try await session.run(intent)
+            } catch {
+                self?.removePlaceholder(placeholder)
+                throw error
+            }
             guard let self else { return }
             if let clip = result.clip {
                 self.idMap.adopted[clip] = placeholder
@@ -216,6 +227,15 @@ final class EditorState {
             self.noteEngineOpDuringPanel()
             self.applyRefresh(state)
         }
+    }
+
+    /// Drop an optimistic clip whose engine create was rejected.
+    private func removePlaceholder(_ id: UUID) {
+        overlayClips.removeAll { $0.id == id && $0.engineID == nil }
+        effectClips.removeAll { $0.id == id && $0.engineID == nil }
+        audioClips.removeAll { $0.id == id && $0.engineID == nil }
+        pruneEmptyLanes()
+        reconcileSelection()
     }
 
     /// Apply one raw wire command + refresh.
@@ -238,7 +258,8 @@ final class EditorState {
             return
         }
         appliedRevision = state.revision
-        let projection = EngineBridge.project(state, previous: currentProjection(), ids: idMap)
+        var projection = EngineBridge.project(state, previous: currentProjection(), ids: idMap)
+        carryUnconfirmedPlaceholders(into: &projection)
 
         var newClips = projection.clips
         var newOverlays = projection.overlays
@@ -275,6 +296,44 @@ final class EditorState {
         projection.effects = effectClips
         projection.audios = audioClips
         return projection
+    }
+
+    /// Keep optimistic clips whose create-intent is still queued behind this
+    /// refresh (engineID nil, absent from the engine state): they stay on
+    /// screen, and their styling is still around when the create adopts them.
+    /// Their optimistic lanes ride along at the kind's default row.
+    private func carryUnconfirmedPlaceholders(into projection: inout EngineProjection) {
+        var carriedLanes: [UUID] = []
+
+        for overlay in overlayClips
+        where overlay.engineID == nil && !projection.overlays.contains(where: { $0.id == overlay.id }) {
+            projection.overlays.append(overlay)
+            carriedLanes.append(overlay.laneID)
+        }
+        for effect in effectClips
+        where effect.engineID == nil && !projection.effects.contains(where: { $0.id == effect.id }) {
+            projection.effects.append(effect)
+            carriedLanes.append(effect.laneID)
+        }
+        for audio in audioClips
+        where audio.engineID == nil && !projection.audios.contains(where: { $0.id == audio.id }) {
+            projection.audios.append(audio)
+            carriedLanes.append(audio.laneID)
+        }
+
+        for laneID in carriedLanes where !projection.lanes.contains(where: { $0.id == laneID }) {
+            guard let lane = lanes.first(where: { $0.id == laneID }) else { continue }
+            let mainRow = projection.lanes.firstIndex(where: \.isMain) ?? 0
+            let audioFloor =
+                projection.lanes.firstIndex(where: { $0.kind == .audio }) ?? projection.lanes.count
+            let row =
+                switch lane.kind {
+                case .video: mainRow
+                case .audio: projection.lanes.count
+                case .text, .sticker, .effect: audioFloor
+                }
+            projection.lanes.insert(lane, at: min(row, projection.lanes.count))
+        }
     }
 
     /// Copy the selected item's local struct over the freshly projected one
@@ -814,6 +873,16 @@ final class EditorState {
     func seedIntents(_ intents: [Intent]) {
         for intent in intents {
             runIntent(intent)
+        }
+    }
+
+    /// Suspends until every queued engine op (and its refresh) has landed.
+    /// Used by tests; the app never blocks on the chain.
+    func waitForEngine() async {
+        var seen = -1
+        while seen != opCounter {
+            seen = opCounter
+            await opChain?.value
         }
     }
 

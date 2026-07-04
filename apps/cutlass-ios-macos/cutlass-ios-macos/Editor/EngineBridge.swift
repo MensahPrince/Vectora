@@ -61,12 +61,23 @@ nonisolated enum TransitionMap {
         "Blur": "crossfade",
     ]
 
+    /// Canonical UI style per engine id (several UI styles can share an
+    /// engine transition; the projection shows the canonical one).
+    private static let engineToUI: [String: String] = [
+        "crossfade": "Fade",
+        "dip_to_black": "Dissolve",
+        "slide": "Slide",
+        "wipe_left": "Wipe",
+        "dip_to_white": "Zoom",
+        "wipe_up": "Spin",
+    ]
+
     static func engineID(forStyle style: String) -> String? {
         uiToEngine[style]
     }
 
     static func style(forEngineID id: String) -> String {
-        uiToEngine.first { $0.value == id }?.key ?? "Fade"
+        engineToUI[id] ?? "Fade"
     }
 }
 
@@ -128,10 +139,19 @@ nonisolated enum EngineBridge {
         result.aspect = AspectRatio.from(wireName: state.canvas.aspect)
         result.canvasBackground = color(state.canvas.background)
 
+        // Old items are matched by engine id, falling back to UUID so a
+        // placeholder created optimistically in Swift (engineID nil until the
+        // engine confirms) still hands its styling to the adopted clip.
         let oldClips = index(previous.clips)
         let oldOverlays = index(previous.overlays)
         let oldEffects = index(previous.effects)
         let oldAudios = index(previous.audios)
+        let oldClipsByUUID = Dictionary(uniqueKeysWithValues: previous.clips.map { ($0.id, $0) })
+        let oldOverlaysByUUID = Dictionary(
+            uniqueKeysWithValues: previous.overlays.map { ($0.id, $0) })
+        let oldEffectsByUUID = Dictionary(
+            uniqueKeysWithValues: previous.effects.map { ($0.id, $0) })
+        let oldAudiosByUUID = Dictionary(uniqueKeysWithValues: previous.audios.map { ($0.id, $0) })
 
         var lanes: [MockLane] = []
         for lane in state.lanes {
@@ -149,25 +169,31 @@ nonisolated enum EngineBridge {
                 result.clipLane[clip.id] = kind
                 let uuid = ids.clip(clip.id)
                 if lane.isMain {
-                    result.clips.append(mainClip(clip, uuid: uuid, old: oldClips[clip.id]))
+                    let old = oldClips[clip.id] ?? oldClipsByUUID[uuid]
+                    result.clips.append(mainClip(clip, uuid: uuid, old: old))
                     continue
                 }
+                let oldOverlay = oldOverlays[clip.id] ?? oldOverlaysByUUID[uuid]
                 switch lane.kind {
                 case "video":
                     result.overlays.append(
-                        pipOverlay(clip, uuid: uuid, laneID: laneUUID, old: oldOverlays[clip.id]))
+                        pipOverlay(clip, uuid: uuid, laneID: laneUUID, old: oldOverlay))
                 case "text":
                     result.overlays.append(
-                        textOverlay(clip, uuid: uuid, laneID: laneUUID, old: oldOverlays[clip.id]))
+                        textOverlay(clip, uuid: uuid, laneID: laneUUID, old: oldOverlay))
                 case "sticker":
                     result.overlays.append(
-                        stickerOverlay(clip, uuid: uuid, laneID: laneUUID, old: oldOverlays[clip.id]))
+                        stickerOverlay(clip, uuid: uuid, laneID: laneUUID, old: oldOverlay))
                 case "effect", "filter", "adjustment":
                     result.effects.append(
-                        effectClip(clip, uuid: uuid, lane: lane.kind, laneID: laneUUID, old: oldEffects[clip.id]))
+                        effectClip(
+                            clip, uuid: uuid, lane: lane.kind, laneID: laneUUID,
+                            old: oldEffects[clip.id] ?? oldEffectsByUUID[uuid]))
                 case "audio":
                     result.audios.append(
-                        audioClip(clip, uuid: uuid, laneID: laneUUID, old: oldAudios[clip.id]))
+                        audioClip(
+                            clip, uuid: uuid, laneID: laneUUID,
+                            old: oldAudios[clip.id] ?? oldAudiosByUUID[uuid]))
                 default:
                     break
                 }

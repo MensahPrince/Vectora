@@ -96,6 +96,8 @@ struct PanelSlider: View {
     var range: ClosedRange<Double>
     /// Renders the bubble text; defaults to a percent-style integer.
     var format: (Double) -> String = { "\(Int(($0 * 100).rounded()))" }
+    /// Drag lifecycle passthrough (commit-on-release panels hook `false`).
+    var onEditingChanged: (Bool) -> Void = { _ in }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -104,7 +106,7 @@ struct PanelSlider: View {
                 .foregroundStyle(Theme.textSecondary)
                 .frame(width: 82, alignment: .leading)
 
-            Slider(value: $value, in: range)
+            Slider(value: $value, in: range, onEditingChanged: onEditingChanged)
                 .tint(Theme.accent)
 
             Text(format(value))
