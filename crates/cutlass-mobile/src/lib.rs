@@ -22,6 +22,7 @@
 //! [`ui_state`] shapes the project into the lane-stack JSON the UIs render,
 //! and [`wire`] carries it all as JSON strings across the C ABI.
 
+pub mod audio;
 pub mod export_job;
 pub mod intents;
 pub mod session;
@@ -29,6 +30,7 @@ pub mod thumbs;
 pub mod ui_state;
 pub mod wire;
 
+pub use audio::CutlassAudioReader;
 pub use export_job::CutlassExportJob;
 pub use session::CutlassSession;
 pub use thumbs::CutlassThumbnailer;
