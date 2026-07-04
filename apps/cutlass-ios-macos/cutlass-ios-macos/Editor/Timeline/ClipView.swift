@@ -8,6 +8,11 @@ struct ClipView: View {
     var clip: MockClip
     var pointsPerSecond: Double
     var isSelected: Bool = false
+    /// Square sort mode: while a reorder is live the whole track renders as
+    /// uniform square tiles, so shuffling never means dragging across a
+    /// long clip. Same view tree (the width just changes) so the in-flight
+    /// long-press gesture survives the morph.
+    var sortMode: Bool = false
     var onTap: () -> Void = {}
     var onTrim: (EditorState.TrimEdge, MockClip, Double) -> Void = { _, _, _ in }
     var onTrimEnd: () -> Void = {}
@@ -19,43 +24,77 @@ struct ClipView: View {
     private static let waveformHeight: CGFloat = 20
     private static let handleWidth: CGFloat = 16
 
-    private var width: CGFloat {
+    private var timeWidth: CGFloat {
         max(2, clip.length * pointsPerSecond)
+    }
+
+    private var width: CGFloat {
+        sortMode ? Self.height : timeWidth
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            thumbnailStrip(height: clip.hasAudio ? Self.height - Self.waveformHeight : Self.height)
-            if clip.hasAudio {
+            thumbnailStrip(height: clip.hasAudio && !sortMode ? Self.height - Self.waveformHeight : Self.height)
+            if clip.hasAudio, !sortMode {
                 WaveformStrip(seed: clip.id.hashValue)
                     .frame(height: Self.waveformHeight)
             }
         }
         .frame(width: width, height: Self.height)
-        .clipShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: sortMode ? 9 : 5, style: .continuous))
         // Hairline separator so adjacent clips read as distinct without
         // shifting the time math the way real HStack spacing would.
         .overlay(alignment: .trailing) {
-            if !isSelected {
+            if !isSelected, !sortMode {
                 Rectangle()
                     .fill(Theme.timelineBed)
                     .frame(width: 1)
             }
         }
-        .overlay(alignment: .bottomLeading) { badges }
-        .overlay { keyframeDiamonds }
+        .overlay(alignment: .bottomLeading) {
+            if !sortMode {
+                badges
+            }
+        }
         .overlay {
-            if isSelected {
+            if !sortMode {
+                keyframeDiamonds
+            }
+        }
+        .overlay {
+            if sortMode {
+                RoundedRectangle(cornerRadius: 9, style: .continuous)
+                    .strokeBorder(.white.opacity(0.25), lineWidth: 1)
+            }
+        }
+        .overlay(alignment: .bottom) {
+            if sortMode {
+                sortDurationLabel
+            }
+        }
+        .overlay {
+            if isSelected, !sortMode {
                 selectionChrome
             }
         }
         .overlay(alignment: .top) {
-            if isSelected {
+            if isSelected, !sortMode {
                 durationBubble
             }
         }
         .contentShape(Rectangle())
         .onTapGesture(perform: onTap)
+    }
+
+    private var sortDurationLabel: some View {
+        Text(String(format: "%.1fs", clip.length))
+            .font(.system(size: 8.5, weight: .semibold).monospacedDigit())
+            .foregroundStyle(.white)
+            .padding(.horizontal, 4)
+            .padding(.vertical, 1)
+            .background(.black.opacity(0.55), in: Capsule())
+            .padding(.bottom, 3)
+            .allowsHitTesting(false)
     }
 
     // MARK: Status badges (speed / mute / reverse / freeze / filter)

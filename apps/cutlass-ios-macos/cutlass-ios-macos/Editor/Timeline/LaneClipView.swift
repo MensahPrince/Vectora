@@ -27,12 +27,22 @@ struct LaneClipView: View {
     /// (anchorStart, delta seconds) for horizontal drags to a new start.
     var onMove: (TimeInterval, TimeInterval) -> Void
     var onGestureEnd: () -> Void
+    /// Global finger location while the clip is lifted (2D drag); the
+    /// timeline uses it for cross-lane band hit-testing.
+    var onLiftChange: (CGPoint) -> Void = { _ in }
+    /// Final global finger location on release (nil if the lift never
+    /// produced a drag). Called before onGestureEnd.
+    var onLiftEnd: (CGPoint?) -> Void = { _ in }
 
     static let height: CGFloat = 30
     private static let handleWidth: CGFloat = 13
 
     /// (start, length) captured at the first update of a trim/move drag.
     @State private var anchor: (start: TimeInterval, length: TimeInterval)?
+    /// Vertical finger-follow while lifted; springs back unless the drop
+    /// converted the clip to another lane (then this view disappears).
+    @State private var liftY: CGFloat = 0
+    @State private var isLifting = false
 
     private var width: CGFloat {
         max(6, length * pointsPerSecond)
@@ -57,8 +67,13 @@ struct LaneClipView: View {
             .onTapGesture(perform: onTap)
             // The .none mask matters: even a nil optional gesture installs a
             // recognizer that can stall other gestures in the hierarchy.
+            // Selected clips move on an immediate drag; unselected ones need
+            // the long-press lift so plain drags still pan the timeline.
             .highPriorityGesture(moveGesture, including: isSelected ? .all : .none)
-            .offset(x: start * pointsPerSecond)
+            .gesture(liftGesture, including: isSelected ? .none : .all)
+            .scaleEffect(isLifting ? 1.06 : 1)
+            .shadow(color: .black.opacity(isLifting ? 0.5 : 0), radius: 8, y: 3)
+            .offset(x: start * pointsPerSecond, y: liftY)
     }
 
     // MARK: Pieces
@@ -187,21 +202,57 @@ struct LaneClipView: View {
             )
     }
 
-    /// Selected lane clips drag horizontally to a new start time; the drag
-    /// claims the touch so the timeline doesn't scroll underneath. Global
-    /// coordinate space because the clip offsets under the finger as it
-    /// moves — local deltas would oscillate.
+    /// Selected lane clips drag on an immediate touch; the drag claims the
+    /// touch so the timeline doesn't scroll underneath. Global coordinate
+    /// space because the clip offsets under the finger as it moves —
+    /// local deltas would oscillate.
     private var moveGesture: some Gesture {
         DragGesture(minimumDistance: 6, coordinateSpace: .global)
             .onChanged { value in
-                let anchor = self.anchor ?? (start, length)
-                self.anchor = anchor
-                onMove(anchor.start, value.translation.width / pointsPerSecond)
+                applyLiftDrag(translation: value.translation, location: value.location)
             }
-            .onEnded { _ in
-                anchor = nil
-                onGestureEnd()
+            .onEnded { value in
+                finishLiftDrag(location: value.location)
             }
+    }
+
+    /// Unselected clips lift after a long press, then track the finger in
+    /// 2D exactly like the selected-move drag.
+    private var liftGesture: some Gesture {
+        LongPressGesture(minimumDuration: 0.35, maximumDistance: 12)
+            .sequenced(before: DragGesture(minimumDistance: 0, coordinateSpace: .global))
+            .onChanged { value in
+                guard case .second(true, let drag) = value, let drag else { return }
+                applyLiftDrag(translation: drag.translation, location: drag.location)
+            }
+            .onEnded { value in
+                guard case .second(true, let drag) = value else { return }
+                finishLiftDrag(location: drag?.location)
+            }
+    }
+
+    /// Shared 2D lift handling: horizontal component re-times the clip via
+    /// onMove (sub-rows re-pack live), vertical component is a visual
+    /// follow, and the raw location feeds cross-lane band hit-testing.
+    private func applyLiftDrag(translation: CGSize, location: CGPoint) {
+        let anchor = self.anchor ?? (start, length)
+        self.anchor = anchor
+        isLifting = true
+        liftY = translation.height
+        onMove(anchor.start, translation.width / pointsPerSecond)
+        onLiftChange(location)
+    }
+
+    private func finishLiftDrag(location: CGPoint?) {
+        anchor = nil
+        isLifting = false
+        onLiftEnd(location)
+        // If the drop converted the clip to another lane this view is gone
+        // and the spring-back never renders; otherwise snap home.
+        withAnimation(.snappy(duration: 0.25)) {
+            liftY = 0
+        }
+        onGestureEnd()
     }
 }
 

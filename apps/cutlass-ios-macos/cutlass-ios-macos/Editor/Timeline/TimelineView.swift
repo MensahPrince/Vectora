@@ -14,8 +14,12 @@ struct TimelineView: View {
 
     /// seconds-per-point captured when a pinch begins.
     @State private var pinchBase: Double?
-    /// Live long-press drag-to-reorder on the main track.
+    /// Live long-press drag-to-reorder on the main track (square sort mode).
     @State private var reorder: ReorderDrag?
+    /// Live long-press lift of a lane clip (2D drag; may convert on drop).
+    @State private var laneLift: (selection: TimelineSelection, overMain: Bool)?
+    /// Bumped on every successful cross-lane conversion (success haptic).
+    @State private var conversionPulse = 0
     /// How far the lane stack is panned up inside its viewport.
     @State private var laneOffset: CGFloat = 0
     /// Playhead + lane offset captured when a timeline pan begins.
@@ -24,6 +28,9 @@ struct TimelineView: View {
     @State private var panMode: PanMode?
     /// Post-flick momentum; cancelled by any new touch or playback.
     @State private var decayTask: Task<Void, Never>?
+    /// The timeline's frame in screen space; drag locations arrive in the
+    /// global coordinate space, so band/time hit-testing needs this origin.
+    @State private var globalFrame: CGRect = .zero
 
     private enum PanMode {
         case scrub, lanes
@@ -32,8 +39,23 @@ struct TimelineView: View {
     private struct ReorderDrag: Equatable {
         var clipID: UUID
         var fromIndex: Int
-        var translation: CGFloat = 0
+        /// Keeps the square strip anchored where the lifted clip's leading
+        /// edge was in time layout, so the morph doesn't jump.
+        var stripShift: CGFloat
+        var translation: CGSize = .zero
+        var location: CGPoint = .zero
         var insertionIndex: Int
+        /// Finger is over the overlay band: drop converts to a PiP overlay.
+        var overOverlayBand = false
+    }
+
+    /// Vertical band a finger can hover during a cross-lane drag, in the
+    /// lane stack's own coordinates (shared with `timelineHeight`).
+    private struct BandLayout {
+        var effects: ClosedRange<CGFloat>
+        var main: ClosedRange<CGFloat>
+        var overlay: ClosedRange<CGFloat>
+        var audio: ClosedRange<CGFloat>?
     }
 
     private static let rowSpacing: CGFloat = 5
@@ -94,40 +116,62 @@ struct TimelineView: View {
                         .clipped()
 
                     VStack(alignment: .leading, spacing: Self.rowSpacing) {
-                        if effectRows == 0 {
-                            Color.clear.frame(height: Self.emptyLaneHeight)
-                        } else {
-                            laneRows(
-                                rowCount: effectRows,
-                                width: contentWidth,
-                                entries: effects,
-                                view: effectClipView(_:)
-                            )
+                        Group {
+                            if effectRows == 0 {
+                                Color.clear.frame(height: Self.emptyLaneHeight)
+                            } else {
+                                laneRows(
+                                    rowCount: effectRows,
+                                    width: contentWidth,
+                                    entries: effects,
+                                    liftedID: liftedLaneClipID,
+                                    view: effectClipView(_:)
+                                )
+                            }
                         }
+                        .opacity(reorder == nil ? 1 : 0.35)
 
                         ZStack(alignment: .leading) {
                             track
                             transitionBoundaries
                         }
-
-                        if overlayRows == 0 {
-                            Color.clear.frame(height: Self.emptyLaneHeight)
-                        } else {
-                            laneRows(
-                                rowCount: overlayRows,
-                                width: contentWidth,
-                                entries: overlays,
-                                view: overlayClipView(_:)
-                            )
+                        // Band tint above the clips (the background band is
+                        // fully covered by them) while a PiP hovers here.
+                        .overlay {
+                            if laneLift?.overMain == true {
+                                Rectangle()
+                                    .fill(Theme.accent.opacity(0.28))
+                                    .allowsHitTesting(false)
+                            }
                         }
+                        // The lifted square renders above the lane rows it is
+                        // dragged across.
+                        .zIndex(reorder != nil ? 5 : 0)
+
+                        Group {
+                            if overlayRows == 0 {
+                                Color.clear.frame(height: Self.emptyLaneHeight)
+                            } else {
+                                laneRows(
+                                    rowCount: overlayRows,
+                                    width: contentWidth,
+                                    entries: overlays,
+                                    liftedID: liftedLaneClipID,
+                                    view: overlayClipView(_:)
+                                )
+                            }
+                        }
+                        .opacity(reorder == nil ? 1 : 0.35)
 
                         if audioRows > 0 {
                             laneRows(
                                 rowCount: audioRows,
                                 width: contentWidth,
                                 entries: audio,
+                                liftedID: liftedLaneClipID,
                                 view: audioClipView(_:)
                             )
+                            .opacity(reorder == nil ? 1 : 0.35)
                         }
                     }
                     // Bands pan with the lane stack so they always line up
@@ -165,9 +209,18 @@ struct TimelineView: View {
         .clipped()
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("timeline")
-        .onChange(of: displayHeight) { _, newHeight in
-            keepMainTrackVisible(displayHeight: newHeight, effectRows: effectRows, naturalHeight: naturalHeight)
+        .onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .global)
+        } action: { frame in
+            globalFrame = frame
         }
+        .onChange(of: displayHeight) { _, newHeight in
+            keepMainTrackVisible(displayHeight: newHeight, naturalHeight: naturalHeight)
+        }
+        .sensoryFeedback(.impact(weight: .medium), trigger: liftedLaneClipID) { _, newValue in
+            newValue != nil
+        }
+        .sensoryFeedback(.success, trigger: conversionPulse)
         .onDisappear { decayTask?.cancel() }
     }
 
@@ -175,48 +228,127 @@ struct TimelineView: View {
     /// minimum needed to keep the main track fully inside the viewport, so
     /// collapsing always lands focused on the track (CapCut behavior). The
     /// user can still pan away afterwards.
-    private func keepMainTrackVisible(displayHeight: CGFloat, effectRows: Int, naturalHeight: CGFloat) {
+    private func keepMainTrackVisible(displayHeight: CGFloat, naturalHeight: CGFloat) {
         let viewport = max(displayHeight - Self.rulerHeight - Self.rowSpacing, 40)
         let maxOffset = max(0, naturalHeight - Self.rulerHeight - Self.rowSpacing - viewport)
-        let effectsBlock = effectRows == 0
-            ? Self.emptyLaneHeight
-            : CGFloat(effectRows) * LaneClipView.height + CGFloat(effectRows - 1) * Self.rowSpacing
-        let trackTop = effectsBlock + Self.rowSpacing
-        let trackBottom = trackTop + ClipView.height
+        let main = currentBandLayout().main
 
         var target = min(max(0, laneOffset), maxOffset)
-        if target > trackTop { target = trackTop }
-        if target < trackBottom - viewport { target = trackBottom - viewport }
+        if target > main.lowerBound { target = main.lowerBound }
+        if target < main.upperBound - viewport { target = main.upperBound - viewport }
         laneOffset = min(max(0, target), maxOffset)
     }
 
     private func timelineHeight(effectRows: Int, overlayRows: Int, audioRows: Int) -> CGFloat {
-        let laneHeight = LaneClipView.height + Self.rowSpacing
-        var height = Self.rulerHeight + ClipView.height + Self.rowSpacing * 2 + 16
-        height += effectRows == 0 ? Self.emptyLaneHeight + Self.rowSpacing : CGFloat(effectRows) * laneHeight
-        height += overlayRows == 0 ? Self.emptyLaneHeight + Self.rowSpacing : CGFloat(overlayRows) * laneHeight
-        height += CGFloat(audioRows) * laneHeight
-        return height
+        let layout = bandLayout(effectRows: effectRows, overlayRows: overlayRows, audioRows: audioRows)
+        let bottom = layout.audio?.upperBound ?? layout.overlay.upperBound
+        return Self.rulerHeight + Self.rowSpacing + bottom + Self.rowSpacing + 16
+    }
+
+    // MARK: Band geometry (cross-lane drag targets)
+
+    private var rowCounts: (effects: Int, overlays: Int, audio: Int) {
+        (
+            packedEffects.map { $0.row + 1 }.max() ?? 0,
+            packedOverlays.map { $0.row + 1 }.max() ?? 0,
+            packedAudio.map { $0.row + 1 }.max() ?? 0
+        )
+    }
+
+    /// Y-ranges of each band inside the lane stack; the same math that sizes
+    /// `timelineHeight`, so hit-testing can't drift from the layout.
+    private func bandLayout(effectRows: Int, overlayRows: Int, audioRows: Int) -> BandLayout {
+        let spacing = Self.rowSpacing
+        let lane = LaneClipView.height
+        func blockHeight(_ rows: Int) -> CGFloat {
+            rows == 0 ? Self.emptyLaneHeight : CGFloat(rows) * lane + CGFloat(rows - 1) * spacing
+        }
+
+        let effectsEnd = blockHeight(effectRows)
+        let mainStart = effectsEnd + spacing
+        let mainEnd = mainStart + ClipView.height
+        let overlayEnd = mainEnd + spacing + blockHeight(overlayRows)
+        let audio: ClosedRange<CGFloat>? = audioRows > 0
+            ? (overlayEnd + spacing)...(overlayEnd + spacing + blockHeight(audioRows))
+            : nil
+        return BandLayout(
+            effects: 0...effectsEnd,
+            main: mainStart...mainEnd,
+            overlay: (mainEnd + spacing)...overlayEnd,
+            audio: audio
+        )
+    }
+
+    private func currentBandLayout() -> BandLayout {
+        let counts = rowCounts
+        return bandLayout(effectRows: counts.effects, overlayRows: counts.overlays, audioRows: counts.audio)
+    }
+
+    /// Converts a global (screen) y to the lane stack's coordinate space,
+    /// accounting for the ruler and the live lane pan.
+    private func laneStackY(fromGlobalY y: CGFloat) -> CGFloat? {
+        guard globalFrame != .zero else { return nil }
+        let counts = rowCounts
+        let natural = timelineHeight(effectRows: counts.effects, overlayRows: counts.overlays, audioRows: counts.audio)
+        let display = min(max(userHeight ?? natural, Self.minHeight), max(natural, Self.minHeight))
+        let viewport = max(display - Self.rulerHeight - Self.rowSpacing, 40)
+        let maxOffset = max(0, natural - Self.rulerHeight - Self.rowSpacing - viewport)
+        let effectiveOffset = min(laneOffset, maxOffset)
+        return y - globalFrame.minY - Self.rulerHeight - Self.rowSpacing + effectiveOffset
+    }
+
+    /// Is the finger over the overlay band (main-clip drop target)?
+    private func overlayDropTarget(globalY: CGFloat) -> Bool {
+        guard let y = laneStackY(fromGlobalY: globalY) else { return false }
+        let overlay = currentBandLayout().overlay
+        return y > overlay.lowerBound - 8 && y < overlay.upperBound + 8
+    }
+
+    /// Is the finger over the main track (PiP-overlay drop target)?
+    private func mainDropTarget(globalY: CGFloat) -> Bool {
+        guard let y = laneStackY(fromGlobalY: globalY) else { return false }
+        let main = currentBandLayout().main
+        return y > main.lowerBound - 8 && y < main.upperBound + 8
+    }
+
+    /// Timeline time under a global (screen) x; the fixed center is the
+    /// playhead.
+    private func timeAt(globalX x: CGFloat) -> TimeInterval {
+        guard globalFrame.width > 0 else { return state.playhead }
+        return max(0, state.playhead + (x - globalFrame.midX) * state.secondsPerPoint)
+    }
+
+    private var liftedLaneClipID: UUID? {
+        switch laneLift?.selection {
+        case .overlay(let id), .effect(let id), .audio(let id):
+            return id
+        case .main, nil:
+            return nil
+        }
     }
 
     // MARK: Rows
 
-    /// Sub-rows of one lane; each clip offsets to its start time.
+    /// Sub-rows of one lane; each clip offsets to its start time. The row
+    /// holding a lifted clip raises above the other lanes.
     private func laneRows<Item: Identifiable>(
         rowCount: Int,
         width: CGFloat,
         entries: [(item: Item, row: Int)],
+        liftedID: UUID? = nil,
         view: @escaping (Item) -> LaneClipView
-    ) -> some View {
+    ) -> some View where Item.ID == UUID {
         ForEach(0..<rowCount, id: \.self) { row in
             ZStack(alignment: .topLeading) {
                 Color.clear
                     .frame(width: max(width, 1), height: LaneClipView.height)
                 ForEach(entries.filter { $0.row == row }, id: \.item.id) { entry in
                     view(entry.item)
+                        .zIndex(entry.item.id == liftedID ? 2 : 0)
                 }
             }
             .frame(width: max(width, 1), height: LaneClipView.height, alignment: .topLeading)
+            .zIndex(entries.contains { $0.row == row && $0.item.id == liftedID } ? 6 : 0)
         }
     }
 
@@ -250,7 +382,19 @@ struct TimelineView: View {
             onMove: { anchorStart, delta in
                 state.moveLaneClip(.overlay(clip.id), anchorStart: anchorStart, by: delta)
             },
-            onGestureEnd: { state.endGesture() }
+            onGestureEnd: { state.endGesture() },
+            onLiftChange: { location in
+                // Only PiP clips have a main-track equivalent; text/stickers
+                // lift visually but never arm the main band.
+                let overMain = clip.kind == .pip && mainDropTarget(globalY: location.y)
+                laneLift = (.overlay(clip.id), overMain)
+            },
+            onLiftEnd: { location in
+                defer { laneLift = nil }
+                guard clip.kind == .pip, let location, mainDropTarget(globalY: location.y) else { return }
+                state.convertOverlayToMainClip(clip.id, at: timeAt(globalX: location.x))
+                conversionPulse += 1
+            }
         )
     }
 
@@ -270,7 +414,9 @@ struct TimelineView: View {
             onMove: { anchorStart, delta in
                 state.moveLaneClip(.effect(clip.id), anchorStart: anchorStart, by: delta)
             },
-            onGestureEnd: { state.endGesture() }
+            onGestureEnd: { state.endGesture() },
+            onLiftChange: { _ in laneLift = (.effect(clip.id), false) },
+            onLiftEnd: { _ in laneLift = nil }
         )
     }
 
@@ -291,7 +437,9 @@ struct TimelineView: View {
             onMove: { anchorStart, delta in
                 state.moveLaneClip(.audio(clip.id), anchorStart: anchorStart, by: delta)
             },
-            onGestureEnd: { state.endGesture() }
+            onGestureEnd: { state.endGesture() },
+            onLiftChange: { _ in laneLift = (.audio(clip.id), false) },
+            onLiftEnd: { _ in laneLift = nil }
         )
     }
 
@@ -310,6 +458,7 @@ struct TimelineView: View {
                     clip: clip,
                     pointsPerSecond: pointsPerSecond,
                     isSelected: state.selection == .main(clip.id),
+                    sortMode: reorder != nil,
                     onTap: { toggleSelection(.main(clip.id)) },
                     onTrim: { edge, anchor, delta in
                         state.trim(clip.id, edge: edge, anchor: anchor, by: delta)
@@ -318,13 +467,15 @@ struct TimelineView: View {
                 )
                 .scaleEffect(isLifted ? 1.07 : 1)
                 .shadow(color: .black.opacity(isLifted ? 0.55 : 0), radius: 10, y: 3)
-                .offset(x: reorderOffset(index: index, clip: clip, widths: widths))
+                .offset(reorderTileOffset(index: index, clip: clip, timeWidths: widths))
                 .animation(
                     isLifted ? nil : .easeOut(duration: 0.18),
                     value: reorder?.insertionIndex
                 )
+                // Morph between time widths and square tiles on lift/drop.
+                .animation(.snappy(duration: 0.22), value: reorder != nil)
                 .zIndex(isLifted ? 10 : 0)
-                .gesture(reorderGesture(clip: clip, index: index, widths: widths))
+                .gesture(reorderGesture(clip: clip, index: index, timeWidths: widths))
             }
 
             Button(action: onAddMedia) {
@@ -339,8 +490,11 @@ struct TimelineView: View {
             }
             .buttonStyle(.plain)
             .padding(.leading, state.isEmpty ? 0 : 4)
+            .opacity(reorder == nil ? 1 : 0)
         }
-        .sensoryFeedback(.impact(weight: .medium), trigger: reorder != nil)
+        .sensoryFeedback(.impact(weight: .medium), trigger: reorder != nil) { _, lifted in
+            lifted
+        }
     }
 
     // MARK: Timeline pan (scrub / lane browse)
@@ -410,11 +564,13 @@ struct TimelineView: View {
         }
     }
 
-    // MARK: Drag to reorder
+    // MARK: Drag to reorder (square sort mode) / drop onto the overlay band
 
-    /// Long-press lifts a main-track clip; horizontal drag slides an
-    /// insertion gap through the neighbors; release commits the move.
-    private func reorderGesture(clip: MockClip, index: Int, widths: [CGFloat]) -> some Gesture {
+    /// Long-press lifts a main-track clip and morphs the whole track into
+    /// uniform square tiles; horizontal drag slides an insertion gap through
+    /// the neighbors, dragging down onto the overlay band converts the clip
+    /// to a PiP overlay at the drop time.
+    private func reorderGesture(clip: MockClip, index: Int, timeWidths: [CGFloat]) -> some Gesture {
         // Global coordinate space: the lifted clip follows the finger, so a
         // local-space translation would feed back on itself. The tight
         // maximumDistance matters: anything looser swallows slow-starting
@@ -424,19 +580,35 @@ struct TimelineView: View {
             .onChanged { value in
                 guard case .second(true, let drag) = value else { return }
                 state.isPlaying = false
-                var current = reorder ?? ReorderDrag(clipID: clip.id, fromIndex: index, insertionIndex: index)
-                current.translation = drag?.translation.width ?? 0
-                current.insertionIndex = insertionIndex(
+                var current = reorder ?? ReorderDrag(
+                    clipID: clip.id,
                     fromIndex: index,
-                    translation: current.translation,
-                    widths: widths
+                    // Anchor the square strip so the lifted tile morphs in
+                    // place of the original clip's leading edge.
+                    stripShift: timeWidths.prefix(index).reduce(0, +) - CGFloat(index) * ClipView.height,
+                    insertionIndex: index
                 )
+                if let drag {
+                    current.translation = drag.translation
+                    current.location = drag.location
+                    current.overOverlayBand = overlayDropTarget(globalY: drag.location.y)
+                    current.insertionIndex = insertionIndex(
+                        fromIndex: index,
+                        translation: drag.translation.width,
+                        widths: Array(repeating: ClipView.height, count: timeWidths.count)
+                    )
+                }
                 reorder = current
             }
             .onEnded { value in
                 defer { reorder = nil }
                 guard case .second(true, _) = value, let final = reorder else { return }
-                state.moveClip(fromIndex: final.fromIndex, toIndex: final.insertionIndex)
+                if final.overOverlayBand {
+                    state.convertMainClipToOverlay(final.clipID, at: timeAt(globalX: final.location.x))
+                    conversionPulse += 1
+                } else {
+                    state.moveClip(fromIndex: final.fromIndex, toIndex: final.insertionIndex)
+                }
             }
     }
 
@@ -457,23 +629,29 @@ struct TimelineView: View {
         return slot
     }
 
-    /// Offsets that visualize the removal + insertion gap while dragging.
-    private func reorderOffset(index: Int, clip: MockClip, widths: [CGFloat]) -> CGFloat {
-        guard let reorder, widths.indices.contains(reorder.fromIndex) else { return 0 }
+    /// Tile offsets while sorting: every tile shifts by the strip anchor,
+    /// the lifted one follows the finger in 2D, and the others slide to
+    /// visualize the removal + insertion gap (gap hidden while the drop
+    /// would convert to an overlay instead of reordering).
+    private func reorderTileOffset(index: Int, clip: MockClip, timeWidths: [CGFloat]) -> CGSize {
+        guard let reorder, timeWidths.indices.contains(reorder.fromIndex) else { return .zero }
+        let square = ClipView.height
         if reorder.clipID == clip.id {
-            return reorder.translation
+            return CGSize(
+                width: reorder.stripShift + reorder.translation.width,
+                height: reorder.translation.height
+            )
         }
 
-        let draggedWidth = widths[reorder.fromIndex]
+        var x = reorder.stripShift
         let postRemovalIndex = index > reorder.fromIndex ? index - 1 : index
-        var offset: CGFloat = 0
         if index > reorder.fromIndex {
-            offset -= draggedWidth
+            x -= square
         }
-        if postRemovalIndex >= reorder.insertionIndex {
-            offset += draggedWidth
+        if !reorder.overOverlayBand, postRemovalIndex >= reorder.insertionIndex {
+            x += square
         }
-        return offset
+        return CGSize(width: x, height: 0)
     }
 
     /// Small boundary buttons between adjacent main-track clips; accent when
@@ -507,30 +685,60 @@ struct TimelineView: View {
 
     /// Full-width dim bands behind the scrolling rows, mirroring the actual
     /// lane layout (ruler excluded; it sits above the lane scroll view).
+    /// During cross-lane drags the hovered target band tints accent and the
+    /// bystander bands dim.
     private func laneBackground(effectRows: Int, overlayRows: Int, audioRows: Int) -> some View {
-        VStack(spacing: Self.rowSpacing) {
-            if effectRows == 0 {
-                Rectangle().fill(Theme.trackEmpty.opacity(0.55)).frame(height: Self.emptyLaneHeight)
-            } else {
-                ForEach(0..<effectRows, id: \.self) { _ in
-                    Rectangle().fill(Theme.trackEmpty.opacity(0.7)).frame(height: LaneClipView.height)
+        let sortActive = reorder != nil
+        let highlightOverlay = reorder?.overOverlayBand == true
+        let highlightMain = laneLift?.overMain == true
+
+        return VStack(spacing: Self.rowSpacing) {
+            Group {
+                if effectRows == 0 {
+                    Rectangle().fill(Theme.trackEmpty.opacity(0.55)).frame(height: Self.emptyLaneHeight)
+                } else {
+                    ForEach(0..<effectRows, id: \.self) { _ in
+                        Rectangle().fill(Theme.trackEmpty.opacity(0.7)).frame(height: LaneClipView.height)
+                    }
                 }
             }
+            .opacity(sortActive ? 0.35 : 1)
 
-            Rectangle().fill(Theme.trackEmpty).frame(height: ClipView.height)
+            Rectangle().fill(Theme.trackEmpty)
+                .overlay {
+                    if highlightMain {
+                        Theme.accent.opacity(0.3)
+                    }
+                }
+                .frame(height: ClipView.height)
 
-            if overlayRows == 0 {
-                Rectangle().fill(Theme.trackEmpty.opacity(0.55)).frame(height: Self.emptyLaneHeight)
-            } else {
-                ForEach(0..<overlayRows, id: \.self) { _ in
-                    Rectangle().fill(Theme.trackEmpty.opacity(0.7)).frame(height: LaneClipView.height)
+            Group {
+                if overlayRows == 0 {
+                    overlayBandRect(height: Self.emptyLaneHeight, baseOpacity: 0.55, highlighted: highlightOverlay)
+                } else {
+                    ForEach(0..<overlayRows, id: \.self) { _ in
+                        overlayBandRect(height: LaneClipView.height, baseOpacity: 0.7, highlighted: highlightOverlay)
+                    }
                 }
             }
+            .opacity(sortActive && !highlightOverlay ? 0.35 : 1)
 
             ForEach(0..<audioRows, id: \.self) { _ in
                 Rectangle().fill(Theme.trackEmpty.opacity(0.7)).frame(height: LaneClipView.height)
             }
+            .opacity(sortActive ? 0.35 : 1)
         }
+    }
+
+    private func overlayBandRect(height: CGFloat, baseOpacity: Double, highlighted: Bool) -> some View {
+        Rectangle()
+            .fill(Theme.trackEmpty.opacity(highlighted ? 0.95 : baseOpacity))
+            .overlay {
+                if highlighted {
+                    Theme.accent.opacity(0.32)
+                }
+            }
+            .frame(height: height)
     }
 
     // MARK: Overlays

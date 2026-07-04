@@ -171,6 +171,9 @@ nonisolated struct MockOverlayClip: Identifiable, Hashable {
     // Picture-in-picture
     var art: MockArt?
     var sourceDuration: TimeInterval?
+    /// Whether the PiP's source media carries audio (photos don't); kept so
+    /// converting to a main clip round-trips faithfully.
+    var pipHasAudio = false
     var volume: Double = 1
 
     // Canvas placement (normalized 0...1 center within the frame)

@@ -156,7 +156,16 @@ final class EditorState {
         // While a panel session is open the session snapshot owns undo; ops
         // triggered from inside the panel fold into one step on Apply.
         guard panelSnapshot == nil else { return }
-        undoStack.append(snapshot)
+        if let anchor = gestureSnapshot {
+            // An op landing mid-gesture (cross-lane drop after a lift-move):
+            // the gesture anchor is the truthful "before", and consuming it
+            // folds the move + op into one undo step (endGesture then has
+            // nothing left to push).
+            undoStack.append(anchor)
+            gestureSnapshot = nil
+        } else {
+            undoStack.append(snapshot)
+        }
         if undoStack.count > 50 {
             undoStack.removeFirst()
         }
@@ -338,6 +347,7 @@ final class EditorState {
         var clip = MockOverlayClip(kind: .pip, start: insertionTime, length: length)
         clip.art = item.art
         clip.sourceDuration = item.videoDuration ?? MockClip.photoMaxDuration
+        clip.pipHasAudio = item.videoDuration != nil
         clip.scale = 0.5
         clip.posY = 0.32
         overlayClips.append(clip)
@@ -390,19 +400,24 @@ final class EditorState {
     // MARK: Cross-lane conversions (drag a clip onto another lane)
 
     /// Pulls a clip off the main track and re-creates it as a PiP overlay
-    /// starting at `start` (clamped to the timeline).
+    /// starting at `start` (snap-aware, clamped to the timeline).
     func convertMainClipToOverlay(_ id: UUID, at start: TimeInterval) {
         guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
         pushUndoSnapshot()
 
         let clip = clips.remove(at: index)
+        var dropStart = max(0, start)
+        if let snapped = snapTime(near: dropStart, candidates: laneSnapCandidates(excluding: nil)) {
+            dropStart = max(0, snapped)
+        }
         var overlay = MockOverlayClip(
             kind: .pip,
-            start: max(0, start),
+            start: dropStart,
             length: clip.length
         )
         overlay.art = clip.art
         overlay.sourceDuration = clip.sourceDuration
+        overlay.pipHasAudio = clip.hasAudio
         overlay.volume = clip.volume
         overlay.scale = 0.5
         overlay.posY = 0.32
@@ -425,7 +440,7 @@ final class EditorState {
             art: art,
             sourceDuration: overlay.sourceDuration ?? overlay.length,
             length: overlay.length,
-            hasAudio: overlay.sourceDuration != nil
+            hasAudio: overlay.pipHasAudio
         )
         clips.insert(clip, at: mainInsertionIndex(nearest: time))
         selection = .main(clip.id)
