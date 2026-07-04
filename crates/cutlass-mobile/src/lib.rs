@@ -22,6 +22,8 @@
 //! [`ui_state`] shapes the project into the lane-stack JSON the UIs render,
 //! and [`wire`] carries it all as JSON strings across the C ABI.
 
+#[cfg(target_os = "android")]
+pub mod android;
 pub mod audio;
 pub mod catalogs;
 pub mod export_job;
@@ -508,7 +510,7 @@ mod android_jni {
 
     /// Route `log::*` to logcat (tag `cutlass`) once, so native failures are
     /// visible via `adb logcat -s cutlass`. Idempotent.
-    fn init_logging() {
+    pub(crate) fn init_logging() {
         use std::sync::Once;
         static INIT: Once = Once::new();
         INIT.call_once(|| {

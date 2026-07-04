@@ -1376,7 +1376,7 @@ fn set_speed_preset(
     let curve = match preset.as_deref() {
         Some(id) => Some(
             cutlass_models::speed_preset(id)
-                .ok_or_else(|| invalid(&format!("unknown speed preset '{id}'")))?,
+                .ok_or_else(|| invalid(format!("unknown speed preset '{id}'")))?,
         ),
         None => None,
     };
