@@ -35,6 +35,10 @@ struct RootView: View {
     /// reach while iterating on the mock UI. Add `-autoplay` to press play
     /// once the seeded timeline lands (audio pipeline smoke).
     init() {
+        // Nothing is editing yet: sweep media-only project dirs abandoned
+        // before their first save, and stale picker staging.
+        ProjectStore.purgeUnsaved()
+
         let arguments = ProcessInfo.processInfo.arguments
         autoplayOnLaunch = arguments.contains("-autoplay")
         guard let flag = arguments.firstIndex(of: "-startScreen"),
@@ -46,6 +50,7 @@ struct RootView: View {
             _pickerIntent = State(initialValue: .newProject)
         case "editor":
             let state = EditorState()
+            state.autoSaveEnabled = false
             state.startProject(with: FixtureLibrary.sampleTimeline)
             _editorState = State(initialValue: state)
             _screen = State(initialValue: .editor)
@@ -56,6 +61,7 @@ struct RootView: View {
             // real engine intents (FIFO, so times are explicit rather than
             // playhead-derived).
             let state = EditorState()
+            state.autoSaveEnabled = false
             state.startProject(with: FixtureLibrary.sampleTimeline)
             state.seedIntents([
                 .addSticker(atSeconds: 0),
@@ -88,10 +94,8 @@ struct RootView: View {
                         editorState.startProject(with: [])
                         screen = .editor
                     },
-                    onOpenProject: { _ in
-                        // Mock "reopen": seed the editor with sample media
-                        // (the real project store lands with persistence).
-                        editorState.startProject(with: FixtureLibrary.sampleTimeline)
+                    onOpenProject: { entry in
+                        editorState.openProject(entry)
                         screen = .editor
                     }
                 )
@@ -100,6 +104,7 @@ struct RootView: View {
                     state: editorState,
                     onHome: {
                         editorState.isPlaying = false
+                        editorState.flushSave()
                         screen = .home
                     },
                     onAddMedia: { pickerIntent = .appendToTimeline },

@@ -124,6 +124,10 @@ struct MediaPickerView: View {
                 ForEach(FixtureLibrary.samples, id: \.self) { url in
                     MediaCell(url: url, selectionIndex: sampleIndex(of: url))
                         .onTapGesture { toggleSample(url) }
+                        .accessibilityElement(children: .ignore)
+                        .accessibilityLabel(url.lastPathComponent)
+                        .accessibilityAddTraits(.isButton)
+                        .accessibilityIdentifier("sampleCell-\(url.lastPathComponent)")
                 }
             }
             .padding(.bottom, 110)
@@ -154,6 +158,7 @@ struct MediaPickerView: View {
                         .background(Theme.accent, in: Capsule())
                 }
                 .buttonStyle(.plain)
+                .accessibilityIdentifier("pickerAddButton")
             }
 
             Spacer()

@@ -5,7 +5,7 @@ import SwiftUI
 struct HomeView: View {
     var onNewProject: () -> Void
     var onBlankProject: () -> Void
-    var onOpenProject: (MockProject) -> Void = { _ in }
+    var onOpenProject: (ProjectStore.Entry) -> Void = { _ in }
 
     /// Template selection routed into the detail sheet, kept together so one
     /// `sheet(item:)` covers every carousel.
@@ -15,9 +15,9 @@ struct HomeView: View {
         var id: UUID { template.id }
     }
 
-    @State private var projects = MockData.projects
-    @State private var menuProject: MockProject?
-    @State private var renameProject: MockProject?
+    @State private var projects: [ProjectStore.Entry] = []
+    @State private var menuProject: ProjectStore.Entry?
+    @State private var renameProject: ProjectStore.Entry?
     @State private var renameText = ""
     @State private var templatePick: TemplatePick?
 
@@ -38,7 +38,9 @@ struct HomeView: View {
                         onNewProject: onNewProject,
                         onBlankProject: onBlankProject
                     )
-                    projectsSection
+                    if !projects.isEmpty {
+                        projectsSection
+                    }
                     ForEach(MockData.templateSections) { section in
                         TemplateSection(section: section) { template in
                             templatePick = TemplatePick(template: template, sectionTitle: section.title)
@@ -49,6 +51,7 @@ struct HomeView: View {
                 .padding(.bottom, 96)
             }
         }
+        .onAppear { projects = ProjectStore.list() }
         .overlay(alignment: .bottomTrailing) {
             fab
         }
@@ -83,37 +86,34 @@ struct HomeView: View {
         }
     }
 
-    // MARK: Project mutations
+    // MARK: Project mutations (store-backed; the list re-reads after each)
 
-    private func beginRename(_ project: MockProject) {
+    private func beginRename(_ project: ProjectStore.Entry) {
         renameText = project.name
         renameProject = project
     }
 
     private func commitRename() {
-        guard let project = renameProject,
-              let index = projects.firstIndex(where: { $0.id == project.id })
-        else { return }
+        guard let project = renameProject else { return }
         let trimmed = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
-            projects[index].name = trimmed
+            ProjectStore.rename(id: project.id, to: trimmed)
+            projects = ProjectStore.list()
         }
         renameProject = nil
     }
 
-    private func duplicate(_ project: MockProject) {
-        guard let index = projects.firstIndex(where: { $0.id == project.id }) else { return }
-        var copy = project
-        copy.id = UUID()
-        copy.name = project.name + " copy"
+    private func duplicate(_ project: ProjectStore.Entry) {
+        guard ProjectStore.duplicate(id: project.id) != nil else { return }
         withAnimation(.snappy(duration: 0.25)) {
-            projects.insert(copy, at: index + 1)
+            projects = ProjectStore.list()
         }
     }
 
-    private func delete(_ project: MockProject) {
+    private func delete(_ project: ProjectStore.Entry) {
+        ProjectStore.delete(id: project.id)
         withAnimation(.snappy(duration: 0.25)) {
-            projects.removeAll { $0.id == project.id }
+            projects = ProjectStore.list()
         }
     }
 
@@ -165,6 +165,7 @@ struct HomeView: View {
                             ProjectCard(project: project, onMenu: { menuProject = project })
                         }
                         .buttonStyle(.plain)
+                        .accessibilityIdentifier("projectCard")
                         .contextMenu {
                             Button("Rename", systemImage: "pencil") { beginRename(project) }
                             Button("Duplicate", systemImage: "plus.square.on.square") { duplicate(project) }
