@@ -1194,12 +1194,17 @@ dependencies = [
  "objc2 0.6.4",
  "objc2-av-foundation",
  "objc2-core-foundation",
+ "objc2-core-graphics",
  "objc2-core-media",
  "objc2-core-video",
  "objc2-foundation 0.3.2",
+ "objc2-image-io",
+ "png 0.17.16",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
  "windows",
+ "zune-jpeg 0.5.15",
 ]
 
 [[package]]
@@ -1238,6 +1243,7 @@ dependencies = [
  "cutlass-encoder",
  "cutlass-models",
  "cutlass-render",
+ "png 0.17.16",
  "serde",
  "tempfile",
  "thiserror 2.0.18",
@@ -3720,10 +3726,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
  "bitflags 2.13.0",
+ "block2 0.6.2",
  "dispatch2",
+ "libc",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-io-surface",
+ "objc2-metal 0.3.2",
 ]
 
 [[package]]
@@ -3850,6 +3859,7 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32b0446e98cf4a784cc7a0177715ff317eeaa8463841c616cfc78aa4f953c4ea"
 dependencies = [
+ "block2 0.6.2",
  "objc2 0.6.4",
  "objc2-core-foundation",
  "objc2-core-graphics",

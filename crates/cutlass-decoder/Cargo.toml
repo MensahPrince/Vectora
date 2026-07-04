@@ -11,6 +11,12 @@ description = "Platform-native video decoding behind the cutlass-core VideoDecod
 cutlass-core = { path = "../cutlass-core" }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+# Portable still-image decode (PNG/JPEG), pure Rust. Compiled on every
+# platform: it is the primary path where no native image codec is wired
+# (Windows/Android/Linux hosts) and the fallback behind ImageIO on Apple.
+# `png` is pinned to the same 0.17 line cutlass-render already uses.
+png = "0.17"
+zune-jpeg = "0.5"
 
 # Apple backend: AVFoundation reader (demux + VideoToolbox decode) producing
 # IOSurface-backed CVPixelBuffers. objc2 framework crates are pinned to the same
@@ -22,6 +28,10 @@ tracing = { workspace = true }
 [target.'cfg(target_vendor = "apple")'.dependencies]
 objc2 = "0.6.4"
 objc2-foundation = "0.3.2"
+# Still-image decode via ImageIO (CGImageSource): covers HEIC/HEIF, WebP,
+# GIF, TIFF, BMP on top of PNG/JPEG, honoring EXIF orientation.
+objc2-image-io = "0.3.2"
+objc2-core-graphics = "0.3.2"
 # `objc2-core-media` / `objc2-core-video` features turn on the AVFoundation
 # methods that return CMSampleBuffer / CVImageBuffer (e.g. copyNextSampleBuffer),
 # which aren't in the default set.
@@ -45,6 +55,9 @@ windows = { version = "0.62", features = [
     "Win32_System_Com_StructuredStorage",
     "Win32_System_Variant",
 ] }
+
+[dev-dependencies]
+tempfile = "3"
 
 # Android backend: NDK MediaExtractor (demux) + MediaCodec (hardware decode).
 # We use the raw `ndk-sys` FFI rather than the safe `ndk` wrapper because `ndk`

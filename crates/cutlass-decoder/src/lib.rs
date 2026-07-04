@@ -48,6 +48,11 @@ mod seek;
 mod probe;
 pub use probe::{MediaProbe, probe};
 
+pub mod image;
+#[cfg(target_vendor = "apple")]
+mod image_apple;
+pub use image::{ImageFormat, ImageInfo, decode_image, probe_image, sniff_image};
+
 use std::path::Path;
 
 use cutlass_core::{AudioReader, DecodeError, VideoDecoder};

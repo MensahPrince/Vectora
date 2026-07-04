@@ -14,18 +14,24 @@ use crate::OutputMode;
 /// Static metadata for a media file, read without decoding any frames.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaProbe {
-    /// Visible frame size in pixels, after applying container rotation.
+    /// Visible frame size in pixels, after applying container rotation (or
+    /// EXIF orientation for stills).
     pub width: u32,
     pub height: u32,
-    /// Native (nominal) frame rate.
+    /// Native (nominal) frame rate. Meaningless for stills, which have no
+    /// frame cadence — importers use the model's still-image convention.
     pub frame_rate: Rational,
     /// Source length in whole frames at [`frame_rate`](Self::frame_rate); `0`
-    /// when the container reports no duration.
+    /// when the container reports no duration (and always for stills, whose
+    /// placement length is a policy of the media pool, not the file).
     pub frame_count: i64,
     /// Whether the source carries an audio track, detected per-platform
     /// ([`has_audio_track`]). The [`VideoDecoder`] surfaces only the video
     /// track, so audio presence is queried from the demuxer separately.
     pub has_audio: bool,
+    /// Still image (PNG/JPEG/HEIC/WebP/...): one frame, no timebase.
+    /// Detected by magic bytes before the video probe runs.
+    pub is_image: bool,
 }
 
 impl MediaProbe {
@@ -45,6 +51,7 @@ impl MediaProbe {
             frame_rate,
             frame_count,
             has_audio,
+            is_image: false,
         }
     }
 }
@@ -56,13 +63,28 @@ const AUDIO_TICK_RATE: Rational = Rational::new(1000, 1);
 
 /// Probe `path` with the platform-native decoder.
 ///
-/// Opens the source (demux + codec setup) far enough to read its
-/// [`SourceInfo`], then drops the decoder, and separately checks for an audio
-/// track. Sources without a video stream (music/voiceover files) fall back to
-/// an audio-only probe: zero dimensions, millisecond ticks, and the audio
-/// track's duration. Returns [`DecodeError::Unsupported`] on platforms
+/// Still images are recognized first by magic bytes (a cheap 16-byte read)
+/// and probed via [`crate::probe_image`] — dimensions only, no timebase.
+/// Otherwise this opens the source (demux + codec setup) far enough to read
+/// its [`SourceInfo`], then drops the decoder, and separately checks for an
+/// audio track. Sources without a video stream (music/voiceover files) fall
+/// back to an audio-only probe: zero dimensions, millisecond ticks, and the
+/// audio track's duration. Returns [`DecodeError::Unsupported`] on platforms
 /// without a native decoder.
 pub fn probe(path: &Path) -> Result<MediaProbe, DecodeError> {
+    if crate::image::sniff_image(path).is_some() {
+        let info = crate::image::probe_image(path)?;
+        return Ok(MediaProbe {
+            width: info.width,
+            height: info.height,
+            // Stills have no cadence; rate/count are placeholders the
+            // importer replaces with the model's still-image convention.
+            frame_rate: AUDIO_TICK_RATE,
+            frame_count: 0,
+            has_audio: false,
+            is_image: true,
+        });
+    }
     let decoder = match open(path) {
         Ok(decoder) => decoder,
         Err(video_err) => {
@@ -82,6 +104,7 @@ fn audio_only_probe(path: &Path) -> Option<MediaProbe> {
         frame_rate: AUDIO_TICK_RATE,
         frame_count: resample(duration, AUDIO_TICK_RATE).value.max(0),
         has_audio: true,
+        is_image: false,
     })
 }
 
