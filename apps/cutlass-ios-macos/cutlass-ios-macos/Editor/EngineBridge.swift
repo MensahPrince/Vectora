@@ -237,6 +237,7 @@ nonisolated enum EngineBridge {
         result.speed = clip.speed
         result.isReversed = clip.reversed
         result.keyframes = clip.keyframes
+        result.isStill = clip.isImage
         // Freeze stills are the images the freeze intent wrote (named by the
         // media store); ordinary photo picks don't wear the snowflake.
         result.isFreeze = clip.isImage && clip.label.hasPrefix("freeze-")
@@ -275,6 +276,9 @@ nonisolated enum EngineBridge {
     private static func pipOverlay(_ clip: UiClip, uuid: UUID, laneID: UUID, old: MockOverlayClip?) -> MockOverlayClip {
         var result = base(clip, uuid: uuid, kind: .pip, laneID: laneID)
         result.art = old?.art ?? art(for: clip)
+        result.mediaPath = clip.path
+        result.trimStart = clip.trimInSeconds ?? 0
+        result.isStill = clip.isImage
         result.sourceDuration = clip.sourceDurationSeconds
         result.pipHasAudio = clip.hasAudio
         result.volume = Double(clip.volume)

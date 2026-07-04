@@ -7,7 +7,7 @@ struct LaneClipView: View {
     enum Style {
         case text
         case sticker
-        case pip(MockArt?)
+        case pip(FilmstripSource)
         case effect(MockEffectClip.Kind)
         case audio(seed: Int)
     }
@@ -81,18 +81,16 @@ struct LaneClipView: View {
             Color(hex: 0x4338CA)
         case .sticker:
             Color(hex: 0x9D174D)
-        case .pip(let art):
-            if let art {
-                HStack(spacing: 0) {
-                    let tiles = max(1, Int((width / rowHeight).rounded(.up)))
-                    ForEach(0..<tiles, id: \.self) { index in
-                        MockArtView(art: art, symbolSize: 9)
-                            .frame(width: rowHeight, height: rowHeight)
-                            .overlay(Color.black.opacity(index.isMultiple(of: 2) ? 0 : 0.12))
-                            .clipped()
-                    }
-                }
-                .frame(width: width, alignment: .leading)
+        case .pip(let source):
+            if source.path != nil || source.art != nil {
+                FilmstripView(
+                    source: source,
+                    clipLength: length,
+                    pointsPerSecond: pointsPerSecond,
+                    tileSize: rowHeight,
+                    width: width,
+                    symbolSize: 9
+                )
             } else {
                 Color(hex: 0x155E75)
             }

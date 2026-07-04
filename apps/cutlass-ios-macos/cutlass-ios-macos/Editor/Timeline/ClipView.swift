@@ -169,18 +169,20 @@ struct ClipView: View {
     }
 
     private func thumbnailStrip(height: CGFloat) -> some View {
-        let tileCount = max(1, Int((width / height).rounded(.up)))
-        return HStack(spacing: 0) {
-            ForEach(0..<tileCount, id: \.self) { index in
-                MockArtView(art: clip.art, symbolSize: 15)
-                    .frame(width: height, height: height)
-                    // Alternate slight shading to fake distinct frames.
-                    .overlay(Color.black.opacity(index.isMultiple(of: 2) ? 0 : 0.10))
-                    .clipped()
-            }
-        }
-        .frame(width: width, alignment: .leading)
-        .clipped()
+        FilmstripView(
+            source: FilmstripSource(
+                path: clip.mediaPath,
+                trimStart: clip.trimStart,
+                speed: clip.speed,
+                reversed: clip.isReversed,
+                isStill: clip.isStill,
+                art: clip.art
+            ),
+            clipLength: clip.length,
+            pointsPerSecond: pointsPerSecond,
+            tileSize: height,
+            width: width
+        )
     }
 
     // MARK: Selection + trim handles
@@ -265,8 +267,14 @@ private struct WaveformStrip: View {
 
 #Preview {
     HStack(spacing: 0) {
-        ClipView(clip: MockClip(from: MockData.libraryItems[1]), pointsPerSecond: 44, isSelected: true)
-        ClipView(clip: MockClip(from: MockData.libraryItems[0]), pointsPerSecond: 44)
+        ClipView(
+            clip: MockClip(
+                art: MockData.libraryItems[1].art, sourceDuration: 9, length: 9, hasAudio: true),
+            pointsPerSecond: 44, isSelected: true)
+        ClipView(
+            clip: MockClip(
+                art: MockData.libraryItems[0].art, sourceDuration: 30, length: 3, hasAudio: false),
+            pointsPerSecond: 44)
     }
     .padding()
     .background(Theme.timelineBed)

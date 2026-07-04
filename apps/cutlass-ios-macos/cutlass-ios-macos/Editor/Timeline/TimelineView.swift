@@ -504,7 +504,13 @@ struct TimelineView: View {
         case .pip:
             // Video-lane clips read like footage: thumbnails + duration, not
             // an "Overlay" identity.
-            style = .pip(clip.art)
+            style = .pip(
+                FilmstripSource(
+                    path: clip.mediaPath,
+                    trimStart: clip.trimStart,
+                    isStill: clip.isStill,
+                    art: clip.art
+                ))
             symbol = "video.fill"
             label = String(format: "%.1fs", clip.length)
         }

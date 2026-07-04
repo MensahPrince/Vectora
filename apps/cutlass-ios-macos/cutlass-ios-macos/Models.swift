@@ -120,6 +120,9 @@ nonisolated struct MockClip: Identifiable, Hashable {
     var hasAudio: Bool
     /// Freeze-frame segments render as stills and carry no audio.
     var isFreeze = false
+    /// Still image media (photos and freeze frames): one repeated frame, so
+    /// the filmstrip renders a single slot.
+    var isStill = false
 
     // MARK: Mock style values (design-only; wired to panels)
 
@@ -157,22 +160,8 @@ nonisolated struct MockClip: Identifiable, Hashable {
     var keyframes: [TimeInterval] = []
     var transitionAfter: MockTransition?
 
-    init(from item: MockMediaItem) {
-        art = item.art
-        switch item.kind {
-        case .photo:
-            sourceDuration = Self.photoMaxDuration
-            length = Self.photoDefaultDuration
-            hasAudio = false
-        case .video(let duration):
-            sourceDuration = duration
-            length = duration
-            hasAudio = true
-        }
-    }
-
-    /// Direct init (the custom `init(from:)` suppressed the memberwise one),
-    /// used when a clip is rebuilt from another lane's content.
+    /// Direct init (other stored properties keep their defaults), used when
+    /// a clip is rebuilt from another lane's content or projected fresh.
     init(art: MockArt, sourceDuration: TimeInterval, length: TimeInterval, hasAudio: Bool) {
         self.art = art
         self.sourceDuration = sourceDuration
@@ -220,6 +209,12 @@ nonisolated struct MockOverlayClip: Identifiable, Hashable {
 
     // Picture-in-picture
     var art: MockArt?
+    /// Source file backing a PiP (engine media path), for filmstrips.
+    var mediaPath: String?
+    /// Trim in-point within the source.
+    var trimStart: TimeInterval = 0
+    /// PiP backed by a still image (one repeated filmstrip frame).
+    var isStill = false
     var sourceDuration: TimeInterval?
     /// Whether the PiP's source media carries audio (photos don't); kept so
     /// converting to a main clip round-trips faithfully.
