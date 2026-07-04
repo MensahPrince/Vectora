@@ -15,7 +15,8 @@
 use serde::Serialize;
 
 use cutlass_models::{
-    Clip, ClipSource, Generator, Param, Project, Rational, TextStyle, Track, TrackId, TrackKind,
+    AudioRole, ChromaKey, Clip, ClipSource, ColorAdjustments, Filter, Generator, Mask, Param,
+    Project, Rational, StabilizeLevel, TextStyle, Track, TrackId, TrackKind,
 };
 use cutlass_render::canvas_size;
 
@@ -135,6 +136,30 @@ pub struct UiClip {
     /// Link-group id (e.g. video + extracted audio).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link: Option<u64>,
+
+    /// Look properties (persist-only this milestone; model wire shapes).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mask: Option<Mask>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chroma_key: Option<ChromaKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stabilize: Option<StabilizeLevel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<Filter>,
+    #[serde(skip_serializing_if = "ColorAdjustments::is_neutral")]
+    pub adjust: ColorAdjustments,
+    /// Animation catalog ids per slot (combo excludes in/out).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub animation_in: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub animation_out: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub animation_combo: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_role: Option<AudioRole>,
+    /// Catalog id when the speed curve matches a preset exactly.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_preset: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -326,6 +351,16 @@ fn build_clip(project: &Project, track: &Track, clip: &Clip, rate: Rational) -> 
         effects: clip.effects.iter().map(|e| e.effect_id.clone()).collect(),
         transition_after,
         link: clip.link.map(|l| l.raw()),
+        mask: clip.mask,
+        chroma_key: clip.chroma_key,
+        stabilize: clip.stabilize,
+        filter: clip.filter.clone(),
+        adjust: clip.adjust,
+        animation_in: clip.animation_in.as_ref().map(|a| a.id.clone()),
+        animation_out: clip.animation_out.as_ref().map(|a| a.id.clone()),
+        animation_combo: clip.animation_combo.as_ref().map(|a| a.id.clone()),
+        audio_role: clip.audio_role,
+        speed_preset: cutlass_models::speed_preset_id(&clip.speed_curve).map(str::to_owned),
     }
 }
 

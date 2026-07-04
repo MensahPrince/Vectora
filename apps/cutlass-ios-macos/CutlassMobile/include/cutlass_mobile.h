@@ -93,6 +93,15 @@ typedef struct CutlassSession CutlassSession;
 void cutlass_string_free(char *ptr);
 
 /*
+ * Every preset vocabulary the panels render (effects, transitions, masks,
+ * filters, animations, text effects, speed presets, stabilize levels, audio
+ * roles) as one JSON document of `{id, label, ...}` lists — the same catalogs
+ * the engine validates against. Static data: fetch once per process, no
+ * session needed. Free with `cutlass_string_free`.
+ */
+char *cutlass_catalogs(void);
+
+/*
  * Open a fresh session: an empty project at `fps_num/fps_den` (falls back to
  * 30 fps when non-positive) with a main video track. NULL when the GPU
  * renderer can't be brought up. Free with `cutlass_session_close`.

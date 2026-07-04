@@ -330,6 +330,17 @@ pub enum AnimationSlot {
     Combo,
 }
 
+impl AnimationSlot {
+    /// Stable wire/catalog id (the serde name).
+    pub const fn id(self) -> &'static str {
+        match self {
+            AnimationSlot::In => "in",
+            AnimationSlot::Out => "out",
+            AnimationSlot::Combo => "combo",
+        }
+    }
+}
+
 /// A reference to a catalog animation, stored per slot on the clip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AnimationRef {

@@ -23,6 +23,7 @@
 //! and [`wire`] carries it all as JSON strings across the C ABI.
 
 pub mod audio;
+pub mod catalogs;
 pub mod export_job;
 pub mod intents;
 pub mod session;

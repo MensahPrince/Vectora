@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineError};
 use cutlass_models::{
-    Clip, ClipId, ClipParam, ClipSource, ClipTransform, Easing, Generator, MediaId, ModelError,
-    Param, ParamValue, Project, Rational, RationalTime, TimeRange, TrackId, TrackKind,
+    AudioRole, Clip, ClipId, ClipParam, ClipSource, ClipTransform, Easing, Generator, MediaId,
+    ModelError, Param, ParamValue, Project, Rational, RationalTime, TimeRange, TrackId, TrackKind,
 };
 
 /// Which clip edge a trim gesture drags.
@@ -120,11 +120,18 @@ pub enum Intent {
     /// Import a file and drop it as picture-in-picture on an overlay video
     /// lane (half scale, upper half of the canvas — the CapCut drop pose).
     AddPip { path: PathBuf, at_seconds: f64 },
-    /// Import a file and drop it on an audio lane.
-    AddAudio { path: PathBuf, at_seconds: f64 },
+    /// Import a file and drop it on an audio lane. `role` tags the clip with
+    /// the picker tab it came from (music / sfx / voiceover).
+    AddAudio {
+        path: PathBuf,
+        at_seconds: f64,
+        #[serde(default)]
+        role: Option<AudioRole>,
+    },
     /// Duplicate a clip right after itself (ripple on main, free slot on a
-    /// lane). Copies content, speed, transform, audio mix, crop, and effect
-    /// ids; keyframed animation flattens to its start value for now.
+    /// lane). Copies content, speed, transform, audio mix, crop, effect ids,
+    /// and look fields (mask/chroma/stabilize/filter/adjust/animations/role);
+    /// keyframed animation flattens to its start value, speed curves reset.
     Duplicate { clip: ClipId },
     /// Swap a media clip's source for a new file, keeping its slot. The
     /// replacement must be at least as long as the clip needs (images are
@@ -151,6 +158,13 @@ pub enum Intent {
         speed: f64,
         #[serde(default)]
         reversed: bool,
+    },
+    /// Apply a speed-curve preset from the catalog (`None` restores constant
+    /// speed). The clip's duration re-derives from the curve in one undo step.
+    SetSpeedPreset {
+        clip: ClipId,
+        #[serde(default)]
+        preset: Option<String>,
     },
     /// Volume slider + fade handles. `volume: None` keeps the current gain.
     SetAudio {
@@ -263,9 +277,11 @@ pub fn run(engine: &mut Engine, intent: Intent) -> Result<serde_json::Value, Eng
             )
         }),
         Intent::AddPip { path, at_seconds } => grouped(engine, |e| add_pip(e, &path, at_seconds)),
-        Intent::AddAudio { path, at_seconds } => {
-            grouped(engine, |e| add_audio(e, &path, at_seconds))
-        }
+        Intent::AddAudio {
+            path,
+            at_seconds,
+            role,
+        } => grouped(engine, |e| add_audio(e, &path, at_seconds, role)),
         Intent::Duplicate { clip } => grouped(engine, |e| duplicate(e, clip)),
         Intent::ReplaceMedia { clip, path } => grouped(engine, |e| replace_media(e, clip, &path)),
         Intent::ExtractAudio { clip } => grouped(engine, |e| extract_audio(e, clip)),
@@ -282,6 +298,7 @@ pub fn run(engine: &mut Engine, intent: Intent) -> Result<serde_json::Value, Eng
             speed,
             reversed,
         } => set_speed(engine, clip, speed, reversed),
+        Intent::SetSpeedPreset { clip, preset } => set_speed_preset(engine, clip, preset),
         Intent::SetAudio {
             clip,
             volume,
@@ -684,6 +701,7 @@ fn add_audio(
     engine: &mut Engine,
     path: &std::path::Path,
     at_seconds: f64,
+    role: Option<AudioRole>,
 ) -> Result<serde_json::Value, EngineError> {
     let rate = engine.project().timeline().frame_rate;
     let media_id = apply_imported(engine, path)?;
@@ -708,6 +726,9 @@ fn add_audio(
             start: RationalTime::new(start, rate),
         },
     )?;
+    if role.is_some() {
+        engine.apply(Command::Edit(EditCommand::SetAudioRole { clip, role }))?;
+    }
     Ok(serde_json::json!({ "clip": clip.raw(), "track": lane.raw(), "media": media_id.raw() }))
 }
 
@@ -1037,8 +1058,67 @@ fn duplicate(engine: &mut Engine, clip: ClipId) -> Result<serde_json::Value, Eng
             effect_id: effect.effect_id.clone(),
         }))?;
     }
+    copy_look(engine, &snapshot, new)?;
 
     Ok(serde_json::json!({ "clip": new.raw() }))
+}
+
+/// Carry the Phase I look fields onto a duplicated clip. Each setter runs only
+/// when the source had the property, so validation never trips on defaults.
+fn copy_look(engine: &mut Engine, snapshot: &Clip, new: ClipId) -> Result<(), EngineError> {
+    if snapshot.mask.is_some() {
+        engine.apply(Command::Edit(EditCommand::SetClipMask {
+            clip: new,
+            mask: snapshot.mask,
+        }))?;
+    }
+    if snapshot.chroma_key.is_some() {
+        engine.apply(Command::Edit(EditCommand::SetClipChroma {
+            clip: new,
+            chroma: snapshot.chroma_key,
+        }))?;
+    }
+    if snapshot.stabilize.is_some() {
+        engine.apply(Command::Edit(EditCommand::SetClipStabilize {
+            clip: new,
+            stabilize: snapshot.stabilize,
+        }))?;
+    }
+    if snapshot.filter.is_some() {
+        engine.apply(Command::Edit(EditCommand::SetClipFilter {
+            clip: new,
+            filter: snapshot.filter.clone(),
+        }))?;
+    }
+    if !snapshot.adjust.is_neutral() {
+        engine.apply(Command::Edit(EditCommand::SetClipAdjustments {
+            clip: new,
+            adjust: snapshot.adjust,
+        }))?;
+    }
+    for (slot, animation) in [
+        (cutlass_models::AnimationSlot::In, &snapshot.animation_in),
+        (cutlass_models::AnimationSlot::Out, &snapshot.animation_out),
+        (
+            cutlass_models::AnimationSlot::Combo,
+            &snapshot.animation_combo,
+        ),
+    ] {
+        if animation.is_some() {
+            engine.apply(Command::Edit(EditCommand::SetClipAnimation {
+                clip: new,
+                slot,
+                animation: animation.clone(),
+            }))?;
+        }
+    }
+    if snapshot.audio_role.is_some() {
+        engine.apply(Command::Edit(EditCommand::SetAudioRole {
+            clip: new,
+            role: snapshot.audio_role,
+        }))?;
+    }
+    Ok(())
 }
 
 fn replace_media(
@@ -1123,6 +1203,10 @@ fn extract_audio(engine: &mut Engine, clip: ClipId) -> Result<serde_json::Value,
     // linked audio partner goes silent on its own lane by the audibility rule.
     engine.apply(Command::Edit(EditCommand::LinkClips {
         clips: vec![clip, audio_clip],
+    }))?;
+    engine.apply(Command::Edit(EditCommand::SetAudioRole {
+        clip: audio_clip,
+        role: Some(AudioRole::Extracted),
     }))?;
     Ok(serde_json::json!({ "clip": audio_clip.raw(), "track": lane.raw() }))
 }
@@ -1281,6 +1365,22 @@ fn set_speed(
         speed: speed_to_rational(speed),
         reversed,
     }))?;
+    Ok(serde_json::json!({ "clip": clip.raw() }))
+}
+
+fn set_speed_preset(
+    engine: &mut Engine,
+    clip: ClipId,
+    preset: Option<String>,
+) -> Result<serde_json::Value, EngineError> {
+    let curve = match preset.as_deref() {
+        Some(id) => Some(
+            cutlass_models::speed_preset(id)
+                .ok_or_else(|| invalid(&format!("unknown speed preset '{id}'")))?,
+        ),
+        None => None,
+    };
+    engine.apply(Command::Edit(EditCommand::SetSpeedCurve { clip, curve }))?;
     Ok(serde_json::json!({ "clip": clip.raw() }))
 }
 
