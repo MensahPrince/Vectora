@@ -38,7 +38,12 @@ fn finalize_structural(
 }
 
 /// Result of applying a wire [`Command`] through the engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes adjacently tagged (`{"type": "Imported", "value": {"media": 3}}`,
+/// `{"type": "Saved"}`) so shells and the AI agent read one stable shape;
+/// `Edited` nests the [`EditOutcome`] wire object under `value`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value")]
 pub enum ApplyOutcome {
     Imported { media: cutlass_models::MediaId },
     RemovedMedia { media: cutlass_models::MediaId },

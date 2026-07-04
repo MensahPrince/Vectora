@@ -17,6 +17,7 @@ cutlass-commands = { path = "../cutlass-commands" }
 cutlass-decoder = { path = "../cutlass-decoder" }
 cutlass-models = { path = "../cutlass-models" }
 cutlass-render = { path = "../cutlass-render" }
+serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

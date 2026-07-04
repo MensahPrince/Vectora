@@ -38,3 +38,23 @@ pub enum EngineError {
     #[error("unsupported on this build: {0}")]
     Unsupported(String),
 }
+
+impl EngineError {
+    /// Stable machine-readable error category for the FFI/agent wire format
+    /// (`{"kind": …, "message": …}`). Kinds are part of the protocol: shells
+    /// branch on them (e.g. `missing_media` → relink flow), so renaming one is
+    /// a breaking change.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            EngineError::Model(_) => "model",
+            EngineError::Time(_) => "time",
+            EngineError::Render(_) => "render",
+            EngineError::Decode(_) => "decode",
+            EngineError::Io(_) => "io",
+            EngineError::Import(_) => "import",
+            EngineError::Export(_) => "export",
+            EngineError::MissingMedia(_) => "missing_media",
+            EngineError::Unsupported(_) => "unsupported",
+        }
+    }
+}

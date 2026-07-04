@@ -222,3 +222,12 @@ impl Engine {
         action.apply(&mut ctx)
     }
 }
+
+// The mobile FFI hands a session across threads (calls serialized by the shell,
+// e.g. a Swift actor whose executor hops threads), which is only sound if the
+// engine is `Send`. Assert it at compile time so a non-Send component (a decoder
+// handle, a GPU resource) can never sneak in silently.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Engine>()
+};
