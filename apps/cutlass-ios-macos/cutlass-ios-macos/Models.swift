@@ -133,6 +133,15 @@ nonisolated struct MockClip: Identifiable, Hashable {
             hasAudio = true
         }
     }
+
+    /// Direct init (the custom `init(from:)` suppressed the memberwise one),
+    /// used when a clip is rebuilt from another lane's content.
+    init(art: MockArt, sourceDuration: TimeInterval, length: TimeInterval, hasAudio: Bool) {
+        self.art = art
+        self.sourceDuration = sourceDuration
+        self.length = length
+        self.hasAudio = hasAudio
+    }
 }
 
 /// A clip on a floating lane below/above the main track: text, sticker, or

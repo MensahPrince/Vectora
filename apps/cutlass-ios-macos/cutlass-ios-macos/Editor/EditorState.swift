@@ -387,6 +387,67 @@ final class EditorState {
         clips.insert(clip, at: toIndex)
     }
 
+    // MARK: Cross-lane conversions (drag a clip onto another lane)
+
+    /// Pulls a clip off the main track and re-creates it as a PiP overlay
+    /// starting at `start` (clamped to the timeline).
+    func convertMainClipToOverlay(_ id: UUID, at start: TimeInterval) {
+        guard let index = clips.firstIndex(where: { $0.id == id }) else { return }
+        pushUndoSnapshot()
+
+        let clip = clips.remove(at: index)
+        var overlay = MockOverlayClip(
+            kind: .pip,
+            start: max(0, start),
+            length: clip.length
+        )
+        overlay.art = clip.art
+        overlay.sourceDuration = clip.sourceDuration
+        overlay.volume = clip.volume
+        overlay.scale = 0.5
+        overlay.posY = 0.32
+        overlayClips.append(overlay)
+        selection = .overlay(overlay.id)
+        clampPlayhead()
+    }
+
+    /// Drops a PiP overlay into the main track at the boundary nearest
+    /// `time`; other overlay kinds have no main-track equivalent.
+    func convertOverlayToMainClip(_ id: UUID, at time: TimeInterval) {
+        guard let index = overlayClips.firstIndex(where: { $0.id == id }),
+              overlayClips[index].kind == .pip,
+              let art = overlayClips[index].art
+        else { return }
+        pushUndoSnapshot()
+
+        let overlay = overlayClips.remove(at: index)
+        let clip = MockClip(
+            art: art,
+            sourceDuration: overlay.sourceDuration ?? overlay.length,
+            length: overlay.length,
+            hasAudio: overlay.sourceDuration != nil
+        )
+        clips.insert(clip, at: mainInsertionIndex(nearest: time))
+        selection = .main(clip.id)
+        clampPlayhead()
+    }
+
+    /// Index of the main-track boundary closest to `time`.
+    private func mainInsertionIndex(nearest time: TimeInterval) -> Int {
+        var boundary: TimeInterval = 0
+        var bestIndex = 0
+        var bestDistance = abs(time)
+        for (index, clip) in clips.enumerated() {
+            boundary += clip.length
+            let distance = abs(time - boundary)
+            if distance < bestDistance {
+                bestDistance = distance
+                bestIndex = index + 1
+            }
+        }
+        return bestIndex
+    }
+
     /// Splits whatever is selected at the playhead; with no selection, splits
     /// the main-track clip under the playhead.
     func splitAtPlayhead() {
