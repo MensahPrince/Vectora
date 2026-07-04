@@ -1,27 +1,44 @@
+import CutlassMobile
 import SwiftUI
 
-/// Mock export flow: settings (resolution / frame rate / quality / estimated
-/// size) -> fake progress ring -> saved confirmation. No real rendering.
-struct ExportSheet: View {
-    var duration: TimeInterval
+#if os(iOS)
+import Photos
+#endif
 
-    private enum Phase {
+/// Export flow riding the engine's background export job: settings
+/// (resolution / frame rate) -> live progress ring with cancel -> saved
+/// confirmation. The engine snapshots the project when the job starts, so
+/// the editor stays fully interactive behind the sheet.
+///
+/// The finished mp4 goes to Photos on iOS; macOS offers a save panel (the
+/// job writes to a temp file either way).
+struct ExportSheet: View {
+    var state: EditorState
+
+    private enum Phase: Equatable {
         case settings
         case exporting
+        /// Export finished; macOS only — waiting for the user to pick where
+        /// the movie goes.
+        case finished
         case saved
+        case failed(String)
     }
 
     private struct Resolution: Hashable {
         var label: String
         var detail: String
-        /// Rough H.264 bitrate in megabits per second at quality 1.
+        /// Output short side in pixels (1080 ⇒ "1080p"); aspect follows the
+        /// project canvas.
+        var shortSide: Int
+        /// Rough H.264 bitrate in megabits per second at 30 fps.
         var mbps: Double
     }
 
     private static let resolutions: [Resolution] = [
-        Resolution(label: "720p", detail: "HD", mbps: 7),
-        Resolution(label: "1080p", detail: "Full HD", mbps: 14),
-        Resolution(label: "4K", detail: "Ultra HD", mbps: 45),
+        Resolution(label: "720p", detail: "HD", shortSide: 720, mbps: 7),
+        Resolution(label: "1080p", detail: "Full HD", shortSide: 1080, mbps: 14),
+        Resolution(label: "4K", detail: "Ultra HD", shortSide: 2160, mbps: 45),
     ]
     private static let frameRates: [Int] = [24, 30, 60]
 
@@ -29,9 +46,10 @@ struct ExportSheet: View {
     @State private var phase: Phase = .settings
     @State private var resolution = Self.resolutions[1]
     @State private var frameRate = 30
-    @State private var quality: Double = 0.8
     @State private var progress: Double = 0
+    @State private var job: ExportJob?
     @State private var exportTask: Task<Void, Never>?
+    @State private var savePanelPresented = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -45,15 +63,22 @@ struct ExportSheet: View {
                 settings
             case .exporting:
                 exporting
+            case .finished:
+                finished
             case .saved:
                 saved
+            case .failed(let message):
+                failed(message)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Theme.surface)
         .presentationDetents([.medium])
         .interactiveDismissDisabled(phase == .exporting)
-        .onDisappear { exportTask?.cancel() }
+        .onDisappear {
+            exportTask?.cancel()
+            job?.cancel()
+        }
     }
 
     // MARK: Settings
@@ -79,6 +104,7 @@ struct ExportSheet: View {
                         ) {
                             resolution = option
                         }
+                        .accessibilityIdentifier("exportResolution-\(option.label)")
                     }
                 }
             }
@@ -96,26 +122,13 @@ struct ExportSheet: View {
                         ) {
                             frameRate = fps
                         }
+                        .accessibilityIdentifier("exportFps-\(fps)")
                     }
                 }
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                HStack {
-                    Text("Quality")
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(Theme.textSecondary)
-                    Spacer()
-                    Text(qualityLabel)
-                        .font(.footnote.weight(.semibold))
-                        .foregroundStyle(.white)
-                }
-                Slider(value: $quality, in: 0.2...1)
-                    .tint(Theme.accent)
-            }
-
             HStack {
-                Label(duration.timecode, systemImage: "clock")
+                Label(state.duration.timecode, systemImage: "clock")
                 Spacer()
                 Label(estimatedSize, systemImage: "internaldrive")
             }
@@ -133,22 +146,16 @@ struct ExportSheet: View {
                     .background(.white, in: Capsule())
             }
             .buttonStyle(.plain)
+            .accessibilityIdentifier("exportStartButton")
+            .disabled(state.isEmpty)
+            .opacity(state.isEmpty ? 0.4 : 1)
         }
         .padding(.horizontal, 22)
     }
 
-    private var qualityLabel: String {
-        switch quality {
-        case ..<0.45: "Low"
-        case ..<0.75: "Medium"
-        case ..<0.95: "High"
-        default: "Best"
-        }
-    }
-
     private var estimatedSize: String {
-        let mbps = resolution.mbps * (0.35 + 0.65 * quality) * (Double(frameRate) / 30)
-        let megabytes = mbps * max(duration, 0) / 8
+        let mbps = resolution.mbps * (Double(frameRate) / 30)
+        let megabytes = mbps * max(state.duration, 0) / 8
         if megabytes >= 1000 {
             return String(format: "~%.1f GB", megabytes / 1000)
         }
@@ -160,17 +167,65 @@ struct ExportSheet: View {
     private func startExport() {
         withAnimation(.snappy(duration: 0.2)) { phase = .exporting }
         progress = 0
+        let shortSide = resolution.shortSide
+        let fps = frameRate
         exportTask = Task {
-            while !Task.isCancelled, progress < 1 {
-                try? await Task.sleep(for: .milliseconds(60))
-                withAnimation(.linear(duration: 0.06)) {
-                    progress = min(1, progress + Double.random(in: 0.008...0.028))
-                }
+            guard let job = await state.startExport(shortSide: shortSide, fps: fps) else {
+                setPhase(.failed("The export could not start."))
+                return
             }
-            guard !Task.isCancelled else { return }
-            try? await Task.sleep(for: .milliseconds(250))
-            withAnimation(.snappy(duration: 0.25)) { phase = .saved }
+            // The sheet may have disappeared while the job was starting; its
+            // onDisappear saw job == nil, so this task owns the cancel.
+            if Task.isCancelled {
+                job.cancel()
+            }
+            self.job = job
+
+            while !job.isFinished, !Task.isCancelled {
+                withAnimation(.linear(duration: 0.1)) { progress = job.progress }
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            do {
+                _ = try await job.wait()
+                withAnimation(.linear(duration: 0.1)) { progress = 1 }
+                await deliver(URL(fileURLWithPath: job.outputPath))
+            } catch let error as CutlassError where error.kind == "cancelled" {
+                setPhase(.settings)
+            } catch {
+                setPhase(.failed(String(describing: error)))
+            }
+            self.job = nil
         }
+    }
+
+    /// Hand the finished movie off: straight into the photo library on iOS,
+    /// a save panel on macOS.
+    private func deliver(_ movie: URL) async {
+        #if os(iOS)
+        let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
+        guard status == .authorized || status == .limited else {
+            try? FileManager.default.removeItem(at: movie)
+            setPhase(.failed("Allow photo library access in Settings to save exports."))
+            return
+        }
+        do {
+            try await PHPhotoLibrary.shared().performChanges {
+                PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: movie)
+            }
+            try? FileManager.default.removeItem(at: movie)
+            setPhase(.saved)
+        } catch {
+            try? FileManager.default.removeItem(at: movie)
+            setPhase(.failed("Saving to Photos failed: \(error.localizedDescription)"))
+        }
+        #else
+        exportedMovie = movie
+        setPhase(.finished)
+        #endif
+    }
+
+    private func setPhase(_ new: Phase) {
+        withAnimation(.snappy(duration: 0.25)) { phase = new }
     }
 
     private var exporting: some View {
@@ -185,6 +240,7 @@ struct ExportSheet: View {
                 Text("\(Int(progress * 100))%")
                     .font(.title2.bold().monospacedDigit())
                     .foregroundStyle(.white)
+                    .accessibilityIdentifier("exportProgressLabel")
             }
             .frame(width: 116, height: 116)
             .padding(.top, 36)
@@ -193,18 +249,66 @@ struct ExportSheet: View {
                 Text("Exporting...")
                     .font(.headline)
                     .foregroundStyle(.white)
-                Text("\(resolution.label) · \(frameRate) fps · \(qualityLabel)")
+                Text("\(resolution.label) · \(frameRate) fps")
                     .font(.footnote)
                     .foregroundStyle(Theme.textSecondary)
             }
 
             Button("Cancel") {
-                exportTask?.cancel()
-                withAnimation(.snappy(duration: 0.2)) { phase = .settings }
+                job?.cancel()
             }
             .font(.subheadline.weight(.semibold))
             .foregroundStyle(Theme.textSecondary)
             .buttonStyle(.plain)
+            .accessibilityIdentifier("exportCancelButton")
+        }
+    }
+
+    // MARK: Finished (macOS save panel)
+
+    /// Where the export job left the movie, until the user places it.
+    @State private var exportedMovie: URL?
+
+    private var finished: some View {
+        VStack(spacing: 18) {
+            Image(systemName: "checkmark.seal.fill")
+                .font(.system(size: 54))
+                .foregroundStyle(Theme.accent)
+                .padding(.top, 40)
+
+            VStack(spacing: 5) {
+                Text("Export complete")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                Text("\(resolution.label) · \(frameRate) fps")
+                    .font(.footnote)
+                    .foregroundStyle(Theme.textSecondary)
+            }
+
+            Button {
+                savePanelPresented = true
+            } label: {
+                Text("Save…")
+                    .font(.headline)
+                    .foregroundStyle(.black)
+                    .padding(.horizontal, 52)
+                    .padding(.vertical, 12)
+                    .background(.white, in: Capsule())
+            }
+            .buttonStyle(.plain)
+            .padding(.top, 8)
+            .fileMover(isPresented: $savePanelPresented, file: exportedMovie) { result in
+                if case .success = result {
+                    exportedMovie = nil
+                    setPhase(.saved)
+                }
+            }
+        }
+        .onDisappear {
+            // Sheet dismissed without placing the file: don't litter tmp.
+            if let leftover = exportedMovie {
+                try? FileManager.default.removeItem(at: leftover)
+            }
         }
     }
 
@@ -218,10 +322,16 @@ struct ExportSheet: View {
                 .padding(.top, 40)
 
             VStack(spacing: 5) {
+                #if os(iOS)
                 Text("Saved to Photos")
                     .font(.headline)
                     .foregroundStyle(.white)
-                Text("\(resolution.label) · \(frameRate) fps · \(estimatedSize)")
+                #else
+                Text("Saved")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                #endif
+                Text("\(resolution.label) · \(frameRate) fps")
                     .font(.footnote)
                     .foregroundStyle(Theme.textSecondary)
             }
@@ -236,6 +346,38 @@ struct ExportSheet: View {
                     .padding(.vertical, 12)
                     .background(.white, in: Capsule())
             }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("exportDoneButton")
+            .padding(.top, 8)
+        }
+    }
+
+    // MARK: Failed
+
+    private func failed(_ message: String) -> some View {
+        VStack(spacing: 18) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 54))
+                .foregroundStyle(.yellow)
+                .padding(.top, 40)
+
+            VStack(spacing: 5) {
+                Text("Export failed")
+                    .font(.headline)
+                    .foregroundStyle(.white)
+                Text(message)
+                    .font(.footnote)
+                    .foregroundStyle(Theme.textSecondary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(3)
+            }
+            .padding(.horizontal, 24)
+
+            Button("Back") {
+                setPhase(.settings)
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(Theme.textSecondary)
             .buttonStyle(.plain)
             .padding(.top, 8)
         }
@@ -271,6 +413,6 @@ struct ExportSheet: View {
 
 #Preview {
     Color.black.sheet(isPresented: .constant(true)) {
-        ExportSheet(duration: 57)
+        ExportSheet(state: EditorState())
     }
 }

@@ -1,4 +1,5 @@
 import CoreGraphics
+import CutlassMobile
 import Foundation
 import Testing
 
@@ -561,5 +562,32 @@ struct EditorStateEngineTests {
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)
         return context?.makeImage()
+    }
+
+    // MARK: Export
+
+    @Test func exportJobWritesTheTimelineToAMovie() async throws {
+        let state = await makeProject([shortVideo])
+
+        // 240p at 24 fps: small enough to stay fast, still the full pipeline
+        // (settings mapping, render, H.264/AAC encode, temp file).
+        let job = try #require(await state.startExport(shortSide: 240, fps: 24))
+        let frames = try await job.wait()
+        #expect(frames == 96, "4 seconds at 24 fps")
+
+        let attributes = try FileManager.default.attributesOfItem(atPath: job.outputPath)
+        let bytes = (attributes[.size] as? Int) ?? 0
+        #expect(bytes > 10_000, "the mp4 has real encoded payload")
+        try? FileManager.default.removeItem(atPath: job.outputPath)
+    }
+
+    @Test func cancellingAnExportDeletesThePartialFile() async throws {
+        let state = await makeProject([shortVideo, video])
+
+        // Native size (no overrides) so there's enough work to cancel into.
+        let job = try #require(await state.startExport())
+        job.cancel()
+        await #expect(throws: CutlassError.self) { try await job.wait() }
+        #expect(!FileManager.default.fileExists(atPath: job.outputPath))
     }
 }

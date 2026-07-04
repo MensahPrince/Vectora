@@ -107,7 +107,7 @@ struct EditorView: View {
             }
         }
         .sheet(isPresented: $exportPresented) {
-            ExportSheet(duration: state.duration)
+            ExportSheet(state: state)
         }
     }
 

@@ -956,6 +956,41 @@ final class EditorState {
             atSeconds: seconds, maxWidth: maxWidth, maxHeight: maxHeight)
     }
 
+    // MARK: Export
+
+    /// Snapshot the project into a background export job writing an H.264/AAC
+    /// mp4 to a fresh temp path. Queued edits land first, so the snapshot is
+    /// exactly what the timeline shows. The output is sized so the canvas
+    /// short side hits `shortSide` (aspect preserved, e.g. 1080 ⇒ 1080p);
+    /// `fps` overrides the timeline rate. nil keeps native values.
+    /// Returns nil while the session is still coming up (or the job can't
+    /// start); the caller owns the temp file on success.
+    func startExport(shortSide: Int? = nil, fps: Int? = nil) async -> ExportJob? {
+        await waitForEngine()
+        guard let session else { return nil }
+
+        var width = 0
+        var height = 0
+        if let shortSide, let canvas = canvasSize, canvas.width > 0, canvas.height > 0 {
+            let side = Double(shortSide)
+            if canvas.width >= canvas.height {
+                width = Int((side * canvas.width / canvas.height).rounded())
+                height = shortSide
+            } else {
+                width = shortSide
+                height = Int((side * canvas.height / canvas.width).rounded())
+            }
+        }
+
+        let url = FileManager.default.temporaryDirectory
+            .appendingPathComponent("cutlass-export-\(UUID().uuidString).mp4")
+        return await session.startExport(
+            to: url.path,
+            width: width > 0 ? width : nil,
+            height: height > 0 ? height : nil,
+            fps: fps.map { Fraction(num: Int32($0), den: 1) })
+    }
+
     // MARK: Transport
 
     func stepFrame(by direction: Double) {
