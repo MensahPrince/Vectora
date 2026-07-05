@@ -1386,8 +1386,23 @@ fn worker_loop(
                         ),
                     }
                 }
-                last_tick = tick;
+                let prev_tick = std::mem::replace(&mut last_tick, tick);
                 render_frame(engine, tl_rate, &preview_weak, tick, &fit, &cache);
+                // Steady forward motion (playback, frame-stepping, a slow
+                // forward drag) requests evenly spaced ticks: with nothing
+                // else queued, render the predicted next tick into the cache
+                // now. Its decode overlaps the UI's display time of `tick`,
+                // so the request that follows is a hit; if playback skips
+                // ahead instead, the work still advanced the decoder's
+                // roll-forward cursor, so nothing is lost. Gestures render
+                // uncacheable override state — never speculate under one.
+                let delta = tick - prev_tick;
+                if (1..=MAX_SPECULATIVE_STEP).contains(&delta)
+                    && req_rx.is_empty()
+                    && !engine.has_live_overrides()
+                {
+                    let _ = render_frame_buffer(engine, tl_rate, tick + delta, &fit, &cache);
+                }
             }
             // Drag-gesture overrides arrive at pointer-move rate; render only
             // the newest one (same coalescing as scrub frames) so a fast drag
@@ -4876,6 +4891,12 @@ impl FrameFit {
 /// ~3.7 MB) this holds ~70 recently displayed frames — several seconds of
 /// scrub-back headroom — while staying far below what decode already uses.
 const FRAME_CACHE_BYTES: usize = 256 << 20;
+
+/// Largest per-request tick step still treated as steady forward motion
+/// worth speculating one step past (1 = real-time playback and stepping;
+/// larger = fast-forward playback or a brisk forward drag). Beyond this the
+/// pattern is a jump, and predicting the next target is a coin flip.
+const MAX_SPECULATIVE_STEP: i64 = 8;
 
 /// What a composited preview frame was rendered *from*: any difference in
 /// these means the pixels may differ.
