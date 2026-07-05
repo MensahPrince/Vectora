@@ -17,8 +17,10 @@
 //!   when available, falling back to a flat `Lock`) into [`FrameData::Cpu`] —
 //!   for DXGI-backed samples the lock performs the staging readback
 //!   internally.
-//! - Probes size / rotation / frame-rate / colorimetry from the negotiated
-//!   output [`IMFMediaType`], duration from the presentation descriptor
+//! - Probes size / rotation / frame-rate / colorimetry and the clean-aperture
+//!   crop (`MF_MT_MINIMUM_DISPLAY_APERTURE` — hardware decoders report
+//!   macroblock-padded coded sizes) from the negotiated output
+//!   [`IMFMediaType`], duration from the presentation descriptor
 //!   (`MF_PD_DURATION`) with a fragmented-MP4 fallback
 //!   ([`crate::mp4_duration`]), and seeks with `SetCurrentPosition` (100-ns
 //!   units).
@@ -46,7 +48,8 @@ use std::sync::Once;
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFAttributes, IMFByteStream, IMFMediaBuffer, IMFMediaType, IMFSample,
     IMFSourceReader, MF_ACCESSMODE_READ, MF_FILEFLAGS_NONE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE,
+    MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+    MF_MT_VIDEO_NOMINAL_RANGE,
     MF_MT_VIDEO_PRIMARIES, MF_MT_VIDEO_ROTATION, MF_MT_YUV_MATRIX, MF_OPENMODE_FAIL_IF_NOT_EXIST,
     MF_PD_DURATION, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
     MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
@@ -54,7 +57,7 @@ use windows::Win32::Media::MediaFoundation::{
     MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION,
     MFCreateAttributes, MFCreateFile, MFCreateMediaType, MFCreateSourceReaderFromByteStream,
     MFCreateSourceReaderFromURL, MFMediaType_Video, MFNominalRange_0_255,
-    MFSTARTUP_FULL, MFStartup, MFVideoFormat_NV12, MFVideoFormat_P010,
+    MFSTARTUP_FULL, MFStartup, MFVideoArea, MFVideoFormat_NV12, MFVideoFormat_P010,
     MFVideoPrimaries_BT470_2_SysBG, MFVideoPrimaries_BT709, MFVideoPrimaries_BT2020,
     MFVideoPrimaries_DCI_P3, MFVideoPrimaries_SMPTE170M, MFVideoTransFunc_709,
     MFVideoTransFunc_2084, MFVideoTransFunc_HLG, MFVideoTransFunc_sRGB,
@@ -87,6 +90,9 @@ pub struct WmfDecoder {
     /// The magic "first video stream" selector, reused for every reader call.
     stream: u32,
     info: SourceInfo,
+    /// Visible region within the coded frame (the clean aperture); the
+    /// decoder pads coded sizes to macroblock multiples (e.g. 1080 → 1088).
+    visible: Rect,
     mode: OutputMode,
     /// The shared decode device when this reader runs the hardware (DXVA)
     /// path; `None` means software MFTs deliver system-memory samples.
@@ -138,12 +144,13 @@ impl WmfDecoder {
             None => (configure_reader(path, stream, None)?, None),
         };
 
-        let info = probe(&reader, stream, Some(path))?;
+        let (info, visible) = probe(&reader, stream, Some(path))?;
 
         Ok(Self {
             reader,
             stream,
             info,
+            visible,
             mode,
             d3d,
             eos: false,
@@ -194,7 +201,7 @@ impl WmfDecoder {
                     self.info.pixel_format,
                     self.info.color,
                     (width, height),
-                    Rect::from_size(width, height),
+                    self.visible,
                     self.info.rotation,
                     FrameData::Cpu(CpuImage::new(planes)),
                 ))
@@ -246,7 +253,9 @@ impl VideoDecoder for WmfDecoder {
             // correctly. The duration is already known, so no path is needed.
             if stream_flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0 {
                 let duration = self.info.duration;
-                self.info = probe(&self.reader, self.stream, None)?;
+                let (info, visible) = probe(&self.reader, self.stream, None)?;
+                self.info = info;
+                self.visible = visible;
                 self.info.duration = self.info.duration.or(duration);
             }
 
@@ -466,6 +475,7 @@ pub(crate) fn probe_duration(
 }
 
 /// Read static source properties from the reader's negotiated output type.
+/// Returns the info plus the visible rect within the coded frame.
 ///
 /// `path` (when available) feeds the fragmented-MP4 duration fallback; pass
 /// `None` for mid-stream re-probes where the duration is already known.
@@ -473,13 +483,20 @@ fn probe(
     reader: &IMFSourceReader,
     stream: u32,
     path: Option<&Path>,
-) -> Result<SourceInfo, DecodeError> {
+) -> Result<(SourceInfo, Rect), DecodeError> {
     let media_type = unsafe { reader.GetCurrentMediaType(stream) }.map_err(open_err)?;
 
     // FRAME_SIZE packs width in the high 32 bits, height in the low 32.
     let frame_size = unsafe { media_type.GetUINT64(&MF_MT_FRAME_SIZE) }.map_err(open_err)?;
     let width = (frame_size >> 32) as u32;
     let height = (frame_size & 0xffff_ffff) as u32;
+
+    // The clean-aperture crop. Software decoders usually pre-crop FRAME_SIZE,
+    // but hardware (DXVA) decoders report the macroblock-padded coded size
+    // (e.g. 1920x1088) and describe the visible 1920x1080 here — without the
+    // crop those padding rows would show as green/garbage edges.
+    let visible = display_aperture(&media_type, width, height)
+        .unwrap_or_else(|| Rect::from_size(width, height));
 
     // FRAME_RATE packs numerator in the high 32 bits, denominator in the low 32.
     let frame_rate = match unsafe { media_type.GetUINT64(&MF_MT_FRAME_RATE) } {
@@ -500,18 +517,43 @@ fn probe(
     let pixel_format = subtype_to_format(unsafe { media_type.GetGUID(&MF_MT_SUBTYPE) }.ok());
     let color = color_from_type(&media_type);
 
-    Ok(SourceInfo {
+    let info = SourceInfo {
         coded_size: (width, height),
-        // MF reports a single frame size; the clean-aperture crop
-        // (MF_MT_MINIMUM_DISPLAY_APERTURE) isn't parsed yet, so visible == coded.
-        display_size: (width, height),
+        display_size: (visible.width, visible.height),
         rotation,
         pixel_format,
         color,
         frame_rate,
         time_base: Rational::new(HNS_PER_SEC as i32, 1),
         duration: probe_duration(reader, path),
-    })
+    };
+    Ok((info, visible))
+}
+
+/// Parse `MF_MT_MINIMUM_DISPLAY_APERTURE` into a [`Rect`], clamped to the
+/// coded size. `None` when the attribute is absent, malformed, or degenerate
+/// (callers then treat the full coded frame as visible).
+fn display_aperture(media_type: &IMFMediaType, coded_w: u32, coded_h: u32) -> Option<Rect> {
+    let mut area = MFVideoArea::default();
+    unsafe {
+        media_type.GetBlob(
+            &MF_MT_MINIMUM_DISPLAY_APERTURE,
+            core::slice::from_raw_parts_mut(
+                (&raw mut area).cast::<u8>(),
+                core::mem::size_of::<MFVideoArea>(),
+            ),
+            None,
+        )
+    }
+    .ok()?;
+    // MFOffset is a fixed-point value; only whole-pixel offsets make sense
+    // for a crop, so the fractional part is ignored.
+    let x = u32::try_from(area.OffsetX.value).ok()?.min(coded_w);
+    let y = u32::try_from(area.OffsetY.value).ok()?.min(coded_h);
+    let w = u32::try_from(area.Area.cx).ok()?.min(coded_w - x);
+    let h = u32::try_from(area.Area.cy).ok()?.min(coded_h - y);
+    let rect = Rect::new(x, y, w, h);
+    (!rect.is_empty()).then_some(rect)
 }
 
 /// Pull colorimetry from the output type's color attributes, falling back to the
