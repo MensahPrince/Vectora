@@ -173,8 +173,10 @@ impl Renderer {
         // below stay valid through the composite call.
         let mut realized: Vec<Realized> = Vec::with_capacity(scene.layers.len());
         for layer in &scene.layers {
+            // The layer carries the anchor position; the quad center falls out
+            // of the final pixel size (bitmap sizes only exist after raster).
             let place = |size: [f32; 2]| LayerPlacement {
-                center: layer.center,
+                center: layer.quad_center(size),
                 size,
                 rotation: layer.rotation,
                 opacity: layer.opacity,
@@ -342,6 +344,7 @@ impl Renderer {
         let layer = crate::resolve::resolve_generator(
             generator,
             [0.0, 0.0],
+            [0.5, 0.5],
             0.0,
             1.0,
             [0.0, 0.0, 1.0, 1.0],

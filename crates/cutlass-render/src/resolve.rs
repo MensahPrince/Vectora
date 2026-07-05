@@ -156,10 +156,12 @@ fn resolve_clip(
         _ => clip.transform.sample(local_tick),
     };
 
-    // `position` is the anchor's offset from the canvas center, as a fraction of
-    // canvas width/height. With the default center anchor (the common case) this
-    // is the placed quad's center; non-center anchors are a follow-up.
+    // `position` is the anchor's offset from the canvas center, as a fraction
+    // of canvas width/height. The layer carries the anchor position plus the
+    // normalized `anchor_point`; the renderer derives the quad center once the
+    // final pixel size is known (identity for the default center anchor).
     let center = [cw * (0.5 + xf.position[0]), ch * (0.5 + xf.position[1])];
+    let anchor_point = xf.anchor_point;
     let rotation = xf.rotation.to_radians();
     let opacity = xf.opacity.clamp(0.0, 1.0);
     let uv = crop_flip_uv(clip);
@@ -194,6 +196,7 @@ fn resolve_clip(
             Ok(Some(SceneLayer {
                 source,
                 center,
+                anchor_point,
                 size,
                 rotation,
                 opacity,
@@ -207,7 +210,16 @@ fn resolve_clip(
                 _ => generator,
             };
             Ok(resolve_generator(
-                generator, center, rotation, opacity, uv, cw, ch, xf.scale, local_tick,
+                generator,
+                center,
+                anchor_point,
+                rotation,
+                opacity,
+                uv,
+                cw,
+                ch,
+                xf.scale,
+                local_tick,
             ))
         }
     }
@@ -217,6 +229,7 @@ fn resolve_clip(
 pub(crate) fn resolve_generator(
     generator: &Generator,
     center: [f32; 2],
+    anchor_point: [f32; 2],
     rotation: f32,
     opacity: f32,
     uv: [f32; 4],
@@ -238,6 +251,7 @@ pub(crate) fn resolve_generator(
                     style: map_text_style(style, cw, ch),
                 },
                 center,
+                anchor_point,
                 size: SizeSpec::BitmapScaled(scale),
                 rotation,
                 opacity,
@@ -247,6 +261,7 @@ pub(crate) fn resolve_generator(
         Generator::SolidColor { rgba } => Some(SceneLayer {
             source: LayerSource::Solid(*rgba),
             center,
+            anchor_point,
             size: SizeSpec::Fixed([cw * scale, ch * scale]),
             rotation,
             opacity,
@@ -269,6 +284,7 @@ pub(crate) fn resolve_generator(
             tick,
             ref_scale * scale,
             center,
+            anchor_point,
             rotation,
             opacity,
             uv,
@@ -299,6 +315,7 @@ fn resolve_shape(
     tick: i64,
     px_scale: f32,
     center: [f32; 2],
+    anchor_point: [f32; 2],
     rotation: f32,
     opacity: f32,
     uv: [f32; 4],
@@ -336,6 +353,7 @@ fn resolve_shape(
                 raster_scale,
             },
             center,
+            anchor_point,
             size: SizeSpec::BitmapScaled(transform_scale),
             rotation,
             opacity,
@@ -355,6 +373,7 @@ fn resolve_shape(
         return Some(SceneLayer {
             source: LayerSource::Solid(fill),
             center,
+            anchor_point,
             size: SizeSpec::Fixed([w, h]),
             rotation,
             opacity,
@@ -391,6 +410,7 @@ fn resolve_shape(
             pad,
         },
         center,
+        anchor_point,
         size: SizeSpec::Fixed([w + 2.0 * pad, h + 2.0 * pad]),
         rotation,
         opacity,
@@ -687,6 +707,83 @@ mod tests {
             other => panic!("expected fixed size, got {other:?}"),
         }
         approx(layer.opacity, 0.5);
+    }
+
+    #[test]
+    fn non_center_anchor_offsets_the_quad_center() {
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        // Anchor on the content's top-left corner, positioned at the canvas
+        // center: the quad center lands half a size down-right of it.
+        project
+            .set_transform(
+                clip,
+                ClipTransform {
+                    anchor_point: [0.0, 0.0],
+                    ..ClipTransform::IDENTITY
+                },
+                None,
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        let layer = &scene.layers[0];
+        // The layer's `center` is the anchor's canvas position...
+        approx2(layer.center, [960.0, 540.0]);
+        assert_eq!(layer.anchor_point, [0.0, 0.0]);
+        // ...and the derived quad center hangs down-right of it.
+        approx2(layer.quad_center([1920.0, 1080.0]), [1920.0, 1080.0]);
+    }
+
+    #[test]
+    fn quad_center_rotates_about_the_anchor() {
+        let layer = SceneLayer {
+            source: LayerSource::Solid([255, 255, 255, 255]),
+            center: [960.0, 540.0],
+            anchor_point: [0.0, 0.0],
+            size: SizeSpec::Fixed([1920.0, 1080.0]),
+            rotation: std::f32::consts::FRAC_PI_2, // 90° clockwise
+            opacity: 1.0,
+            uv: [0.0, 0.0, 1.0, 1.0],
+        };
+        // to_center (960, 540) rotated 90° cw (+y down) → (-540, 960).
+        approx2(layer.quad_center([1920.0, 1080.0]), [420.0, 1500.0]);
+    }
+
+    #[test]
+    fn resolve_with_substitutes_transform_and_generator_for_one_clip() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let clip = project
+            .add_generated(track, Generator::SolidColor { rgba: [255, 0, 0, 255] }, tr(0, 100))
+            .unwrap();
+
+        let overrides = ResolveOverrides {
+            transform: Some((
+                clip,
+                ClipTransform {
+                    position: [0.25, 0.0],
+                    scale: 0.5,
+                    ..ClipTransform::IDENTITY
+                },
+            )),
+            generator: Some((clip, &Generator::SolidColor { rgba: [0, 255, 0, 255] })),
+        };
+        let scene = resolve_with(&project, rt(5), overrides).unwrap();
+        let layer = &scene.layers[0];
+        assert_eq!(layer.source, LayerSource::Solid([0, 255, 0, 255]));
+        approx2(layer.center, [1920.0 * 0.75, 540.0]);
+        match layer.size {
+            SizeSpec::Fixed(size) => approx2(size, [960.0, 540.0]),
+            other => panic!("expected fixed size, got {other:?}"),
+        }
+
+        // Plain resolve still sees only committed state.
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers[0].source, LayerSource::Solid([255, 0, 0, 255]));
+        approx2(scene.layers[0].center, [960.0, 540.0]);
     }
 
     #[test]

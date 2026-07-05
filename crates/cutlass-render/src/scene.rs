@@ -124,17 +124,44 @@ fn scaled_dim(dim: u32, factor: f32) -> u32 {
 pub struct SceneLayer {
     /// What to draw.
     pub source: LayerSource,
-    /// Center of the placed quad in canvas pixels (+x right, +y down).
+    /// Canvas position of the content's anchor point (+x right, +y down) —
+    /// the pivot `rotation` spins about, and what the clip transform's
+    /// `position` places. Equals the placed quad's center for the default
+    /// centered `anchor_point`.
     pub center: [f32; 2],
+    /// Pivot within the content bounds, normalized to the placed size
+    /// (`[0.5, 0.5]` = content center). The renderer derives the quad center
+    /// from `center` once the final pixel size is known — deferred because
+    /// text/path bitmaps only get a size after rasterization.
+    pub anchor_point: [f32; 2],
     /// On-canvas extent of the content.
     pub size: SizeSpec,
-    /// Clockwise rotation about `center`, in radians.
+    /// Clockwise rotation about the anchor (`center`), in radians.
     pub rotation: f32,
     /// Layer opacity in `0.0..=1.0`; multiplies the content's alpha.
     pub opacity: f32,
     /// Sampled UV rect `[u0, v0, u1, v1]` across the visible picture. A sub-rect
     /// crops; a reversed axis mirrors. Ignored by solid fills.
     pub uv: [f32; 4],
+}
+
+impl SceneLayer {
+    /// The placed quad's center for a final pixel `size`: offset the anchor
+    /// by the (rotated) anchor→center vector. Identity for center anchors.
+    pub fn quad_center(&self, size: [f32; 2]) -> [f32; 2] {
+        let to_center = [
+            (0.5 - self.anchor_point[0]) * size[0],
+            (0.5 - self.anchor_point[1]) * size[1],
+        ];
+        if to_center == [0.0, 0.0] {
+            return self.center;
+        }
+        let (sin, cos) = self.rotation.sin_cos();
+        [
+            self.center[0] + to_center[0] * cos - to_center[1] * sin,
+            self.center[1] + to_center[0] * sin + to_center[1] * cos,
+        ]
+    }
 }
 
 /// How a layer's on-canvas size is determined.
@@ -208,6 +235,7 @@ mod tests {
                 source_time: RationalTime::new(0, Rational::FPS_30),
             },
             center,
+            anchor_point: [0.5, 0.5],
             size: SizeSpec::Fixed(size),
             rotation: 0.5,
             opacity: 0.8,
@@ -227,6 +255,7 @@ mod tests {
                 pad: 6.0,
             },
             center: [100.0, 100.0],
+            anchor_point: [0.5, 0.5],
             size: SizeSpec::Fixed([212.0, 112.0]),
             rotation: 0.0,
             opacity: 1.0,
@@ -241,6 +270,7 @@ mod tests {
                 style: TextStyle::new(48.0),
             },
             center: [50.0, 25.0],
+            anchor_point: [0.5, 0.5],
             size: SizeSpec::BitmapScaled(2.0),
             rotation: 0.0,
             opacity: 1.0,
