@@ -2,16 +2,41 @@
 //!
 //! UI gestures and the AI agent both emit these values; the engine applies them
 //! against project/timeline state with undo/redo.
+//!
+//! ## Wire format
+//!
+//! Every command (de)serializes as a single-level JSON object discriminated by
+//! a `"type"` field holding the variant name — `{"type": "SplitClip", "clip":
+//! 5, "at": …}`. [`Command`] itself is untagged: project and edit variant
+//! names never collide, so the same flat object shape serves both (the shells'
+//! FFI protocol and the future AI-agent stream speak this format). The
+//! `tests/wire_format.rs` goldens lock it.
 
 use std::path::PathBuf;
 
 use cutlass_models::{
-    CanvasAspect, ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, MarkerColor,
-    MarkerId, MediaId, Param, ParamValue, Rational, RationalTime, TimeRange, TrackId, TrackKind,
+    AnimationRef, AnimationSlot, AudioRole, CanvasAspect, ChromaKey, ClipId, ClipParam,
+    ClipTransform, ColorAdjustments, CropRect, Easing, Filter, Generator, MarkerColor, MarkerId,
+    Mask, MediaId, Param, ParamValue, Rational, RationalTime, Replaceable, StabilizeLevel,
+    TemplateMeta, TimeRange, TrackId, TrackKind,
 };
+use serde::{Deserialize, Serialize};
+
+/// One media choice for [`ProjectCommand::ApplyTemplate`], in slot order: a
+/// file to probe (like `Import`) and an optional in-point into it. `None`
+/// starts from the beginning, matching CapCut ("takes from the start of the
+/// clip"); the slot's locked timeline duration decides how much source is
+/// drawn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TemplatePick {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub source_in: Option<RationalTime>,
+}
 
 /// A project-level action (media pool, not timeline placement).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum ProjectCommand {
     /// Register a file in the media pool.
     Import { path: PathBuf },
@@ -35,10 +60,27 @@ pub enum ProjectCommand {
     RelinkMedia { media: MediaId, path: PathBuf },
     /// Render the timeline to an H.264 MP4 at the project frame rate.
     Export { path: PathBuf },
+    /// Write the current project as a `.cutlasst` template file (CapCut
+    /// "export template"): the finished timeline plus its `Replaceable` /
+    /// text-editable markers, wrapped in `meta` for the gallery. The session
+    /// itself is untouched — no dirty-flag change, no project-path change.
+    SaveTemplate { path: PathBuf, meta: TemplateMeta },
+    /// Replace the session with a `.cutlasst` template filled by `picks`
+    /// (CapCut "use template"). Each pick is probed like `Import` and fills
+    /// the next slot in order; fewer picks than slots keeps sample media in
+    /// the rest (template preview), more is refused. Like `Open`/`Load` the
+    /// history is cleared, but the result is a *new unsaved* project: the
+    /// project path resets and the session reads dirty until saved. Missing
+    /// sample-media paths are tolerated (matches `Load`).
+    ApplyTemplate {
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+    },
 }
 
 /// A single structured edit against the timeline.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum EditCommand {
     /// Add a track to the timeline stack.
     AddTrack {
@@ -65,6 +107,30 @@ pub enum EditCommand {
     /// a shape). Rejected for media-backed clips. The inverse restores the
     /// previous generator.
     SetGenerator { clip: ClipId, generator: Generator },
+    /// Replace a clip's content with a trimmed window of pooled media,
+    /// keeping its timeline placement, speed, transform, and effects — the
+    /// primitive behind swapping a template's music and re-picking a filled
+    /// slot's in-point (CapCut "replace"). `source` is at the media's native
+    /// rate and must lie within it (images repeat one frame for any window).
+    /// The inverse restores the previous clip content.
+    SetClipMedia {
+        clip: ClipId,
+        media: MediaId,
+        source: TimeRange,
+    },
+    /// Mark (or with `None` unmark) a media clip as a user-replaceable
+    /// template slot (CapCut "set replaceable material clips"). Template
+    /// authoring metadata only — renders nothing. Validated at mark time:
+    /// the clip must be media-backed and the slot's `accepts` must match the
+    /// lane. The inverse restores the previous marker.
+    SetReplaceable {
+        clip: ClipId,
+        replaceable: Option<Replaceable>,
+    },
+    /// Mark a text clip's wording as user-editable when the project is used
+    /// as a template (the text keeps its style and animation). Rejected on
+    /// non-text clips. The inverse restores the previous flag.
+    SetTextEditable { clip: ClipId, editable: bool },
     /// Set a clip's spatial transform (position/scale/rotation/opacity on
     /// the canvas). Rejected for audio-track clips. The inverse restores the
     /// previous transform.
@@ -164,6 +230,58 @@ pub enum EditCommand {
     /// suppress steady background noise. Rejected on generated clips. The
     /// inverse restores the previous flag.
     SetClipDenoise { clip: ClipId, denoise: bool },
+    /// Set (or with `None` clear) a clip's shaped alpha mask (CapCut mask,
+    /// Phase I). Persisted + validated now, rendered later (documented render
+    /// gap, like stickers). Media-backed visual clips only. The inverse
+    /// restores the previous clip state.
+    SetClipMask { clip: ClipId, mask: Option<Mask> },
+    /// Set (or clear) chroma keying (CapCut chroma key, Phase I;
+    /// render-neutral). Media-backed visual clips only. The inverse restores
+    /// the previous clip state.
+    SetClipChroma {
+        clip: ClipId,
+        chroma: Option<ChromaKey>,
+    },
+    /// Set (or clear) stabilization (CapCut stabilize, Phase I;
+    /// render-neutral). Media-backed *video* clips only — stills have no
+    /// motion. The inverse restores the previous clip state.
+    SetClipStabilize {
+        clip: ClipId,
+        stabilize: Option<StabilizeLevel>,
+    },
+    /// Set (or clear) a color-grade filter preset (CapCut filters, Phase I;
+    /// render-neutral). Any visual clip, including `Generator::Filter` lane
+    /// bars; the id must exist in the filter catalog. The inverse restores
+    /// the previous clip state.
+    SetClipFilter {
+        clip: ClipId,
+        filter: Option<Filter>,
+    },
+    /// Set a clip's manual color grade (CapCut adjust, Phase I;
+    /// render-neutral): all five sliders in one shot, neutral values clear.
+    /// Any visual clip, including `Generator::Adjustment` lane bars. The
+    /// inverse restores the previous clip state.
+    SetClipAdjustments {
+        clip: ClipId,
+        adjust: ColorAdjustments,
+    },
+    /// Set (or clear) one animation slot (CapCut animation In / Out / Combo,
+    /// Phase I; render-neutral). The preset must exist in the animation
+    /// catalog and match the slot; CapCut exclusivity (a combo replaces both
+    /// sides and vice versa) is applied by the model. The inverse restores
+    /// the previous clip state.
+    SetClipAnimation {
+        clip: ClipId,
+        slot: AnimationSlot,
+        animation: Option<AnimationRef>,
+    },
+    /// Tag (or untag) what an audio-lane clip *is* (music / sound FX /
+    /// voiceover / extracted, Phase I) — badges and future mixing defaults.
+    /// Audio-track clips only. The inverse restores the previous tag.
+    SetAudioRole {
+        clip: ClipId,
+        role: Option<AudioRole>,
+    },
     /// Append a GPU effect (M4) to a visual clip's chain. `effect_id` must
     /// exist in the effect catalog. The inverse removes it (clip snapshot).
     AddEffect { clip: ClipId, effect_id: String },
@@ -282,6 +400,9 @@ pub enum EditCommand {
         name: String,
         color: MarkerColor,
     },
+    /// Rename the project (the app-owned draft's display name shown in the
+    /// title bar and project gallery). The inverse restores the prior name.
+    SetProjectName { name: String },
     /// Set the project canvas (M1 canvas settings): aspect-ratio preset +
     /// opaque background color, in one shot (callers resolve "keep current"
     /// before dispatch). The inverse restores the previous settings.
@@ -289,20 +410,26 @@ pub enum EditCommand {
         aspect: CanvasAspect,
         background: [u8; 3],
     },
-    /// Rename the project (the app-owned draft's display name shown in the
-    /// title bar and project gallery). The inverse restores the prior name.
-    SetProjectName { name: String },
 }
 
 /// Top-level command surface: media registration or a timeline edit.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Untagged on the wire: the flat `{"type": …}` object of the inner enums is
+/// the whole format (variant names are disjoint across the two sets), so
+/// callers never spell the project/edit split in JSON.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
 pub enum Command {
     Project(ProjectCommand),
     Edit(EditCommand),
 }
 
 /// What an applied edit produced, for callers to act on (e.g. select the new clip).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Adjacently tagged on the wire (`{"type": "Created", "id": 7}`): every
+/// payload is a single entity id, and the unit variant carries none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "id")]
 pub enum EditOutcome {
     Created(ClipId),
     CreatedTrack(TrackId),
@@ -319,6 +446,6 @@ pub enum EditOutcome {
     RemovedMarker(MarkerId),
     /// The project canvas settings changed (M1 canvas settings).
     UpdatedCanvas,
-    /// The project's display name changed (draft rename).
+    /// A project-level property (its display name) changed.
     UpdatedProject,
 }

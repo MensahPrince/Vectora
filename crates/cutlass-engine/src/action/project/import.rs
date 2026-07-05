@@ -12,6 +12,9 @@ pub struct ImportAction {
     pub path: PathBuf,
 }
 
+/// Probe `path` and add it to the media pool, returning the new [`MediaId`] and
+/// the inverse that removes it. Re-importing a file already in the pool is a
+/// no-op: the existing id is returned with no inverse.
 pub fn execute(
     ctx: &mut ApplyContext<'_>,
     path: &Path,
@@ -21,7 +24,7 @@ pub fn execute(
     }
 
     let path = path.canonicalize().map_err(EngineError::Io)?;
-    let media = import_media(&path, ctx.cache)?;
+    let media = import_media(&path)?;
     let id = ctx.project.add_media(media);
     Ok((id, Some(Box::new(RemoveMediaAction { media: id }))))
 }

@@ -126,11 +126,12 @@ fn import_via_command_from_missing_file_fails_cleanly() {
     };
     assert_eq!(engine.project().media_count(), 0);
     assert!(!engine.can_undo());
-    // Canonicalization rejects the missing path before the demuxer opens it.
-    let msg = format!("{err}");
+    // Native probe import resolves the path before opening the decoder, so a
+    // missing file fails cleanly at canonicalization with an I/O error — the
+    // pool stays empty and nothing lands in history.
     assert!(
-        msg.contains("Open") || msg.contains("open") || msg.contains("No such file"),
-        "unexpected import error: {msg}"
+        matches!(err, cutlass_engine::EngineError::Io(_)),
+        "expected I/O error for missing file, got: {err}"
     );
 }
 

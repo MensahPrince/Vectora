@@ -5,8 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
-use cutlass_encoder::ExportStats;
-use cutlass_engine::{ApplyOutcome, ColorConvertPath, Engine, EngineConfig};
+use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
 use cutlass_models::{
     ClipId, Generator, MediaId, Rational, RationalTime, TimeRange, TrackId, TrackKind,
 };
@@ -40,13 +39,7 @@ pub fn image_asset() -> Option<PathBuf> {
 
 pub fn temp_engine() -> (tempfile::TempDir, Engine) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let config = EngineConfig {
-        cache_dir: dir.path().join("cache"),
-        cache_budget_bytes: 64 * 1024 * 1024,
-        undo_limit: 32,
-        color_convert: ColorConvertPath::Gpu,
-    };
-    let engine = Engine::new(config).expect("engine");
+    let engine = Engine::new(EngineConfig { undo_limit: 32 }).expect("engine");
     (dir, engine)
 }
 
@@ -146,14 +139,14 @@ pub fn add_media_clip(
     )
 }
 
-pub fn export_to(engine: &mut Engine, path: &Path) -> ExportStats {
+pub fn export_to(engine: &mut Engine, path: &Path) -> u64 {
     match engine
         .apply(Command::Project(ProjectCommand::Export {
             path: path.to_path_buf(),
         }))
         .expect("export command")
     {
-        ApplyOutcome::Exported { stats } => stats,
+        ApplyOutcome::Exported { frames } => frames,
         other => panic!("expected Exported, got {other:?}"),
     }
 }

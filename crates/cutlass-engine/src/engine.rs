@@ -1,132 +1,74 @@
-//! Session-scoped editing runtime.
+//! Session-scoped editing runtime: project state plus inverse undo/redo.
+//!
+//! Preview (`get_frame`) and file export delegate to the GPU `cutlass-render`
+//! pipeline and the native `cutlass-encoder`; this type owns the session
+//! [`Renderer`] and the undo [`History`].
 
 use std::path::PathBuf;
 
-use cutlass_cache::FrameCache;
 use cutlass_commands::{Command, ProjectCommand};
-use cutlass_compositor::{Compositor, GpuContext};
-use cutlass_models::Project;
+use cutlass_models::{ClipId, ClipTransform, Generator, Project, Rational, RationalTime};
+use cutlass_render::{Renderer, ResolveOverrides, RgbaImage, export_to_file};
 
-use cutlass_models::{ClipId, ClipTransform, RationalTime};
-
-use crate::action::{ApplyContext, ApplyOutcome, History, dispatch};
-use crate::decoder_pool::DecoderPool;
+use crate::action::{ApplyContext, ApplyOutcome, EditAction, History, dispatch};
 use crate::error::EngineError;
-use crate::frame::RgbaFrame;
-use crate::generator_raster::GeneratorRaster;
-use crate::preview;
-
-fn gpu_init_err(err: cutlass_compositor::CompositorError) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Unsupported, err.to_string())
-}
-
-/// Default on-disk frame cache budget (50 GiB).
-pub const DEFAULT_CACHE_BUDGET_BYTES: u64 = 50 * 1024 * 1024 * 1024;
-
-/// Where YUV ↔ RGBA conversion runs for preview and export.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ColorConvertPath {
-    /// GPU shaders in `cutlass-compositor` (default).
-    #[default]
-    Gpu,
-    /// Legacy CPU routines in `cutlass-engine::frame` / `composite`.
-    LegacyCpu,
-}
 
 /// Session configuration for [`Engine`].
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Directory for per-source YUV frame blobs and index sidecars.
-    pub cache_dir: PathBuf,
-    /// Global frame cache byte budget; LRU eviction runs across all sources.
-    pub cache_budget_bytes: u64,
     /// Maximum inverse actions retained on the undo stack.
     pub undo_limit: usize,
-    /// YUV/RGBA conversion path for preview and export compositing.
-    pub color_convert: ColorConvertPath,
 }
 
 impl Default for EngineConfig {
     fn default() -> Self {
-        Self {
-            cache_dir: PathBuf::from(".cutlass/cache"),
-            cache_budget_bytes: DEFAULT_CACHE_BUDGET_BYTES,
-            undo_limit: 100,
-            color_convert: ColorConvertPath::Gpu,
-        }
+        Self { undo_limit: 100 }
     }
 }
 
-/// Cutlass editing engine: project state, inverse undo/redo, session infrastructure.
+/// Cutlass editing engine: project state, inverse undo/redo, and a session
+/// renderer for preview and export.
 pub struct Engine {
     project: Project,
-    cache: FrameCache,
     config: EngineConfig,
     history: History,
     project_path: Option<PathBuf>,
-    decoder_pool: DecoderPool,
-    raster: GeneratorRaster,
-    gpu: GpuContext,
-    compositor: Compositor,
-    /// Live gesture override (preview roadmap Phase 3): one clip rendered
-    /// with this transform instead of its committed one. Session state —
-    /// never serialized, never in history, never seen by export.
-    transform_override: Option<(ClipId, ClipTransform)>,
-    /// Live edit override (inspector live preview): one generated clip
-    /// rasterized from this generator instead of its committed one — e.g.
-    /// dragging the font-size slider repaints without an undo entry per tick.
-    /// Session state — never serialized, never in history, never seen by export.
-    generator_override: Option<(ClipId, cutlass_models::Generator)>,
-    /// Session revision: bumped on every successful project mutation
-    /// (edits, imports, open/load, undo, redo). Never serialized.
+    renderer: Renderer,
+    /// Session revision: bumped on every successful project mutation (edits,
+    /// open/load, undo, redo). Never serialized.
     revision: u64,
-    /// The revision last written to (or read from) disk; together with
-    /// `revision` this is the dirty flag (see [`is_dirty`](Self::is_dirty)).
+    /// Revision last written to (or read from) disk; with `revision` this is
+    /// the dirty flag (see [`is_dirty`](Self::is_dirty)).
     saved_revision: u64,
+    /// Live gesture transform for one clip: preview frames render it instead
+    /// of the committed transform until cleared. Session state only — never
+    /// in the project, history, or export.
+    transform_override: Option<(ClipId, ClipTransform)>,
+    /// Live generator content for one clip (inspector slider preview), same
+    /// session-only semantics as `transform_override`.
+    generator_override: Option<(ClipId, Generator)>,
 }
 
 impl Engine {
-    pub fn new(config: EngineConfig) -> std::io::Result<Self> {
-        let undo_limit = config.undo_limit;
-        let cache = FrameCache::new(config.cache_dir.clone(), config.cache_budget_bytes)?;
-        let gpu = GpuContext::new_headless_blocking().map_err(gpu_init_err)?;
-        let compositor = Compositor::new(&gpu).map_err(gpu_init_err)?;
-        Ok(Self {
-            project: Project::new("untitled", cutlass_models::Rational::FPS_24),
-            cache,
-            history: History::new(undo_limit),
-            project_path: None,
-            decoder_pool: DecoderPool::new(),
-            raster: GeneratorRaster::new(),
-            gpu,
-            compositor,
-            config,
-            transform_override: None,
-            generator_override: None,
-            revision: 0,
-            saved_revision: 0,
-        })
+    /// Build an engine with a fresh, empty project and a headless renderer.
+    pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
+        Self::with_project(config, Project::new("untitled", Rational::FPS_24))
     }
 
-    pub fn with_project(config: EngineConfig, project: Project) -> std::io::Result<Self> {
-        let undo_limit = config.undo_limit;
-        let cache = FrameCache::new(config.cache_dir.clone(), config.cache_budget_bytes)?;
-        let gpu = GpuContext::new_headless_blocking().map_err(gpu_init_err)?;
-        let compositor = Compositor::new(&gpu).map_err(gpu_init_err)?;
+    /// Build an engine around an existing project.
+    pub fn with_project(config: EngineConfig, project: Project) -> Result<Self, EngineError> {
+        let history = History::new(config.undo_limit);
+        let renderer = Renderer::new_headless()?;
         Ok(Self {
             project,
-            cache,
-            history: History::new(undo_limit),
-            project_path: None,
-            decoder_pool: DecoderPool::new(),
-            raster: GeneratorRaster::new(),
-            gpu,
-            compositor,
             config,
-            transform_override: None,
-            generator_override: None,
+            history,
+            project_path: None,
+            renderer,
             revision: 0,
             saved_revision: 0,
+            transform_override: None,
+            generator_override: None,
         })
     }
 
@@ -140,29 +82,18 @@ impl Engine {
         &self.project
     }
 
-    pub fn cache(&self) -> &FrameCache {
-        &self.cache
-    }
-
-    /// Path last written with [`Save`](cutlass_commands::ProjectCommand::Save) or
-    /// loaded with [`Open`](cutlass_commands::ProjectCommand::Open) /
-    /// [`Load`](cutlass_commands::ProjectCommand::Load).
+    /// Path last written with `Save` or read with `Open`/`Load`.
     pub fn project_path(&self) -> Option<&PathBuf> {
         self.project_path.as_ref()
     }
 
-    /// Monotonic session revision: bumped by every successful project
-    /// mutation (edit commands, imports, open/load, undo, redo). Session
-    /// state — never serialized; restarts from 0 with each engine.
+    /// Monotonic session revision, bumped by every successful mutation.
     pub fn revision(&self) -> u64 {
         self.revision
     }
 
-    /// True when the session has mutations not yet written with
-    /// [`Save`](cutlass_commands::ProjectCommand::Save). Conservative by
-    /// design: a rolled-back gesture or an undo back to the saved content
-    /// still reads dirty (revisions only grow) — false-positives only,
-    /// never a false "saved".
+    /// True when the session has mutations not yet saved. Conservative: an undo
+    /// back to saved content still reads dirty (revisions only grow).
     pub fn is_dirty(&self) -> bool {
         self.revision != self.saved_revision
     }
@@ -176,123 +107,76 @@ impl Engine {
     }
 
     /// Group every command applied until [`commit_group`](Self::commit_group)
-    /// into a single history entry, so a gesture that dispatches several
-    /// commands (new-lane move, drop that creates a lane, delete that empties
-    /// its lane) reverts with one undo.
+    /// into one history entry, so a multi-command gesture reverts with one undo.
     pub fn begin_group(&mut self) {
         self.history.begin_group();
     }
 
-    /// Close the open group and record it as one undo entry (no-op if the
-    /// group made no edits).
+    /// Close the open group and record it as one undo entry (no-op if empty).
     pub fn commit_group(&mut self) {
         self.history.commit_group();
     }
 
-    /// Abort the open group: revert its commands in reverse order, restoring
-    /// the pre-group state. History is left untouched — a rolled-back gesture
-    /// records nothing and preserves the redo stack.
+    /// Abort the open group: revert its commands in reverse, restoring the
+    /// pre-group state. History is left untouched.
     pub fn rollback_group(&mut self) {
         for inverse in self.history.take_group().into_iter().rev() {
             if self.run_action(inverse).is_err() {
-                // Inverses are written to be infallible once recorded (same
-                // policy as undo); nothing sensible to do beyond stopping.
                 tracing::error!("history group rollback failed; state may be partial");
-                self.reconcile_decoders();
                 return;
             }
         }
-        self.reconcile_decoders();
     }
 
-    /// Replace the session with a fresh, empty, unsaved project (File →
-    /// New). Clears history, decoders, any gesture override, and the
-    /// project path; the session rebaselines as clean. Mirrors what
-    /// [`new`](Self::new) builds, without tearing down the GPU context or
-    /// caches.
+    /// Replace the session with a fresh, empty, unsaved project (File → New).
     pub fn new_session(&mut self) {
-        self.project = Project::new("untitled", cutlass_models::Rational::FPS_24);
-        self.history.clear();
-        self.decoder_pool.clear();
-        self.transform_override = None;
-        self.generator_override = None;
-        self.project_path = None;
-        self.revision += 1;
-        self.saved_revision = self.revision;
+        self.reset_project(Project::new("untitled", Rational::FPS_24));
     }
 
-    /// Replace the session with the given project (AI-agent sandbox: the
-    /// agent rehearses a prompt's edits against a snapshot clone before the
-    /// live engine replays the validated plan). Same teardown as
-    /// [`new_session`](Self::new_session): history, decoders, and gesture
-    /// overrides clear, no project path binds, the session rebaselines.
+    /// Replace the session with `project` (e.g. the AI-agent sandbox replaying
+    /// a validated plan). Clears history and the project path; rebaselines clean.
     pub fn reset_project(&mut self, project: Project) {
         self.project = project;
         self.history.clear();
-        self.decoder_pool.clear();
+        self.project_path = None;
         self.transform_override = None;
         self.generator_override = None;
-        self.project_path = None;
         self.revision += 1;
         self.saved_revision = self.revision;
     }
 
-    /// Drop decoders for clips that just left the timeline. Run after every
-    /// mutation that can remove a clip (edit, undo, redo, rollback): the
-    /// decoder pool keys by [`ClipId`] and otherwise holds decoders — and the
-    /// FFmpeg buffers behind them — until a New/Open, so deletes, splits, and
-    /// undos would pile up megabytes per dead clip (the empty-timeline-but-GBs
-    /// leak).
-    fn reconcile_decoders(&mut self) {
-        let live: std::collections::HashSet<ClipId> = self
-            .project
-            .timeline()
-            .tracks_ordered()
-            .flat_map(|track| track.clips().map(|clip| clip.id))
-            .collect();
-        self.decoder_pool.retain_clips(&live);
-    }
-
-    /// Apply a wire command. On success, pushes the inverse action onto the undo stack.
+    /// Apply a wire command. On success, pushes the inverse onto the undo stack.
     pub fn apply(&mut self, command: Command) -> Result<ApplyOutcome, EngineError> {
-        if let Command::Project(ProjectCommand::Export { path }) = command {
-            let stats = crate::export::export_timeline(
-                &self.project,
-                &mut self.decoder_pool,
-                &self.gpu,
-                &mut self.compositor,
-                &path,
-                self.config.color_convert,
-            )?;
-            return Ok(ApplyOutcome::Exported { stats });
+        if let Command::Project(ProjectCommand::Export { path }) = &command {
+            let frames = export_to_file(&mut self.renderer, &self.project, path)?;
+            return Ok(ApplyOutcome::Exported { frames });
         }
 
         let mut ctx = ApplyContext {
             project: &mut self.project,
-            cache: &self.cache,
             project_path: &mut self.project_path,
             history: &mut self.history,
         };
         let (outcome, inverse) = dispatch(command, &mut ctx)?;
         match outcome {
             ApplyOutcome::Opened | ApplyOutcome::Loaded => {
-                self.decoder_pool.clear();
-                // The session now mirrors the file it came from: rebaseline
-                // as clean (revision still bumps so observers see a change).
+                // The session now mirrors the file it came from: rebaseline as
+                // clean (revision still bumps so observers see a change).
                 self.revision += 1;
                 self.saved_revision = self.revision;
             }
             ApplyOutcome::Saved => self.saved_revision = self.revision,
-            // Edits and media removal can drop clips off the timeline; free
-            // their now-orphaned decoders instead of holding them till New/Open.
-            ApplyOutcome::Edited(_) | ApplyOutcome::RemovedMedia { .. } => {
-                self.revision += 1;
-                self.reconcile_decoders();
-            }
-            // Relink dirties the session: the repaired path needs saving.
-            ApplyOutcome::Imported { .. } | ApplyOutcome::Relinked { .. } => self.revision += 1,
-            // Export is handled by the early return above.
-            ApplyOutcome::Exported { .. } => {}
+            ApplyOutcome::Edited(_)
+            | ApplyOutcome::RemovedMedia { .. }
+            | ApplyOutcome::Imported { .. }
+            | ApplyOutcome::Relinked { .. } => self.revision += 1,
+            // Unlike Open/Load, a filled template exists nowhere on disk as a
+            // project file: bump without rebaselining so the session reads
+            // dirty until first saved.
+            ApplyOutcome::AppliedTemplate => self.revision += 1,
+            // Writing a `.cutlasst` (like exporting an MP4) doesn't touch the
+            // session project.
+            ApplyOutcome::Exported { .. } | ApplyOutcome::SavedTemplate => {}
         }
         if let Some(inverse) = inverse {
             self.history.record_do(inverse);
@@ -300,69 +184,70 @@ impl Engine {
         Ok(outcome)
     }
 
-    /// Warm decoders and the frame cache for `time` without compositing —
-    /// playback read-ahead (see [`preview::prefetch_frame`]). Errors are the
-    /// caller's to ignore: a tick past the content or mid-edit is expected.
-    pub fn prefetch(&mut self, time: RationalTime) -> Result<(), EngineError> {
-        preview::prefetch_frame(
-            &self.project,
-            &self.cache,
-            &mut self.decoder_pool,
-            &mut self.raster,
-            time,
-            self.config.color_convert,
-        )
+    /// Set (or clear with `None`) the live gesture transform for one clip.
+    ///
+    /// While set, preview frames render this transform in place of the clip's
+    /// committed one; the project, history, and export are untouched. Release
+    /// commits a real `SetClipTransform` and clears the override.
+    pub fn set_transform_override(&mut self, value: Option<(ClipId, ClipTransform)>) {
+        self.transform_override = value;
     }
 
-    /// Composite enabled video layers at `time` and return an RGBA preview frame.
-    pub fn get_frame(&mut self, time: RationalTime) -> Result<RgbaFrame, EngineError> {
-        preview::get_frame(
-            &self.project,
-            &self.cache,
-            &mut self.decoder_pool,
-            &mut self.raster,
-            &self.gpu,
-            &mut self.compositor,
-            time,
-            self.config.color_convert,
-            self.transform_override,
-            self.generator_override
-                .as_ref()
-                .map(|(id, generator)| (*id, generator)),
-        )
+    /// Set (or clear with `None`) the live generator content for one clip —
+    /// the inspector-slider analogue of
+    /// [`set_transform_override`](Self::set_transform_override).
+    pub fn set_generator_override(&mut self, value: Option<(ClipId, Generator)>) {
+        self.generator_override = value;
     }
 
-    /// Replace (or clear) the live gesture transform override. Preview frames
-    /// render the overridden clip at this transform until cleared; project
-    /// state, history, and export are untouched. The drag-release commit
-    /// clears it and applies one `SetClipTransform` instead.
-    pub fn set_transform_override(&mut self, override_transform: Option<(ClipId, ClipTransform)>) {
-        self.transform_override = override_transform;
-    }
-
-    /// Replace (or clear) the live generator override. Preview frames raster
-    /// the overridden clip from this generator until cleared; project state,
-    /// history, and export are untouched. The control-release commit clears it
-    /// and applies one `SetGenerator` instead. Used for live inspector edits
-    /// (e.g. dragging the font-size slider) without flooding the undo history.
-    pub fn set_generator_override(
-        &mut self,
-        override_generator: Option<(ClipId, cutlass_models::Generator)>,
-    ) {
-        self.generator_override = override_generator;
-    }
-
-    /// Tight size (canvas px) of the content `generator` draws on the current
-    /// composite canvas — what a preview selection box should hug, since the
-    /// raster itself is canvas-sized and mostly transparent. `None` for
-    /// generators the compositor doesn't draw. Served from the raster cache
-    /// (`&mut self`: a miss rasterizes once, warming playback too).
+    /// Tight size (canvas px, at transform scale 1.0) of the content
+    /// `generator` draws on the current canvas — what a preview selection box
+    /// should hug, since text/path rasters are mostly transparent padding.
+    /// Animated params sample at clip-local `tick`. `None` for generators the
+    /// compositor doesn't draw. Served from the renderer's raster caches
+    /// (`&mut self`: a miss rasterizes once, warming preview too).
     pub fn generator_content_size(
         &mut self,
-        generator: &cutlass_models::Generator,
+        generator: &Generator,
+        tick: i64,
     ) -> Option<(u32, u32)> {
-        let (width, height) = crate::composite::composite_canvas_size(&self.project);
-        self.raster.content_size(generator, width, height)
+        let (width, height) = cutlass_render::canvas_size(&self.project);
+        self.renderer
+            .generator_content_size(generator, width, height, tick)
+    }
+
+    /// Composite enabled visual layers at `time` into an RGBA preview frame.
+    pub fn get_frame(&mut self, time: RationalTime) -> Result<RgbaImage, EngineError> {
+        let overrides = ResolveOverrides {
+            transform: self.transform_override,
+            generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+        };
+        Ok(self
+            .renderer
+            .render_frame_with(&self.project, time, overrides)?)
+    }
+
+    /// [`get_frame`](Self::get_frame) scaled to fit within
+    /// `max_width`×`max_height` (aspect preserved, never upscaled) — what an
+    /// interactive preview should request so scrubbing pays for view-sized
+    /// pixels instead of the full canvas.
+    pub fn get_frame_fit(
+        &mut self,
+        time: RationalTime,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<RgbaImage, EngineError> {
+        let overrides = ResolveOverrides {
+            transform: self.transform_override,
+            generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+        };
+        Ok(self.renderer.render_frame_fit_with(
+            &self.project,
+            time,
+            max_width,
+            max_height,
+            overrides,
+        )?)
     }
 
     pub fn undo(&mut self) -> bool {
@@ -377,14 +262,11 @@ impl Engine {
             Ok(inverse) => {
                 self.history.push_redo(inverse);
                 self.revision += 1;
-                self.reconcile_decoders();
                 true
             }
-            Err(_) => {
-                // Inverse was popped before apply; on failure the action is lost.
-                // Inverses are written to be infallible once pushed.
-                false
-            }
+            // Inverses are written to be infallible once recorded; on failure
+            // the action is already popped and lost.
+            Err(_) => false,
         }
     }
 
@@ -400,7 +282,6 @@ impl Engine {
             Ok(inverse) => {
                 self.history.push_undo(inverse);
                 self.revision += 1;
-                self.reconcile_decoders();
                 true
             }
             Err(_) => false,
@@ -409,24 +290,22 @@ impl Engine {
 
     fn run_action(
         &mut self,
-        action: Box<dyn crate::action::EditAction>,
-    ) -> Result<Box<dyn crate::action::EditAction>, EngineError> {
+        action: Box<dyn EditAction>,
+    ) -> Result<Box<dyn EditAction>, EngineError> {
         let mut ctx = ApplyContext {
             project: &mut self.project,
-            cache: &self.cache,
             project_path: &mut self.project_path,
             history: &mut self.history,
         };
         action.apply(&mut ctx)
     }
-
-    /// True when the frame cache has paused writes due to a disk-full I/O error.
-    pub fn disk_pressure(&self) -> bool {
-        self.cache.disk_pressure()
-    }
-
-    /// Resume cache writes after disk space is available again.
-    pub fn clear_disk_pressure(&self) {
-        self.cache.clear_disk_pressure();
-    }
 }
+
+// The mobile FFI hands a session across threads (calls serialized by the shell,
+// e.g. a Swift actor whose executor hops threads), which is only sound if the
+// engine is `Send`. Assert it at compile time so a non-Send component (a decoder
+// handle, a GPU resource) can never sneak in silently.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Engine>()
+};

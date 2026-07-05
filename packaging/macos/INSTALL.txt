@@ -13,11 +13,12 @@ Option A — recommended (one-time)
 
 Option B — Terminal
 -------------------
-/Applications/Cutlass.app/Contents/MacOS/cutlass-ui
+/Applications/Cutlass.app/Contents/MacOS/cutlass-desktop
 
 If you see "app is damaged" or it still won't open
 ---------------------------------------------------
 xattr -cr /Applications/Cutlass.app
 Then repeat Option A.
 
-Requirements: macOS 13+ on Apple Silicon (arm64). FFmpeg is bundled inside the app.
+Requirements: macOS 13+ on Apple Silicon (arm64). Media decode/encode uses
+the system's AVFoundation/VideoToolbox — nothing else to install.

@@ -3,10 +3,17 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::Map;
-use crate::clip::{Clip, ClipParam, ClipSource, ClipTransform, CropRect, Generator, ParamValue};
+use crate::clip::{
+    Clip, ClipParam, ClipSource, ClipTransform, CropRect, Generator, ParamValue, Replaceable,
+    SlotMedia,
+};
 use crate::effects::EffectInstance;
 use crate::error::ModelError;
 use crate::ids::{ClipId, MediaId, ProjectId, TrackId};
+use crate::look::{
+    AnimationRef, AnimationSlot, AudioRole, ChromaKey, ColorAdjustments, Filter, Mask,
+    StabilizeLevel, animation_spec,
+};
 use crate::media::MediaSource;
 use crate::metadata::ProjectMetadata;
 use crate::param::{Easing, Param};
@@ -195,6 +202,9 @@ impl Project {
         if timeline.is_empty() {
             return Err(ModelError::InvalidRange);
         }
+        let mut generator = generator;
+        generator.resolve_presets()?;
+        generator.validate()?;
         let clip = Clip::generated(generator, timeline);
         self.timeline.add_clip(track_id, clip)
     }
@@ -227,6 +237,9 @@ impl Project {
                 kind,
             });
         }
+        let mut generator = generator;
+        generator.resolve_presets()?;
+        generator.validate()?;
         let content = ClipSource::Generated(generator);
         if !kind.accepts_content(&content) {
             return Err(ModelError::IncompatibleTrackKind {
@@ -238,6 +251,129 @@ impl Project {
             .clip_mut(clip_id)
             .ok_or(ModelError::UnknownClip(clip_id))?
             .content = content;
+        Ok(())
+    }
+
+    /// Replace `clip_id`'s content with a trimmed window of `media_id`, keeping
+    /// its timeline placement, speed, transform, and effects. This is the
+    /// primitive behind filling a template slot and re-picking a filled slot's
+    /// in-point (CapCut "tap clip → adjust which part plays"). Validates media
+    /// existence, that the track accepts media content, the source rate, and —
+    /// for non-image media — that the source window lies within the source.
+    pub fn set_clip_media(
+        &mut self,
+        clip_id: ClipId,
+        media_id: MediaId,
+        source: TimeRange,
+    ) -> Result<(), ModelError> {
+        let track_id = self
+            .timeline
+            .track_of(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        let kind = self
+            .timeline
+            .track(track_id)
+            .ok_or(ModelError::UnknownTrack(track_id))?
+            .kind;
+        let media = self
+            .media
+            .get(&media_id)
+            .ok_or(ModelError::UnknownMedia(media_id))?;
+        check_same_rate(source.start.rate, media.frame_rate)?;
+        if source.is_empty() {
+            return Err(ModelError::InvalidRange);
+        }
+        // Stills repeat one frame for any window; real media must contain the
+        // requested span.
+        if source.start.value < 0 || (!media.is_image && source.end_tick() > media.duration.value) {
+            return Err(ModelError::SourceOutOfBounds);
+        }
+        let content = ClipSource::Media {
+            media: media_id,
+            source,
+        };
+        if !kind.accepts_content(&content) {
+            return Err(ModelError::IncompatibleTrackKind {
+                track: track_id,
+                kind,
+            });
+        }
+        self.timeline
+            .clip_mut(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?
+            .content = content;
+        Ok(())
+    }
+
+    /// Mark (or, with `None`, unmark) a clip as a CapCut-style replaceable
+    /// template slot. The marker is metadata only — it does not change what
+    /// renders — and is what [`Template`](crate::Template) scans to build its
+    /// list of fillable slots.
+    ///
+    /// Marking validates eagerly (mirroring [`set_text_editable`]
+    /// (Self::set_text_editable)) so authoring mistakes surface here, not at
+    /// apply time with a misleading error: the clip must be a media clip
+    /// (generated content cannot be refilled), and the slot's `accepts` must
+    /// match the lane — visual restrictions belong on video tracks,
+    /// [`SlotMedia::AudioOnly`] on audio tracks. Errors if the clip is
+    /// unknown. Unmarking never fails for known clips.
+    pub fn set_replaceable(
+        &mut self,
+        clip_id: ClipId,
+        replaceable: Option<Replaceable>,
+    ) -> Result<(), ModelError> {
+        if let Some(marker) = &replaceable {
+            let track_id = self
+                .timeline
+                .track_of(clip_id)
+                .ok_or(ModelError::UnknownClip(clip_id))?;
+            let kind = self
+                .timeline
+                .track(track_id)
+                .ok_or(ModelError::UnknownTrack(track_id))?
+                .kind;
+            let clip = self
+                .timeline
+                .clip(clip_id)
+                .ok_or(ModelError::UnknownClip(clip_id))?;
+            if clip.media().is_none() {
+                return Err(ModelError::InvalidParam(
+                    "replaceable slots apply only to media clips".into(),
+                ));
+            }
+            let want = if marker.accepts == SlotMedia::AudioOnly {
+                TrackKind::Audio
+            } else {
+                TrackKind::Video
+            };
+            if kind != want {
+                return Err(ModelError::InvalidParam(format!(
+                    "a {:?} slot cannot sit on a {kind:?} track",
+                    marker.accepts
+                )));
+            }
+        }
+        self.timeline
+            .clip_mut(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?
+            .replaceable = replaceable;
+        Ok(())
+    }
+
+    /// Mark a text clip's content as user-editable when the project is used as
+    /// a template (the text keeps its style and animation). Errors if the clip
+    /// is unknown or is not a [`Generator::Text`] clip.
+    pub fn set_text_editable(&mut self, clip_id: ClipId, editable: bool) -> Result<(), ModelError> {
+        let clip = self
+            .timeline
+            .clip_mut(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        if !matches!(clip.content, ClipSource::Generated(Generator::Text { .. })) {
+            return Err(ModelError::InvalidParam(
+                "text editability applies only to text generator clips".into(),
+            ));
+        }
+        clip.text_editable = editable;
         Ok(())
     }
 
@@ -383,6 +519,9 @@ impl Project {
                 let v = scalar_param(value)?;
                 effect_mut(clip, effect)?.set_param_keyframe(param as usize, tick, v, easing)
             }
+            ClipParam::Shape { param } => {
+                generator_mut(clip)?.set_shape_param_keyframe(param, tick, value, easing)
+            }
             _ => clip
                 .transform
                 .set_param_keyframe(param, tick, value, easing),
@@ -423,6 +562,9 @@ impl Project {
             ClipParam::Effect { effect, param } => {
                 effect_mut(clip, effect)?.remove_param_keyframe(param as usize, tick)
             }
+            ClipParam::Shape { param } => {
+                generator_mut(clip)?.remove_shape_param_keyframe(param, tick)
+            }
             _ => clip.transform.remove_param_keyframe(param, tick),
         }
     }
@@ -454,6 +596,9 @@ impl Project {
             ClipParam::Effect { effect, param } => {
                 let v = scalar_param(value)?;
                 effect_mut(clip, effect)?.set_param_constant(param as usize, v)
+            }
+            ClipParam::Shape { param } => {
+                generator_mut(clip)?.set_shape_param_constant(param, value)
             }
             _ => clip.transform.set_param_constant(param, value),
         }
@@ -1116,6 +1261,233 @@ impl Project {
         Ok(std::mem::replace(&mut clip.beats, beats))
     }
 
+    // --- Phase I look properties (persisted + validated, render-neutral) ----
+
+    /// The kind of the track hosting `clip_id`, or the unknown-clip error.
+    fn track_kind_of(&self, clip_id: ClipId) -> Result<(TrackId, TrackKind), ModelError> {
+        let track_id = self
+            .timeline
+            .track_of(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        let kind = self
+            .timeline
+            .track(track_id)
+            .ok_or(ModelError::UnknownTrack(track_id))?
+            .kind;
+        Ok((track_id, kind))
+    }
+
+    /// Guard for edits that only make sense where pixels show.
+    fn require_visual(&self, clip_id: ClipId, what: &str) -> Result<(), ModelError> {
+        let (track_id, kind) = self.track_kind_of(clip_id)?;
+        if !kind.is_visual() {
+            return Err(ModelError::IncompatibleTrackKind {
+                track: track_id,
+                kind,
+            });
+        }
+        let _ = what;
+        Ok(())
+    }
+
+    /// Guard for edits that need decoded source pixels (mask, chroma, …):
+    /// a media-backed clip on a visual lane.
+    fn require_visual_media(&self, clip_id: ClipId, what: &str) -> Result<(), ModelError> {
+        self.require_visual(clip_id, what)?;
+        let clip = self
+            .timeline
+            .clip(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        if clip.is_generated() {
+            return Err(ModelError::InvalidParam(format!(
+                "{what} requires a media-backed clip"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Set (or with `None` clear) a clip's shaped alpha mask (CapCut mask,
+    /// Phase I — persisted now, rendered later). Media-backed visual clips
+    /// only; the mask itself is validated (feather range).
+    pub fn set_clip_mask(&mut self, clip_id: ClipId, mask: Option<Mask>) -> Result<(), ModelError> {
+        if let Some(mask) = &mask {
+            mask.validate()?;
+        }
+        self.require_visual_media(clip_id, "a mask")?;
+        self.timeline
+            .clip_mut(clip_id)
+            .expect("clip existence checked above")
+            .mask = mask;
+        Ok(())
+    }
+
+    /// Set (or clear) chroma keying (CapCut chroma key, Phase I —
+    /// render-neutral). Media-backed visual clips only; strength/shadow
+    /// validated to `0..=1`.
+    pub fn set_clip_chroma_key(
+        &mut self,
+        clip_id: ClipId,
+        chroma: Option<ChromaKey>,
+    ) -> Result<(), ModelError> {
+        if let Some(chroma) = &chroma {
+            chroma.validate()?;
+        }
+        self.require_visual_media(clip_id, "chroma key")?;
+        self.timeline
+            .clip_mut(clip_id)
+            .expect("clip existence checked above")
+            .chroma_key = chroma;
+        Ok(())
+    }
+
+    /// Set (or clear) stabilization (CapCut stabilize, Phase I —
+    /// render-neutral). Media-backed *video* clips only: stills have no
+    /// motion to smooth.
+    pub fn set_clip_stabilize(
+        &mut self,
+        clip_id: ClipId,
+        stabilize: Option<StabilizeLevel>,
+    ) -> Result<(), ModelError> {
+        self.require_visual_media(clip_id, "stabilization")?;
+        let clip = self
+            .timeline
+            .clip(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        if let ClipSource::Media { media, .. } = &clip.content
+            && self.media(*media).is_some_and(|m| m.is_image)
+        {
+            return Err(ModelError::InvalidParam(
+                "stabilization requires video (stills have no motion)".into(),
+            ));
+        }
+        self.timeline
+            .clip_mut(clip_id)
+            .expect("clip existence checked above")
+            .stabilize = stabilize;
+        Ok(())
+    }
+
+    /// Set (or clear) a color-grade filter preset (CapCut filters, Phase I —
+    /// render-neutral). Any visual clip, including `Generator::Filter` lane
+    /// bars; the id must exist in the filter catalog.
+    pub fn set_clip_filter(
+        &mut self,
+        clip_id: ClipId,
+        filter: Option<Filter>,
+    ) -> Result<(), ModelError> {
+        if let Some(filter) = &filter {
+            filter.validate()?;
+        }
+        self.require_visual(clip_id, "a filter")?;
+        self.timeline
+            .clip_mut(clip_id)
+            .expect("clip existence checked above")
+            .filter = filter;
+        Ok(())
+    }
+
+    /// Set a clip's manual color grade (CapCut adjust, Phase I —
+    /// render-neutral). Any visual clip, including `Generator::Adjustment`
+    /// lane bars; neutral values simply clear the grade.
+    pub fn set_clip_adjustments(
+        &mut self,
+        clip_id: ClipId,
+        adjust: ColorAdjustments,
+    ) -> Result<(), ModelError> {
+        adjust.validate()?;
+        self.require_visual(clip_id, "adjustments")?;
+        self.timeline
+            .clip_mut(clip_id)
+            .expect("clip existence checked above")
+            .adjust = adjust;
+        Ok(())
+    }
+
+    /// Set (or clear) one animation slot (CapCut animation In / Out / Combo,
+    /// Phase I — render-neutral). Any visual clip. The preset must exist in
+    /// the catalog, match the slot, and — for `text_only` presets — sit on a
+    /// text clip. CapCut exclusivity is enforced here so every platform
+    /// agrees: setting In or Out clears a combo, setting a combo clears both
+    /// sides.
+    pub fn set_clip_animation(
+        &mut self,
+        clip_id: ClipId,
+        slot: AnimationSlot,
+        animation: Option<AnimationRef>,
+    ) -> Result<(), ModelError> {
+        self.require_visual(clip_id, "animations")?;
+        if let Some(animation) = &animation {
+            let spec = animation_spec(&animation.id).ok_or_else(|| {
+                ModelError::InvalidParam(format!("unknown animation '{}'", animation.id))
+            })?;
+            if spec.slot != slot {
+                return Err(ModelError::InvalidParam(format!(
+                    "animation '{}' does not fit that slot",
+                    animation.id
+                )));
+            }
+            if spec.text_only {
+                let clip = self
+                    .timeline
+                    .clip(clip_id)
+                    .ok_or(ModelError::UnknownClip(clip_id))?;
+                if !matches!(clip.content, ClipSource::Generated(Generator::Text { .. })) {
+                    return Err(ModelError::InvalidParam(format!(
+                        "animation '{}' is a text preset",
+                        animation.id
+                    )));
+                }
+            }
+        }
+        let clip = self
+            .timeline
+            .clip_mut(clip_id)
+            .expect("clip existence checked above");
+        match slot {
+            AnimationSlot::In => {
+                clip.animation_in = animation;
+                if clip.animation_in.is_some() {
+                    clip.animation_combo = None;
+                }
+            }
+            AnimationSlot::Out => {
+                clip.animation_out = animation;
+                if clip.animation_out.is_some() {
+                    clip.animation_combo = None;
+                }
+            }
+            AnimationSlot::Combo => {
+                clip.animation_combo = animation;
+                if clip.animation_combo.is_some() {
+                    clip.animation_in = None;
+                    clip.animation_out = None;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Tag (or untag) what an audio-lane clip *is* (music / sound FX /
+    /// voiceover / extracted, Phase I). Clips on audio tracks only.
+    pub fn set_clip_audio_role(
+        &mut self,
+        clip_id: ClipId,
+        role: Option<AudioRole>,
+    ) -> Result<(), ModelError> {
+        let (track_id, kind) = self.track_kind_of(clip_id)?;
+        if kind != TrackKind::Audio {
+            return Err(ModelError::IncompatibleTrackKind {
+                track: track_id,
+                kind,
+            });
+        }
+        self.timeline
+            .clip_mut(clip_id)
+            .expect("clip existence checked above")
+            .audio_role = role;
+        Ok(())
+    }
+
     /// Move a clip to `to_track` at `new_start`, preserving duration and source.
     pub fn move_clip(
         &mut self,
@@ -1287,6 +1659,17 @@ fn effect_mut(clip: &mut Clip, index: u32) -> Result<&mut EffectInstance, ModelE
         .ok_or_else(|| ModelError::InvalidParam(format!("effect index {index} out of range")))
 }
 
+/// A generated clip's generator, or an error for media-backed clips (shape
+/// params route here; the generator itself rejects non-shape kinds).
+fn generator_mut(clip: &mut Clip) -> Result<&mut Generator, ModelError> {
+    match &mut clip.content {
+        ClipSource::Generated(generator) => Ok(generator),
+        ClipSource::Media { .. } => Err(ModelError::InvalidParam(
+            "shape parameters apply only to generated clips".into(),
+        )),
+    }
+}
+
 /// Timeline ticks a retimed clip occupies: `source ÷ (base_speed × average
 /// ramp)`. A flat ramp keeps the exact integer division M1 used (no f64
 /// drift on the common constant-speed path); an active ramp folds in its
@@ -1307,7 +1690,7 @@ fn retimed_duration(src_dur_tl: i64, speed: Rational, average: f64, has_curve: b
 fn scalar_param(value: ParamValue) -> Result<f32, ModelError> {
     match value {
         ParamValue::Scalar(v) => Ok(v),
-        ParamValue::Vec2(_) => Err(ModelError::InvalidParam(
+        ParamValue::Vec2(_) | ParamValue::Color(_) => Err(ModelError::InvalidParam(
             "effect parameters take a scalar value".into(),
         )),
     }
@@ -1344,6 +1727,93 @@ mod tests {
         let media_id = project.add_media(sample_media(R24, duration));
         let track = project.add_track(TrackKind::Video, "V1");
         (project, media_id, track)
+    }
+
+    // --- shape params -------------------------------------------------------
+
+    #[test]
+    fn shape_params_keyframe_through_project_api() {
+        let mut project = Project::new("p", R24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let clip = project
+            .add_generated(
+                track,
+                Generator::shape(Shape::Ellipse, [255, 255, 255, 255]),
+                tr(100, 48),
+            )
+            .unwrap();
+
+        // Keyframe ticks are clip-relative: timeline 100/140 → ticks 0/40.
+        let width = ClipParam::Shape {
+            param: crate::ShapeParam::Width,
+        };
+        project
+            .set_param_keyframe(
+                clip,
+                width,
+                rt(100),
+                ParamValue::Scalar(100.0),
+                Easing::Linear,
+            )
+            .unwrap();
+        project
+            .set_param_keyframe(
+                clip,
+                width,
+                rt(140),
+                ParamValue::Scalar(500.0),
+                Easing::Linear,
+            )
+            .unwrap();
+        let ClipSource::Generated(Generator::Shape { width: w, .. }) =
+            &project.clip(clip).unwrap().content
+        else {
+            panic!("expected shape");
+        };
+        assert_eq!(w.sample(20), 300.0);
+
+        // Constants flatten; out-of-range and wrong-kind values are rejected
+        // with the clip unchanged.
+        project
+            .set_param_constant(clip, width, ParamValue::Scalar(250.0))
+            .unwrap();
+        assert!(
+            project
+                .set_param_keyframe(
+                    clip,
+                    width,
+                    rt(100),
+                    ParamValue::Color([0; 4]),
+                    Easing::Linear
+                )
+                .is_err()
+        );
+        assert!(
+            project
+                .set_param_constant(clip, width, ParamValue::Scalar(f32::NAN))
+                .is_err()
+        );
+
+        // Media clips reject shape params outright.
+        let media = project.add_media(sample_media(R24, 500));
+        let vtrack = project.add_track(TrackKind::Video, "V1");
+        let mclip = project.add_clip(vtrack, media, tr(0, 100), rt(0)).unwrap();
+        assert!(
+            project
+                .set_param_constant(mclip, width, ParamValue::Scalar(10.0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn add_generated_rejects_invalid_shape() {
+        let mut project = Project::new("p", R24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let bad = Generator::shape(Shape::Polygon { sides: 2 }, [255, 255, 255, 255]);
+        assert!(matches!(
+            project.add_generated(track, bad, tr(0, 48)),
+            Err(ModelError::InvalidParam(_))
+        ));
     }
 
     // --- transitions (M4) -------------------------------------------------
@@ -2560,5 +3030,358 @@ mod tests {
         cloned.remove_clip(clip);
         assert!(cloned.clip(clip).is_none());
         assert!(project.clip(clip).is_some());
+    }
+
+    // --- Phase I look properties --------------------------------------------
+
+    use crate::look::{
+        AnimationRef, AnimationSlot, AudioRole, ChromaKey, ColorAdjustments, Filter, Mask,
+        MaskKind, StabilizeLevel,
+    };
+
+    #[test]
+    fn look_setters_persist_on_a_media_clip() {
+        let (mut project, media_id, track) = project_with_media(100);
+        let clip = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
+
+        project
+            .set_clip_mask(clip, Some(Mask::new(MaskKind::Circle)))
+            .unwrap();
+        project
+            .set_clip_chroma_key(
+                clip,
+                Some(ChromaKey {
+                    rgb: [0, 255, 0],
+                    strength: 0.7,
+                    shadow: 0.2,
+                }),
+            )
+            .unwrap();
+        project
+            .set_clip_stabilize(clip, Some(StabilizeLevel::Smooth))
+            .unwrap();
+        project
+            .set_clip_filter(clip, Some(Filter::new("vivid")))
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                clip,
+                ColorAdjustments {
+                    brightness: 0.25,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let c = project.clip(clip).unwrap();
+        assert_eq!(c.mask.unwrap().kind, MaskKind::Circle);
+        assert_eq!(c.chroma_key.unwrap().strength, 0.7);
+        assert_eq!(c.stabilize, Some(StabilizeLevel::Smooth));
+        assert_eq!(c.filter.as_ref().unwrap().id, "vivid");
+        assert_eq!(c.adjust.brightness, 0.25);
+
+        // Clearing works and the fields vanish from saves again.
+        project.set_clip_mask(clip, None).unwrap();
+        assert!(project.clip(clip).unwrap().mask.is_none());
+    }
+
+    #[test]
+    fn look_setters_reject_wrong_content() {
+        let (mut project, media_id, _) = project_with_media(100);
+
+        // Generated clips have no source pixels to mask/key/stabilize.
+        let fx = project.add_track(TrackKind::Adjustment, "FX");
+        let bar = project
+            .add_generated(fx, Generator::Adjustment, tr(0, 24))
+            .unwrap();
+        assert!(
+            project
+                .set_clip_mask(bar, Some(Mask::new(MaskKind::Linear)))
+                .is_err()
+        );
+        assert!(
+            project
+                .set_clip_stabilize(bar, Some(StabilizeLevel::Recommended))
+                .is_err()
+        );
+        // …but filters and adjustments are exactly what lane bars persist.
+        assert!(
+            project
+                .set_clip_filter(bar, Some(Filter::new("noir")))
+                .is_ok()
+        );
+        assert!(
+            project
+                .set_clip_adjustments(
+                    bar,
+                    ColorAdjustments {
+                        contrast: -0.5,
+                        ..Default::default()
+                    }
+                )
+                .is_ok()
+        );
+
+        // Audio-lane clips show no pixels.
+        let audio = project.add_track(TrackKind::Audio, "A1");
+        let aclip = project.add_clip(audio, media_id, tr(0, 50), rt(0)).unwrap();
+        assert!(
+            project
+                .set_clip_filter(aclip, Some(Filter::new("warm")))
+                .is_err()
+        );
+
+        // Stills have no motion to stabilize.
+        let image = project.add_media(MediaSource::image("/tmp/photo.png", 800, 600));
+        let video = project.add_track(TrackKind::Video, "V2");
+        let still = project
+            .add_clip(
+                video,
+                image,
+                tr_at(0, 100, crate::media::STILL_TICK_RATE),
+                rt(0),
+            )
+            .unwrap();
+        assert!(
+            project
+                .set_clip_stabilize(still, Some(StabilizeLevel::Smooth))
+                .is_err()
+        );
+        assert!(
+            project
+                .set_clip_mask(still, Some(Mask::new(MaskKind::Heart)))
+                .is_ok(),
+            "masks apply to stills"
+        );
+
+        // Unknown ids and out-of-range values are rejected.
+        let (mut p2, m2, t2) = project_with_media(100);
+        let clip = p2.add_clip(t2, m2, tr(0, 50), rt(0)).unwrap();
+        assert!(p2.set_clip_filter(clip, Some(Filter::new("nope"))).is_err());
+        let mut hot = Filter::new("vivid");
+        hot.intensity = 1.5;
+        assert!(p2.set_clip_filter(clip, Some(hot)).is_err());
+    }
+
+    #[test]
+    fn animation_slots_enforce_capcut_exclusivity() {
+        let (mut project, media_id, track) = project_with_media(100);
+        let clip = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
+
+        project
+            .set_clip_animation(clip, AnimationSlot::In, Some(AnimationRef::new("fade_in")))
+            .unwrap();
+        project
+            .set_clip_animation(clip, AnimationSlot::Out, Some(AnimationRef::new("drop")))
+            .unwrap();
+        let c = project.clip(clip).unwrap();
+        assert_eq!(c.animation_in.as_ref().unwrap().id, "fade_in");
+        assert_eq!(c.animation_out.as_ref().unwrap().id, "drop");
+
+        // A combo replaces both sides…
+        project
+            .set_clip_animation(clip, AnimationSlot::Combo, Some(AnimationRef::new("pulse")))
+            .unwrap();
+        let c = project.clip(clip).unwrap();
+        assert!(c.animation_in.is_none() && c.animation_out.is_none());
+        assert_eq!(c.animation_combo.as_ref().unwrap().id, "pulse");
+
+        // …and an entrance evicts the combo again.
+        project
+            .set_clip_animation(clip, AnimationSlot::In, Some(AnimationRef::new("zoom_in")))
+            .unwrap();
+        let c = project.clip(clip).unwrap();
+        assert!(c.animation_combo.is_none());
+
+        // Wrong slot, unknown id, and text-only presets on media are rejected.
+        assert!(
+            project
+                .set_clip_animation(clip, AnimationSlot::Out, Some(AnimationRef::new("fade_in")))
+                .is_err()
+        );
+        assert!(
+            project
+                .set_clip_animation(clip, AnimationSlot::In, Some(AnimationRef::new("nope")))
+                .is_err()
+        );
+        assert!(
+            project
+                .set_clip_animation(
+                    clip,
+                    AnimationSlot::Combo,
+                    Some(AnimationRef::new("typewriter"))
+                )
+                .is_err()
+        );
+
+        // Text clips accept the text-only presets.
+        let text = project.add_track(TrackKind::Text, "T1");
+        let title = project
+            .add_generated(text, Generator::text("Hi"), tr(0, 24))
+            .unwrap();
+        assert!(
+            project
+                .set_clip_animation(
+                    title,
+                    AnimationSlot::Combo,
+                    Some(AnimationRef::new("typewriter"))
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn audio_role_tags_audio_lane_clips_only() {
+        let (mut project, media_id, video) = project_with_media(100);
+        let vclip = project.add_clip(video, media_id, tr(0, 50), rt(0)).unwrap();
+        assert!(
+            project
+                .set_clip_audio_role(vclip, Some(AudioRole::Music))
+                .is_err()
+        );
+
+        let audio = project.add_track(TrackKind::Audio, "A1");
+        let aclip = project.add_clip(audio, media_id, tr(0, 50), rt(0)).unwrap();
+        project
+            .set_clip_audio_role(aclip, Some(AudioRole::Voiceover))
+            .unwrap();
+        assert_eq!(
+            project.clip(aclip).unwrap().audio_role,
+            Some(AudioRole::Voiceover)
+        );
+        project.set_clip_audio_role(aclip, None).unwrap();
+        assert!(project.clip(aclip).unwrap().audio_role.is_none());
+    }
+
+    #[test]
+    fn text_effect_presets_bake_onto_the_style() {
+        let mut project = Project::new("t", R24);
+        let track = project.add_track(TrackKind::Text, "T1");
+
+        let style = crate::TextStyle {
+            effect_preset: Some("neon".into()),
+            ..Default::default()
+        };
+        let clip = project
+            .add_generated(
+                track,
+                Generator::Text {
+                    content: "Glow".into(),
+                    style,
+                },
+                tr(0, 24),
+            )
+            .unwrap();
+
+        let ClipSource::Generated(Generator::Text { style, .. }) =
+            &project.clip(clip).unwrap().content
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(style.effect_preset.as_deref(), Some("neon"));
+        let spec = crate::look::text_effect_spec("neon").unwrap();
+        assert_eq!(style.stroke, spec.stroke);
+        assert_eq!(style.shadow, spec.shadow);
+        assert_eq!(style.background, spec.background);
+
+        // Unknown presets are rejected at the door.
+        let bad = crate::TextStyle {
+            effect_preset: Some("nope".into()),
+            ..Default::default()
+        };
+        assert!(
+            project
+                .set_generator(
+                    clip,
+                    Generator::Text {
+                        content: "Glow".into(),
+                        style: bad,
+                    }
+                )
+                .is_err()
+        );
+
+        // Clearing the preset keeps whatever treatments the style carries.
+        let manual = crate::TextStyle {
+            effect_preset: None,
+            stroke: Some(crate::TextStroke {
+                rgba: [1, 2, 3, 255],
+                width: 2.0,
+            }),
+            ..Default::default()
+        };
+        project
+            .set_generator(
+                clip,
+                Generator::Text {
+                    content: "Glow".into(),
+                    style: manual.clone(),
+                },
+            )
+            .unwrap();
+        let ClipSource::Generated(Generator::Text { style, .. }) =
+            &project.clip(clip).unwrap().content
+        else {
+            panic!("expected text");
+        };
+        assert_eq!(style.stroke, manual.stroke);
+    }
+
+    #[test]
+    fn look_fields_roundtrip_and_stay_off_the_wire_when_unset() {
+        let (mut project, media_id, track) = project_with_media(100);
+        let plain = project.add_clip(track, media_id, tr(0, 50), rt(0)).unwrap();
+        let styled = project
+            .add_clip(track, media_id, tr(50, 50), rt(50))
+            .unwrap();
+        project
+            .set_clip_mask(styled, Some(Mask::new(MaskKind::Star)))
+            .unwrap();
+        project
+            .set_clip_filter(styled, Some(Filter::new("sunset")))
+            .unwrap();
+
+        let plain_json = serde_json::to_value(project.clip(plain).unwrap()).unwrap();
+        for key in [
+            "mask",
+            "chroma_key",
+            "stabilize",
+            "filter",
+            "adjust",
+            "audio_role",
+        ] {
+            assert!(
+                plain_json.get(key).is_none(),
+                "untouched clip should not serialize `{key}`"
+            );
+        }
+        let styled_json = serde_json::to_value(project.clip(styled).unwrap()).unwrap();
+        assert_eq!(styled_json["mask"]["kind"], "star");
+        assert_eq!(styled_json["filter"]["id"], "sunset");
+
+        // The whole project (with looks) survives a save/load roundtrip.
+        let json = serde_json::to_value(&project).unwrap();
+        let back: Project = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            back.clip(styled).unwrap().mask,
+            project.clip(styled).unwrap().mask
+        );
+        assert_eq!(
+            back.clip(styled).unwrap().filter,
+            project.clip(styled).unwrap().filter
+        );
+        assert!(back.clip(plain).unwrap().mask.is_none());
+    }
+
+    #[test]
+    fn speed_preset_catalog_ids_resolve_and_match_back() {
+        for spec in crate::speed_preset_catalog() {
+            let curve = crate::speed_preset(spec.id)
+                .unwrap_or_else(|| panic!("catalog id '{}' has no curve", spec.id));
+            crate::validate_speed_curve(&curve)
+                .unwrap_or_else(|e| panic!("preset '{}' curve invalid: {e}", spec.id));
+            assert_eq!(crate::speed_preset_id(&curve), Some(spec.id));
+        }
+        assert_eq!(crate::speed_preset_id(&Param::Constant(1.0)), None);
     }
 }

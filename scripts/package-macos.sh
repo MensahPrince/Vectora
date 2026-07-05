@@ -2,28 +2,26 @@
 # Assemble a distributable Cutlass.app for macOS (alpha packaging).
 #
 # Usage:
-#   ./scripts/package-macos.sh              # aarch64 (native)
-#   ./scripts/package-macos.sh --no-ffmpeg  # skip dylib bundling (dev only)
+#   ./scripts/package-macos.sh   # aarch64 (native)
 #
 # Output:
 #   dist/Cutlass-<version>-macos-<arch>.zip   (the .app inside)
 #
 # Prerequisites:
 #   - Rust stable (see rust-toolchain.toml)
-#   - FFmpeg via Homebrew (linked at build time; bundled into the .app)
-#   - dylibbundler (brew install dylibbundler) unless --no-ffmpeg
+#
+# Media decode/encode uses the system's AVFoundation/VideoToolbox, so the
+# bundle carries no third-party dylibs (no FFmpeg, no dylibbundler step).
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
-BUNDLE_FFMPEG=1
 for arg in "$@"; do
     case "$arg" in
-        --no-ffmpeg) BUNDLE_FFMPEG=0 ;;
         -h|--help)
-            sed -n '2,12p' "$0"
+            sed -n '2,14p' "$0"
             exit 0
             ;;
         *)
@@ -39,22 +37,22 @@ DIST="dist"
 APP_NAME="Cutlass.app"
 STAGING="$DIST/staging-$ARCH"
 APP="$STAGING/$APP_NAME"
-BINARY_SRC="target/release/cutlass-ui"
+BINARY_SRC="target/release/cutlass-desktop"
 ICON_PNG="assets/icon/cutlass-in-app.png"
 
 echo "==> packaging Cutlass $VERSION for macOS ($ARCH)"
 
 if [[ ! -f "$BINARY_SRC" ]]; then
-    echo "==> release binary missing; building cutlass-ui"
-    cargo build --release -p cutlass-ui
+    echo "==> release binary missing; building cutlass-desktop"
+    cargo build --release -p cutlass-desktop
 fi
 
 rm -rf "$STAGING"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 cp packaging/macos/Info.plist "$APP/Contents/Info.plist"
-cp "$BINARY_SRC" "$APP/Contents/MacOS/cutlass-ui"
-chmod +x "$APP/Contents/MacOS/cutlass-ui"
+cp "$BINARY_SRC" "$APP/Contents/MacOS/cutlass-desktop"
+chmod +x "$APP/Contents/MacOS/cutlass-desktop"
 
 # App icon (.icns) from the same PNG the dock icon uses at runtime.
 # Optional: skip if the source PNG isn't present so packaging still succeeds.
@@ -71,20 +69,7 @@ else
     echo "==> note: $ICON_PNG missing; building .app without a custom icon"
 fi
 
-if [[ "$BUNDLE_FFMPEG" -eq 1 ]]; then
-    if ! command -v dylibbundler >/dev/null; then
-        echo "dylibbundler not found — install with: brew install dylibbundler" >&2
-        echo "or re-run with --no-ffmpeg (not suitable for distribution)" >&2
-        exit 1
-    fi
-    echo "==> bundling dynamic libraries into Contents/Frameworks"
-    mkdir -p "$APP/Contents/Frameworks"
-    dylibbundler -od -b -x "$APP/Contents/MacOS/cutlass-ui" \
-        -d "$APP/Contents/Frameworks" \
-        -p @executable_path/../Frameworks/
-fi
-
-# Adhoc-sign the full bundle so Launch Services can validate nested Frameworks.
+# Adhoc-sign the bundle so Launch Services accepts it.
 echo "==> adhoc-signing app bundle"
 codesign --force --deep --sign - "$APP"
 codesign --verify --deep --strict "$APP"
@@ -99,7 +84,7 @@ ZIP="$DIST/Cutlass-${VERSION}-macos-${ARCH}.zip"
 rm -f "$ZIP"
 (
     cd "$RELEASE"
-    # zip -y preserves symlinks inside the .app Frameworks tree.
+    # zip -y preserves symlinks, should the bundle ever grow any.
     zip -r -y "$ROOT/$ZIP" "$APP_NAME" INSTALL-macos.txt
 )
 

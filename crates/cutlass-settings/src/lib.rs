@@ -2,10 +2,10 @@
 //!
 //! This crate is the **single owner** of the user config file. Everything the
 //! app persists between runs that isn't project data or the recents/autosave
-//! sidecars (those live in the OS data dir, see `cutlass-ui::paths`) lives
-//! here: the AI provider, the theme, the autosave cadence, and the cache
-//! limits. Keys never live in project files — the `[ai]` table is the
-//! historical home for the API key and stays here.
+//! sidecars (those live in the OS data dir, see `cutlass-desktop::paths`)
+//! lives here: the AI provider and the theme. Keys never live in project
+//! files — the `[ai]` table is the historical home for the API key and stays
+//! here.
 //!
 //! Two design rules carried over from the rest of the app:
 //!
@@ -28,20 +28,11 @@
 //!
 //! [appearance]
 //! theme = "dark-blue"              # "default" | "ember" | "dark-blue"
-//!
-//! [cache]
-//! budget_mb = 51200               # 50 GiB
-//! # dir = "/path/to/cache"        # absent ⇒ the OS cache dir
 //! ```
 
 use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, value};
-
-/// Default on-disk frame cache budget in MiB (50 GiB), mirroring
-/// `cutlass_engine::DEFAULT_CACHE_BUDGET_BYTES` so an unconfigured install
-/// matches the engine default exactly.
-pub const DEFAULT_CACHE_BUDGET_MB: u64 = 50 * 1024;
 
 /// Which bundled theme the shell renders. The variant order matches the
 /// `index()` the UI dropdown uses; `DarkBlue` is the shipped default.
@@ -138,25 +129,6 @@ pub struct AppearanceSettings {
     pub theme: ThemeChoice,
 }
 
-/// The `[cache]` table: limits on the on-disk frame cache.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CacheSettings {
-    /// Override for the cache directory; `None` uses the OS cache dir
-    /// (`cutlass-ui::paths::cache_dir`). Applied at the next launch.
-    pub dir: Option<PathBuf>,
-    /// LRU eviction budget in MiB. Applied at the next launch.
-    pub budget_mb: u64,
-}
-
-impl Default for CacheSettings {
-    fn default() -> Self {
-        Self {
-            dir: None,
-            budget_mb: DEFAULT_CACHE_BUDGET_MB,
-        }
-    }
-}
-
 /// The whole user config, one struct per table. [`Settings::default`] is the
 /// state of a fresh install (no file on disk).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -165,8 +137,6 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     /// `[ai]`.
     pub ai: AiSettings,
-    /// `[cache]`.
-    pub cache: CacheSettings,
 }
 
 /// `~/.cutlass/config.toml` — the user's home dir on every platform
@@ -247,15 +217,6 @@ impl Settings {
             }
         }
 
-        if let Some(t) = section(doc, "cache") {
-            if let Some(v) = int_at(t, "budget_mb") {
-                s.cache.budget_mb = v.max(0) as u64;
-            }
-            s.cache.dir = string_at(t, "dir")
-                .filter(|v| !v.trim().is_empty())
-                .map(PathBuf::from);
-        }
-
         s
     }
 
@@ -271,12 +232,6 @@ impl Settings {
             let t = ensure_table(doc, "appearance");
             set_str(t, "theme", self.appearance.theme.key());
         }
-        {
-            let dir = self.cache.dir.as_ref().map(|p| p.to_string_lossy());
-            let t = ensure_table(doc, "cache");
-            set_int(t, "budget_mb", self.cache.budget_mb as i64);
-            set_optional(t, "dir", dir.as_deref());
-        }
     }
 }
 
@@ -288,10 +243,6 @@ fn section<'a>(doc: &'a DocumentMut, key: &str) -> Option<&'a Table> {
 
 fn string_at(table: &Table, key: &str) -> Option<String> {
     table.get(key).and_then(Item::as_str).map(str::to_owned)
-}
-
-fn int_at(table: &Table, key: &str) -> Option<i64> {
-    table.get(key).and_then(Item::as_integer)
 }
 
 /// Borrow (creating if absent or if the existing item isn't a table) the
@@ -311,12 +262,6 @@ fn ensure_table<'a>(doc: &'a mut DocumentMut, key: &str) -> &'a mut Table {
 /// core of the format-preserving promise.
 fn set_str(table: &mut Table, key: &str, v: &str) {
     if table.get(key).and_then(Item::as_str) != Some(v) {
-        table[key] = value(v);
-    }
-}
-
-fn set_int(table: &mut Table, key: &str, v: i64) {
-    if table.get(key).and_then(Item::as_integer) != Some(v) {
         table[key] = value(v);
     }
 }
@@ -342,7 +287,6 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert!(!s.ai.is_configured());
         assert_eq!(s.appearance.theme, ThemeChoice::DarkBlue);
-        assert_eq!(s.cache.budget_mb, DEFAULT_CACHE_BUDGET_MB);
     }
 
     #[test]
@@ -362,10 +306,6 @@ api_key_env = "OPENAI_API_KEY"
 
 [appearance]
 theme = "ember"
-
-[cache]
-budget_mb = 1024
-dir = "/tmp/cutlass-cache"
 "#,
         )
         .unwrap();
@@ -376,11 +316,6 @@ dir = "/tmp/cutlass-cache"
         assert_eq!(s.ai.api_key_env.as_deref(), Some("OPENAI_API_KEY"));
         assert!(s.ai.is_configured());
         assert_eq!(s.appearance.theme, ThemeChoice::Ember);
-        assert_eq!(s.cache.budget_mb, 1024);
-        assert_eq!(
-            s.cache.dir.as_deref(),
-            Some(Path::new("/tmp/cutlass-cache"))
-        );
     }
 
     #[test]
@@ -415,6 +350,24 @@ dir = "/tmp/cutlass-cache"
         let reloaded = load(&path).unwrap();
         assert_eq!(reloaded.ai.model, "qwen3:14b");
         assert_eq!(reloaded.appearance.theme, ThemeChoice::Default);
+    }
+
+    #[test]
+    fn preserves_tables_from_other_builds() {
+        // A config written by a build that still had a `[cache]` table (or any
+        // future section) must survive a save from this one untouched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[cache]\nbudget_mb = 1024\n").unwrap();
+
+        let mut s = load(&path).unwrap();
+        s.ai.base_url = "http://x/v1".into();
+        s.ai.model = "m".into();
+        save(&path, &s).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("[cache]"), "unowned table kept: {raw}");
+        assert!(raw.contains("budget_mb = 1024"));
     }
 
     #[test]

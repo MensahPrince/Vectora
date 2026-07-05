@@ -6,7 +6,8 @@ use common::{image_asset, import_asset, rt, small_video_asset, temp_engine, tr};
 use cutlass_commands::{Command, EditCommand, EditOutcome};
 use cutlass_engine::ApplyOutcome;
 use cutlass_models::{
-    CanvasAspect, ClipParam, ClipTransform, CropRect, Easing, Generator, ParamValue, TrackKind,
+    CanvasAspect, ClipParam, ClipTransform, CropRect, Easing, Generator, ParamValue, Shape,
+    ShapeParam, TrackKind,
 };
 
 fn created(outcome: ApplyOutcome) -> cutlass_models::ClipId {
@@ -934,19 +935,10 @@ fn set_canvas_undo_redo_roundtrip() {
     let canvas = |engine: &cutlass_engine::Engine| engine.project().timeline().canvas();
     assert_eq!(canvas(&engine).aspect, CanvasAspect::Tall9x16);
     assert_eq!(canvas(&engine).background, [12, 34, 56]);
-    // The composite canvas reshapes immediately (empty project: 1080 tier).
-    assert_eq!(
-        cutlass_engine::composite_canvas_size(engine.project()),
-        (1080, 1920)
-    );
 
     // One undo restores both fields.
     assert!(engine.undo());
     assert!(canvas(&engine).is_default());
-    assert_eq!(
-        cutlass_engine::composite_canvas_size(engine.project()),
-        (1920, 1080)
-    );
 
     assert!(engine.redo());
     assert_eq!(canvas(&engine).aspect, CanvasAspect::Tall9x16);
@@ -1769,6 +1761,222 @@ fn effect_param_keyframe_through_clip_param() {
     assert_eq!(radius_at(&engine, 12.0), Some(4.0)); // back to default constant
 }
 
+/// Add an ellipse sticker at [0, 48) and return its id — fixture for shape
+/// param tests.
+fn shape_clip(engine: &mut cutlass_engine::Engine) -> cutlass_models::ClipId {
+    let track = common::add_track(engine, TrackKind::Sticker, "S1");
+    created(
+        engine
+            .apply(Command::Edit(EditCommand::AddGenerated {
+                track,
+                generator: Generator::shape(Shape::Ellipse, [255, 0, 0, 255]),
+                timeline: tr(0, 48),
+            }))
+            .expect("add shape"),
+    )
+}
+
+/// Borrow the shape generator fields of `clip_id` for assertions.
+fn shape_generator(
+    engine: &cutlass_engine::Engine,
+    clip_id: cutlass_models::ClipId,
+) -> cutlass_models::Generator {
+    match &engine.project().clip(clip_id).unwrap().content {
+        cutlass_models::ClipSource::Generated(generator) => generator.clone(),
+        other => panic!("expected generated clip, got {other:?}"),
+    }
+}
+
+#[test]
+fn shape_param_keyframe_undo_redo_roundtrip() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = shape_clip(&mut engine);
+    let width_param = ClipParam::Shape {
+        param: ShapeParam::Width,
+    };
+
+    for (tick, value) in [(0, 100.0), (40, 500.0)] {
+        engine
+            .apply(Command::Edit(EditCommand::SetParamKeyframe {
+                clip: clip_id,
+                param: width_param,
+                at: rt(tick),
+                value: ParamValue::Scalar(value),
+                easing: Easing::Linear,
+            }))
+            .expect("keyframe");
+    }
+
+    let width = |engine: &cutlass_engine::Engine| match shape_generator(engine, clip_id) {
+        Generator::Shape { width, .. } => width,
+        other => panic!("expected shape, got {other:?}"),
+    };
+    assert_eq!(width(&engine).keyframes().len(), 2);
+    assert_eq!(width(&engine).sample(20), 300.0);
+
+    // Undo peels one keyframe at a time, then restores the drop constant.
+    assert!(engine.undo());
+    assert_eq!(width(&engine).keyframes().len(), 1);
+    assert!(engine.undo());
+    assert!(!width(&engine).is_animated());
+
+    assert!(engine.redo());
+    assert!(engine.redo());
+    assert_eq!(width(&engine).sample(20), 300.0);
+}
+
+#[test]
+fn shape_fill_color_keyframes_animate_and_flatten() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = shape_clip(&mut engine);
+    let fill_param = ClipParam::Shape {
+        param: ShapeParam::Fill,
+    };
+
+    for (tick, rgba) in [(0, [0, 0, 0, 255]), (40, [200, 100, 0, 255])] {
+        engine
+            .apply(Command::Edit(EditCommand::SetParamKeyframe {
+                clip: clip_id,
+                param: fill_param,
+                at: rt(tick),
+                value: ParamValue::Color(rgba),
+                easing: Easing::Linear,
+            }))
+            .expect("keyframe");
+    }
+
+    let fill = |engine: &cutlass_engine::Engine| match shape_generator(engine, clip_id) {
+        Generator::Shape { rgba, .. } => rgba,
+        other => panic!("expected shape, got {other:?}"),
+    };
+    assert_eq!(fill(&engine).sample(20), [100, 50, 0, 255]);
+
+    // Flattening to a constant drops the curve; undo restores it.
+    engine
+        .apply(Command::Edit(EditCommand::SetParamConstant {
+            clip: clip_id,
+            param: fill_param,
+            value: ParamValue::Color([1, 2, 3, 255]),
+        }))
+        .expect("flatten");
+    assert_eq!(fill(&engine).constant(), Some([1, 2, 3, 255]));
+
+    assert!(engine.undo());
+    assert_eq!(fill(&engine).keyframes().len(), 2);
+    assert!(engine.redo());
+    assert_eq!(fill(&engine).constant(), Some([1, 2, 3, 255]));
+}
+
+#[test]
+fn shape_param_commands_reject_bad_targets_without_history() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = shape_clip(&mut engine);
+    let before = engine.project().clip(clip_id).unwrap().clone();
+
+    // Stroke params need a stroke; the fixture has none.
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetParamKeyframe {
+                clip: clip_id,
+                param: ClipParam::Shape {
+                    param: ShapeParam::StrokeWidth,
+                },
+                at: rt(0),
+                value: ParamValue::Scalar(4.0),
+                easing: Easing::Linear,
+            }))
+            .is_err()
+    );
+    // Color params reject scalar values (and vice versa).
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetParamKeyframe {
+                clip: clip_id,
+                param: ClipParam::Shape {
+                    param: ShapeParam::Fill,
+                },
+                at: rt(0),
+                value: ParamValue::Scalar(0.5),
+                easing: Easing::Linear,
+            }))
+            .is_err()
+    );
+    // Shape params are meaningless on non-shape clips.
+    let text = text_clip(&mut engine);
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetParamKeyframe {
+                clip: text,
+                param: ClipParam::Shape {
+                    param: ShapeParam::Width,
+                },
+                at: rt(0),
+                value: ParamValue::Scalar(100.0),
+                easing: Easing::Linear,
+            }))
+            .is_err()
+    );
+
+    assert_eq!(engine.project().clip(clip_id).unwrap(), &before);
+    // Failed edits push no history: only the three setup steps (two tracks +
+    // two generated clips = four) are undoable.
+    assert!(engine.undo()); // add text clip
+    assert!(engine.undo()); // add text track
+    assert!(engine.undo()); // add shape clip
+    assert!(engine.undo()); // add sticker track
+    assert!(!engine.can_undo());
+}
+
+#[test]
+fn set_generator_recolors_shape_with_undo() {
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = shape_clip(&mut engine);
+
+    // Recolor + re-shape in one SetGenerator, as the properties panel does.
+    let mut generator = shape_generator(&engine, clip_id);
+    let Generator::Shape { shape, rgba, .. } = &mut generator else {
+        panic!("expected shape");
+    };
+    *shape = Shape::Star {
+        points: 5,
+        inner_ratio: cutlass_models::Param::Constant(0.5),
+    };
+    *rgba = cutlass_models::Param::Constant([0, 255, 0, 255]);
+    engine
+        .apply(Command::Edit(EditCommand::SetGenerator {
+            clip: clip_id,
+            generator,
+        }))
+        .expect("set generator");
+
+    match shape_generator(&engine, clip_id) {
+        Generator::Shape { shape, rgba, .. } => {
+            assert!(matches!(shape, Shape::Star { points: 5, .. }));
+            assert_eq!(rgba.constant(), Some([0, 255, 0, 255]));
+        }
+        other => panic!("expected shape, got {other:?}"),
+    }
+
+    assert!(engine.undo());
+    match shape_generator(&engine, clip_id) {
+        Generator::Shape { shape, rgba, .. } => {
+            assert_eq!(shape, Shape::Ellipse);
+            assert_eq!(rgba.constant(), Some([255, 0, 0, 255]));
+        }
+        other => panic!("expected shape, got {other:?}"),
+    }
+
+    // Invalid generators are rejected at the engine boundary too.
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetGenerator {
+                clip: clip_id,
+                generator: Generator::shape(Shape::Polygon { sides: 2 }, [255, 255, 255, 255]),
+            }))
+            .is_err()
+    );
+}
+
 #[test]
 fn effect_commands_reject_unknown_ids_without_history() {
     let (_dir, mut engine) = temp_engine();
@@ -1795,4 +2003,198 @@ fn effect_commands_reject_unknown_ids_without_history() {
     assert!(engine.undo());
     assert!(engine.undo());
     assert!(!engine.can_undo());
+}
+
+// --- Phase I look commands ---------------------------------------------------
+
+#[test]
+fn look_commands_undo_redo_roundtrip() {
+    use cutlass_models::{
+        AnimationRef, AnimationSlot, ChromaKey, ColorAdjustments, Filter, Mask, MaskKind,
+        StabilizeLevel,
+    };
+
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = common::add_track(&mut engine, TrackKind::Video, "V1");
+    let clip_id = created(
+        engine
+            .apply(Command::Edit(EditCommand::AddClip {
+                track,
+                media: media_id,
+                source: tr(0, 48),
+                start: rt(0),
+            }))
+            .expect("add"),
+    );
+    let clip = |engine: &cutlass_engine::Engine| engine.project().clip(clip_id).unwrap().clone();
+
+    // Mask, chroma, stabilize, filter, adjust — five history entries.
+    engine
+        .apply(Command::Edit(EditCommand::SetClipMask {
+            clip: clip_id,
+            mask: Some(Mask::new(MaskKind::Heart)),
+        }))
+        .expect("mask");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipChroma {
+            clip: clip_id,
+            chroma: Some(ChromaKey {
+                rgb: [0, 255, 0],
+                strength: 0.7,
+                shadow: 0.1,
+            }),
+        }))
+        .expect("chroma");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipStabilize {
+            clip: clip_id,
+            stabilize: Some(StabilizeLevel::Recommended),
+        }))
+        .expect("stabilize");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipFilter {
+            clip: clip_id,
+            filter: Some(Filter::new("noir")),
+        }))
+        .expect("filter");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipAdjustments {
+            clip: clip_id,
+            adjust: ColorAdjustments {
+                exposure: 0.5,
+                ..Default::default()
+            },
+        }))
+        .expect("adjust");
+
+    let styled = clip(&engine);
+    assert_eq!(styled.mask.unwrap().kind, MaskKind::Heart);
+    assert_eq!(styled.chroma_key.unwrap().rgb, [0, 255, 0]);
+    assert_eq!(styled.stabilize, Some(StabilizeLevel::Recommended));
+    assert_eq!(styled.filter.as_ref().unwrap().id, "noir");
+    assert_eq!(styled.adjust.exposure, 0.5);
+
+    // Undo peels them off one at a time (each is one history entry)…
+    assert!(engine.undo());
+    assert!(clip(&engine).adjust.is_neutral());
+    assert!(engine.undo());
+    assert!(clip(&engine).filter.is_none());
+    assert!(engine.undo());
+    assert!(clip(&engine).stabilize.is_none());
+    assert!(engine.undo());
+    assert!(clip(&engine).chroma_key.is_none());
+    assert!(engine.undo());
+    assert!(clip(&engine).mask.is_none());
+
+    // …and redo brings the whole look back.
+    for _ in 0..5 {
+        assert!(engine.redo());
+    }
+    assert_eq!(clip(&engine), styled);
+
+    // Animations: a combo evicts the entrance in one undoable step.
+    engine
+        .apply(Command::Edit(EditCommand::SetClipAnimation {
+            clip: clip_id,
+            slot: AnimationSlot::In,
+            animation: Some(AnimationRef::new("zoom_in")),
+        }))
+        .expect("animation in");
+    engine
+        .apply(Command::Edit(EditCommand::SetClipAnimation {
+            clip: clip_id,
+            slot: AnimationSlot::Combo,
+            animation: Some(AnimationRef::new("pulse")),
+        }))
+        .expect("animation combo");
+    let c = clip(&engine);
+    assert!(c.animation_in.is_none());
+    assert_eq!(c.animation_combo.as_ref().unwrap().id, "pulse");
+    assert!(engine.undo());
+    let c = clip(&engine);
+    assert_eq!(c.animation_in.as_ref().unwrap().id, "zoom_in");
+    assert!(c.animation_combo.is_none());
+}
+
+#[test]
+fn look_commands_reject_invalid_targets_without_history() {
+    use cutlass_models::{AudioRole, Filter, Mask, MaskKind};
+
+    let (_dir, mut engine) = temp_engine();
+    let clip_id = text_clip(&mut engine);
+    let before = engine.project().clip(clip_id).unwrap().clone();
+    let history_before = (engine.can_undo(), engine.can_redo());
+
+    // Generated text: no pixels to mask, no audio lane for a role, unknown
+    // filter ids bounce.
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetClipMask {
+                clip: clip_id,
+                mask: Some(Mask::new(MaskKind::Linear)),
+            }))
+            .is_err()
+    );
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetAudioRole {
+                clip: clip_id,
+                role: Some(AudioRole::Music),
+            }))
+            .is_err()
+    );
+    assert!(
+        engine
+            .apply(Command::Edit(EditCommand::SetClipFilter {
+                clip: clip_id,
+                filter: Some(Filter::new("no_such_filter")),
+            }))
+            .is_err()
+    );
+    assert_eq!(engine.project().clip(clip_id).unwrap(), &before);
+    assert_eq!((engine.can_undo(), engine.can_redo()), history_before);
+}
+
+#[test]
+fn set_audio_role_tags_audio_clips_with_undo() {
+    use cutlass_models::AudioRole;
+
+    let Some(path) = small_video_asset() else {
+        return;
+    };
+    let (_dir, mut engine) = temp_engine();
+    let media_id = import_asset(&mut engine, &path);
+    let track = common::add_track(&mut engine, TrackKind::Audio, "A1");
+    let clip_id = created(
+        engine
+            .apply(Command::Edit(EditCommand::AddClip {
+                track,
+                media: media_id,
+                source: tr(0, 48),
+                start: rt(0),
+            }))
+            .expect("add"),
+    );
+
+    engine
+        .apply(Command::Edit(EditCommand::SetAudioRole {
+            clip: clip_id,
+            role: Some(AudioRole::Extracted),
+        }))
+        .expect("role");
+    assert_eq!(
+        engine.project().clip(clip_id).unwrap().audio_role,
+        Some(AudioRole::Extracted)
+    );
+    assert!(engine.undo());
+    assert!(engine.project().clip(clip_id).unwrap().audio_role.is_none());
+    assert!(engine.redo());
+    assert_eq!(
+        engine.project().clip(clip_id).unwrap().audio_role,
+        Some(AudioRole::Extracted)
+    );
 }

@@ -1,20 +1,20 @@
 ; Inno Setup script for the Cutlass Windows installer.
 ;
 ; This compiles the staged payload produced by scripts/package-windows.ps1
-; (the cutlass-ui.exe + bundled FFmpeg DLLs + licenses) into a single
-; Setup.exe with Start-menu shortcut, optional desktop icon, and uninstaller.
+; (cutlass-desktop.exe + licenses + README) into a single Setup.exe with
+; Start-menu shortcut, optional desktop icon, and uninstaller.
 ;
 ; Do not run this file directly; use scripts/package-windows-installer.ps1,
 ; which builds, stages, and invokes ISCC with the right defines. To compile
 ; by hand:
 ;
-;   iscc /DMyAppVersion=0.3.0-alpha.0 ^
-;        "/DMySourceDir=C:\path\to\dist\staging-windows-x86_64\cutlass-0.3.0-alpha.0-windows-x86_64" ^
+;   iscc /DMyAppVersion=0.5.3-alpha.0 ^
+;        "/DMySourceDir=C:\path\to\dist\staging-windows-x86_64\cutlass-0.5.3-alpha.0-windows-x86_64" ^
 ;        "/DMyOutputDir=C:\path\to\dist" ^
 ;        packaging\windows\cutlass.iss
 
 #define MyAppName "Cutlass"
-#define MyAppExeName "cutlass-ui.exe"
+#define MyAppExeName "cutlass-desktop.exe"
 #define MyAppPublisher "Cutlass"
 #define MyAppURL "https://github.com/1Mr-Newton/cutlass"
 

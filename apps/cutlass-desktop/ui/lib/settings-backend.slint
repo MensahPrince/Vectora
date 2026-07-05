@@ -1,0 +1,35 @@
+// App settings plumbing, implemented in Rust (src/main.rs loads the values
+// at startup and wires the callbacks). The settings screen (shell/
+// settings-dialog.slint) two-way binds these properties to its fields and
+// calls `save` to persist them to ~/.cutlass/config.toml via the
+// cutlass-settings crate.
+//
+// The theme is the one setting that lives elsewhere (AppStore.theme-id), so
+// it can drive the live theme binding the whole shell reads; `save` folds it
+// in from there. (No cache section on this branch: the engine decodes
+// through the native media stack with no disk cache to configure.)
+export global SettingsBackend {
+    // --- AI provider ([ai]) --------------------------------------------
+    in-out property <string> ai-base-url;
+    in-out property <string> ai-model;
+    in-out property <string> ai-api-key;
+    in-out property <string> ai-api-key-env;
+
+    // The config file path, shown at the foot of the screen.
+    in-out property <string> config-path;
+
+    // --- Test connection feedback (set by Rust) ------------------------
+    in-out property <bool> ai-testing: false;
+    in-out property <string> ai-test-status;
+    in-out property <bool> ai-test-ok: false;
+
+    // Persist every value (plus AppStore.theme-id) to config.toml. The Rust
+    // handler also applies the live-settable bits immediately (the agent's
+    // configured state).
+    callback save();
+    // Probe the endpoint with the *current, unsaved* AI fields and report
+    // back through `ai-test-status` / `ai-test-ok`.
+    callback test-connection();
+    // Reveal the config file in the OS file browser.
+    callback reveal-config();
+}

@@ -1,49 +1,47 @@
-//! Register a file in the media pool using demux-only probing.
+//! Register a file in the media pool via native (FFmpeg-free) probing.
+//!
+//! Probing opens the platform decoder ([`cutlass_decoder::probe`]) just far
+//! enough to read the source's dimensions, frame rate, and duration, then
+//! builds a [`MediaSource`] for the project's pool. No frame cache and no
+//! FFmpeg: the same native codec that decodes for preview/export reports the
+//! metadata.
 
 use std::path::Path;
 
-use cutlass_cache::{CacheSpec, FrameCache, SourceFingerprint};
+use cutlass_decoder::probe;
 use cutlass_models::MediaSource;
-use cutlass_probe::probe;
 use tracing::debug;
 
 use crate::error::EngineError;
 
-/// Probe a media file and register it with the frame cache.
+/// Probe a media file and build a [`MediaSource`] describing it.
 ///
-/// Audio-only sources (probe reports zero dimensions) and still images skip
-/// cache registration: the frame cache stores video YUV for scrubbing, while
-/// stills decode once into the in-memory RGBA cache (see `DecoderPool`).
-pub fn import_media(path: &Path, cache: &FrameCache) -> Result<MediaSource, EngineError> {
+/// `path` should already exist and be canonical; callers resolve it before
+/// probing so the pool stores a stable absolute path.
+pub fn import_media(path: &Path) -> Result<MediaSource, EngineError> {
     let probed = probe(path)?;
-
-    if probed.width > 0 && !probed.is_image {
-        let fingerprint = SourceFingerprint::from_path(path)?;
-        // The preview cache stores frames at the reduced preview resolution
-        // (see PREVIEW_MAX_HEIGHT), so the spec must describe *those* dims:
-        // flipping the cap changes the spec and invalidates the stale index.
-        let (width, height) = crate::composite::preview_scaled_dims(probed.width, probed.height);
-        let spec = CacheSpec {
-            width,
-            height,
-            pixfmt: "yuv420p".into(),
-        };
-        cache
-            .register_source(fingerprint, spec)
-            .map_err(cutlass_cache::DiskCacheError::from)?;
-    }
-
-    let media = probed.to_media_source(path);
+    // Stills carry no timebase of their own: the pool applies the model's
+    // convention (millisecond ticks, 5s default placement length).
+    let media = if probed.is_image {
+        MediaSource::image(path, probed.width, probed.height)
+    } else {
+        MediaSource::new(
+            path,
+            probed.width,
+            probed.height,
+            probed.frame_rate,
+            probed.frame_count,
+            probed.has_audio,
+        )
+    };
 
     debug!(
         path = %path.display(),
         width = media.width,
         height = media.height,
-        duration_ticks = media.duration.value,
+        frames = media.duration.value,
         has_audio = media.has_audio,
-        is_image = media.is_image,
-        codec = %probed.video_codec,
-        "imported media"
+        "probed media"
     );
 
     Ok(media)

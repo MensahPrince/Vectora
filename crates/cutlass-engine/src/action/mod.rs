@@ -6,7 +6,6 @@ pub(crate) mod project;
 
 pub use dispatch::{ApplyOutcome, dispatch};
 
-use cutlass_cache::FrameCache;
 use cutlass_models::Project;
 
 use crate::error::EngineError;
@@ -14,7 +13,6 @@ use crate::error::EngineError;
 /// Session surface passed to every command handler.
 pub struct ApplyContext<'a> {
     pub project: &'a mut Project,
-    pub cache: &'a FrameCache,
     pub project_path: &'a mut Option<std::path::PathBuf>,
     pub history: &'a mut History,
 }
@@ -169,27 +167,21 @@ mod tests {
         add_clip, add_generated, add_track, link_clips, move_clip, remove_media, ripple_delete,
         ripple_insert, set_project_name, set_track_flags, shift_clips, split_clip, trim_clip,
     };
-    use cutlass_cache::FrameCache;
     use cutlass_models::{
         Clip, Generator, MediaSource, Rational, RationalTime, TimeRange, TrackKind,
     };
 
-    fn setup() -> (tempfile::TempDir, Project, FrameCache) {
-        let dir = tempfile::tempdir().unwrap();
-        let cache = FrameCache::new(dir.path().join("cache"), 1024 * 1024).unwrap();
-        let project = Project::new("test", Rational::FPS_24);
-        (dir, project, cache)
+    fn setup() -> Project {
+        Project::new("test", Rational::FPS_24)
     }
 
     fn test_ctx<'a>(
         project: &'a mut Project,
-        cache: &'a FrameCache,
         project_path: &'a mut Option<std::path::PathBuf>,
         history: &'a mut History,
     ) -> ApplyContext<'a> {
         ApplyContext {
             project,
-            cache,
             project_path,
             history,
         }
@@ -197,7 +189,7 @@ mod tests {
 
     #[test]
     fn add_clip_inverse_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let media_id = project.add_media(MediaSource::new(
             "/tmp/x.mp4",
             1920,
@@ -210,7 +202,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let (id, inv1) = add_clip::execute(
             &mut ctx,
@@ -235,13 +227,13 @@ mod tests {
 
     #[test]
     fn remove_media_inverse_restores_snapshot() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let media = MediaSource::new("/tmp/y.mp4", 1280, 720, Rational::FPS_24, 100, false);
         let id = project.add_media(media.clone());
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv1 = Box::new(remove_media::RemoveMediaAction { media: id });
         let inv2 = inv1.apply(&mut ctx).unwrap();
@@ -257,7 +249,7 @@ mod tests {
 
     #[test]
     fn split_clip_inverse_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let media_id = project.add_media(MediaSource::new(
             "/tmp/split.mp4",
             1920,
@@ -278,7 +270,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let (_tail, inv1) = split_clip::execute(&mut ctx, clip_id, rt(24)).unwrap();
         assert_eq!(ctx.project.timeline().clip_count(), 2);
@@ -307,7 +299,7 @@ mod tests {
 
     #[test]
     fn ripple_delete_inverse_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Adjustment, "FX");
         let first = project
             .timeline_mut()
@@ -320,7 +312,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv1 = ripple_delete::execute(&mut ctx, first).unwrap();
         assert_eq!(ctx.project.timeline().clip_count(), 1);
@@ -336,7 +328,7 @@ mod tests {
 
     #[test]
     fn ripple_delete_middle_of_three_adjacent_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Adjustment, "FX");
         let a = project
             .timeline_mut()
@@ -353,7 +345,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv1 = ripple_delete::execute(&mut ctx, b).unwrap();
         assert_eq!(ctx.project.clip(c).unwrap().start().value, 10);
@@ -370,7 +362,7 @@ mod tests {
 
     #[test]
     fn trim_clip_inverse_restores_snapshot() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let media_id = project.add_media(MediaSource::new(
             "/tmp/trim.mp4",
             1280,
@@ -392,7 +384,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv1 = trim_clip::execute(&mut ctx, clip_id, tr(10, 28)).unwrap();
         assert_eq!(ctx.project.clip(clip_id).unwrap().timeline.start.value, 10);
@@ -410,7 +402,7 @@ mod tests {
 
     #[test]
     fn move_clip_inverse_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let v1 = project.add_track(TrackKind::Text, "T1");
         let v2 = project.add_track(TrackKind::Text, "T2");
         let clip_id = project
@@ -420,7 +412,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv1 = move_clip::execute(&mut ctx, clip_id, v2, rt(40)).unwrap();
         assert_eq!(ctx.project.timeline().track_of(clip_id), Some(v2));
@@ -435,12 +427,12 @@ mod tests {
 
     #[test]
     fn add_generated_inverse_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Sticker, "S1");
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let (id, inv1) = add_generated::execute(
             &mut ctx,
@@ -464,7 +456,7 @@ mod tests {
 
     #[test]
     fn split_generated_clip_inverse_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Text, "T1");
         let clip_id = project
             .timeline_mut()
@@ -476,7 +468,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let (_tail, inv1) = split_clip::execute(&mut ctx, clip_id, rt(10)).unwrap();
         assert_eq!(ctx.project.timeline().clip_count(), 2);
@@ -494,7 +486,7 @@ mod tests {
 
     #[test]
     fn shift_clips_inverse_selects_exactly_the_shifted_set() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Adjustment, "FX");
         // A [60,80) stays put; B [100,120) shifts left into [80,100). The
         // inverse boundary (B's new start, 80) must re-select only B — a
@@ -511,7 +503,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv = shift_clips::execute(&mut ctx, track, rt(100), rt(-20)).unwrap();
         assert_eq!(ctx.project.clip(b).unwrap().start().value, 80);
@@ -531,7 +523,7 @@ mod tests {
 
     #[test]
     fn ripple_insert_shifts_then_places_and_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let media_id = project.add_media(MediaSource::new(
             "/tmp/ri.mp4",
             1920,
@@ -560,7 +552,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         // Insert 24 ticks at the boundary between the two clips.
         let (inserted, inv) = ripple_insert::execute(
@@ -586,7 +578,7 @@ mod tests {
 
     #[test]
     fn ripple_insert_rejected_placement_restores_shift() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let media_id = project.add_media(MediaSource::new(
             "/tmp/ri-bad.mp4",
             1920,
@@ -607,7 +599,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         // Source range exceeds the media's 240 ticks → add_clip rejects after
         // the shift already ran; the shift must be rolled back atomically.
@@ -629,11 +621,11 @@ mod tests {
 
     #[test]
     fn compound_action_applies_in_reverse_and_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         // Gesture: AddTrack + AddGenerated. Inverses are stored in execution
         // order; undo must run them in reverse (remove the clip before its
@@ -662,7 +654,7 @@ mod tests {
     #[test]
     fn add_transition_inverse_oscillates() {
         use crate::action::edit::set_transition;
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Adjustment, "FX");
         let left = project
             .timeline_mut()
@@ -675,7 +667,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv1 = set_transition::add_transition(&mut ctx, left, "crossfade").unwrap();
         assert!(
@@ -713,7 +705,7 @@ mod tests {
     fn structural_edit_prunes_dead_junction_and_undo_restores_it() {
         use crate::action::dispatch;
         use cutlass_commands::{Command, EditCommand};
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Adjustment, "FX");
         let left = project
             .timeline_mut()
@@ -727,7 +719,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         // Move the left clip away: the junction breaks and the transition is
         // pruned as part of the edit.
@@ -779,13 +771,13 @@ mod tests {
 
     #[test]
     fn set_track_flags_inverse_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Video, "V1");
         assert!(project.timeline().track(track).unwrap().enabled);
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         // Disable the track; only `enabled` changes, the rest stay put.
         let inv1 =
@@ -805,7 +797,7 @@ mod tests {
 
     #[test]
     fn link_clips_inverse_restores_prior_links_and_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Adjustment, "FX");
         let a = project
             .timeline_mut()
@@ -818,7 +810,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv1 = link_clips::execute(&mut ctx, &[a, b]).unwrap();
         let group = ctx.project.clip(a).unwrap().link;
@@ -856,7 +848,7 @@ mod tests {
 
     #[test]
     fn link_clips_unknown_clip_mutates_nothing() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let track = project.add_track(TrackKind::Adjustment, "FX");
         let a = project
             .timeline_mut()
@@ -865,7 +857,7 @@ mod tests {
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let missing = cutlass_models::ClipId::from_raw(999);
         assert!(link_clips::execute(&mut ctx, &[a, missing]).is_err());
@@ -878,12 +870,12 @@ mod tests {
 
     #[test]
     fn set_project_name_inverse_oscillates() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         assert_eq!(project.name, "test");
 
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
 
         let inv1 = set_project_name::set_project_name(&mut ctx, "renamed".to_string()).unwrap();
         assert_eq!(ctx.project.name, "renamed");
@@ -897,10 +889,10 @@ mod tests {
 
     #[test]
     fn set_track_flags_unknown_track_errors() {
-        let (_dir, mut project, cache) = setup();
+        let mut project = setup();
         let mut project_path = None;
         let mut history = History::new(32);
-        let mut ctx = test_ctx(&mut project, &cache, &mut project_path, &mut history);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
         let missing = cutlass_models::TrackId::from_raw(999);
         assert!(
             set_track_flags::execute(&mut ctx, missing, Some(false), None, None, None).is_err()

@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # Assemble a distributable Linux tarball for Cutlass (alpha packaging).
 #
+# DORMANT: the app compiles and launches on Linux, but this branch's media
+# stack (decode/encode) has no Linux backend yet — imported media won't play.
+# The script is kept working so packaging is ready the day the backend lands.
+#
 # Usage:
 #   ./scripts/package-linux.sh
 #
 # Output:
 #   dist/Cutlass-<version>-linux-<arch>.tar.gz
-#
-# The archive contains the cutlass-ui binary, licenses, and a short README.
-# FFmpeg must be installed on the target system (see README-INSTALL.txt).
 
 set -euo pipefail
 
@@ -23,16 +24,16 @@ PKG="cutlass-$VERSION-linux-$ARCH"
 
 echo "==> packaging Cutlass $VERSION for Linux ($ARCH)"
 
-BINARY_SRC="target/release/cutlass-ui"
+BINARY_SRC="target/release/cutlass-desktop"
 if [[ ! -f "$BINARY_SRC" ]]; then
-    echo "==> release binary missing; building cutlass-ui"
-    cargo build --release -p cutlass-ui
+    echo "==> release binary missing; building cutlass-desktop"
+    cargo build --release -p cutlass-desktop
 fi
 
 rm -rf "$STAGING"
 mkdir -p "$STAGING/$PKG"
-cp "$BINARY_SRC" "$STAGING/$PKG/cutlass-ui"
-chmod +x "$STAGING/$PKG/cutlass-ui"
+cp "$BINARY_SRC" "$STAGING/$PKG/cutlass-desktop"
+chmod +x "$STAGING/$PKG/cutlass-desktop"
 cp LICENSE-MIT LICENSE-APACHE "$STAGING/$PKG/"
 
 cat >"$STAGING/$PKG/README-INSTALL.txt" <<EOF
@@ -40,14 +41,10 @@ Cutlass $VERSION — Linux ($ARCH)
 ================================
 
 Run:
-  ./cutlass-ui
+  ./cutlass-desktop
 
-Requires FFmpeg development libraries at runtime. On Debian/Ubuntu:
-  sudo apt-get install -y libavcodec-dev libavformat-dev libavutil-dev \\
-    libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
-
-Or install the matching runtime packages from your distro if the binary
-was linked against shared FFmpeg libs.
+Preview build: the editor UI runs, but video/audio decode and export are
+not implemented on Linux yet in this line — imported media will not play.
 
 See https://github.com/1Mr-Newton/cutlass for source and issue tracker.
 EOF

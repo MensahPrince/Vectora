@@ -4,7 +4,7 @@ use super::edit::add_track::RemoveTrackAction;
 use super::edit::remove_media::RemoveMediaAction;
 use super::edit::restore_transitions::RestoreTransitionsAction;
 use super::edit::{self, remove_clip::RemoveClipAction};
-use super::project::{self, import};
+use super::project;
 use super::{ApplyContext, CompoundAction, EditAction};
 use crate::error::EngineError;
 use cutlass_models::{TrackId, Transition};
@@ -38,15 +38,34 @@ fn finalize_structural(
 }
 
 /// Result of applying a wire [`Command`] through the engine.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializes adjacently tagged (`{"type": "Imported", "value": {"media": 3}}`,
+/// `{"type": "Saved"}`) so shells and the AI agent read one stable shape;
+/// `Edited` nests the [`EditOutcome`] wire object under `value`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "value")]
 pub enum ApplyOutcome {
-    Imported { media: cutlass_models::MediaId },
-    RemovedMedia { media: cutlass_models::MediaId },
+    Imported {
+        media: cutlass_models::MediaId,
+    },
+    RemovedMedia {
+        media: cutlass_models::MediaId,
+    },
     Saved,
     Opened,
     Loaded,
-    Relinked { media: cutlass_models::MediaId },
-    Exported { stats: cutlass_encoder::ExportStats },
+    Relinked {
+        media: cutlass_models::MediaId,
+    },
+    /// The timeline was exported to a file; `frames` is the number written.
+    Exported {
+        frames: u64,
+    },
+    /// A `.cutlasst` template file was written; the session is unchanged.
+    SavedTemplate,
+    /// The session was replaced with a filled template — a new, unsaved
+    /// project (history cleared, project path reset).
+    AppliedTemplate,
     Edited(EditOutcome),
 }
 
@@ -66,7 +85,7 @@ fn dispatch_project(
 ) -> Result<(ApplyOutcome, Option<Box<dyn EditAction>>), EngineError> {
     match command {
         ProjectCommand::Import { path } => {
-            let (media, inverse) = import::execute(ctx, &path)?;
+            let (media, inverse) = project::import::execute(ctx, &path)?;
             Ok((ApplyOutcome::Imported { media }, inverse))
         }
         ProjectCommand::RemoveMedia { media } => {
@@ -92,6 +111,14 @@ fn dispatch_project(
         ProjectCommand::Export { .. } => Err(EngineError::Export(
             "export is handled by Engine::apply, not dispatch".into(),
         )),
+        ProjectCommand::SaveTemplate { path, meta } => {
+            project::save_template::execute(ctx, path, meta)?;
+            Ok((ApplyOutcome::SavedTemplate, None))
+        }
+        ProjectCommand::ApplyTemplate { path, picks } => {
+            project::apply_template::execute(ctx, path, picks)?;
+            Ok((ApplyOutcome::AppliedTemplate, None))
+        }
     }
 }
 
@@ -132,6 +159,31 @@ fn dispatch_edit(
         }
         EditCommand::SetGenerator { clip, generator } => {
             let inverse = edit::set_generator::execute(ctx, clip, generator)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipMedia {
+            clip,
+            media,
+            source,
+        } => {
+            let inverse = edit::set_clip_media::execute(ctx, clip, media, source)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetReplaceable { clip, replaceable } => {
+            let inverse = edit::template_marks::set_replaceable(ctx, clip, replaceable)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetTextEditable { clip, editable } => {
+            let inverse = edit::template_marks::set_text_editable(ctx, clip, editable)?;
             Ok((
                 ApplyOutcome::Edited(EditOutcome::Updated(clip)),
                 Some(inverse),
@@ -229,6 +281,59 @@ fn dispatch_edit(
         }
         EditCommand::SetClipDenoise { clip, denoise } => {
             let inverse = edit::set_denoise::set_denoise(ctx, clip, denoise)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipMask { clip, mask } => {
+            let inverse = edit::set_look::set_mask(ctx, clip, mask)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipChroma { clip, chroma } => {
+            let inverse = edit::set_look::set_chroma(ctx, clip, chroma)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipStabilize { clip, stabilize } => {
+            let inverse = edit::set_look::set_stabilize(ctx, clip, stabilize)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipFilter { clip, filter } => {
+            let inverse = edit::set_look::set_filter(ctx, clip, filter)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipAdjustments { clip, adjust } => {
+            let inverse = edit::set_look::set_adjustments(ctx, clip, adjust)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetClipAnimation {
+            clip,
+            slot,
+            animation,
+        } => {
+            let inverse = edit::set_look::set_animation(ctx, clip, slot, animation)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::SetAudioRole { clip, role } => {
+            let inverse = edit::set_look::set_audio_role(ctx, clip, role)?;
             Ok((
                 ApplyOutcome::Edited(EditOutcome::Updated(clip)),
                 Some(inverse),
@@ -408,33 +513,13 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
-        EditCommand::DuckLanes {
-            voice,
-            music,
-            threshold,
-            amount,
-            attack,
-            release,
-        } => {
-            let (clip, inverse) =
-                edit::duck::duck(ctx, &voice, &music, threshold, amount, attack, release)?;
-            Ok((
-                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
-                Some(inverse),
-            ))
-        }
-        EditCommand::DetectBeats { clip } => {
-            let inverse = edit::detect_beats::detect(ctx, clip)?;
-            Ok((
-                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
-                Some(inverse),
-            ))
-        }
-        EditCommand::ClearBeats { clip } => {
-            let inverse = edit::detect_beats::clear(ctx, clip)?;
-            Ok((
-                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
-                Some(inverse),
+        EditCommand::DuckLanes { .. } => Err(EngineError::Unsupported(
+            "audio ducking needs the decoder's audio reader (deferred on mobile-support)".into(),
+        )),
+        EditCommand::DetectBeats { .. } | EditCommand::ClearBeats { .. } => {
+            Err(EngineError::Unsupported(
+                "beat detection needs the decoder's audio reader (deferred on mobile-support)"
+                    .into(),
             ))
         }
         EditCommand::AddMarker { at, name, color } => {

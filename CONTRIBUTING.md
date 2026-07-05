@@ -49,18 +49,11 @@ just gives reviewers helpful context.
 ## Development Setup
 
 Cutlass is a Rust workspace. You need a recent stable Rust toolchain (the repo
-pins `stable` via `rust-toolchain.toml`, edition 2024, MSRV 1.85) and FFmpeg
-development libraries.
-
-```bash
-# macOS
-brew install ffmpeg pkg-config
-
-# Debian / Ubuntu
-sudo apt-get install -y pkg-config clang \
-  libavcodec-dev libavformat-dev libavutil-dev \
-  libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
-```
+pins `stable` via `rust-toolchain.toml`, edition 2024, MSRV 1.85). Media
+decode/encode is platform-native — AVFoundation/VideoToolbox on Apple
+platforms — so there are no third-party media libraries to install on macOS.
+The desktop app compiles on Windows and Linux, but their media backends
+aren't implemented yet (the UI runs; media won't decode).
 
 Build and test the whole workspace:
 
@@ -72,38 +65,44 @@ cargo test --workspace
 Run the desktop editor (optionally with a media file):
 
 ```bash
-cargo run -p cutlass-ui
-cargo run -p cutlass-ui -- path/to/video.mp4
+cargo run -p cutlass-desktop
+cargo run -p cutlass-desktop -- path/to/video.mp4
 ```
 
-`cutlass-app` is a headless smoke-test CLI that drives the engine end to end
-(import, edit, preview, save, export) without the UI — handy for quick checks:
-
-```bash
-cargo run -p cutlass-app
-```
+The iOS/macOS SwiftUI app (`apps/cutlass-ios-macos`) builds with Xcode on top
+of the engine's C ABI; `./scripts/build-ios-xcframework.sh` produces the
+XCFramework it links.
 
 ## Project Layout
 
-The workspace is split into focused crates, layered from data up to UI:
+The workspace is split into focused crates, layered from data up to the apps:
 
-- `cutlass-models` — shared project/timeline data model, time math, and the
-  `.cutlass` file schema. UI-, decode-, and render-agnostic.
+- `cutlass-core` — shared primitives: rational time, colorimetry, pixel
+  formats, the GPU/CPU frame handoff, and the decode/encode contracts.
+- `cutlass-models` — project/timeline data model, media pool, templates, and
+  the `.cutlass` file schema. UI-, decode-, and render-agnostic.
 - `cutlass-commands` — the structured command vocabulary every edit goes through.
-- `cutlass-probe` — reads media metadata before import.
-- `cutlass-decoder` — FFmpeg-backed video/image decode, thumbnails, waveforms,
-  and audio playback.
-- `cutlass-cache` — on-disk decoded-frame cache for preview.
-- `cutlass-compositor` — WGPU GPU compositor that combines layers into RGBA frames.
-- `cutlass-encoder` — FFmpeg encode/mux for exported MP4 and proxy media.
+- `cutlass-decoder` — platform-native video/image decode behind the core
+  `VideoDecoder` trait (AVFoundation/VideoToolbox on Apple), plus audio peaks.
+- `cutlass-encoder` — platform-native H.264/mp4 encode behind the core
+  `VideoEncoder` trait (VideoToolbox on Apple).
+- `cutlass-compositor` — WGPU GPU compositor that combines layers into RGBA
+  frames.
+- `cutlass-text` / `cutlass-shapes` — text and vector-shape generators the
+  compositor places as layers.
+- `cutlass-render` — resolves a project at an instant into a scene, renders
+  frames, mixes audio, and exports timelines to video.
 - `cutlass-engine` — the headless editing engine: applies commands, records
-  undo/redo, produces preview frames, and exports timelines. Main integration
-  point for non-UI callers.
-- `cutlass-ai` — prompt-to-edit layer that turns model responses into validated
-  commands applied through the normal engine path.
-- `cutlass-ui` — the Slint desktop editor (timeline, preview, inspector,
-  library, export dialog, AI panel).
-- `cutlass-app` — end-to-end smoke-test CLI for the engine.
+  undo/redo, produces preview frames. Main integration point for non-UI
+  callers.
+- `cutlass-mobile` — C ABI + JNI bridge the iOS/Android apps link.
+- `cutlass-settings` — desktop user settings (`~/.cutlass/config.toml`).
+- `cutlass-cli` — command-line compositor demos (headless GPU → image file).
+- `cutlass-py` — MoviePy-style Python bindings (excluded from the default
+  workspace build; built with maturin).
+- `apps/cutlass-desktop` — the Slint desktop editor (timeline, preview,
+  inspector, library, export dialog).
+- `apps/cutlass-ios-macos`, `apps/cutlass-android` — the mobile apps.
 
 Each crate has its own `README.md` describing its responsibilities and what
 does and does not belong there. Read the relevant one before adding code.
@@ -111,9 +110,9 @@ does and does not belong there. Read the relevant one before adding code.
 Two boundaries matter:
 
 - **Keep the engine UI-agnostic.** Slint models, widgets, file dialogs, and
-  interaction state belong in `cutlass-ui`, not `cutlass-engine`.
-- **Keep `cutlass-models` pure data.** No file I/O, FFmpeg, GPU work, Slint
-  bindings, LLM prompts, or undo/redo dispatch — those live in higher crates.
+  interaction state belong in `apps/cutlass-desktop`, not `cutlass-engine`.
+- **Keep `cutlass-models` pure data.** No file I/O, GPU work, Slint bindings,
+  or undo/redo dispatch — those live in higher crates.
 
 ## Coding Conventions
 
@@ -150,7 +149,7 @@ one giant change.
 
 ## Submitting a Pull Request
 
-1. Fork the repo and create a topic branch from `master`.
+1. Fork the repo and create a topic branch from `main`.
 2. Make your change as a clean series of commits (see above).
 3. Run the same checks CI runs, and make sure they pass:
 
@@ -165,8 +164,7 @@ one giant change.
    suite. Running `cargo fmt` keeps formatting consistent.
 4. Add or update tests. Engine and model changes should cover invariants and
    behavior; for undoable edits, test both the forward edit and its inverse.
-   Run a single crate's tests with `cargo test -p <crate>` and benchmarks with
-   `cargo bench -p cutlass-engine --bench preview` (or `--bench export`).
+   Run a single crate's tests with `cargo test -p <crate>`.
 5. Update docs (crate `README.md`, `docs/`, the icon registry) when behavior or
    structure changes.
 6. Open the PR with a clear description of what changed and why, and link any

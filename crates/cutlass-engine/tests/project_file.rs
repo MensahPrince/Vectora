@@ -2,20 +2,13 @@
 
 mod common;
 
-use std::path::PathBuf;
-
 use common::{import_asset, rt, small_video_asset, temp_engine, tr};
 use cutlass_commands::{Command, EditCommand, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
 use cutlass_models::{Project, Rational, TrackKind};
 
-fn engine_config(cache_dir: PathBuf) -> EngineConfig {
-    EngineConfig {
-        cache_dir,
-        cache_budget_bytes: 64 * 1024 * 1024,
-        undo_limit: 8,
-        ..Default::default()
-    }
+fn engine_config() -> EngineConfig {
+    EngineConfig { undo_limit: 8 }
 }
 
 #[test]
@@ -167,9 +160,7 @@ fn open_fails_when_media_missing() {
         100,
         false,
     ));
-    let mut engine2 =
-        Engine::with_project(engine_config(dir.path().join("cache2")), offline_project)
-            .expect("engine");
+    let mut engine2 = Engine::with_project(engine_config(), offline_project).expect("engine");
     let offline = dir.path().join("missing_media.cutlass");
     engine2
         .apply(Command::Project(ProjectCommand::Save {
@@ -198,8 +189,7 @@ fn load_tolerates_missing_media() {
     ));
     fixture.add_track(TrackKind::Video, "V1");
 
-    let mut engine =
-        Engine::with_project(engine_config(dir.path().join("cache")), fixture).expect("engine");
+    let mut engine = Engine::with_project(engine_config(), fixture).expect("engine");
 
     let project_file = dir.path().join("ghost.cutlass");
     engine
@@ -208,7 +198,7 @@ fn load_tolerates_missing_media() {
         }))
         .expect("save");
 
-    let mut engine2 = Engine::new(engine_config(dir.path().join("cache3"))).expect("engine");
+    let mut engine2 = Engine::new(engine_config()).expect("engine");
     assert!(matches!(
         engine2
             .apply(Command::Project(ProjectCommand::Load {

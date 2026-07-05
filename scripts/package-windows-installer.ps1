@@ -1,25 +1,26 @@
 # Build a Windows Setup.exe installer for Cutlass (Inno Setup).
 #
+# DORMANT: see scripts/package-windows.ps1 — Windows media backends aren't
+# implemented in this line yet, so this stays a preview installer.
+#
 # This reuses scripts/package-windows.ps1 to build + stage the payload
-# (cutlass-ui.exe, bundled FFmpeg DLLs, licenses, README), then compiles it
-# into a single installer via the Inno Setup compiler (ISCC.exe).
+# (cutlass-desktop.exe, licenses, README), then compiles it into a single
+# installer via the Inno Setup compiler (ISCC.exe).
 #
 # Usage:
 #   .\scripts\package-windows-installer.ps1
 #   .\scripts\package-windows-installer.ps1 -Arch arm64        # native ARM64 build
-#   .\scripts\package-windows-installer.ps1 -NoFfmpeg          # dev only
 #   .\scripts\package-windows-installer.ps1 -IsccPath "C:\...\ISCC.exe"
 #
 # Output:
 #   dist\Cutlass-<version>-windows-<arch>-Setup.exe
 #
 # Prerequisites:
-#   - Everything package-windows.ps1 needs (Rust, vcpkg FFmpeg, VCPKG_ROOT)
+#   - Everything package-windows.ps1 needs (Rust stable)
 #   - Inno Setup 6 (ISCC.exe on PATH or installed in Program Files,
 #     or pass -IsccPath). Install via: choco install innosetup
 
 param(
-    [switch]$NoFfmpeg,
     [ValidateSet("x86_64", "arm64")]
     [string]$Arch = "x86_64",
     [string]$IsccPath
@@ -30,13 +31,9 @@ $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
-# Stage the payload (builds the release binary and bundles FFmpeg if needed).
-# Use hashtable splatting so the values bind to named parameters; array
-# splatting would pass them positionally and bind "-Arch" as the value.
+# Stage the payload (builds the release binary if needed).
 Write-Host "==> staging Windows payload via package-windows.ps1 ($Arch)"
-$StageArgs = @{ Arch = $Arch }
-if ($NoFfmpeg) { $StageArgs.NoFfmpeg = $true }
-& (Join-Path $Root "scripts\package-windows.ps1") @StageArgs
+& (Join-Path $Root "scripts\package-windows.ps1") -Arch $Arch
 
 $VersionLine = (Select-String -Path Cargo.toml -Pattern '^version' | Select-Object -First 1).Line
 $Version = $VersionLine -replace '.*"(.*)".*', '$1'

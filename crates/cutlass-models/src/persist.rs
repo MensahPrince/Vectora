@@ -98,8 +98,9 @@ fn unwrap_legacy_envelope(doc: &mut serde_json::Value) {
 }
 
 /// Read the document's schema (object or legacy bare-integer form) without
-/// deserializing the whole project.
-fn read_schema(doc: &serde_json::Value) -> Result<ProjectSchema, ModelError> {
+/// deserializing the whole project. Shared with the template loader, which
+/// wraps a project document and versions in lockstep with it.
+pub(crate) fn read_schema(doc: &serde_json::Value) -> Result<ProjectSchema, ModelError> {
     #[derive(Deserialize)]
     struct Holder(#[serde(deserialize_with = "crate::schema::deserialize")] ProjectSchema);
 
@@ -127,7 +128,10 @@ fn read_schema(doc: &serde_json::Value) -> Result<ProjectSchema, ModelError> {
 /// - **Newer documents are refused** before this runs
 ///   ([`ModelError::UnsupportedProjectSchema`] from `validate_schema`) —
 ///   guessing at a future format risks silent data loss.
-fn migrate_document(doc: &mut serde_json::Value, from: u32) {
+///
+/// The template loader reuses this on its embedded project document
+/// (`.cutlasst` files version in lockstep with [`PROJECT_SCHEMA_VERSION`]).
+pub(crate) fn migrate_document(doc: &mut serde_json::Value, from: u32) {
     for step in from..PROJECT_SCHEMA_VERSION {
         match step {
             1 => migrate_v1_to_v2(doc),
