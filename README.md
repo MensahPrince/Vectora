@@ -42,20 +42,22 @@ It's still alpha and moving fast, but it's a real editor now, not a toy.
 
 Describe an edit in plain language and the assistant makes it on your timeline.
 It uses the same actions you would, so every change stays visible, undoable, and
-reviewable — nothing happens behind your back, and you can preview the plan
-before it runs. It's optional; the editor works fine without it.
+reviewable — nothing happens behind your back. It's optional; the editor works
+fine without it. (The assistant is still being ported to this native-media
+line: the desktop panel and provider settings are in place, the model bridge
+isn't wired yet.)
 
 ## Install
 
 Download a build from the [releases page](https://github.com/1Mr-Newton/cutlass/releases).
 
-- **Windows** (x64 / Arm64) — run the `Setup.exe` installer, or use the
-  portable `.zip`.
 - **macOS** (Apple Silicon) — unzip and drag `Cutlass.app` to Applications.
   On first launch, right-click the app and choose **Open** (builds aren't
-  notarized yet).
-- **Linux** (x86_64) — extract the `.tar.gz` and run `./cutlass-ui`. You'll need
-  FFmpeg installed.
+  notarized yet). Media decode/encode uses the OS's AVFoundation — nothing
+  else to install.
+- **Windows / Linux** — preview builds only for now: the editor UI runs, but
+  these platforms' native media backends aren't implemented yet, so imported
+  media won't play.
 
 ## Setting up the AI assistant
 
@@ -89,24 +91,16 @@ disk, so importing a project from another machine may ask you to relink media.
 
 ## Build from source
 
-You need a recent stable Rust toolchain and FFmpeg.
+You need a recent stable Rust toolchain. Media decode/encode is
+platform-native (AVFoundation/VideoToolbox on Apple platforms), so there are
+no third-party media libraries to install on macOS.
+
+Run the desktop editor:
 
 ```bash
-# macOS
-brew install ffmpeg pkg-config
-
-# Debian / Ubuntu
-sudo apt-get install -y pkg-config clang \
-  libavcodec-dev libavformat-dev libavutil-dev \
-  libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev
-```
-
-Then run the editor:
-
-```bash
-cargo run -p cutlass-ui
+cargo run -p cutlass-desktop
 # or open straight into a file:
-cargo run -p cutlass-ui -- path/to/video.mp4
+cargo run -p cutlass-desktop -- path/to/video.mp4
 ```
 
 To build and test the whole workspace:
@@ -116,10 +110,9 @@ cargo build --workspace
 cargo test --workspace
 ```
 
-## Roadmap
-
-See the [v1 roadmap](docs/v1-roadmap.md) for what's planned, in progress, and
-already done.
+The iOS/macOS SwiftUI app lives in `apps/cutlass-ios-macos` (built with Xcode
+on top of the same engine through `cutlass-mobile`), and the Android test app
+in `apps/cutlass-android`.
 
 ## Contributing
 
@@ -136,7 +129,6 @@ from a person or an assistant, as long as they're solid and meet the bar.
 Dual-licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT),
 at your option.
 
-Cutlass links FFmpeg (via [`ffmpeg-next`](https://crates.io/crates/ffmpeg-next)),
-which is LGPL-2.1-or-later by default and may be GPL depending on how the FFmpeg
-you link was built. If you distribute builds that link FFmpeg, check the terms of
-the FFmpeg build you ship.
+Media decode/encode goes through the operating system's frameworks
+(AVFoundation/VideoToolbox on Apple platforms), so builds bundle no
+third-party media libraries.
