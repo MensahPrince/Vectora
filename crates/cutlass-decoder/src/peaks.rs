@@ -131,9 +131,12 @@ mod tests {
     fn any_audio_asset() -> Option<PathBuf> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         // The checked-in iOS fixture tone guarantees real decode coverage;
-        // local-assets lets developers point at richer media.
+        // local-assets lets developers point at richer media. Require the
+        // reader to actually open it, not just that the file exists: platforms
+        // with no native audio backend (e.g. Linux CI) can't decode it, and
+        // these tests skip rather than assert on an Unsupported error.
         let fixture = root.join("../../apps/cutlass-ios-macos/cutlass-ios-macos/Fixtures/tone.m4a");
-        if fixture.exists() {
+        if fixture.exists() && crate::open_audio_reader(&fixture, PEAK_RATE, 1).is_ok() {
             return Some(fixture);
         }
         std::fs::read_dir(root.join("../../local-assets/assets"))
