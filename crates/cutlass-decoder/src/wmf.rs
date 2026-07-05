@@ -43,19 +43,22 @@
 //!
 //! ## Measured (4K H.264 3840×2160@29.97, Intel UHD 630, Win11)
 //!
-//! `decode_bench` means over 150 frames:
+//! `decode_bench` / `composite_bench` means over 150 frames:
 //!
 //! | path | per frame | eff fps |
 //! |---|---|---|
 //! | software decode → CPU planes | 12.2 ms | 71 |
 //! | hardware decode → CPU readback | 19.4 ms | 49 |
 //! | hardware decode → GPU surface (zero-copy) | 5.0 ms | 199 |
+//! | decode + composite + readback, CPU path | 41.1 ms | 23 |
+//! | decode + composite + readback, zero-copy | 12.9 ms | 74 |
 //!
 //! Hardware decode with CPU *readback* loses to software on mean latency
 //! (the 12 MB/frame NV12 copy over PCIe dominates) but wins on p95 and CPU
-//! load; the zero-copy path removes the readback entirely. Sequential
-//! `frame_at` overhead on top of raw decode is ~0.9×–1.1×; seek-per-frame is
-//! ~80× slower than the roll-forward path it replaced (see [`crate::seek`]).
+//! load; the zero-copy path removes the readback and the re-upload, which is
+//! where the 3×+ end-to-end win comes from. Sequential `frame_at` overhead on
+//! top of raw decode is ~0.9×–1.1×; seek-per-frame is ~80× slower than the
+//! roll-forward path it replaced (see [`crate::seek`]).
 //!
 //! ## Time base
 //!

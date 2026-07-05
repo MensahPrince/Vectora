@@ -39,10 +39,12 @@ pub struct Renderer {
     /// the project's still count, with each entry capped at
     /// [`cutlass_decoder::image::MAX_DECODE_DIMENSION`] on the long side.
     stills: HashMap<MediaId, RgbaImage>,
-    /// Preferred decoder output mode. Apple starts in [`OutputMode::Gpu`] so
-    /// hardware-decoded `CVPixelBuffer`s import into the compositor with no CPU
-    /// copy; if a produced surface can't be imported (e.g. 10-bit/HDR), the
-    /// renderer permanently falls back to [`OutputMode::Cpu`] and retries.
+    /// Preferred decoder output mode. Apple and Windows start in
+    /// [`OutputMode::Gpu`] so hardware-decoded surfaces (`CVPixelBuffer` /
+    /// shared D3D11 NV12 textures) import into the compositor with no CPU
+    /// copy; if a produced surface can't be imported (e.g. 10-bit/HDR, or a
+    /// GPU without NV12 texture support), the renderer permanently falls back
+    /// to [`OutputMode::Cpu`] and retries.
     decode_mode: OutputMode,
 }
 
@@ -146,9 +148,9 @@ impl Renderer {
     /// Composite an already-resolved [`Scene`]. `project` supplies media file
     /// paths for the decoder cache.
     ///
-    /// When decoding zero-copy (Apple's [`OutputMode::Gpu`]) produces a surface
-    /// the compositor can't import, this falls back to CPU decode once and
-    /// retries, so unusual formats (10-bit/HDR) still render.
+    /// When decoding zero-copy ([`OutputMode::Gpu`] on Apple/Windows) produces
+    /// a surface the compositor can't import, this falls back to CPU decode
+    /// once and retries, so unusual formats (10-bit/HDR) still render.
     pub fn render_scene(
         &mut self,
         project: &Project,
@@ -437,33 +439,30 @@ fn fixed_size(size: SizeSpec, canvas: [f32; 2]) -> [f32; 2] {
     }
 }
 
-/// The renderer's starting decode mode: zero-copy GPU surfaces on Apple (with a
-/// CPU fallback in [`Renderer::render_scene`]), CPU planes elsewhere until those
-/// backends grow a zero-copy import path.
-#[cfg(target_vendor = "apple")]
+/// The renderer's starting decode mode: zero-copy GPU surfaces on Apple and
+/// Windows (with a CPU fallback in [`Renderer::render_scene`]), CPU planes
+/// elsewhere until those backends grow a zero-copy import path.
+#[cfg(any(target_vendor = "apple", target_os = "windows"))]
 fn default_decode_mode() -> OutputMode {
     OutputMode::Gpu
 }
 
-#[cfg(not(target_vendor = "apple"))]
+#[cfg(not(any(target_vendor = "apple", target_os = "windows")))]
 fn default_decode_mode() -> OutputMode {
     OutputMode::Cpu
 }
 
-/// Open the platform's native decoder for `path` in `mode`. Only Apple has a
-/// zero-copy import path today, so the other backends always decode to CPU
-/// planes regardless of the requested mode.
+/// Open the platform's native decoder for `path` in `mode`. Only Apple and
+/// Windows have a zero-copy import path today, so the other backends always
+/// decode to CPU planes regardless of the requested mode.
 #[cfg(target_vendor = "apple")]
 fn open_decoder(path: &Path, mode: OutputMode) -> Result<Box<dyn VideoDecoder>, RenderError> {
     Ok(Box::new(cutlass_decoder::AvfDecoder::open(path, mode)?))
 }
 
 #[cfg(target_os = "windows")]
-fn open_decoder(path: &Path, _mode: OutputMode) -> Result<Box<dyn VideoDecoder>, RenderError> {
-    Ok(Box::new(cutlass_decoder::WmfDecoder::open(
-        path,
-        OutputMode::Cpu,
-    )?))
+fn open_decoder(path: &Path, mode: OutputMode) -> Result<Box<dyn VideoDecoder>, RenderError> {
+    Ok(Box::new(cutlass_decoder::WmfDecoder::open(path, mode)?))
 }
 
 #[cfg(target_os = "android")]
