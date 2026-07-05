@@ -48,6 +48,9 @@ mod seek;
 mod probe;
 pub use probe::{MediaProbe, probe};
 
+mod peaks;
+pub use peaks::{AudioPeaks, audio_peaks, audio_peaks_per_second};
+
 pub mod image;
 #[cfg(target_vendor = "apple")]
 mod image_apple;
