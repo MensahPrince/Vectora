@@ -129,17 +129,22 @@ mod tests {
     use std::path::PathBuf;
 
     fn any_audio_asset() -> Option<PathBuf> {
-        std::fs::read_dir(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../local-assets/assets"),
-        )
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .find(|p| {
-            p.extension().is_some_and(|e| e == "mp3" || e == "m4a")
-                || (p.extension().is_some_and(|e| e == "mp4")
-                    && crate::open_audio_reader(p, PEAK_RATE, 1).is_ok())
-        })
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        // The checked-in iOS fixture tone guarantees real decode coverage;
+        // local-assets lets developers point at richer media.
+        let fixture = root.join("../../apps/cutlass-ios-macos/cutlass-ios-macos/Fixtures/tone.m4a");
+        if fixture.exists() {
+            return Some(fixture);
+        }
+        std::fs::read_dir(root.join("../../local-assets/assets"))
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.extension().is_some_and(|e| e == "mp3" || e == "m4a")
+                    || (p.extension().is_some_and(|e| e == "mp4")
+                        && crate::open_audio_reader(p, PEAK_RATE, 1).is_ok())
+            })
     }
 
     #[test]
