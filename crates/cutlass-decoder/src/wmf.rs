@@ -60,6 +60,15 @@
 //! top of raw decode is ~0.9×–1.1×; seek-per-frame is ~80× slower than the
 //! roll-forward path it replaced (see [`crate::seek`]).
 //!
+//! **`MF_LOW_LATENCY` was measured and rejected.** Setting it on the reader
+//! (same clip/machine, `decode_bench` over 150 frames) improved only the
+//! first frame after a cold open (CPU 109→84 ms, GPU 38→32 ms) while
+//! regressing everything sustained: sequential decode 20.4→24.3 ms mean CPU
+//! (−19%) and 5.75→6.03 ms GPU, seek-per-frame 1 545→1 638 ms, random scrub
+//! 2 363→2 539 ms. The flag caps the decoder MFT's internal pipelining, and
+//! seek cost here *is* prefix-decode throughput (long GOPs), so shrinking
+//! the queue makes seeks slower, not faster.
+//!
 //! ## Time base
 //!
 //! Media Foundation timestamps are in **100-nanosecond units** (`hns`), so every
