@@ -329,6 +329,9 @@ fn edit_samples() -> Vec<EditCommand> {
             aspect: CanvasAspect::Tall9x16,
             background: [0, 0, 0],
         },
+        EditCommand::SetProjectName {
+            name: "Sunday cut".into(),
+        },
     ]
 }
 
@@ -400,6 +403,7 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
         EditCommand::RemoveMarker { .. } => "RemoveMarker",
         EditCommand::SetMarker { .. } => "SetMarker",
         EditCommand::SetCanvas { .. } => "SetCanvas",
+        EditCommand::SetProjectName { .. } => "SetProjectName",
     }
 }
 

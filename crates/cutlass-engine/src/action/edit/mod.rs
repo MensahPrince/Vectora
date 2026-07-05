@@ -26,6 +26,7 @@ pub mod set_generator;
 pub mod set_look;
 pub mod set_param;
 pub mod set_pitch;
+pub mod set_project_name;
 pub mod set_speed;
 pub mod set_speed_curve;
 pub mod set_track_flags;

@@ -397,6 +397,9 @@ pub enum EditCommand {
         name: String,
         color: MarkerColor,
     },
+    /// Rename the project (the app-owned draft's display name shown in the
+    /// title bar and project gallery). The inverse restores the prior name.
+    SetProjectName { name: String },
     /// Set the project canvas (M1 canvas settings): aspect-ratio preset +
     /// opaque background color, in one shot (callers resolve "keep current"
     /// before dispatch). The inverse restores the previous settings.
@@ -440,4 +443,6 @@ pub enum EditOutcome {
     RemovedMarker(MarkerId),
     /// The project canvas settings changed (M1 canvas settings).
     UpdatedCanvas,
+    /// A project-level property (its display name) changed.
+    UpdatedProject,
 }
