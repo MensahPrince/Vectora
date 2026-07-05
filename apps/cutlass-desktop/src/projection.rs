@@ -153,9 +153,9 @@ fn media_to_slint(
         is_image: media.is_image,
         duration_label: duration_label(media.duration).into(),
         usage_count,
-        // PORT (Phase 4): generated asynchronously after import by the
-        // thumbnailer; until it lands every tile shows its placeholder card.
-        thumbnail: slint::Image::default(),
+        // Generated asynchronously after import; until it lands the tile shows
+        // its placeholder card (see src/thumbnails.rs).
+        thumbnail: crate::thumbnails::thumbnail_for(media.id.raw()).unwrap_or_default(),
     }
 }
 

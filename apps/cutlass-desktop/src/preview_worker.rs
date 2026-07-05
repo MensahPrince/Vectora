@@ -23,6 +23,8 @@ use cutlass_models::{
 };
 use tracing::{debug, error, info, warn};
 
+use crate::strips::StripHandle;
+use crate::thumbnails::{ThumbKind, ThumbnailHandle};
 use crate::{EditorStore, PreviewStore};
 
 /// Everything a mutation publishes to: the Slint view model. The audio
@@ -34,6 +36,10 @@ struct UiSink {
     /// project snapshot here, so mid-playback edits become audible (the
     /// mixer reopens over the new snapshot at its current position).
     audio: crate::audio::AudioHandle,
+    /// Off-thread tile workers: pool changes (import/open/relink) register
+    /// media for library thumbnails and filmstrip/waveform decode.
+    thumbs: ThumbnailHandle,
+    strips: StripHandle,
 }
 
 pub struct PreviewSession {
@@ -827,6 +833,8 @@ impl PreviewWorker {
         preview_weak: slint::Weak<PreviewStore<'static>>,
         editor_weak: slint::Weak<EditorStore<'static>>,
         audio: crate::audio::AudioHandle,
+        thumbs: ThumbnailHandle,
+        strips: StripHandle,
     ) -> Result<(Self, PreviewSession), String> {
         let (ready_tx, ready_rx) = bounded(1);
         let (req_tx, req_rx) = unbounded();
@@ -834,9 +842,16 @@ impl PreviewWorker {
         let join = std::thread::Builder::new()
             .name("cutlass-preview".into())
             .spawn(move || {
-                if let Err(e) =
-                    worker_main(config, preview_weak, editor_weak, audio, req_rx, ready_tx)
-                {
+                if let Err(e) = worker_main(
+                    config,
+                    preview_weak,
+                    editor_weak,
+                    audio,
+                    thumbs,
+                    strips,
+                    req_rx,
+                    ready_tx,
+                ) {
                     error!("preview worker exited: {e}");
                 }
             })
@@ -862,11 +877,14 @@ impl PreviewWorker {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one-shot thread entry, mirrors spawn
 fn worker_main(
     config: EngineConfig,
     preview_weak: slint::Weak<PreviewStore<'static>>,
     editor_weak: slint::Weak<EditorStore<'static>>,
     audio: crate::audio::AudioHandle,
+    thumbs: ThumbnailHandle,
+    strips: StripHandle,
     req_rx: Receiver<WorkerMsg>,
     ready_tx: Sender<Result<PreviewSession, String>>,
 ) -> Result<(), String> {
@@ -895,6 +913,8 @@ fn worker_main(
     let ui = UiSink {
         editor: editor_weak,
         audio,
+        thumbs,
+        strips,
     };
     publish_projection(&mut engine, &ui);
 
@@ -1652,8 +1672,11 @@ fn import_and_publish(engine: &mut Engine, path: &Path, ui: &UiSink) {
                 pool = engine.project().media_count(),
                 "imported media into pool"
             );
-            // PORT (Phase 4): register the source with the thumbnail/strip
-            // workers here so tiles and filmstrips generate off-thread.
+            // Kick off tile thumbnail generation off-thread; the tile shows
+            // its placeholder until the image lands (see src/thumbnails.rs).
+            if let Some(source) = engine.project().media(media) {
+                register_media_with_workers(source, ui);
+            }
             publish_projection(engine, ui);
         }
         Ok(other) => error!(path = %path.display(), "unexpected import outcome: {other:?}"),
@@ -1711,9 +1734,11 @@ fn open_project_and_publish(engine: &mut Engine, path: PathBuf, ui: &UiSink) {
                 pool = engine.project().media_count(),
                 "opened project"
             );
-            // PORT (Phase 4): re-register still-present pool media with the
-            // thumbnail/strip workers here (the same bookkeeping an import
-            // does).
+            for media in engine.project().media_iter() {
+                if media.path().exists() {
+                    register_media_with_workers(media, ui);
+                }
+            }
             publish_projection(engine, ui);
             bump_session_epoch(ui);
         }
@@ -1743,8 +1768,9 @@ fn relink_media_and_publish(engine: &mut Engine, media: &str, path: &Path, ui: &
     })) {
         Ok(ApplyOutcome::Relinked { media }) => {
             info!(?media, path = %path.display(), "relinked media");
-            // PORT (Phase 4): re-register with the tile workers so the
-            // thumbnail and filmstrips regenerate from the new file.
+            if let Some(source) = engine.project().media(media) {
+                register_media_with_workers(source, ui);
+            }
             publish_projection(engine, ui);
         }
         Ok(other) => error!(path = %path.display(), "unexpected relink outcome: {other:?}"),
@@ -1788,9 +1814,12 @@ fn relink_folder_and_publish(engine: &mut Engine, folder: PathBuf, ui: &UiSink) 
             media: media_id,
             path: path.clone(),
         })) {
-            // PORT (Phase 4): re-register each relinked source with the tile
-            // workers so thumbnails/filmstrips regenerate.
-            Ok(ApplyOutcome::Relinked { .. }) => relinked += 1,
+            Ok(ApplyOutcome::Relinked { media }) => {
+                relinked += 1;
+                if let Some(source) = engine.project().media(media) {
+                    register_media_with_workers(source, ui);
+                }
+            }
             Ok(other) => error!(path = %path.display(), "unexpected relink outcome: {other:?}"),
             Err(e) => error!(path = %path.display(), "folder relink failed: {e}"),
         }
@@ -1825,7 +1854,7 @@ fn remove_media_and_publish(engine: &mut Engine, media: &str, force: bool, ui: &
         })) {
             Ok(ApplyOutcome::RemovedMedia { media }) => {
                 info!(?media, "removed media from pool");
-                // PORT (Phase 4): evict the thumbnail cache entry here.
+                crate::thumbnails::forget(media.raw());
                 publish_projection(engine, ui);
             }
             Ok(other) => error!(%media_id, "unexpected remove-media outcome: {other:?}"),
@@ -1878,8 +1907,25 @@ fn remove_media_and_publish(engine: &mut Engine, media: &str, force: bool, ui: &
     }
     engine.commit_group();
     info!(%media_id, clips = doomed.len(), "removed media and its referencing clips");
-    // PORT (Phase 4): evict the thumbnail cache entry here.
+    crate::thumbnails::forget(media_id.raw());
     publish_projection(engine, ui);
+}
+
+/// Register one pool media with the off-thread tile workers: a library
+/// thumbnail render and the strip worker's id → path record (filmstrips /
+/// waveforms resolve by media id alone). Shared by import, open, and relink.
+fn register_media_with_workers(media: &cutlass_models::MediaSource, ui: &UiSink) {
+    let kind = match media.kind() {
+        cutlass_models::MediaKind::Audio => ThumbKind::Audio,
+        cutlass_models::MediaKind::Image => ThumbKind::Image,
+        cutlass_models::MediaKind::Video => ThumbKind::Video,
+    };
+    ui.thumbs
+        .request(media.id.raw(), media.path().to_path_buf(), kind);
+    // Stills register too: the strip sampler repeats the one picture across
+    // the clip's filmstrip tiles.
+    ui.strips
+        .register_media(media.id.raw(), media.path().to_path_buf());
 }
 
 /// Replace the session with a fresh, empty project (the launch screen's New,

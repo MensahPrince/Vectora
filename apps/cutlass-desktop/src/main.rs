@@ -13,6 +13,8 @@ mod projection;
 mod ruler;
 mod selection;
 mod snap;
+mod strips;
+mod thumbnails;
 mod timecode;
 mod timeline;
 mod transport;
@@ -404,10 +406,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let editor = app.global::<EditorStore>();
 
-    // ENGINE WIRING (Phases 1–2): session flows, imports, and the full edit
+    // ENGINE WIRING (Phases 1–4): session flows, imports, the full edit
     // surface (drag/trim/split, inspector commits, clipboard, tracks,
-    // keyframes, effects) bind to the preview worker below. Still to come:
-    // audio (3), thumbnails (4), export (5), live overrides (6).
+    // keyframes, effects), audio playback, and library/timeline tiles bind
+    // to the workers below. Still to come: export (5), live overrides (6).
 
     // --- engine service (preview worker thread) ---------------------------
 
@@ -415,6 +417,18 @@ fn main() -> Result<(), slint::PlatformError> {
     // opens; a machine without a usable output device degrades to the
     // wall-clock transport (`handle.active() == false`).
     let audio_system = audio::AudioSystem::start();
+
+    // Library tile thumbnails decode on their own thread so imports never
+    // stall preview scrubbing. Keep the worker alive for the app's lifetime.
+    let thumbnail_worker =
+        thumbnails::ThumbnailWorker::spawn(app.global::<EditorStore>().as_weak())
+            .map_err(slint::PlatformError::Other)?;
+
+    // Timeline clip content (filmstrip frames, waveform tiles) decodes on a
+    // third thread: a long strip batch must not delay library tiles, and
+    // neither may ever touch the UI or engine threads.
+    let strip_worker = strips::StripWorker::spawn(app.global::<StripBackend>().as_weak())
+        .map_err(slint::PlatformError::Other)?;
 
     // The worker thread owns the Engine (decoders aren't Send); the UI talks
     // to it through a message queue and it answers with projection publishes
@@ -427,6 +441,8 @@ fn main() -> Result<(), slint::PlatformError> {
         preview_store_weak,
         editor_store_weak,
         audio_system.handle(),
+        thumbnail_worker.handle(),
+        strip_worker.handle(),
     )
     .map_err(slint::PlatformError::Other)?;
     tracing::debug!(
@@ -906,6 +922,64 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         });
     });
+
+    // Timeline clip content tiles (Phase 4). Cache lookups on the UI thread;
+    // misses queue decode work on the strip thread and come back through a
+    // `StripBackend.generation` bump (the trailing argument both callbacks
+    // take exists only to re-trigger evaluation on delivery).
+    let filmstrip_handle = strip_worker.handle();
+    app.global::<StripBackend>().on_filmstrip_tiles(
+        move |media_id,
+              source_in_s,
+              duration,
+              fps_num,
+              fps_den,
+              speed,
+              zoom,
+              from_bucket,
+              to_bucket,
+              _generation| {
+            strips::filmstrip_tiles(
+                &filmstrip_handle,
+                media_id.as_str(),
+                source_in_s,
+                duration,
+                fps_num,
+                fps_den,
+                speed,
+                zoom,
+                from_bucket,
+                to_bucket,
+            )
+        },
+    );
+
+    let waveform_handle = strip_worker.handle();
+    app.global::<StripBackend>().on_waveform_tiles(
+        move |media_id,
+              source_in_s,
+              duration,
+              fps_num,
+              fps_den,
+              speed,
+              zoom,
+              from_bucket,
+              to_bucket,
+              _generation| {
+            strips::waveform_tiles(
+                &waveform_handle,
+                media_id.as_str(),
+                source_in_s,
+                duration,
+                fps_num,
+                fps_den,
+                speed,
+                zoom,
+                from_bucket,
+                to_bucket,
+            )
+        },
+    );
 
     app.global::<DragBackend>().on_snap_clip_start(
         |sequence,
