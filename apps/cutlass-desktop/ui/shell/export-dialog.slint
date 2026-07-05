@@ -1,7 +1,7 @@
 // Export settings dialog (CapCut-style): an in-window modal over the whole
-// shell — destination, resolution, frame rate, and quality, then a progress
-// bar while the job runs. In-window rather than a native `Dialog` window so
-// it lives inside the frameless shell like the rest of the chrome.
+// shell — destination, resolution, and frame rate, then a progress bar while
+// the job runs. In-window rather than a native `Dialog` window so it lives
+// inside the frameless shell like the rest of the chrome.
 //
 // The job itself runs on a dedicated thread (src/preview_worker.rs); this
 // dialog only reads/writes ExportBackend. While a job runs the dialog can't
@@ -28,7 +28,6 @@ export component ExportDialog inherits Rectangle {
     // Height 0 ⇒ composite canvas size; fps 0 ⇒ timeline rate.
     property <[int]> resolution-heights: [0, 2160, 1440, 1080, 720, 480];
     property <[int]> fps-values: [0, 24, 25, 30, 50, 60];
-    property <[int]> crf-values: [18, 23, 28];
 
     property <bool> configuring: !ExportBackend.running && !ExportBackend.completed && !ExportBackend.failed;
 
@@ -170,21 +169,6 @@ export component ExportDialog inherits Rectangle {
                 }
             }
 
-            HorizontalLayout {
-                spacing: AppStore.theme.metrics.spacing.sm;
-
-                FieldLabel {
-                    text: "Quality";
-                }
-
-                quality := ComboBox {
-                    horizontal-stretch: 1;
-                    enabled: root.configuring;
-                    model: ["High (CRF 18)", "Medium (CRF 23)", "Low (CRF 28)"];
-                    current-index: 0;
-                }
-            }
-
             // --- progress / outcome ------------------------------------
             if ExportBackend.running: VerticalLayout {
                 spacing: AppStore.theme.metrics.spacing.sm;
@@ -238,8 +222,7 @@ export component ExportDialog inherits Rectangle {
                         ExportBackend.start(
                             ExportBackend.output-path,
                             root.resolution-heights[resolution.current-index],
-                            root.fps-values[fps.current-index],
-                            root.crf-values[quality.current-index]);
+                            root.fps-values[fps.current-index]);
                     }
                 }
 

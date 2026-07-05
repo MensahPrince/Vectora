@@ -269,6 +269,39 @@ fn non_empty(s: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+/// Native save dialog for the export destination, seeded with the current
+/// path's folder and file name. `None` when the user cancels.
+async fn pick_export_path(current: std::path::PathBuf) -> Option<std::path::PathBuf> {
+    let mut dialog = rfd::AsyncFileDialog::new().add_filter("MP4 video", &["mp4"]);
+    if let Some(dir) = current.parent().filter(|d| d.is_dir()) {
+        dialog = dialog.set_directory(dir);
+    }
+    dialog = dialog.set_file_name(
+        current
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled.mp4".into()),
+    );
+    dialog
+        .save_file()
+        .await
+        .map(|file| file.path().to_path_buf())
+}
+
+/// Prefilled export destination: the OS videos folder (Movies on macOS,
+/// Videos on Windows, XDG videos on Linux), else the home directory, else the
+/// temp dir — never the working directory, which is the read-only install
+/// folder on Windows. Only seeds the save panel; the user picks the real spot.
+fn default_export_path() -> SharedString {
+    let dir = dirs::video_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(std::env::temp_dir);
+    dir.join("untitled.mp4")
+        .to_string_lossy()
+        .into_owned()
+        .into()
+}
+
 // The Dock icon of a bare (non-bundled) binary is the generic executable
 // glyph: AppKit takes it from the .app bundle, which `cargo run` doesn't
 // have, and winit has no window-icon concept on macOS — so `Window.icon`
@@ -406,10 +439,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let editor = app.global::<EditorStore>();
 
-    // ENGINE WIRING (Phases 1–4): session flows, imports, the full edit
+    // ENGINE WIRING (Phases 1–5): session flows, imports, the full edit
     // surface (drag/trim/split, inspector commits, clipboard, tracks,
-    // keyframes, effects), audio playback, and library/timeline tiles bind
-    // to the workers below. Still to come: export (5), live overrides (6).
+    // keyframes, effects), audio playback, library/timeline tiles, and the
+    // export job bind to the workers below. Still to come: live overrides (6).
 
     // --- engine service (preview worker thread) ---------------------------
 
@@ -440,6 +473,7 @@ fn main() -> Result<(), slint::PlatformError> {
         EngineConfig::default(),
         preview_store_weak,
         editor_store_weak,
+        app.global::<ExportBackend>().as_weak(),
         audio_system.handle(),
         thumbnail_worker.handle(),
         strip_worker.handle(),
@@ -762,6 +796,53 @@ fn main() -> Result<(), slint::PlatformError> {
     app.window().on_close_requested(move || {
         request_close(&app_weak, &close_handle);
         slint::CloseRequestResponse::KeepWindowShown
+    });
+
+    // --- export (title bar → dialog → engine thread → export thread) -----
+
+    let export_backend = app.global::<ExportBackend>();
+    export_backend.set_output_path(default_export_path());
+
+    let export_backend_weak = export_backend.as_weak();
+    export_backend.on_browse_output_clicked(move || {
+        let backend_weak = export_backend_weak.clone();
+        let current = backend_weak
+            .upgrade()
+            .map(|b| b.get_output_path().to_string())
+            .unwrap_or_default();
+        let task = slint::spawn_local(async move {
+            let current = std::path::PathBuf::from(current);
+            if let Some(path) = pick_export_path(current).await
+                && let Some(backend) = backend_weak.upgrade()
+            {
+                backend.set_output_path(path.to_string_lossy().into_owned().into());
+            }
+        });
+        if let Err(e) = task {
+            tracing::error!("failed to open export dialog: {e}");
+        }
+    });
+
+    let export_handle = preview_worker.handle();
+    export_backend.on_start(move |path, target_height, fps_num| {
+        export_handle.export(preview_worker::ExportRequest {
+            path: std::path::PathBuf::from(path.as_str()),
+            target_height: u32::try_from(target_height).ok().filter(|&h| h > 0),
+            fps_num: (fps_num > 0).then_some(fps_num),
+        });
+    });
+
+    let export_cancel_handle = preview_worker.handle();
+    export_backend.on_cancel(move || {
+        export_cancel_handle.cancel_export();
+    });
+
+    let export_reveal_weak = export_backend.as_weak();
+    export_backend.on_reveal_output_clicked(move || {
+        if let Some(backend) = export_reveal_weak.upgrade() {
+            let path = std::path::PathBuf::from(backend.get_output_path().to_string());
+            reveal_in_file_browser(&path);
+        }
     });
 
     // --- app settings (gear / Cutlass menu → dialog → config.toml) -------

@@ -10,6 +10,8 @@
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -21,17 +23,20 @@ use cutlass_models::{
     LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param, ParamValue, Rational,
     RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
 };
+use cutlass_render::{ExportSettings, RenderError, Renderer};
 use tracing::{debug, error, info, warn};
 
 use crate::strips::StripHandle;
 use crate::thumbnails::{ThumbKind, ThumbnailHandle};
-use crate::{EditorStore, PreviewStore};
+use crate::{EditorStore, ExportBackend, PreviewStore};
 
 /// Everything a mutation publishes to: the Slint view model. The audio
 /// mixer's snapshot rejoins in Phase 3 so sound can never diverge from the
 /// projected timeline.
 struct UiSink {
     editor: slint::Weak<EditorStore<'static>>,
+    /// Export job progress/outcome lands here (from the export thread).
+    export: slint::Weak<ExportBackend<'static>>,
     /// Audio mixer inbox: every projection republish also publishes the
     /// project snapshot here, so mid-playback edits become audible (the
     /// mixer reopens over the new snapshot at its current position).
@@ -361,8 +366,12 @@ enum WorkerMsg {
         flag: TrackFlag,
         value: bool,
     },
-    // PORT (Phase 5): main's `Export(ExportRequest)` / `CancelExport` job
-    // messages return with the export thread (export_to_file_observed).
+    /// Start an export job: the worker clones the project and hands it to a
+    /// dedicated export thread (fresh renderer, own GPU queue + decoders),
+    /// which publishes progress into `ExportBackend`. One job at a time.
+    Export(ExportRequest),
+    /// Flag the running export job to stop after the frame in flight.
+    CancelExport,
     /// Flush the live draft to its project file. `None` reuses the engine's
     /// current draft path (the normal case: explicit Cmd+S, or the debounce /
     /// session-swap / close flush); `Some` rebinds it (binding a freshly
@@ -419,6 +428,17 @@ enum WorkerMsg {
     // PORT (later): main's `SnapshotProject` / `AgentApplyPlan` round-trips
     // return with the cutlass-ai port (the agent rehearses on a sandbox
     // clone, then replays the plan here as one history group).
+}
+
+/// Dialog settings for one export job (see `ui/lib/export-backend.slint`).
+pub struct ExportRequest {
+    /// Destination file (the platform encoder writes H.264/AAC mp4).
+    pub path: PathBuf,
+    /// Scale the output to this height (aspect preserved, evened for H.264);
+    /// `None` exports at the composite canvas size.
+    pub target_height: Option<u32>,
+    /// Resample to this integer frame rate; `None` keeps the timeline rate.
+    pub fps_num: Option<i32>,
 }
 
 /// One clip's resolved landing inside a [`WorkerMsg::MoveGroup`] batch.
@@ -511,6 +531,14 @@ impl WorkerHandle {
 
     pub fn remove_media(&self, media: String, force: bool) {
         let _ = self.tx.send(WorkerMsg::RemoveMedia { media, force });
+    }
+
+    pub fn export(&self, request: ExportRequest) {
+        let _ = self.tx.send(WorkerMsg::Export(request));
+    }
+
+    pub fn cancel_export(&self) {
+        let _ = self.tx.send(WorkerMsg::CancelExport);
     }
 
     pub fn add_clip(
@@ -828,10 +856,12 @@ pub struct PreviewWorker {
 
 impl PreviewWorker {
     /// Spawns a dedicated thread that owns the [`Engine`] (required: decoders are not `Send`).
+    #[allow(clippy::too_many_arguments)] // one-shot bring-up call from main()
     pub fn spawn(
         config: EngineConfig,
         preview_weak: slint::Weak<PreviewStore<'static>>,
         editor_weak: slint::Weak<EditorStore<'static>>,
+        export_weak: slint::Weak<ExportBackend<'static>>,
         audio: crate::audio::AudioHandle,
         thumbs: ThumbnailHandle,
         strips: StripHandle,
@@ -846,6 +876,7 @@ impl PreviewWorker {
                     config,
                     preview_weak,
                     editor_weak,
+                    export_weak,
                     audio,
                     thumbs,
                     strips,
@@ -882,6 +913,7 @@ fn worker_main(
     config: EngineConfig,
     preview_weak: slint::Weak<PreviewStore<'static>>,
     editor_weak: slint::Weak<EditorStore<'static>>,
+    export_weak: slint::Weak<ExportBackend<'static>>,
     audio: crate::audio::AudioHandle,
     thumbs: ThumbnailHandle,
     strips: StripHandle,
@@ -912,6 +944,7 @@ fn worker_main(
     // from the first frame (rather than any Slint-side placeholder).
     let ui = UiSink {
         editor: editor_weak,
+        export: export_weak,
         audio,
         thumbs,
         strips,
@@ -957,6 +990,9 @@ fn worker_loop(
     // it current; edits re-render here so the composite reflects a delete,
     // generator change, etc. without waiting for the user to move the playhead.
     let mut last_tick: i64 = 0;
+    // One export job at a time. `active` outlives jobs (the export thread
+    // clears it when it exits); `cancel` flags the running job to stop.
+    let export_state = ExportJobState::default();
 
     let mutate = |engine: &mut Engine,
                   clipboard: &mut Option<Vec<ClipboardClip>>,
@@ -1184,6 +1220,11 @@ fn worker_loop(
             }
             WorkerMsg::SetTrackFlag { track, flag, value } => {
                 set_track_flag_and_publish(engine, &track, flag, value, &ui)
+            }
+            WorkerMsg::Export(request) => start_export(engine, &ui, &export_state, request),
+            WorkerMsg::CancelExport => {
+                info!("export cancel requested");
+                export_state.cancel.store(true, Ordering::Relaxed);
             }
             WorkerMsg::SaveProject { path } => save_project_and_publish(engine, path, &ui),
             WorkerMsg::OpenProject { path } => open_project_and_publish(engine, path, &ui),
@@ -3307,11 +3348,195 @@ fn set_track_flag_and_publish(
     }
 }
 
-// PORT (Phase 5): main ran the export job here — a dedicated thread cloning
-// the project, rendering through the engine's export path, and publishing
-// progress/cancel state to the Slint `ExportBackend`. It returns on this
-// branch's `cutlass_render::export_to_file_observed` (the mobile
-// `export_job.rs` pattern).
+/// Shared flags between the worker loop and the export thread. `active`
+/// gates one-job-at-a-time (the export thread clears it when it exits);
+/// `cancel` is reset at job start and set by [`WorkerMsg::CancelExport`].
+#[derive(Default)]
+struct ExportJobState {
+    active: Arc<AtomicBool>,
+    cancel: Arc<AtomicBool>,
+}
+
+/// One snapshot of the export job for the Slint `ExportBackend` global.
+#[derive(Default)]
+struct ExportUiState {
+    running: bool,
+    done: u64,
+    total: u64,
+    completed: bool,
+    failed: bool,
+    status: String,
+}
+
+fn publish_export_state(weak: &slint::Weak<ExportBackend<'static>>, state: ExportUiState) {
+    let weak = weak.clone();
+    if let Err(e) = slint::invoke_from_event_loop(move || {
+        if let Some(backend) = weak.upgrade() {
+            backend.set_running(state.running);
+            backend.set_frames_done(state.done.min(i32::MAX as u64) as i32);
+            backend.set_frames_total(state.total.min(i32::MAX as u64) as i32);
+            backend.set_progress(if state.total > 0 {
+                (state.done as f32 / state.total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            });
+            backend.set_completed(state.completed);
+            backend.set_failed(state.failed);
+            backend.set_status(state.status.into());
+        }
+    }) {
+        error!("failed to publish export state to UI: {e}");
+    }
+}
+
+/// The output settings for one export request: the dialog's height preset
+/// scales the composite canvas (aspect preserved), the fps preset overrides
+/// the sampling rate, and everything is evened for H.264.
+fn export_settings_for(project: &cutlass_models::Project, request: &ExportRequest) -> ExportSettings {
+    let mut settings = ExportSettings::for_project(project);
+    if let Some(target_h) = request.target_height.filter(|&h| h > 0) {
+        let (w, h) = settings.size;
+        if h > 0 {
+            let scaled_w = ((u64::from(w) * u64::from(target_h) + u64::from(h) / 2)
+                / u64::from(h)) as u32;
+            settings.size = (scaled_w.max(2), target_h);
+        }
+    }
+    if let Some(num) = request.fps_num.filter(|&n| n > 0) {
+        settings.frame_rate = Rational::new(num, 1);
+    }
+    settings.evened()
+}
+
+/// Snapshot the project and run the export on a dedicated thread: decode +
+/// GPU composite + encode would otherwise freeze preview and edits for the
+/// whole render. The thread brings up its own headless [`Renderer`] (own GPU
+/// queue + decoder cache — the mobile `export_job.rs` pattern), publishes
+/// progress to the UI at most ~10×/sec, and tears the `active` gate down
+/// when it exits — whatever the outcome.
+fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: ExportRequest) {
+    if state.active.swap(true, Ordering::SeqCst) {
+        warn!("export refused: a job is already running");
+        return;
+    }
+    state.cancel.store(false, Ordering::SeqCst);
+
+    let project = engine.project().clone();
+    let settings = export_settings_for(&project, &request);
+    let export_weak = ui.export.clone();
+    let active = state.active.clone();
+    let cancel = state.cancel.clone();
+    let path = request.path;
+
+    publish_export_state(
+        &export_weak,
+        ExportUiState {
+            running: true,
+            ..Default::default()
+        },
+    );
+
+    let spawned = std::thread::Builder::new()
+        .name("cutlass-export".into())
+        .spawn(move || {
+            info!(path = %path.display(), size = ?settings.size, "export job started");
+            let weak = export_weak.clone();
+            let mut last_publish = Instant::now();
+            let mut published_once = false;
+            let result = Renderer::new_headless().and_then(|mut renderer| {
+                cutlass_render::export_to_file_observed(
+                    &mut renderer,
+                    &project,
+                    &path,
+                    settings,
+                    &mut |done, total| {
+                        if cancel.load(Ordering::Relaxed) {
+                            return false;
+                        }
+                        // Throttle event-loop traffic, but always deliver the
+                        // first call (the dialog learns the total) and the last.
+                        if !published_once
+                            || done == total
+                            || last_publish.elapsed() >= Duration::from_millis(100)
+                        {
+                            published_once = true;
+                            last_publish = Instant::now();
+                            publish_export_state(
+                                &weak,
+                                ExportUiState {
+                                    running: true,
+                                    done,
+                                    total,
+                                    ..Default::default()
+                                },
+                            );
+                        }
+                        true
+                    },
+                )
+            });
+
+            let outcome = match result {
+                Ok(frames) => {
+                    info!(
+                        frames,
+                        width = settings.size.0,
+                        height = settings.size.1,
+                        path = %path.display(),
+                        "export job finished"
+                    );
+                    ExportUiState {
+                        done: frames,
+                        total: frames,
+                        completed: true,
+                        status: format!(
+                            "Saved {}×{}, {} frames to {}",
+                            settings.size.0,
+                            settings.size.1,
+                            frames,
+                            path.display()
+                        ),
+                        ..Default::default()
+                    }
+                }
+                Err(RenderError::Cancelled) => {
+                    // The half-written file is junk; don't leave it behind.
+                    let _ = std::fs::remove_file(&path);
+                    info!(path = %path.display(), "export job cancelled");
+                    ExportUiState {
+                        failed: true,
+                        status: "Export cancelled".into(),
+                        ..Default::default()
+                    }
+                }
+                Err(e) => {
+                    // An errored output was never finalized — same junk.
+                    let _ = std::fs::remove_file(&path);
+                    error!(path = %path.display(), "export job failed: {e}");
+                    ExportUiState {
+                        failed: true,
+                        status: format!("Export failed: {e}"),
+                        ..Default::default()
+                    }
+                }
+            };
+            publish_export_state(&weak, outcome);
+            active.store(false, Ordering::SeqCst);
+        });
+
+    if let Err(e) = spawned {
+        error!("failed to spawn export thread: {e}");
+        state.active.store(false, Ordering::SeqCst);
+        publish_export_state(
+            &ui.export,
+            ExportUiState {
+                failed: true,
+                status: format!("Export failed to start: {e}"),
+                ..Default::default()
+            },
+        );
+    }
+}
 
 /// Remove every clip in `clips`; lanes the removals empty are removed with
 /// them (CapCut deletes emptied overlay tracks — same policy the drag-moves
@@ -4417,6 +4642,60 @@ mod tests {
 
         assert!(keyframes_at(&t, 15).is_empty());
         assert_eq!(keyframes_at(&t, 30).len(), 1);
+    }
+
+    // --- export settings mapping ---------------------------------------
+
+    #[test]
+    fn export_settings_default_to_the_project_native_output() {
+        let project = Project::new("t", Rational::FPS_30);
+        let request = ExportRequest {
+            path: PathBuf::from("/tmp/out.mp4"),
+            target_height: None,
+            fps_num: None,
+        };
+        let settings = export_settings_for(&project, &request);
+        let native = ExportSettings::for_project(&project).evened();
+        assert_eq!(settings, native);
+    }
+
+    #[test]
+    fn export_settings_scale_to_the_target_height_preserving_aspect() {
+        let project = Project::new("t", Rational::FPS_30);
+        let (cw, ch) = ExportSettings::for_project(&project).size;
+        let request = ExportRequest {
+            path: PathBuf::from("/tmp/out.mp4"),
+            target_height: Some(720),
+            fps_num: None,
+        };
+        let settings = export_settings_for(&project, &request);
+        assert_eq!(settings.size.1, 720);
+        // Aspect preserved (within the even rounding).
+        let expected_w = (f64::from(cw) * 720.0 / f64::from(ch)).round();
+        assert!((f64::from(settings.size.0) - expected_w).abs() <= 1.0);
+        // Evened for H.264.
+        assert_eq!(settings.size.0 % 2, 0);
+        assert_eq!(settings.size.1 % 2, 0);
+    }
+
+    #[test]
+    fn export_settings_override_the_frame_rate() {
+        let project = Project::new("t", Rational::FPS_30);
+        let request = ExportRequest {
+            path: PathBuf::from("/tmp/out.mp4"),
+            target_height: None,
+            fps_num: Some(24),
+        };
+        let settings = export_settings_for(&project, &request);
+        assert_eq!(settings.frame_rate, Rational::new(24, 1));
+        // Zero/negative presets keep the timeline rate.
+        let request = ExportRequest {
+            path: PathBuf::from("/tmp/out.mp4"),
+            target_height: None,
+            fps_num: Some(0),
+        };
+        let settings = export_settings_for(&project, &request);
+        assert_eq!(settings.frame_rate, Rational::FPS_30);
     }
 
     // --- magnet ripple trim (commit path) -----------------------------------
