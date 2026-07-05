@@ -29,6 +29,13 @@
 //! [`MAX_ROLL_WINDOW_SECS`]. Cold-start defaults reproduce the old fixed
 //! window (~1 s at 30 fps) until real measurements arrive.
 //!
+//! Measured (`scrub_bench`, 4K H.264 fragmented MP4 with ~8 s GOPs, Intel
+//! UHD 630, zero-copy GPU output, mean/p95 per target): a +30-frame forward
+//! drag — 1.001 s at 29.97 fps, one tick past the old fixed window — went
+//! from 449/1 239 ms to 175/238 ms; the CPU path from 1 530/4 282 ms to
+//! 646/1 185 ms. Small steps (+2, +8) and the never-rolling patterns
+//! (backward, random) are unchanged.
+//!
 //! ## Tick-truncation slack
 //!
 //! The walk treats a frame as satisfying the target when its PTS is within
