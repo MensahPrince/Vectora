@@ -7,11 +7,16 @@
 //!
 //! ## What this backend does today
 //!
+//! - Attaches the process's **D3D11 device manager** so the reader loads the
+//!   GPU vendor's hardware decoder MFT (DXVA); machines where that fails
+//!   (VMs, RDP, driver trouble) fall back to Microsoft's software decoders
+//!   transparently ([`crate::wmf_d3d`]).
 //! - Forces an **uncompressed NV12** output type, which makes the reader insert
-//!   a decoder (+ a converter when the codec is 10-bit), and hands back
-//!   system-memory planes.
+//!   a decoder (+ a converter when the codec is 10-bit).
 //! - Reads each sample's [`IMFMediaBuffer`] stride-aware (via [`IMF2DBuffer`]
-//!   when available, falling back to a flat `Lock`) into [`FrameData::Cpu`].
+//!   when available, falling back to a flat `Lock`) into [`FrameData::Cpu`] —
+//!   for DXGI-backed samples the lock performs the staging readback
+//!   internally.
 //! - Probes size / rotation / frame-rate / colorimetry from the negotiated
 //!   output [`IMFMediaType`], duration from the presentation descriptor
 //!   (`MF_PD_DURATION`) with a fragmented-MP4 fallback
@@ -43,10 +48,11 @@ use windows::Win32::Media::MediaFoundation::{
     IMFSourceReader, MF_ACCESSMODE_READ, MF_FILEFLAGS_NONE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_NOMINAL_RANGE,
     MF_MT_VIDEO_PRIMARIES, MF_MT_VIDEO_ROTATION, MF_MT_YUV_MATRIX, MF_OPENMODE_FAIL_IF_NOT_EXIST,
-    MF_PD_DURATION, MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    MF_PD_DURATION, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
+    MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
     MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION,
-    MFCreateFile, MFCreateMediaType, MFCreateSourceReaderFromByteStream,
+    MFCreateAttributes, MFCreateFile, MFCreateMediaType, MFCreateSourceReaderFromByteStream,
     MFCreateSourceReaderFromURL, MFMediaType_Video, MFNominalRange_0_255,
     MFSTARTUP_FULL, MFStartup, MFVideoFormat_NV12, MFVideoFormat_P010,
     MFVideoPrimaries_BT470_2_SysBG, MFVideoPrimaries_BT709, MFVideoPrimaries_BT2020,
@@ -66,6 +72,7 @@ use cutlass_core::{
 };
 
 use crate::OutputMode;
+use crate::wmf_d3d::D3dShared;
 
 /// Media Foundation's timestamp tick rate: 100-nanosecond units per second.
 pub(crate) const HNS_PER_SEC: i64 = 10_000_000;
@@ -81,6 +88,9 @@ pub struct WmfDecoder {
     stream: u32,
     info: SourceInfo,
     mode: OutputMode,
+    /// The shared decode device when this reader runs the hardware (DXVA)
+    /// path; `None` means software MFTs deliver system-memory samples.
+    d3d: Option<&'static D3dShared>,
     eos: bool,
     /// PTS of the last emitted frame — the [`crate::seek`] roll-forward anchor.
     /// Cleared on [`VideoDecoder::seek`] (decode position moved).
@@ -96,6 +106,13 @@ unsafe impl Send for WmfDecoder {}
 
 impl WmfDecoder {
     /// Open `path` and probe its first video track.
+    ///
+    /// Tries the **hardware decode** path first: the reader gets the shared
+    /// D3D11 device manager plus `MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS`,
+    /// so it loads the GPU vendor's decoder MFT (DXVA) instead of Microsoft's
+    /// software one. Any failure along that path — no usable GPU, a codec the
+    /// hardware can't handle, a negotiation quirk — falls back to the plain
+    /// software reader, which is the previous behavior verbatim.
     pub fn open(path: &Path, mode: OutputMode) -> Result<Self, DecodeError> {
         ensure_mf_platform();
         // The source resolver instantiates COM objects on the calling thread, so
@@ -106,37 +123,20 @@ impl WmfDecoder {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
         }
 
-        // `None: Param<IMFAttributes>` — default source-reader configuration.
-        let reader = open_source_reader(path, None)?;
-
         let stream = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
-        // Decode only the video track (leave audio deselected so MF never spins
-        // up an audio decoder for it).
-        unsafe {
-            reader
-                .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
-                .map_err(open_err)?;
-            reader.SetStreamSelection(stream, true).map_err(open_err)?;
-        }
-
-        // Request uncompressed NV12. Setting an uncompressed subtype is what
-        // makes the reader insert the decoder (and a converter for 10-bit
-        // sources); without it the reader would hand back compressed samples.
-        let out_type = unsafe { MFCreateMediaType() }.map_err(open_err)?;
-        unsafe {
-            out_type
-                .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
-                .map_err(open_err)?;
-            out_type
-                .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)
-                .map_err(open_err)?;
-            reader
-                .SetCurrentMediaType(stream, None, &out_type)
-                .map_err(|e| {
-                    DecodeError::Unsupported(format!("could not negotiate NV12 output: {e}"))
-                })?;
-        }
+        let d3d = crate::wmf_d3d::shared();
+        let hardware = d3d.and_then(|d3d| match configure_reader(path, stream, Some(d3d)) {
+            Ok(reader) => Some(reader),
+            Err(error) => {
+                tracing::debug!(%error, "hardware decode path failed; retrying in software");
+                None
+            }
+        });
+        let (reader, d3d) = match hardware {
+            Some(reader) => (reader, d3d),
+            None => (configure_reader(path, stream, None)?, None),
+        };
 
         let info = probe(&reader, stream, Some(path))?;
 
@@ -145,9 +145,16 @@ impl WmfDecoder {
             stream,
             info,
             mode,
+            d3d,
             eos: false,
             last_pts: None,
         })
+    }
+
+    /// Whether this decoder runs on the hardware (DXVA) path. Diagnostic —
+    /// the output contract is identical either way.
+    pub fn is_hardware_accelerated(&self) -> bool {
+        self.d3d.is_some()
     }
 
     /// Turn one decoded [`IMFSample`] into a [`VideoFrame`].
@@ -370,6 +377,67 @@ fn reader_from_byte_stream(
         )
     }?;
     unsafe { MFCreateSourceReaderFromByteStream(&stream, attributes) }
+}
+
+/// Reader-creation attributes for the hardware decode path: the shared D3D11
+/// device (so decoder MFTs output DXGI textures) and permission to load
+/// hardware transforms at all (off by default in the source reader).
+///
+/// `MF_SOURCE_READER_ENABLE_ADVANCED_VIDEO_PROCESSING` is deliberately *not*
+/// set: it would splice in a video processor that auto-rotates and converts,
+/// while rotation/colorimetry are already reported to (and applied by) the
+/// renderer — the processor would double-apply them.
+fn video_reader_attributes(d3d: &D3dShared) -> Result<IMFAttributes, windows::core::Error> {
+    let mut attributes: Option<IMFAttributes> = None;
+    unsafe { MFCreateAttributes(&mut attributes, 2) }?;
+    let attributes = attributes.expect("MFCreateAttributes succeeded");
+    unsafe {
+        attributes.SetUnknown(&MF_SOURCE_READER_D3D_MANAGER, &d3d.manager)?;
+        attributes.SetUINT32(&MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, 1)?;
+    }
+    Ok(attributes)
+}
+
+/// Open a source reader for `path` and negotiate NV12 on the video stream —
+/// in hardware when `d3d` is given, in software otherwise.
+fn configure_reader(
+    path: &Path,
+    stream: u32,
+    d3d: Option<&D3dShared>,
+) -> Result<IMFSourceReader, DecodeError> {
+    let attributes = match d3d {
+        Some(d3d) => Some(video_reader_attributes(d3d).map_err(open_err)?),
+        None => None,
+    };
+    let reader = open_source_reader(path, attributes.as_ref())?;
+
+    // Decode only the video track (leave audio deselected so MF never spins
+    // up an audio decoder for it).
+    unsafe {
+        reader
+            .SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false)
+            .map_err(open_err)?;
+        reader.SetStreamSelection(stream, true).map_err(open_err)?;
+    }
+
+    // Request uncompressed NV12. Setting an uncompressed subtype is what
+    // makes the reader insert the decoder (and a converter for 10-bit
+    // sources); without it the reader would hand back compressed samples.
+    let out_type = unsafe { MFCreateMediaType() }.map_err(open_err)?;
+    unsafe {
+        out_type
+            .SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)
+            .map_err(open_err)?;
+        out_type
+            .SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)
+            .map_err(open_err)?;
+        reader
+            .SetCurrentMediaType(stream, None, &out_type)
+            .map_err(|e| {
+                DecodeError::Unsupported(format!("could not negotiate NV12 output: {e}"))
+            })?;
+    }
+    Ok(reader)
 }
 
 /// Source duration from the presentation descriptor (`MF_PD_DURATION`, a

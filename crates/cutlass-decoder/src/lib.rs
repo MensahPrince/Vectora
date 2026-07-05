@@ -39,6 +39,9 @@ pub use wmf::WmfDecoder;
 mod wmf_audio;
 #[cfg(target_os = "windows")]
 pub use wmf_audio::WmfAudioReader;
+/// Shared D3D11 device + DXGI device manager backing hardware decode.
+#[cfg(target_os = "windows")]
+mod wmf_d3d;
 /// Fragmented-MP4 duration recovery, for demuxers that report none
 /// (Media Foundation today; usable by any backend with the same gap).
 #[cfg(target_os = "windows")]
