@@ -40,10 +40,6 @@ pub struct PreviewSession {
 /// Work submitted to the engine thread. Scrub frames coalesce to the latest
 /// pending tick; imports must not be dropped by that coalescing (see
 /// [`worker_loop`]).
-// PORT (Phase 2): the whole edit message set is live worker-side, but main.rs
-// only wires sessions/imports/drops/frames so far — the rest of the EditorStore
-// callbacks bind in Phase 2 and this allow goes away.
-#[allow(dead_code)]
 enum WorkerMsg {
     Frame(i64),
     /// The preview panel's on-screen size in physical pixels — the fit bound
@@ -424,8 +420,6 @@ pub struct GroupMove {
 }
 
 /// Which track header toggle a [`WorkerMsg::SetTrackFlag`] addresses.
-// PORT (Phase 2): constructed once the track-header callbacks wire up.
-#[allow(dead_code)]
 #[derive(Clone, Copy)]
 pub enum TrackFlag {
     /// Video: contributes to the composite (the eye toggle).
@@ -466,9 +460,6 @@ pub struct WorkerHandle {
     tx: Sender<WorkerMsg>,
 }
 
-// PORT (Phase 2): most senders bind to EditorStore callbacks in Phase 2;
-// until then only the session/import/drop/frame subset is called from main.
-#[allow(dead_code)]
 impl WorkerHandle {
     pub fn request_frame(&self, tick: i64) {
         let _ = self.tx.send(WorkerMsg::Frame(tick));

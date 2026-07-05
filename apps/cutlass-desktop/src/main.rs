@@ -54,6 +54,26 @@ fn generator_from_key(key: &str) -> Option<cutlass_models::Generator> {
     })
 }
 
+/// Map an inspector param key to the engine's `ClipParam` plus the matching
+/// `ParamValue` shape (position is the one vec2; scalars ride `value_x`).
+/// `None` for an unknown key.
+fn clip_param_value(
+    param: &str,
+    value_x: f32,
+    value_y: f32,
+) -> Option<(cutlass_models::ClipParam, cutlass_models::ParamValue)> {
+    use cutlass_models::{ClipParam, ParamValue};
+    Some(match param {
+        "position" => (ClipParam::Position, ParamValue::Vec2([value_x, value_y])),
+        "anchor" => (ClipParam::AnchorPoint, ParamValue::Vec2([value_x, value_y])),
+        "scale" => (ClipParam::Scale, ParamValue::Scalar(value_x)),
+        "rotation" => (ClipParam::Rotation, ParamValue::Scalar(value_x)),
+        "opacity" => (ClipParam::Opacity, ParamValue::Scalar(value_x)),
+        "volume" => (ClipParam::Volume, ParamValue::Scalar(value_x)),
+        _ => return None,
+    })
+}
+
 /// Run `f` on the next event-loop turn, outside whatever callback is
 /// currently executing. Used to flip Timer-bound state (see `request-stop`)
 /// without re-entering Slint's timer machinery. Must never run anything that
@@ -383,10 +403,10 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let editor = app.global::<EditorStore>();
 
-    // ENGINE WIRING (Phase 1+): playhead → frame requests, clip drops,
-    // import, media delete/relink, magnet, and the session flows bind to the
-    // preview worker below; the remaining edit callbacks (trim/move/split,
-    // inspector commits, clipboard, tracks…) wire up in Phase 2.
+    // ENGINE WIRING (Phases 1–2): session flows, imports, and the full edit
+    // surface (drag/trim/split, inspector commits, clipboard, tracks,
+    // keyframes, effects) bind to the preview worker below. Still to come:
+    // audio (3), thumbnails (4), export (5), live overrides (6).
 
     // --- engine service (preview worker thread) ---------------------------
 
@@ -526,6 +546,118 @@ fn main() -> Result<(), slint::PlatformError> {
     editor.on_on_redo(move || {
         redo_handle.redo();
     });
+
+    // --- timeline edit surface (drag/trim/split land as engine edits) -----
+
+    let move_handle = preview_worker.handle();
+    editor.on_on_clip_moved(move |clip_id, track_id, insert_row, start_tick, insert| {
+        move_handle.move_clip(
+            clip_id.to_string(),
+            track_id.to_string(),
+            i64::from(insert_row),
+            i64::from(start_tick),
+            insert,
+        );
+    });
+
+    let group_move_handle = preview_worker.handle();
+    editor.on_on_group_moved(move |moves| {
+        let moves: Vec<preview_worker::GroupMove> = moves
+            .iter()
+            .map(|m| preview_worker::GroupMove {
+                clip: m.clip_id.to_string(),
+                track: m.track_id.to_string(),
+                start_tick: i64::from(m.start_tick),
+            })
+            .collect();
+        group_move_handle.move_group(moves);
+    });
+
+    let linkage_handle = preview_worker.handle();
+    editor.on_on_linkage_changed(move |enabled| {
+        linkage_handle.set_linkage(enabled);
+    });
+
+    let trim_handle = preview_worker.handle();
+    editor.on_on_clip_trimmed(move |clip_id, start_tick, duration_ticks| {
+        trim_handle.trim_clip(
+            clip_id.to_string(),
+            i64::from(start_tick),
+            i64::from(duration_ticks),
+        );
+    });
+
+    let delete_handle = preview_worker.handle();
+    editor.on_on_clips_deleted(move |clip_ids| {
+        let clips: Vec<String> = clip_ids.iter().map(|id| id.to_string()).collect();
+        delete_handle.remove_clips(clips);
+    });
+
+    let split_handle = preview_worker.handle();
+    editor.on_on_clip_split(move |clip_id, at_tick| {
+        split_handle.split_clip(clip_id.to_string(), i64::from(at_tick));
+    });
+
+    let marker_handle = preview_worker.handle();
+    let timeline_store = app.global::<TimelineStore>();
+    timeline_store.on_on_marker_added(move |at_tick, name, color| {
+        marker_handle.add_marker(i64::from(at_tick), name.to_string(), color.to_string());
+    });
+    let marker_remove_handle = preview_worker.handle();
+    timeline_store.on_on_marker_removed(move |marker_id| {
+        marker_remove_handle.remove_marker(marker_id.to_string());
+    });
+
+    // Clipboard ops (Cmd/Ctrl+C / V / D, context menu): the worker owns the
+    // clipboard as project-independent snapshots.
+    let copy_handle = preview_worker.handle();
+    editor.on_on_clips_copied(move |clip_ids| {
+        let clips: Vec<String> = clip_ids.iter().map(|id| id.to_string()).collect();
+        copy_handle.copy_clips(clips);
+    });
+
+    let paste_handle = preview_worker.handle();
+    editor.on_on_paste_at(move |tick| {
+        paste_handle.paste_at(i64::from(tick));
+    });
+
+    let duplicate_handle = preview_worker.handle();
+    editor.on_on_clips_duplicated(move |clip_ids| {
+        let clips: Vec<String> = clip_ids.iter().map(|id| id.to_string()).collect();
+        duplicate_handle.duplicate_clips(clips);
+    });
+
+    let unlink_handle = preview_worker.handle();
+    editor.on_on_clips_unlinked(move |clip_ids| {
+        let clips: Vec<String> = clip_ids.iter().map(|id| id.to_string()).collect();
+        unlink_handle.unlink_clips(clips);
+    });
+
+    // Track header toggles (eye/speaker/lock/duck) → undoable track flags.
+    let track_flag_handle = preview_worker.handle();
+    editor.on_on_track_flag_toggled(move |track_id, flag, value| {
+        let flag = match flag.as_str() {
+            "enabled" => preview_worker::TrackFlag::Enabled,
+            "muted" => preview_worker::TrackFlag::Muted,
+            "locked" => preview_worker::TrackFlag::Locked,
+            "duck-source" => preview_worker::TrackFlag::DuckSource,
+            other => {
+                tracing::error!(flag = other, "ignoring unknown track flag");
+                return;
+            }
+        };
+        track_flag_handle.set_track_flag(track_id.to_string(), flag, value);
+    });
+
+    // Canvas settings (title bar → dialog → engine thread).
+    let set_canvas_handle = preview_worker.handle();
+    app.global::<CanvasBackend>()
+        .on_set_canvas(move |aspect_index, background| {
+            set_canvas_handle.set_canvas(
+                aspect_index,
+                [background.red(), background.green(), background.blue()],
+            );
+        });
 
     // --- project lifecycle: app-owned drafts, auto-saved -----------------
 
@@ -877,10 +1009,427 @@ fn main() -> Result<(), slint::PlatformError> {
     app.global::<SelectionBackend>()
         .on_has_link(|sequence, ids| selection::selection_has_link(&sequence, &ids));
 
-    // Timeline keyframe diamonds: merged tick model for the selected clip
-    // (drag-retime and delete need the engine — Phase 2).
+    // --- preview viewport: click-to-select, gestures, zoom/pan ------------
+
+    app.global::<PreviewBackend>().on_hit_test(
+        |sequence, tick, x, y, view_w, view_h, zoom, pan_x, pan_y| {
+            preview_select::hit_test_in_viewport(
+                &sequence, tick, x, y, view_w, view_h, zoom, pan_x, pan_y,
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>().on_selected_contains(
+        |sequence, clip_id, tick, x, y, view_w, view_h, zoom, pan_x, pan_y| {
+            preview_select::selected_clip_contains_in_viewport(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                x,
+                y,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>().on_selection_box(
+        |sequence, clip_id, tick, view_w, view_h, zoom, pan_x, pan_y, gesture_active, gesture| {
+            preview_select::selection_box_in_viewport(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+                gesture_active.then_some(&gesture),
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>().on_resolve_drag(
+        |sequence,
+         clip_id,
+         tick,
+         press_x,
+         press_y,
+         cursor_x,
+         cursor_y,
+         view_w,
+         view_h,
+         zoom,
+         pan_x,
+         pan_y,
+         snap_tol| {
+            preview_gesture::resolve_drag_in_viewport(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                press_x,
+                press_y,
+                cursor_x,
+                cursor_y,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+                snap_tol,
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>()
+        .on_nudge(|sequence, clip_id, tick, dx, dy| {
+            preview_gesture::nudge(&sequence, clip_id.as_str(), tick, dx, dy)
+        });
+
+    app.global::<PreviewBackend>().on_resolve_scale(
+        |sequence,
+         clip_id,
+         tick,
+         press_x,
+         press_y,
+         cursor_x,
+         cursor_y,
+         view_w,
+         view_h,
+         zoom,
+         pan_x,
+         pan_y| {
+            preview_gesture::resolve_scale_in_viewport(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                press_x,
+                press_y,
+                cursor_x,
+                cursor_y,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>().on_resolve_rotate(
+        |sequence,
+         clip_id,
+         tick,
+         press_x,
+         press_y,
+         cursor_x,
+         cursor_y,
+         view_w,
+         view_h,
+         zoom,
+         pan_x,
+         pan_y,
+         snap_deg| {
+            preview_gesture::resolve_rotate_in_viewport(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                press_x,
+                press_y,
+                cursor_x,
+                cursor_y,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+                snap_deg,
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>().on_resolve_anchor(
+        |sequence,
+         clip_id,
+         tick,
+         press_x,
+         press_y,
+         cursor_x,
+         cursor_y,
+         view_w,
+         view_h,
+         zoom,
+         pan_x,
+         pan_y| {
+            preview_gesture::resolve_anchor_in_viewport(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                press_x,
+                press_y,
+                cursor_x,
+                cursor_y,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>().on_clamp_view(
+        |canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y| {
+            preview_view::clamp_view(canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y)
+        },
+    );
+
+    app.global::<PreviewBackend>().on_zoom_to(
+        |canvas_w,
+         canvas_h,
+         view_w,
+         view_h,
+         zoom,
+         pan_x,
+         pan_y,
+         cursor_x,
+         cursor_y,
+         target_zoom| {
+            preview_view::zoom_to(
+                canvas_w,
+                canvas_h,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+                cursor_x,
+                cursor_y,
+                target_zoom,
+            )
+        },
+    );
+
+    app.global::<PreviewBackend>().on_pan_view(
+        |canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y, dx, dy| {
+            preview_view::pan_by(
+                canvas_w, canvas_h, view_w, view_h, zoom, pan_x, pan_y, dx, dy,
+            )
+        },
+    );
+
+    // Gestures are commit-on-release in this phase: the selection box tracks
+    // the drag UI-side, and release lands one undoable SetClipTransform.
+    // PORT (Phase 6): main previewed the drag in the rendered frame through
+    // engine-side transform overrides; these two stay inert until the
+    // override APIs return.
+    editor.on_on_preview_transform_overridden(
+        move |_clip_id, _pos_x, _pos_y, _anchor_x, _anchor_y, _scale, _rotation, _opacity, _tick| {
+        },
+    );
+    editor.on_on_preview_override_cleared(move |_tick| {});
+
+    let transform_commit_handle = preview_worker.handle();
+    editor.on_on_clip_transform_committed(
+        move |clip_id, pos_x, pos_y, anchor_x, anchor_y, scale, rotation, opacity, tick| {
+            transform_commit_handle.set_transform(
+                clip_id.to_string(),
+                cutlass_models::ClipTransform {
+                    position: [pos_x, pos_y],
+                    anchor_point: [anchor_x, anchor_y],
+                    scale,
+                    rotation,
+                    opacity,
+                },
+                i64::from(tick),
+            );
+        },
+    );
+
+    // --- inspector: selection resolve, playhead sampling, commits ---------
+
+    app.global::<InspectorBackend>()
+        .on_resolve_selection(|sequence, track_id, clip_id| {
+            inspector::resolve_selection(sequence, track_id.as_str(), clip_id.as_str())
+        });
+
+    app.global::<InspectorBackend>()
+        .on_sample_transform(|clip, playhead| inspector::sample_transform(&clip, playhead));
+    app.global::<InspectorBackend>()
+        .on_compensate_anchor_position(
+            |clip, sequence, playhead, anchor_x, anchor_y, scale, rotation| {
+                inspector::compensate_anchor_position(
+                    &clip, sequence, playhead, anchor_x, anchor_y, scale, rotation,
+                )
+            },
+        );
+
+    app.global::<InspectorBackend>()
+        .on_sample_audio(|clip, playhead| inspector::sample_audio(&clip, playhead));
+
+    let kf_set_handle = preview_worker.handle();
+    app.global::<InspectorBackend>().on_set_param_keyframe(
+        move |clip_id, param, tick, value_x, value_y, easing| {
+            let Some((param, value)) = clip_param_value(param.as_str(), value_x, value_y) else {
+                tracing::error!(param = param.as_str(), "ignoring keyframe on unknown param");
+                return;
+            };
+            kf_set_handle.set_param_keyframe(
+                clip_id.to_string(),
+                param,
+                i64::from(tick),
+                value,
+                params::easing_from_ui(easing, [0.0; 4]),
+            );
+        },
+    );
+
+    let kf_remove_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_remove_param_keyframe(move |clip_id, param, tick| {
+            let Some((param, _)) = clip_param_value(param.as_str(), 0.0, 0.0) else {
+                tracing::error!(
+                    param = param.as_str(),
+                    "ignoring keyframe removal on unknown param"
+                );
+                return;
+            };
+            kf_remove_handle.remove_param_keyframe(clip_id.to_string(), param, i64::from(tick));
+        });
+
+    // Timeline keyframe diamonds: merged tick model for the selected clip,
+    // drag-retime, right-click delete.
     app.global::<KeyframeBackend>()
         .on_ticks(|clip| params::merged_keyframe_ticks(&clip));
+    let kf_retime_handle = preview_worker.handle();
+    app.global::<KeyframeBackend>()
+        .on_retime(move |clip_id, from_tick, to_tick| {
+            kf_retime_handle.retime_keyframes(
+                clip_id.to_string(),
+                i64::from(from_tick),
+                i64::from(to_tick),
+            );
+        });
+    let kf_remove_at_handle = preview_worker.handle();
+    app.global::<KeyframeBackend>()
+        .on_remove_at(move |clip_id, tick| {
+            kf_remove_at_handle.remove_keyframes_at(clip_id.to_string(), i64::from(tick));
+        });
+    let set_speed_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_clip_speed(move |clip_id, num, den, reversed| {
+            set_speed_handle.set_clip_speed(clip_id.to_string(), num, den, reversed);
+        });
+    let set_pitch_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_clip_pitch(move |clip_id, preserve| {
+            set_pitch_handle.set_clip_pitch(clip_id.to_string(), preserve);
+        });
+    let set_denoise_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_denoise(move |clip_id, denoise| {
+            set_denoise_handle.set_denoise(clip_id.to_string(), denoise);
+        });
+    let set_curve_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_speed_curve(move |clip_id, preset| {
+            set_curve_handle.set_speed_curve(clip_id.to_string(), preset.to_string());
+        });
+    let set_curve_point_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_speed_curve_point(move |clip_id, index, value| {
+            set_curve_point_handle.set_speed_curve_point(clip_id.to_string(), index, value);
+        });
+    let set_audio_handle = preview_worker.handle();
+    app.global::<InspectorBackend>().on_set_clip_audio(
+        move |clip_id, volume, fade_in_s, fade_out_s| {
+            set_audio_handle.set_clip_audio(clip_id.to_string(), volume, fade_in_s, fade_out_s);
+        },
+    );
+    let set_fades_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_clip_fades(move |clip_id, fade_in_s, fade_out_s| {
+            set_fades_handle.set_clip_fades(clip_id.to_string(), fade_in_s, fade_out_s);
+        });
+    app.global::<InspectorBackend>()
+        .on_can_duck_under_voice(|sequence, track_id| {
+            inspector::can_duck_under_voice(sequence, track_id.as_str())
+        });
+    let duck_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_duck_under_voice(move |clip_id| {
+            duck_handle.duck_under_voice(clip_id.to_string());
+        });
+    let detect_beats_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_detect_beats(move |clip_id| {
+            detect_beats_handle.detect_beats(clip_id.to_string());
+        });
+    let clear_beats_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_clear_beats(move |clip_id| {
+            clear_beats_handle.clear_beats(clip_id.to_string());
+        });
+    let set_crop_handle = preview_worker.handle();
+    app.global::<InspectorBackend>().on_set_clip_crop(
+        move |clip_id, left, top, right, bottom, flip_h, flip_v| {
+            // Insets (UI/agent shape) → kept-region rect (model shape). The
+            // sliders cap each inset at 49%, so the window stays valid; the
+            // floor only guards float dust against the engine's minimum.
+            let crop = cutlass_models::CropRect {
+                x: left,
+                y: top,
+                w: (1.0 - left - right).max(cutlass_models::MIN_CROP_FRACTION),
+                h: (1.0 - top - bottom).max(cutlass_models::MIN_CROP_FRACTION),
+            };
+            set_crop_handle.set_clip_crop(clip_id.to_string(), crop, flip_h, flip_v);
+        },
+    );
+
+    let fit_clip_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_fit_clip(move |clip_id, fill, tick| {
+            fit_clip_handle.fit_clip(clip_id.to_string(), fill, i64::from(tick));
+        });
+
+    let set_text_handle = preview_worker.handle();
+    app.global::<InspectorBackend>().on_set_text_generator(
+        move |_track_id, clip_id, content, style| {
+            // Route the edit through the engine (undoable) rather than mutating
+            // the Slint model, which the next projection republish would revert.
+            // The inspector sends the full style each time, so one committed
+            // edit == one coherent `Generator::Text`.
+            set_text_handle.set_generator(
+                clip_id.to_string(),
+                cutlass_models::Generator::Text {
+                    content: content.to_string(),
+                    style: inspector::text_style_from_ui(&style),
+                },
+            );
+        },
+    );
+
+    // Live text/shape preview during slider drags rides the engine's
+    // generator override — PORT (Phase 6). Until then these are inert and
+    // the control commits on release via set-text/shape-generator.
+    app.global::<InspectorBackend>()
+        .on_preview_text_generator(move |_clip_id, _content, _style, _tick| {});
+    app.global::<InspectorBackend>()
+        .on_clear_text_generator(move |_tick| {});
+
+    let set_shape_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_shape_generator(move |clip_id, width, height| {
+            set_shape_handle.set_shape_size(clip_id.to_string(), width, height);
+        });
+
+    app.global::<InspectorBackend>()
+        .on_preview_shape_generator(move |_clip_id, _width, _height, _tick| {});
+    app.global::<InspectorBackend>()
+        .on_clear_shape_generator(move |_tick| {});
 
     app.global::<InspectorBackend>()
         .on_filter_fonts(|query, items| {
@@ -894,8 +1443,8 @@ fn main() -> Result<(), slint::PlatformError> {
             ModelRc::new(VecModel::from(filtered))
         });
 
-    // Effects & transitions: fill the Library catalogs once; the add/remove
-    // edits route through the engine when it lands (Phase 2).
+    // Effects & transitions: fill the Library catalogs once, then route the
+    // inspector/timeline edits through the engine's undoable commands.
     {
         let effects = app.global::<EffectsBackend>();
         let effect_rows: Vec<CatalogEntry> = cutlass_models::effect_catalog()
@@ -915,6 +1464,55 @@ fn main() -> Result<(), slint::PlatformError> {
             .collect();
         effects.set_transition_catalog(ModelRc::new(VecModel::from(transition_rows)));
     }
+    let add_effect_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_add_effect(move |clip_id, effect_id| {
+            add_effect_handle.add_effect(clip_id.to_string(), effect_id.to_string());
+        });
+    let remove_effect_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_remove_effect(move |clip_id, index| {
+            remove_effect_handle.remove_effect(clip_id.to_string(), index.max(0) as u32);
+        });
+    let set_effect_param_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_set_effect_param(move |clip_id, index, param, value| {
+            set_effect_param_handle.set_effect_param(
+                clip_id.to_string(),
+                index.max(0) as u32,
+                param.to_string(),
+                value,
+            );
+        });
+    let add_transition_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_add_transition(move |clip_id, transition_id| {
+            add_transition_handle.add_transition(clip_id.to_string(), transition_id.to_string());
+        });
+    let remove_transition_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_remove_transition(move |clip_id| {
+            remove_transition_handle.remove_transition(clip_id.to_string());
+        });
+    let set_transition_handle = preview_worker.handle();
+    app.global::<EffectsBackend>()
+        .on_set_transition(move |clip_id, duration| {
+            set_transition_handle.set_transition(clip_id.to_string(), i64::from(duration));
+        });
+
+    // Enumerate system fonts off the UI thread (the scan is slow) and feed
+    // the font picker once ready.
+    let font_app = app.as_weak();
+    std::thread::spawn(move || {
+        let families = cutlass_text::system_font_families();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = font_app.upgrade() {
+                let model: Vec<SharedString> = families.into_iter().map(Into::into).collect();
+                app.global::<InspectorBackend>()
+                    .set_font_families(ModelRc::new(VecModel::from(model)));
+            }
+        });
+    });
 
     app.run()
 }
