@@ -154,6 +154,13 @@ pub struct Compositor {
     /// and the caller can decode in CPU mode instead.
     #[cfg(target_vendor = "apple")]
     metal_import: Option<crate::metal_import::MetalSurfaceImporter>,
+    /// Maps Windows shared D3D11 NV12 textures into `wgpu` textures with no
+    /// CPU copy. `None` when the device isn't the D3D12 backend or lacks
+    /// `TEXTURE_FORMAT_NV12` — GPU frames then fall back to
+    /// [`CompositorError::UnsupportedFormat`] and the caller can decode in CPU
+    /// mode instead.
+    #[cfg(target_os = "windows")]
+    dx12_import: Option<crate::dx12_import::Dx12SurfaceImporter>,
 }
 
 impl Compositor {
@@ -261,6 +268,8 @@ impl Compositor {
             target: None,
             #[cfg(target_vendor = "apple")]
             metal_import: crate::metal_import::MetalSurfaceImporter::new(gpu),
+            #[cfg(target_os = "windows")]
+            dx12_import: crate::dx12_import::Dx12SurfaceImporter::new(gpu),
         }
     }
 
@@ -686,9 +695,37 @@ impl Compositor {
                 ))),
             }
         }
-        // Android (`AHardwareBuffer`) and Windows (`D3D11Texture2D`) import are
-        // not wired yet; the decoders deliver CPU planes on those platforms, so
-        // this branch is currently unreachable in practice.
+        #[cfg(target_os = "windows")]
+        {
+            use cutlass_core::GpuSurfaceKind;
+            match surface.kind() {
+                GpuSurfaceKind::D3D11Texture2D => {
+                    if frame.format != PixelFormat::Nv12 {
+                        return Err(CompositorError::UnsupportedFormat(format!(
+                            "zero-copy import supports NV12 D3D11 surfaces; got {:?}",
+                            frame.format
+                        )));
+                    }
+                    let importer = self.dx12_import.as_ref().ok_or_else(|| {
+                        CompositorError::UnsupportedFormat(
+                            "D3D12 surface import is unavailable on this device".into(),
+                        )
+                    })?;
+                    let textures = importer.import_nv12(gpu, surface, (cw, ch))?;
+                    // No compositor-side keep-alive needed: the wgpu texture
+                    // holds the opened ID3D12Resource, and the decoder-side
+                    // pool slot rides in the *frame's* keep-alive, which the
+                    // renderer holds until the pass completes.
+                    Ok((textures, true, None))
+                }
+                other => Err(CompositorError::UnsupportedFormat(format!(
+                    "GPU surface kind {other:?} import is not implemented yet"
+                ))),
+            }
+        }
+        // Android (`AHardwareBuffer`) import is not wired yet; the decoder
+        // delivers CPU planes there, so this branch is currently unreachable
+        // in practice.
         //
         // Android plan: decode into a `Surface`/`ImageReader` to obtain an
         // `AHardwareBuffer`, then import on the Vulkan backend via
@@ -715,7 +752,7 @@ impl Compositor {
         // copy, but not a single-sample import. Until that lands, Android stays
         // on the hardware-decode + CPU-plane path (one plane copy/frame), which
         // is already wired and correct.
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(target_vendor = "apple", target_os = "windows")))]
         {
             let _ = (gpu, frame, surface, cw, ch);
             Err(CompositorError::UnsupportedFormat(
