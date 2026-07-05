@@ -47,14 +47,17 @@ use std::sync::Once;
 
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer, IMFAttributes, IMFByteStream, IMFMediaBuffer, IMFMediaType, IMFSample,
-    IMFSourceReader, MF_ACCESSMODE_READ, MF_FILEFLAGS_NONE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    IMFSourceReader, MF_ACCESSMODE_READ, MF_E_INVALIDMEDIATYPE, MF_E_TOPO_CODEC_NOT_FOUND,
+    MF_E_UNSUPPORTED_BYTESTREAM_TYPE, MF_E_UNSUPPORTED_D3D_TYPE, MF_FILEFLAGS_NONE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_MAJOR_TYPE, MF_MT_MINIMUM_DISPLAY_APERTURE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
     MF_MT_VIDEO_NOMINAL_RANGE,
     MF_MT_VIDEO_PRIMARIES, MF_MT_VIDEO_ROTATION, MF_MT_YUV_MATRIX, MF_OPENMODE_FAIL_IF_NOT_EXIST,
     MF_PD_DURATION, MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, MF_SOURCE_READER_ALL_STREAMS,
     MF_SOURCE_READER_D3D_MANAGER, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
-    MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM, MF_VERSION,
+    MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
+    MF_SOURCE_READERF_ERROR, MF_VERSION,
     MFCreateAttributes, MFCreateFile, MFCreateMediaType, MFCreateSourceReaderFromByteStream,
     MFCreateSourceReaderFromURL, MFMediaType_Video, MFNominalRange_0_255,
     MFSTARTUP_FULL, MFStartup, MFVideoArea, MFVideoFormat_NV12, MFVideoFormat_P010,
@@ -248,6 +251,16 @@ impl VideoDecoder for WmfDecoder {
             }
             .map_err(decode_err)?;
 
+            // A fatal stream error (bitstream corruption, a decoder failure
+            // mid-file). The reader is done producing frames; surface it as a
+            // decode error rather than draining the read budget on it.
+            if stream_flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
+                self.eos = true;
+                return Err(DecodeError::Decode(
+                    "source reader reported an unrecoverable stream error".into(),
+                ));
+            }
+
             // The decoder renegotiated (resolution / format / color changed
             // mid-stream); re-probe so frames after the change are described
             // correctly. The duration is already known, so no path is needed.
@@ -362,6 +375,15 @@ pub(crate) fn open_source_reader(
         // `&HSTRING: Param<PCWSTR>`.
         Err(stream_err) => {
             unsafe { MFCreateSourceReaderFromURL(&url, attributes) }.map_err(|url_err| {
+                // An unrecognized container is a capability gap, not an I/O
+                // failure — tell the caller (and the user) which it is.
+                if stream_err.code() == MF_E_UNSUPPORTED_BYTESTREAM_TYPE
+                    || url_err.code() == MF_E_UNSUPPORTED_BYTESTREAM_TYPE
+                {
+                    return DecodeError::Unsupported(
+                        "Media Foundation does not recognize this container format".into(),
+                    );
+                }
                 DecodeError::Open(format!(
                     "byte-stream open failed ({stream_err}); URL open failed ({url_err})"
                 ))
@@ -442,11 +464,22 @@ fn configure_reader(
             .map_err(open_err)?;
         reader
             .SetCurrentMediaType(stream, None, &out_type)
-            .map_err(|e| {
-                DecodeError::Unsupported(format!("could not negotiate NV12 output: {e}"))
-            })?;
+            .map_err(negotiate_err)?;
     }
     Ok(reader)
+}
+
+/// Map an NV12-negotiation failure to a [`DecodeError::Unsupported`], turning
+/// the common "this machine can't decode this file" HRESULTs into
+/// plain-language messages instead of raw COM errors.
+fn negotiate_err(error: windows::core::Error) -> DecodeError {
+    let reason = match error.code() {
+        MF_E_TOPO_CODEC_NOT_FOUND => "no decoder is installed for this codec".into(),
+        MF_E_INVALIDMEDIATYPE => "the decoder cannot produce NV12 for this stream".into(),
+        MF_E_UNSUPPORTED_D3D_TYPE => "the hardware decoder rejected this stream's format".into(),
+        _ => format!("could not negotiate NV12 output: {error}"),
+    };
+    DecodeError::Unsupported(reason)
 }
 
 /// Source duration from the presentation descriptor (`MF_PD_DURATION`, a
