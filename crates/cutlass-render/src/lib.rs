@@ -21,6 +21,7 @@ mod render;
 mod resolve;
 mod scene;
 
+pub use cutlass_compositor::FrameSink;
 pub use cutlass_core::RgbaImage;
 pub use error::RenderError;
 pub use export::{

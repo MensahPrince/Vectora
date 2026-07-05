@@ -27,6 +27,38 @@ use crate::layer::{CompositeLayer, CompositorConfig, LayerContent, LayerPlacemen
 /// and read them straight back into PNG/export without an extra transfer.
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
 
+/// Caller-provided destination for a composited frame's pixels, so a render
+/// can write its readback rows straight into storage the caller owns (a UI
+/// framebuffer) instead of allocating an [`RgbaImage`] and copying again.
+pub trait FrameSink {
+    /// Called **once per successful render**, after the GPU work and buffer
+    /// map succeeded, with the output dimensions. Must return exactly
+    /// `width * height * 4` bytes; the compositor fills them with tightly
+    /// packed row-major RGBA. A failed render never calls this.
+    fn pixels(&mut self, width: u32, height: u32) -> &mut [u8];
+}
+
+/// The [`FrameSink`] behind the [`RgbaImage`]-returning render paths: it
+/// allocates the image at the reported size and hands out its bytes.
+#[derive(Default)]
+pub struct ImageSink(Option<RgbaImage>);
+
+impl ImageSink {
+    /// The rendered image; `None` until a render succeeded into this sink.
+    pub fn into_image(self) -> Option<RgbaImage> {
+        self.0
+    }
+}
+
+impl FrameSink for ImageSink {
+    fn pixels(&mut self, width: u32, height: u32) -> &mut [u8] {
+        let image = self
+            .0
+            .insert(RgbaImage::new(width, height, vec![0; (width as usize) * (height as usize) * 4]));
+        &mut image.pixels
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct YuvUniforms {
@@ -329,6 +361,24 @@ impl Compositor {
         config: &CompositorConfig,
         layers: &[CompositeLayer<'_>],
     ) -> Result<RgbaImage, CompositorError> {
+        let mut sink = ImageSink::default();
+        self.render_into(gpu, config, layers, &mut sink)?;
+        Ok(sink
+            .into_image()
+            .expect("render_into fills the sink on success"))
+    }
+
+    /// [`render`](Self::render) writing the readback rows directly into
+    /// `sink`-provided storage — the interactive-preview path, where the
+    /// tight `Vec` this would otherwise allocate is immediately copied into
+    /// a UI pixel buffer and dropped.
+    pub fn render_into(
+        &mut self,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+        layers: &[CompositeLayer<'_>],
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), CompositorError> {
         if config.width == 0 || config.height == 0 {
             return Err(CompositorError::InvalidDimensions {
                 width: config.width,
@@ -421,6 +471,7 @@ impl Compositor {
             target.padded_bytes_per_row,
             config.width,
             config.height,
+            sink,
         );
         if result.is_err() {
             // A failed map can leave the buffer in an unmappable state; drop
@@ -876,15 +927,17 @@ impl Compositor {
     }
 }
 
-/// Map the (already-submitted) readback buffer and copy it into a tight
-/// [`RgbaImage`], stripping the per-row copy padding.
+/// Map the (already-submitted) readback buffer and copy its rows — stripped
+/// of the per-row copy padding — into `sink`-provided storage. The sink is
+/// only consulted once the map succeeded.
 fn map_readback(
     gpu: &GpuContext,
     buffer: &wgpu::Buffer,
     padded: u32,
     width: u32,
     height: u32,
-) -> Result<RgbaImage, CompositorError> {
+    sink: &mut dyn FrameSink,
+) -> Result<(), CompositorError> {
     let slice = buffer.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |res| {
@@ -899,7 +952,8 @@ fn map_readback(
 
     let unpadded = (width * 4) as usize;
     let mapped = slice.get_mapped_range();
-    let mut pixels = vec![0u8; unpadded * height as usize];
+    let pixels = sink.pixels(width, height);
+    debug_assert_eq!(pixels.len(), unpadded * height as usize);
     for row in 0..height as usize {
         let src = row * padded as usize;
         let dst = row * unpadded;
@@ -908,7 +962,7 @@ fn map_readback(
     drop(mapped);
     buffer.unmap();
 
-    Ok(RgbaImage::new(width, height, pixels))
+    Ok(())
 }
 
 fn plane_tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {

@@ -4990,6 +4990,25 @@ fn render_frame(
     }
 }
 
+/// Allocates the UI pixel buffer at the size the renderer reports and lets
+/// the compositor's readback write de-padded rows straight into it — the
+/// single CPU copy between the mapped GPU buffer and the pixels Slint
+/// displays. A fresh buffer per rendered frame is deliberate: the cache and
+/// the UI keep refcounted clones of it, so reusing one would silently
+/// copy-on-write.
+#[derive(Default)]
+struct SlintFrameSink {
+    buffer: Option<SharedPixelBuffer<Rgba8Pixel>>,
+}
+
+impl cutlass_render::FrameSink for SlintFrameSink {
+    fn pixels(&mut self, width: u32, height: u32) -> &mut [u8] {
+        self.buffer
+            .insert(SharedPixelBuffer::new(width, height))
+            .make_mut_bytes()
+    }
+}
+
 /// Produce the composited frame at `tick` — from the cache when the same
 /// (tick, revision, fit) was already rendered, otherwise by rendering and
 /// caching. Cache hits don't feed the quality ladder (nothing was rendered).
@@ -5015,18 +5034,15 @@ fn render_frame_buffer(
 
     let at = RationalTime::new(tick, tl_rate);
     let started = Instant::now();
+    let mut sink = SlintFrameSink::default();
     let result = match bound {
-        Some((max_w, max_h)) => engine.get_frame_fit(at, max_w, max_h),
-        None => engine.get_frame(at),
+        Some((max_w, max_h)) => engine.get_frame_fit_into(at, max_w, max_h, &mut sink),
+        None => engine.get_frame_into(at, &mut sink),
     };
     match result {
-        Ok(frame) => {
+        Ok(()) => {
             fit.note_render_cost(started.elapsed());
-            let buffer = SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
-                &frame.pixels,
-                frame.width,
-                frame.height,
-            );
+            let buffer = sink.buffer.expect("successful render fills the sink");
             if cacheable {
                 cache.insert(key, buffer.clone());
             }

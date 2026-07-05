@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, CompositorError, GpuContext, LayerPlacement,
-    RgbaImage, SdfLayer,
+    CompositeLayer, Compositor, CompositorConfig, CompositorError, FrameSink, GpuContext,
+    ImageSink, LayerPlacement, RgbaImage, SdfLayer,
 };
 use cutlass_core::{RationalTime, VideoDecoder, VideoFrame};
 use cutlass_decoder::OutputMode;
@@ -129,6 +129,38 @@ impl Renderer {
         self.render_scene(project, &scene)
     }
 
+    /// [`render_frame_with`](Self::render_frame_with) writing the composited
+    /// rows directly into `sink`-provided storage (see
+    /// [`render_scene_into`](Self::render_scene_into)).
+    pub fn render_frame_into_with(
+        &mut self,
+        project: &Project,
+        t: RationalTime,
+        overrides: ResolveOverrides<'_>,
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), RenderError> {
+        let scene = resolve_with(project, t, overrides)?;
+        self.render_scene_into(project, &scene, sink)
+    }
+
+    /// [`render_frame_fit_with`](Self::render_frame_fit_with) writing the
+    /// composited rows directly into `sink`-provided storage — the
+    /// interactive-preview path, which hands the pixels straight to the UI's
+    /// frame buffer instead of round-tripping through an [`RgbaImage`].
+    pub fn render_frame_fit_into_with(
+        &mut self,
+        project: &Project,
+        t: RationalTime,
+        max_width: u32,
+        max_height: u32,
+        overrides: ResolveOverrides<'_>,
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), RenderError> {
+        let mut scene = resolve_with(project, t, overrides)?;
+        scene.fit_within(max_width, max_height);
+        self.render_scene_into(project, &scene, sink)
+    }
+
     /// [`render_frame`](Self::render_frame) at an exact output size: content
     /// uniformly scaled (up or down) and centered, aspect mismatches
     /// letterboxed over the canvas background — the export path for a
@@ -156,7 +188,24 @@ impl Renderer {
         project: &Project,
         scene: &Scene,
     ) -> Result<RgbaImage, RenderError> {
-        match self.render_scene_once(project, scene) {
+        let mut sink = ImageSink::default();
+        self.render_scene_into(project, scene, &mut sink)?;
+        Ok(sink
+            .into_image()
+            .expect("render_scene_into fills the sink on success"))
+    }
+
+    /// [`render_scene`](Self::render_scene) writing the composited rows
+    /// directly into `sink`-provided storage. The sink is consulted only
+    /// after the GPU work succeeded, so the CPU-decode fallback retry can
+    /// reuse it — at most one attempt ever writes.
+    pub fn render_scene_into(
+        &mut self,
+        project: &Project,
+        scene: &Scene,
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), RenderError> {
+        match self.render_scene_once(project, scene, sink) {
             Err(RenderError::Compositor(CompositorError::UnsupportedFormat(_)))
                 if self.decode_mode == OutputMode::Gpu =>
             {
@@ -165,7 +214,7 @@ impl Renderer {
                 // decoders reopen in CPU mode on the next decode.
                 self.decode_mode = OutputMode::Cpu;
                 self.decoders.clear();
-                self.render_scene_once(project, scene)
+                self.render_scene_once(project, scene, sink)
             }
             other => other,
         }
@@ -175,7 +224,8 @@ impl Renderer {
         &mut self,
         project: &Project,
         scene: &Scene,
-    ) -> Result<RgbaImage, RenderError> {
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), RenderError> {
         // First pass: decode/rasterize each layer into owned pixels and a final
         // placement. Held in `realized` so the borrowed `CompositeLayer`s built
         // below stay valid through the composite call.
@@ -308,7 +358,9 @@ impl Renderer {
 
         let config =
             CompositorConfig::new(scene.width, scene.height).with_background(scene.background);
-        Ok(self.compositor.render(&self.gpu, &config, &layers)?)
+        Ok(self
+            .compositor
+            .render_into(&self.gpu, &config, &layers, sink)?)
     }
 
     /// Decode the frame of `media` at `source_time`, opening (and caching) a

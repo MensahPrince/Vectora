@@ -34,7 +34,7 @@ mod layer;
 #[cfg(target_vendor = "apple")]
 mod metal_import;
 
-pub use compositor::Compositor;
+pub use compositor::{Compositor, FrameSink, ImageSink};
 pub use cutlass_core::RgbaImage;
 pub use cutlass_shapes::{SdfParams, SdfShape, Stroke};
 pub use error::CompositorError;

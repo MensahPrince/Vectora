@@ -8,7 +8,7 @@ use std::path::PathBuf;
 
 use cutlass_commands::{Command, ProjectCommand};
 use cutlass_models::{ClipId, ClipTransform, Generator, Project, Rational, RationalTime};
-use cutlass_render::{Renderer, ResolveOverrides, RgbaImage, export_to_file};
+use cutlass_render::{FrameSink, Renderer, ResolveOverrides, RgbaImage, export_to_file};
 
 use crate::action::{ApplyContext, ApplyOutcome, EditAction, History, dispatch};
 use crate::error::EngineError;
@@ -263,6 +263,47 @@ impl Engine {
             max_width,
             max_height,
             overrides,
+        )?)
+    }
+
+    /// [`get_frame`](Self::get_frame) writing the composited rows directly
+    /// into `sink`-provided storage: the preview worker hands its UI pixel
+    /// buffer in, so the mapped GPU readback is the only CPU copy.
+    pub fn get_frame_into(
+        &mut self,
+        time: RationalTime,
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), EngineError> {
+        let overrides = ResolveOverrides {
+            transform: self.transform_override,
+            generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+        };
+        Ok(self
+            .renderer
+            .render_frame_into_with(&self.project, time, overrides, sink)?)
+    }
+
+    /// [`get_frame_fit`](Self::get_frame_fit) writing the composited rows
+    /// directly into `sink`-provided storage (see
+    /// [`get_frame_into`](Self::get_frame_into)).
+    pub fn get_frame_fit_into(
+        &mut self,
+        time: RationalTime,
+        max_width: u32,
+        max_height: u32,
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), EngineError> {
+        let overrides = ResolveOverrides {
+            transform: self.transform_override,
+            generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+        };
+        Ok(self.renderer.render_frame_fit_into_with(
+            &self.project,
+            time,
+            max_width,
+            max_height,
+            overrides,
+            sink,
         )?)
     }
 

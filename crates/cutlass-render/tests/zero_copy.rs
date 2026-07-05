@@ -198,7 +198,7 @@ fn renderer_renders_decoded_media() {
     let Some(clip) = test_clip() else { return };
     let info = cutlass_decoder::probe(clip.path()).expect("probe clip");
     let fps = info.frame_rate;
-    let frames = info.frame_count.min(3).max(1);
+    let frames = info.frame_count.clamp(1, 3);
 
     let mut project = Project::new("decoded-media", fps);
     project.timeline_mut().set_canvas(CanvasSettings {
