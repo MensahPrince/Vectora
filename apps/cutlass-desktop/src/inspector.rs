@@ -2,12 +2,12 @@
 //! sample its animated transform at the playhead for the keyframe UI.
 
 use crate::params::{apply_sampled_transform, row_state, sampled_transform, sampled_volume};
+use crate::placement::position_preserving_center;
 use crate::preview_select::{canvas_config, clip_placement};
 use crate::{
     AudioSample, Clip, CompensatedPosition, SelectedClipInfo, Sequence, TextClipStyle, TrackKind,
     TransformSample,
 };
-use crate::placement::position_preserving_center;
 use cutlass_models::{
     TextAlignH, TextAlignV, TextBackground, TextCase, TextShadow, TextStroke,
     TextStyle as ModelTextStyle,

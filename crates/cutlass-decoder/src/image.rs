@@ -140,10 +140,7 @@ pub const MAX_DECODE_DIMENSION: u32 = 4096;
 
 fn require_image(path: &Path) -> Result<ImageFormat, DecodeError> {
     sniff_image(path).ok_or_else(|| {
-        DecodeError::Open(format!(
-            "{}: not a recognized still image",
-            path.display()
-        ))
+        DecodeError::Open(format!("{}: not a recognized still image", path.display()))
     })
 }
 

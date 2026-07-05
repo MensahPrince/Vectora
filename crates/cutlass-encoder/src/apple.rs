@@ -87,8 +87,8 @@ impl AvfEncoder {
         let _ = std::fs::remove_file(path);
 
         let url = NSURL::fileURLWithPath(&NSString::from_str(path_str));
-        let file_type =
-            unsafe { AVFileTypeMPEG4 }.ok_or_else(|| EncodeError::Start("AVFileTypeMPEG4 unavailable".into()))?;
+        let file_type = unsafe { AVFileTypeMPEG4 }
+            .ok_or_else(|| EncodeError::Start("AVFileTypeMPEG4 unavailable".into()))?;
         let writer = unsafe {
             AVAssetWriter::initWithURL_fileType_error(AVAssetWriter::alloc(), &url, file_type)
         }
@@ -97,7 +97,8 @@ impl AvfEncoder {
         // Output settings: { codec: H.264, width, height }.
         let settings = NSMutableDictionary::<NSString, AnyObject>::new();
         let codec_key = unsafe { AVVideoCodecKey }.ok_or_else(missing("AVVideoCodecKey"))?;
-        let codec_h264 = unsafe { AVVideoCodecTypeH264 }.ok_or_else(missing("AVVideoCodecTypeH264"))?;
+        let codec_h264 =
+            unsafe { AVVideoCodecTypeH264 }.ok_or_else(missing("AVVideoCodecTypeH264"))?;
         let width_key = unsafe { AVVideoWidthKey }.ok_or_else(missing("AVVideoWidthKey"))?;
         let height_key = unsafe { AVVideoHeightKey }.ok_or_else(missing("AVVideoHeightKey"))?;
         let width_num = NSNumber::numberWithInt(width as i32);
@@ -206,7 +207,10 @@ impl AvfEncoder {
     }
 
     /// Copy a packed RGBA/BGRA frame into a fresh BGRA `CVPixelBuffer`.
-    fn make_pixel_buffer(&self, frame: &VideoFrame) -> Result<CFRetained<CVPixelBuffer>, EncodeError> {
+    fn make_pixel_buffer(
+        &self,
+        frame: &VideoFrame,
+    ) -> Result<CFRetained<CVPixelBuffer>, EncodeError> {
         let (width, height) = self.size;
         if (frame.width(), frame.height()) != (width, height) {
             return Err(EncodeError::Encode(format!(
@@ -260,7 +264,9 @@ impl AvfEncoder {
 
         unsafe {
             if CVPixelBufferLockBaseAddress(&pb, CVPixelBufferLockFlags(0)) != 0 {
-                return Err(EncodeError::Encode("CVPixelBufferLockBaseAddress failed".into()));
+                return Err(EncodeError::Encode(
+                    "CVPixelBufferLockBaseAddress failed".into(),
+                ));
             }
             let dst_stride = CVPixelBufferGetBytesPerRow(&pb);
             let base = CVPixelBufferGetBaseAddress(&pb) as *mut u8;
@@ -318,16 +324,13 @@ impl AvfEncoder {
             progressed = true;
         }
         if let Some(audio_input) = &self.audio_input {
-            while !self.pending_audio.is_empty()
-                && unsafe { audio_input.isReadyForMoreMediaData() }
+            while !self.pending_audio.is_empty() && unsafe { audio_input.isReadyForMoreMediaData() }
             {
                 let sbuf = self.pending_audio.front().expect("non-empty");
                 let ok = objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
                     audio_input.appendSampleBuffer(sbuf)
                 }))
-                .map_err(|ex| {
-                    EncodeError::Encode(format!("appendSampleBuffer raised: {ex:?}"))
-                })?;
+                .map_err(|ex| EncodeError::Encode(format!("appendSampleBuffer raised: {ex:?}")))?;
                 if !ok {
                     return Err(self.writer_error("appendSampleBuffer (audio) failed"));
                 }
@@ -466,7 +469,9 @@ impl VideoEncoder for AvfEncoder {
         };
         let sbuf = NonNull::new(sbuf_ptr)
             .filter(|_| status == 0)
-            .ok_or_else(|| EncodeError::Encode(format!("CMSampleBufferCreate failed ({status})")))?;
+            .ok_or_else(|| {
+                EncodeError::Encode(format!("CMSampleBufferCreate failed ({status})"))
+            })?;
         let sbuf: CFRetained<CMSampleBuffer> = unsafe { CFRetained::from_raw(sbuf) };
         drop(block); // the sample buffer retains it now
 

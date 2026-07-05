@@ -108,7 +108,12 @@ fn rasterize_uncached(path: &BezierPath, style: &ShapeStyle, scale: f32) -> Rgba
     }
     if let Some(stroke) = style.stroke {
         if stroke_w > 0.0 {
-            paint.set_color_rgba8(stroke.rgba[0], stroke.rgba[1], stroke.rgba[2], stroke.rgba[3]);
+            paint.set_color_rgba8(
+                stroke.rgba[0],
+                stroke.rgba[1],
+                stroke.rgba[2],
+                stroke.rgba[3],
+            );
             let sk_stroke = tiny_skia::Stroke {
                 width: stroke_w,
                 line_cap: LineCap::Round,

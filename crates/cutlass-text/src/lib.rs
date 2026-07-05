@@ -241,10 +241,7 @@ impl TextRenderer {
         // Run-wide ink box; every offset/extent is relative to its origin, so
         // alignment shifts baked into glyph positions normalize out and the
         // bitmap stays tight no matter how lines are aligned.
-        let global = clusters
-            .iter()
-            .filter_map(|c| c.ink)
-            .reduce(union);
+        let global = clusters.iter().filter_map(|c| c.ink).reduce(union);
         let (gx, gy, extent) = match global {
             Some((l, t, r, b)) => (l, t, ((r - l) as u32, (b - t) as u32)),
             None => (0, 0, (0, 0)),
@@ -571,9 +568,10 @@ fn write_glyph(
             for row in 0..gh {
                 for col in 0..gw {
                     let i = (row * gw + col) * 4;
-                    let mean =
-                        (u16::from(img.data[i]) + u16::from(img.data[i + 1]) + u16::from(img.data[i + 2]))
-                            / 3;
+                    let mean = (u16::from(img.data[i])
+                        + u16::from(img.data[i + 1])
+                        + u16::from(img.data[i + 2]))
+                        / 3;
                     blend(col, row, [color[0], color[1], color[2], fold(mean as u8)]);
                 }
             }
@@ -627,7 +625,11 @@ mod tests {
     #[test]
     fn load_font_reports_added_faces() {
         let mut r = TextRenderer::new();
-        assert_eq!(r.load_font(vec![0xDE, 0xAD, 0xBE, 0xEF]), 0, "garbage bytes are not a font");
+        assert_eq!(
+            r.load_font(vec![0xDE, 0xAD, 0xBE, 0xEF]),
+            0,
+            "garbage bytes are not a font"
+        );
         let before = r.font_count();
         assert!(r.load_font(TEST_FONT.to_vec()) > 0);
         assert!(r.font_count() > before);
@@ -726,10 +728,7 @@ mod tests {
         // Byte ranges are in the source string, skipping the newline.
         assert_eq!(shaped.clusters[0].text_range, 0..1);
         assert_eq!(shaped.clusters[1].text_range, 2..3);
-        assert_eq!(
-            (shaped.clusters[0].line, shaped.clusters[1].line),
-            (0, 1)
-        );
+        assert_eq!((shaped.clusters[0].line, shaped.clusters[1].line), (0, 1));
         assert!(
             shaped.clusters[1].baseline > shaped.clusters[0].baseline,
             "second line's baseline must be lower"
@@ -761,8 +760,7 @@ mod tests {
         // Subpixel positioning may wiggle the AA fringe by a pixel; anything
         // more means the alignment offset leaked into the bitmap size again.
         assert!(
-            left.width.abs_diff(centered.width) <= 1
-                && left.height.abs_diff(centered.height) <= 1,
+            left.width.abs_diff(centered.width) <= 1 && left.height.abs_diff(centered.height) <= 1,
             "centered {}x{} vs left {}x{}",
             centered.width,
             centered.height,

@@ -45,14 +45,22 @@ fn finalize_structural(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum ApplyOutcome {
-    Imported { media: cutlass_models::MediaId },
-    RemovedMedia { media: cutlass_models::MediaId },
+    Imported {
+        media: cutlass_models::MediaId,
+    },
+    RemovedMedia {
+        media: cutlass_models::MediaId,
+    },
     Saved,
     Opened,
     Loaded,
-    Relinked { media: cutlass_models::MediaId },
+    Relinked {
+        media: cutlass_models::MediaId,
+    },
     /// The timeline was exported to a file; `frames` is the number written.
-    Exported { frames: u64 },
+    Exported {
+        frames: u64,
+    },
     /// A `.cutlasst` template file was written; the session is unchanged.
     SavedTemplate,
     /// The session was replaced with a filled template — a new, unsaved

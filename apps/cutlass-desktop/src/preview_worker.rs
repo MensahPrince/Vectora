@@ -3672,13 +3672,16 @@ fn publish_export_state(weak: &slint::Weak<ExportBackend<'static>>, state: Expor
 /// The output settings for one export request: the dialog's height preset
 /// scales the composite canvas (aspect preserved), the fps preset overrides
 /// the sampling rate, and everything is evened for H.264.
-fn export_settings_for(project: &cutlass_models::Project, request: &ExportRequest) -> ExportSettings {
+fn export_settings_for(
+    project: &cutlass_models::Project,
+    request: &ExportRequest,
+) -> ExportSettings {
     let mut settings = ExportSettings::for_project(project);
     if let Some(target_h) = request.target_height.filter(|&h| h > 0) {
         let (w, h) = settings.size;
         if h > 0 {
-            let scaled_w = ((u64::from(w) * u64::from(target_h) + u64::from(h) / 2)
-                / u64::from(h)) as u32;
+            let scaled_w =
+                ((u64::from(w) * u64::from(target_h) + u64::from(h) / 2) / u64::from(h)) as u32;
             settings.size = (scaled_w.max(2), target_h);
         }
     }
@@ -4837,7 +4840,11 @@ impl FrameFit {
     fn note_render_cost(&self, elapsed: Duration) {
         let ms = elapsed.as_secs_f64() * 1000.0;
         let avg = self.avg_ms.get();
-        let next = if avg == 0.0 { ms } else { avg * 0.75 + ms * 0.25 };
+        let next = if avg == 0.0 {
+            ms
+        } else {
+            avg * 0.75 + ms * 0.25
+        };
         self.avg_ms.set(next);
 
         let tier = self.tier.get();

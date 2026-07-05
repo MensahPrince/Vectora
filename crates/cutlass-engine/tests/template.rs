@@ -10,8 +10,8 @@ use common::{rt, tr};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand, TemplatePick};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, EngineError};
 use cutlass_models::{
-    ClipId, ClipSource, Generator, MediaId, MediaSource, Project, Rational, Replaceable,
-    SlotMedia, Template, TemplateMeta, TrackKind,
+    ClipId, ClipSource, Generator, MediaId, MediaSource, Project, Rational, Replaceable, SlotMedia,
+    Template, TemplateMeta, TrackKind,
 };
 
 /// A finished-looking session on fake-path media (no test below this line
@@ -36,9 +36,22 @@ fn authoring_engine() -> Authoring {
         240,
         true,
     ));
-    let beat = project.add_media(MediaSource::new("beat.m4a", 0, 0, Rational::FPS_24, 480, true));
-    let swap_media =
-        project.add_media(MediaSource::new("swap.m4a", 0, 0, Rational::FPS_24, 480, true));
+    let beat = project.add_media(MediaSource::new(
+        "beat.m4a",
+        0,
+        0,
+        Rational::FPS_24,
+        480,
+        true,
+    ));
+    let swap_media = project.add_media(MediaSource::new(
+        "swap.m4a",
+        0,
+        0,
+        Rational::FPS_24,
+        480,
+        true,
+    ));
 
     let video = project.add_track(TrackKind::Video, "V1");
     let text = project.add_track(TrackKind::Text, "T1");
@@ -76,14 +89,35 @@ fn mark_replaceable_via_commands_is_undoable() {
         },
     );
     assert!(matches!(out, ApplyOutcome::Edited(EditOutcome::Updated(id)) if id == a.slot_a));
-    assert!(a.engine.project().clip(a.slot_a).unwrap().replaceable.is_some());
+    assert!(
+        a.engine
+            .project()
+            .clip(a.slot_a)
+            .unwrap()
+            .replaceable
+            .is_some()
+    );
     assert!(a.engine.is_dirty(), "marking is a project mutation");
 
     assert!(a.engine.undo());
-    assert!(a.engine.project().clip(a.slot_a).unwrap().replaceable.is_none());
+    assert!(
+        a.engine
+            .project()
+            .clip(a.slot_a)
+            .unwrap()
+            .replaceable
+            .is_none()
+    );
 
     assert!(a.engine.redo());
-    assert!(a.engine.project().clip(a.slot_a).unwrap().replaceable.is_some());
+    assert!(
+        a.engine
+            .project()
+            .clip(a.slot_a)
+            .unwrap()
+            .replaceable
+            .is_some()
+    );
 }
 
 #[test]
@@ -98,7 +132,14 @@ fn mark_replaceable_rejects_generated_clips_and_records_no_history() {
         .expect_err("text clips cannot be slots");
     assert!(matches!(err, EngineError::Model(_)), "unexpected: {err}");
     assert!(!a.engine.can_undo(), "rejected command records no history");
-    assert!(a.engine.project().clip(a.title).unwrap().replaceable.is_none());
+    assert!(
+        a.engine
+            .project()
+            .clip(a.title)
+            .unwrap()
+            .replaceable
+            .is_none()
+    );
 }
 
 #[test]
@@ -384,10 +425,23 @@ mod fill {
         }
 
         // Markers are retained: a filled template stays re-editable.
-        assert!(engine.project().clip(a.slot_a).unwrap().replaceable.is_some());
+        assert!(
+            engine
+                .project()
+                .clip(a.slot_a)
+                .unwrap()
+                .replaceable
+                .is_some()
+        );
         assert!(engine.project().clip(a.title).unwrap().text_editable);
         assert_eq!(
-            engine.project().clip(a.music).unwrap().replaceable.as_ref().map(|r| r.accepts),
+            engine
+                .project()
+                .clip(a.music)
+                .unwrap()
+                .replaceable
+                .as_ref()
+                .map(|r| r.accepts),
             Some(SlotMedia::AudioOnly)
         );
     }

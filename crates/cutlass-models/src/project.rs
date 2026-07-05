@@ -363,19 +363,12 @@ impl Project {
     /// Mark a text clip's content as user-editable when the project is used as
     /// a template (the text keeps its style and animation). Errors if the clip
     /// is unknown or is not a [`Generator::Text`] clip.
-    pub fn set_text_editable(
-        &mut self,
-        clip_id: ClipId,
-        editable: bool,
-    ) -> Result<(), ModelError> {
+    pub fn set_text_editable(&mut self, clip_id: ClipId, editable: bool) -> Result<(), ModelError> {
         let clip = self
             .timeline
             .clip_mut(clip_id)
             .ok_or(ModelError::UnknownClip(clip_id))?;
-        if !matches!(
-            clip.content,
-            ClipSource::Generated(Generator::Text { .. })
-        ) {
+        if !matches!(clip.content, ClipSource::Generated(Generator::Text { .. })) {
             return Err(ModelError::InvalidParam(
                 "text editability applies only to text generator clips".into(),
             ));
@@ -1438,10 +1431,7 @@ impl Project {
                     .timeline
                     .clip(clip_id)
                     .ok_or(ModelError::UnknownClip(clip_id))?;
-                if !matches!(
-                    clip.content,
-                    ClipSource::Generated(Generator::Text { .. })
-                ) {
+                if !matches!(clip.content, ClipSource::Generated(Generator::Text { .. })) {
                     return Err(ModelError::InvalidParam(format!(
                         "animation '{}' is a text preset",
                         animation.id
@@ -1758,10 +1748,22 @@ mod tests {
             param: crate::ShapeParam::Width,
         };
         project
-            .set_param_keyframe(clip, width, rt(100), ParamValue::Scalar(100.0), Easing::Linear)
+            .set_param_keyframe(
+                clip,
+                width,
+                rt(100),
+                ParamValue::Scalar(100.0),
+                Easing::Linear,
+            )
             .unwrap();
         project
-            .set_param_keyframe(clip, width, rt(140), ParamValue::Scalar(500.0), Easing::Linear)
+            .set_param_keyframe(
+                clip,
+                width,
+                rt(140),
+                ParamValue::Scalar(500.0),
+                Easing::Linear,
+            )
             .unwrap();
         let ClipSource::Generated(Generator::Shape { width: w, .. }) =
             &project.clip(clip).unwrap().content
@@ -1777,7 +1779,13 @@ mod tests {
             .unwrap();
         assert!(
             project
-                .set_param_keyframe(clip, width, rt(100), ParamValue::Color([0; 4]), Easing::Linear)
+                .set_param_keyframe(
+                    clip,
+                    width,
+                    rt(100),
+                    ParamValue::Color([0; 4]),
+                    Easing::Linear
+                )
                 .is_err()
         );
         assert!(
@@ -3097,7 +3105,11 @@ mod tests {
                 .is_err()
         );
         // …but filters and adjustments are exactly what lane bars persist.
-        assert!(project.set_clip_filter(bar, Some(Filter::new("noir"))).is_ok());
+        assert!(
+            project
+                .set_clip_filter(bar, Some(Filter::new("noir")))
+                .is_ok()
+        );
         assert!(
             project
                 .set_clip_adjustments(
@@ -3112,16 +3124,23 @@ mod tests {
 
         // Audio-lane clips show no pixels.
         let audio = project.add_track(TrackKind::Audio, "A1");
-        let aclip = project
-            .add_clip(audio, media_id, tr(0, 50), rt(0))
-            .unwrap();
-        assert!(project.set_clip_filter(aclip, Some(Filter::new("warm"))).is_err());
+        let aclip = project.add_clip(audio, media_id, tr(0, 50), rt(0)).unwrap();
+        assert!(
+            project
+                .set_clip_filter(aclip, Some(Filter::new("warm")))
+                .is_err()
+        );
 
         // Stills have no motion to stabilize.
         let image = project.add_media(MediaSource::image("/tmp/photo.png", 800, 600));
         let video = project.add_track(TrackKind::Video, "V2");
         let still = project
-            .add_clip(video, image, tr_at(0, 100, crate::media::STILL_TICK_RATE), rt(0))
+            .add_clip(
+                video,
+                image,
+                tr_at(0, 100, crate::media::STILL_TICK_RATE),
+                rt(0),
+            )
             .unwrap();
         assert!(
             project
@@ -3214,9 +3233,7 @@ mod tests {
     #[test]
     fn audio_role_tags_audio_lane_clips_only() {
         let (mut project, media_id, video) = project_with_media(100);
-        let vclip = project
-            .add_clip(video, media_id, tr(0, 50), rt(0))
-            .unwrap();
+        let vclip = project.add_clip(video, media_id, tr(0, 50), rt(0)).unwrap();
         assert!(
             project
                 .set_clip_audio_role(vclip, Some(AudioRole::Music))
@@ -3224,9 +3241,7 @@ mod tests {
         );
 
         let audio = project.add_track(TrackKind::Audio, "A1");
-        let aclip = project
-            .add_clip(audio, media_id, tr(0, 50), rt(0))
-            .unwrap();
+        let aclip = project.add_clip(audio, media_id, tr(0, 50), rt(0)).unwrap();
         project
             .set_clip_audio_role(aclip, Some(AudioRole::Voiceover))
             .unwrap();
@@ -3321,7 +3336,14 @@ mod tests {
             .unwrap();
 
         let plain_json = serde_json::to_value(project.clip(plain).unwrap()).unwrap();
-        for key in ["mask", "chroma_key", "stabilize", "filter", "adjust", "audio_role"] {
+        for key in [
+            "mask",
+            "chroma_key",
+            "stabilize",
+            "filter",
+            "adjust",
+            "audio_role",
+        ] {
             assert!(
                 plain_json.get(key).is_none(),
                 "untouched clip should not serialize `{key}`"
@@ -3334,7 +3356,10 @@ mod tests {
         // The whole project (with looks) survives a save/load roundtrip.
         let json = serde_json::to_value(&project).unwrap();
         let back: Project = serde_json::from_value(json).unwrap();
-        assert_eq!(back.clip(styled).unwrap().mask, project.clip(styled).unwrap().mask);
+        assert_eq!(
+            back.clip(styled).unwrap().mask,
+            project.clip(styled).unwrap().mask
+        );
         assert_eq!(
             back.clip(styled).unwrap().filter,
             project.clip(styled).unwrap().filter

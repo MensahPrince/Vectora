@@ -222,7 +222,9 @@ impl Engine {
             transform: self.transform_override,
             generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
         };
-        Ok(self.renderer.render_frame_with(&self.project, time, overrides)?)
+        Ok(self
+            .renderer
+            .render_frame_with(&self.project, time, overrides)?)
     }
 
     /// [`get_frame`](Self::get_frame) scaled to fit within
@@ -239,13 +241,20 @@ impl Engine {
             transform: self.transform_override,
             generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
         };
-        Ok(self
-            .renderer
-            .render_frame_fit_with(&self.project, time, max_width, max_height, overrides)?)
+        Ok(self.renderer.render_frame_fit_with(
+            &self.project,
+            time,
+            max_width,
+            max_height,
+            overrides,
+        )?)
     }
 
     pub fn undo(&mut self) -> bool {
-        debug_assert!(!self.history.in_group(), "undo inside an open history group");
+        debug_assert!(
+            !self.history.in_group(),
+            "undo inside an open history group"
+        );
         let Some(action) = self.history.pop_undo() else {
             return false;
         };
@@ -262,7 +271,10 @@ impl Engine {
     }
 
     pub fn redo(&mut self) -> bool {
-        debug_assert!(!self.history.in_group(), "redo inside an open history group");
+        debug_assert!(
+            !self.history.in_group(),
+            "redo inside an open history group"
+        );
         let Some(action) = self.history.pop_redo() else {
             return false;
         };

@@ -439,8 +439,8 @@ fn every_edit_command_roundtrips_through_command() {
 #[test]
 fn command_layer_is_flat_json() {
     // The untagged `Command` never adds a Project/Edit envelope.
-    let json = serde_json::to_value(Command::Edit(EditCommand::RemoveClip { clip: clip(9) }))
-        .unwrap();
+    let json =
+        serde_json::to_value(Command::Edit(EditCommand::RemoveClip { clip: clip(9) })).unwrap();
     assert_eq!(json, json!({"type": "RemoveClip", "clip": 9}));
 }
 

@@ -32,7 +32,9 @@ pub(crate) fn load_session(
     if strict {
         for media in loaded.media_iter() {
             if !media.path().exists() {
-                return Err(EngineError::MissingMedia(media.path().display().to_string()));
+                return Err(EngineError::MissingMedia(
+                    media.path().display().to_string(),
+                ));
             }
         }
     }

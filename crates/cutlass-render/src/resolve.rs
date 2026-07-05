@@ -543,7 +543,10 @@ mod tests {
         }
         approx(layer.opacity, 1.0);
         match &layer.source {
-            LayerSource::Media { media: m, source_time } => {
+            LayerSource::Media {
+                media: m,
+                source_time,
+            } => {
                 assert_eq!(*m, media);
                 assert_eq!(source_time.value, 5);
             }
@@ -568,10 +571,22 @@ mod tests {
         let bottom = project.add_track(TrackKind::Sticker, "S1");
         let top = project.add_track(TrackKind::Sticker, "S2");
         project
-            .add_generated(bottom, Generator::SolidColor { rgba: [255, 0, 0, 255] }, tr(0, 100))
+            .add_generated(
+                bottom,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
             .unwrap();
         project
-            .add_generated(top, Generator::SolidColor { rgba: [0, 0, 255, 255] }, tr(0, 100))
+            .add_generated(
+                top,
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
+                tr(0, 100),
+            )
             .unwrap();
 
         let scene = resolve(&project, rt(5)).unwrap();
@@ -592,7 +607,10 @@ mod tests {
         project
             .add_generated(
                 track,
-                Generator::Text { content: "Hi".into(), style },
+                Generator::Text {
+                    content: "Hi".into(),
+                    style,
+                },
                 tr(0, 100),
             )
             .unwrap();
@@ -618,7 +636,13 @@ mod tests {
         let mut project = Project::new("p", FPS_24);
         let track = project.add_track(TrackKind::Sticker, "S1");
         project
-            .add_generated(track, Generator::SolidColor { rgba: [10, 20, 30, 255] }, tr(0, 100))
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [10, 20, 30, 255],
+                },
+                tr(0, 100),
+            )
             .unwrap();
 
         let scene = resolve(&project, rt(5)).unwrap();
@@ -757,7 +781,13 @@ mod tests {
         let mut project = Project::new("p", FPS_24);
         let track = project.add_track(TrackKind::Sticker, "S1");
         let clip = project
-            .add_generated(track, Generator::SolidColor { rgba: [255, 0, 0, 255] }, tr(0, 100))
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
             .unwrap();
 
         let overrides = ResolveOverrides {
@@ -769,7 +799,12 @@ mod tests {
                     ..ClipTransform::IDENTITY
                 },
             )),
-            generator: Some((clip, &Generator::SolidColor { rgba: [0, 255, 0, 255] })),
+            generator: Some((
+                clip,
+                &Generator::SolidColor {
+                    rgba: [0, 255, 0, 255],
+                },
+            )),
         };
         let scene = resolve_with(&project, rt(5), overrides).unwrap();
         let layer = &scene.layers[0];
@@ -836,11 +871,15 @@ mod tests {
         let mut project = Project::new("p", FPS_24);
         let video_track = project.add_track(TrackKind::Video, "V1");
         let media = project.add_media(video(1920, 1080));
-        project.add_clip(video_track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .add_clip(video_track, media, tr(0, 100), rt(0))
+            .unwrap();
 
         let audio_track = project.add_track(TrackKind::Audio, "A1");
         let song = project.add_media(MediaSource::new("/tmp/a.mp3", 0, 0, FPS_24, 600, true));
-        project.add_clip(audio_track, song, tr(0, 100), rt(0)).unwrap();
+        project
+            .add_clip(audio_track, song, tr(0, 100), rt(0))
+            .unwrap();
 
         let scene = resolve(&project, rt(5)).unwrap();
         assert_eq!(scene.layers.len(), 1);
@@ -852,7 +891,11 @@ mod tests {
         let mut project = Project::new("p", FPS_24);
         let track = project.add_track(TrackKind::Sticker, "S1");
         project
-            .add_generated(track, Generator::shape(Shape::Rectangle, [255, 255, 255, 255]), tr(0, 100))
+            .add_generated(
+                track,
+                Generator::shape(Shape::Rectangle, [255, 255, 255, 255]),
+                tr(0, 100),
+            )
             .unwrap();
         let scene = resolve(&project, rt(5)).unwrap();
         assert_eq!(scene.layers.len(), 1);
@@ -866,7 +909,11 @@ mod tests {
         let mut project = Project::new("p", FPS_24);
         let track = project.add_track(TrackKind::Sticker, "S1");
         project
-            .add_generated(track, Generator::shape(Shape::Ellipse, [10, 20, 30, 255]), tr(0, 100))
+            .add_generated(
+                track,
+                Generator::shape(Shape::Ellipse, [10, 20, 30, 255]),
+                tr(0, 100),
+            )
             .unwrap();
         let scene = resolve(&project, rt(5)).unwrap();
         assert_eq!(scene.layers.len(), 1);
@@ -971,7 +1018,9 @@ mod tests {
         let scene = resolve(&project, rt(25)).unwrap();
         let layer = &scene.layers[0];
         match &layer.source {
-            LayerSource::Shape { params, fill, pad, .. } => {
+            LayerSource::Shape {
+                params, fill, pad, ..
+            } => {
                 assert!(matches!(
                     params,
                     cutlass_shapes::SdfParams::Star { points: 5, .. }

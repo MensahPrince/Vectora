@@ -103,7 +103,13 @@ impl Renderer {
         max_width: u32,
         max_height: u32,
     ) -> Result<RgbaImage, RenderError> {
-        self.render_frame_fit_with(project, t, max_width, max_height, ResolveOverrides::default())
+        self.render_frame_fit_with(
+            project,
+            t,
+            max_width,
+            max_height,
+            ResolveOverrides::default(),
+        )
     }
 
     /// [`render_frame_fit`](Self::render_frame_fit) with live-preview
@@ -298,7 +304,8 @@ impl Renderer {
             })
             .collect();
 
-        let config = CompositorConfig::new(scene.width, scene.height).with_background(scene.background);
+        let config =
+            CompositorConfig::new(scene.width, scene.height).with_background(scene.background);
         Ok(self.compositor.render(&self.gpu, &config, &layers)?)
     }
 
@@ -314,16 +321,16 @@ impl Renderer {
         let decoder = match self.decoders.entry(media) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
-                let src = project.media(media).ok_or(RenderError::MissingMedia(media))?;
+                let src = project
+                    .media(media)
+                    .ok_or(RenderError::MissingMedia(media))?;
                 e.insert(open_decoder(src.path(), mode)?)
             }
         };
-        decoder
-            .frame_at(source_time)?
-            .ok_or(RenderError::NoFrame {
-                media,
-                time: source_time,
-            })
+        decoder.frame_at(source_time)?.ok_or(RenderError::NoFrame {
+            media,
+            time: source_time,
+        })
     }
 
     /// Tight size (canvas px, at transform scale 1.0) of the content
@@ -383,7 +390,9 @@ impl Renderer {
         if self.stills.contains_key(&media) {
             return Ok(());
         }
-        let src = project.media(media).ok_or(RenderError::MissingMedia(media))?;
+        let src = project
+            .media(media)
+            .ok_or(RenderError::MissingMedia(media))?;
         let image = cutlass_decoder::decode_image(src.path())?;
         self.stills.insert(media, image);
         Ok(())

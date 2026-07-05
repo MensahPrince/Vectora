@@ -3,7 +3,7 @@
 
 use cutlass_models::{Generator, Project, Rational, TimeRange, TrackKind};
 use cutlass_render::{
-    ExportSettings, PngSequenceEncoder, Renderer, RenderError, export, export_config,
+    ExportSettings, PngSequenceEncoder, RenderError, Renderer, export, export_config,
     export_observed,
 };
 
@@ -148,7 +148,8 @@ fn observed_export_honors_size_and_rate_overrides() {
     .unwrap();
 
     assert_eq!(frames, 2);
-    let decoder = png::Decoder::new(std::fs::File::open(dir.path().join("frame_00000.png")).unwrap());
+    let decoder =
+        png::Decoder::new(std::fs::File::open(dir.path().join("frame_00000.png")).unwrap());
     let reader = decoder.read_info().unwrap();
     let info = reader.info();
     assert_eq!((info.width, info.height), (480, 270));

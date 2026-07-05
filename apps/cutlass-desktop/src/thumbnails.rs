@@ -124,8 +124,8 @@ fn generate(
             Ok((image.width, image.height, image.pixels))
         }
         ThumbKind::Audio => {
-            let peaks =
-                cutlass_decoder::audio_peaks(&req.path, WAVEFORM_BARS).map_err(|e| e.to_string())?;
+            let peaks = cutlass_decoder::audio_peaks(&req.path, WAVEFORM_BARS)
+                .map_err(|e| e.to_string())?;
             Ok(render_waveform(&peaks, WAVEFORM_SIZE, WAVEFORM_SIZE))
         }
     }
@@ -171,7 +171,12 @@ fn render_poster(
 
     let poster = poster_tick(frames, frame_rate);
     renderer
-        .render_frame_fit(&project, RationalTime::new(poster, frame_rate), max_w, max_h)
+        .render_frame_fit(
+            &project,
+            RationalTime::new(poster, frame_rate),
+            max_w,
+            max_h,
+        )
         .map_err(|e| e.to_string())
 }
 

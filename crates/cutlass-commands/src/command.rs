@@ -253,7 +253,10 @@ pub enum EditCommand {
     /// render-neutral). Any visual clip, including `Generator::Filter` lane
     /// bars; the id must exist in the filter catalog. The inverse restores
     /// the previous clip state.
-    SetClipFilter { clip: ClipId, filter: Option<Filter> },
+    SetClipFilter {
+        clip: ClipId,
+        filter: Option<Filter>,
+    },
     /// Set a clip's manual color grade (CapCut adjust, Phase I;
     /// render-neutral): all five sliders in one shot, neutral values clear.
     /// Any visual clip, including `Generator::Adjustment` lane bars. The

@@ -243,7 +243,12 @@ fn generator_override_previews_without_touching_state() {
         },
     )));
     let frame = engine.get_frame(rt(0)).expect("override frame");
-    assert!(frame.pixels.chunks_exact(4).all(|p| p == [10, 200, 40, 255]));
+    assert!(
+        frame
+            .pixels
+            .chunks_exact(4)
+            .all(|p| p == [10, 200, 40, 255])
+    );
 
     // ...while the committed generator and history stay untouched.
     let clip = engine.project().clip(clip_id).expect("clip");
@@ -262,7 +267,12 @@ fn generator_override_previews_without_touching_state() {
     // Clearing restores the committed render.
     engine.set_generator_override(None);
     let frame = engine.get_frame(rt(0)).expect("committed frame");
-    assert!(frame.pixels.chunks_exact(4).all(|p| p == [200, 40, 10, 255]));
+    assert!(
+        frame
+            .pixels
+            .chunks_exact(4)
+            .all(|p| p == [200, 40, 10, 255])
+    );
 }
 
 #[test]

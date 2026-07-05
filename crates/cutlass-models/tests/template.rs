@@ -52,7 +52,12 @@ fn intro_template() -> Intro {
         .add_generated(t, Generator::text("Your Name"), tr(0, 72))
         .unwrap();
     let music = p
-        .add_clip(a, sample_music, TimeRange::at_rate(0, 30_000, MS_RATE), rt(0))
+        .add_clip(
+            a,
+            sample_music,
+            TimeRange::at_rate(0, 30_000, MS_RATE),
+            rt(0),
+        )
         .unwrap();
 
     // A locked look on the slots: a transform on slot 0, an effect on slot 1.
@@ -181,7 +186,10 @@ fn unfilled_slots_keep_sample_media_for_preview() {
     let out = t.apply(&[video_pick("a.mp4", 120)]).unwrap();
 
     for slot in [intro.slot1, intro.image_slot] {
-        match (&out.clip(slot).unwrap().content, &t.project().clip(slot).unwrap().content) {
+        match (
+            &out.clip(slot).unwrap().content,
+            &t.project().clip(slot).unwrap().content,
+        ) {
             (ClipSource::Media { media: got, .. }, ClipSource::Media { media: sample, .. }) => {
                 assert_eq!(got, sample, "unfilled slot keeps its sample media");
             }
@@ -280,7 +288,9 @@ fn cross_rate_fill_rounds_source_window_up() {
     // Rounding to nearest (31) would under-cover the slot; the window must
     // round up to 32 so the last timeline frame still has source to read.
     let out = t
-        .apply(&[Pick::new(MediaSource::new("m.mp4", 1920, 1080, r30, 32, true))])
+        .apply(&[Pick::new(MediaSource::new(
+            "m.mp4", 1920, 1080, r30, 32, true,
+        ))])
         .unwrap();
     match &out.clip(slot).unwrap().content {
         ClipSource::Media { source, .. } => assert_eq!(source.duration.value, 32),
@@ -288,9 +298,19 @@ fn cross_rate_fill_rounds_source_window_up() {
     }
     // Exactly-31-frame media is refused rather than silently short.
     let err = t
-        .apply(&[Pick::new(MediaSource::new("short.mp4", 1920, 1080, r30, 31, true))])
+        .apply(&[Pick::new(MediaSource::new(
+            "short.mp4",
+            1920,
+            1080,
+            r30,
+            31,
+            true,
+        ))])
         .unwrap_err();
-    assert!(matches!(err, ModelError::SlotDurationUnmet { .. }), "got {err:?}");
+    assert!(
+        matches!(err, ModelError::SlotDurationUnmet { .. }),
+        "got {err:?}"
+    );
 }
 
 #[test]
@@ -302,7 +322,9 @@ fn set_replaceable_validates_at_mark_time() {
     let t = p.add_track(TrackKind::Text, "T1");
     let a = p.add_track(TrackKind::Audio, "A1");
     let video_clip = p.add_clip(v, m, tr(0, 24), rt(0)).unwrap();
-    let title = p.add_generated(t, Generator::text("hi"), tr(0, 24)).unwrap();
+    let title = p
+        .add_generated(t, Generator::text("hi"), tr(0, 24))
+        .unwrap();
     let audio_clip = p
         .add_clip(a, music_m, TimeRange::at_rate(0, 1000, MS_RATE), rt(0))
         .unwrap();
@@ -377,7 +399,14 @@ fn music_swaps_independently_of_visual_slots() {
     let mut out = intro.template.apply(&[]).unwrap();
 
     // The music clip is a real, swappable clip in the applied project.
-    let new_track_music = out.add_media(MediaSource::new("new-song.mp3", 0, 0, MS_RATE, 40_000, true));
+    let new_track_music = out.add_media(MediaSource::new(
+        "new-song.mp3",
+        0,
+        0,
+        MS_RATE,
+        40_000,
+        true,
+    ));
     out.set_clip_media(
         intro.music,
         new_track_music,

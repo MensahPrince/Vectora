@@ -39,7 +39,13 @@ fn test_project() -> Project {
 
     let bg = project.add_track(TrackKind::Sticker, "BG");
     project
-        .add_generated(bg, Generator::SolidColor { rgba: [40, 80, 160, 255] }, span)
+        .add_generated(
+            bg,
+            Generator::SolidColor {
+                rgba: [40, 80, 160, 255],
+            },
+            span,
+        )
         .unwrap();
 
     let titles = project.add_track(TrackKind::Text, "Titles");
@@ -48,7 +54,10 @@ fn test_project() -> Project {
             titles,
             Generator::Text {
                 content: "Hi".into(),
-                style: TextStyle { size: 160.0, ..TextStyle::default() },
+                style: TextStyle {
+                    size: 160.0,
+                    ..TextStyle::default()
+                },
             },
             span,
         )

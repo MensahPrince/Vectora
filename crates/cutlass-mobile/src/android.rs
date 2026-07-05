@@ -13,6 +13,10 @@ use jni::JNIEnv;
 use jni::objects::{JClass, JFloatArray, JString};
 use jni::sys::{jboolean, jdouble, jint, jintArray, jlong, jstring};
 
+use crate::audio::{
+    CutlassAudioReader, cutlass_audio_channels, cutlass_audio_close, cutlass_audio_rate,
+    cutlass_audio_read, cutlass_session_audio_open,
+};
 use crate::catalogs::cutlass_catalogs;
 use crate::export_job::{
     CutlassExportJob, cutlass_export_cancel, cutlass_export_finished, cutlass_export_free,
@@ -29,10 +33,6 @@ use crate::session::{
 use crate::thumbs::{
     CutlassThumbnailer, cutlass_thumbnailer_close, cutlass_thumbnailer_duration_seconds,
     cutlass_thumbnailer_open, cutlass_thumbnailer_thumb,
-};
-use crate::audio::{
-    CutlassAudioReader, cutlass_audio_channels, cutlass_audio_close, cutlass_audio_rate,
-    cutlass_audio_read, cutlass_session_audio_open,
 };
 use crate::wire::cutlass_string_free;
 use crate::{CutlassImage, cutlass_image_free};
@@ -161,15 +161,16 @@ pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sess
 ) -> jstring {
     let json = string_arg(&mut env, &json);
     // SAFETY: session handle per caller contract; bytes borrow `json`.
-    let response = unsafe {
-        cutlass_session_apply(handle as *mut CutlassSession, json.as_ptr(), json.len())
-    };
+    let response =
+        unsafe { cutlass_session_apply(handle as *mut CutlassSession, json.as_ptr(), json.len()) };
     take_string(&env, response)
 }
 
 /// `CutlassNative.sessionIntent(handle, json)`: one gesture intent.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sessionIntent<'local>(
+pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sessionIntent<
+    'local,
+>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -177,16 +178,17 @@ pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sess
 ) -> jstring {
     let json = string_arg(&mut env, &json);
     // SAFETY: same contract as `sessionApply`.
-    let response = unsafe {
-        cutlass_session_intent(handle as *mut CutlassSession, json.as_ptr(), json.len())
-    };
+    let response =
+        unsafe { cutlass_session_intent(handle as *mut CutlassSession, json.as_ptr(), json.len()) };
     take_string(&env, response)
 }
 
 /// `CutlassNative.sessionUiState(handle)`: the lane-stack JSON (null for a
 /// null handle).
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sessionUiState<'local>(
+pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sessionUiState<
+    'local,
+>(
     env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -221,7 +223,9 @@ pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sess
 
 /// `CutlassNative.sessionCanUndo(handle)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sessionCanUndo<'local>(
+pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sessionCanUndo<
+    'local,
+>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -232,7 +236,9 @@ pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sess
 
 /// `CutlassNative.sessionCanRedo(handle)`.
 #[unsafe(no_mangle)]
-pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sessionCanRedo<'local>(
+pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_sessionCanRedo<
+    'local,
+>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
     handle: jlong,
@@ -576,7 +582,10 @@ pub extern "system" fn Java_com_scytheralpha_cutlass_1android_CutlassNative_audi
     };
     if written > 0 {
         let floats = (written as usize) * 2;
-        if env.set_float_array_region(&out, 0, &buffer[..floats]).is_err() {
+        if env
+            .set_float_array_region(&out, 0, &buffer[..floats])
+            .is_err()
+        {
             return -1;
         }
     }

@@ -25,17 +25,18 @@ use std::path::Path;
 use ndk_sys::{
     AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG, AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM,
     AMEDIACODEC_CONFIGURE_FLAG_ENCODE, AMEDIACODEC_INFO_OUTPUT_BUFFERS_CHANGED,
-    AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED, AMEDIAFORMAT_KEY_AAC_PROFILE, AMEDIAFORMAT_KEY_BIT_RATE,
-    AMEDIAFORMAT_KEY_CHANNEL_COUNT, AMEDIAFORMAT_KEY_COLOR_FORMAT, AMEDIAFORMAT_KEY_FRAME_RATE,
-    AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL, AMEDIAFORMAT_KEY_MIME,
-    AMEDIAFORMAT_KEY_SAMPLE_RATE, AMEDIAFORMAT_KEY_WIDTH, AMediaCodec, AMediaCodec_configure,
-    AMediaCodec_createEncoderByType, AMediaCodec_delete, AMediaCodec_dequeueInputBuffer,
-    AMediaCodec_dequeueOutputBuffer, AMediaCodec_getInputBuffer, AMediaCodec_getOutputBuffer,
-    AMediaCodec_getOutputFormat, AMediaCodec_queueInputBuffer, AMediaCodec_releaseOutputBuffer,
-    AMediaCodec_start, AMediaCodec_stop, AMediaCodecBufferInfo, AMediaFormat, AMediaFormat_delete,
-    AMediaFormat_new, AMediaFormat_setFloat, AMediaFormat_setInt32, AMediaFormat_setString,
-    AMediaMuxer, AMediaMuxer_addTrack, AMediaMuxer_delete, AMediaMuxer_new, AMediaMuxer_start,
-    AMediaMuxer_stop, AMediaMuxer_writeSampleData, OutputFormat, media_status_t,
+    AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED, AMEDIAFORMAT_KEY_AAC_PROFILE,
+    AMEDIAFORMAT_KEY_BIT_RATE, AMEDIAFORMAT_KEY_CHANNEL_COUNT, AMEDIAFORMAT_KEY_COLOR_FORMAT,
+    AMEDIAFORMAT_KEY_FRAME_RATE, AMEDIAFORMAT_KEY_HEIGHT, AMEDIAFORMAT_KEY_I_FRAME_INTERVAL,
+    AMEDIAFORMAT_KEY_MIME, AMEDIAFORMAT_KEY_SAMPLE_RATE, AMEDIAFORMAT_KEY_WIDTH, AMediaCodec,
+    AMediaCodec_configure, AMediaCodec_createEncoderByType, AMediaCodec_delete,
+    AMediaCodec_dequeueInputBuffer, AMediaCodec_dequeueOutputBuffer, AMediaCodec_getInputBuffer,
+    AMediaCodec_getOutputBuffer, AMediaCodec_getOutputFormat, AMediaCodec_queueInputBuffer,
+    AMediaCodec_releaseOutputBuffer, AMediaCodec_start, AMediaCodec_stop, AMediaCodecBufferInfo,
+    AMediaFormat, AMediaFormat_delete, AMediaFormat_new, AMediaFormat_setFloat,
+    AMediaFormat_setInt32, AMediaFormat_setString, AMediaMuxer, AMediaMuxer_addTrack,
+    AMediaMuxer_delete, AMediaMuxer_new, AMediaMuxer_start, AMediaMuxer_stop,
+    AMediaMuxer_writeSampleData, OutputFormat, media_status_t,
 };
 
 use cutlass_core::{
@@ -335,7 +336,9 @@ impl MediaCodecEncoder {
         flags: u32,
     ) -> Result<(), EncodeError> {
         if track < 0 {
-            return Err(EncodeError::Encode("sample for an unregistered track".into()));
+            return Err(EncodeError::Encode(
+                "sample for an unregistered track".into(),
+            ));
         }
         let info = AMediaCodecBufferInfo {
             offset: 0,
@@ -347,7 +350,9 @@ impl MediaCodecEncoder {
             AMediaMuxer_writeSampleData(self.muxer, track as usize, data.as_ptr(), &info)
         };
         if !media_ok(status) {
-            return Err(EncodeError::Encode("AMediaMuxer_writeSampleData failed".into()));
+            return Err(EncodeError::Encode(
+                "AMediaMuxer_writeSampleData failed".into(),
+            ));
         }
         Ok(())
     }
@@ -528,8 +533,7 @@ fn open_video_encoder(
     let fps = (frame_rate.num.max(1) as f64 / frame_rate.den.max(1) as f64).round() as i32;
     let fps = fps.max(1);
     // Bitrate heuristic: ~0.1 bits per pixel·second, clamped to a sane floor.
-    let bitrate =
-        (((width as u64) * (height as u64) * (fps as u64)) as f64 * 0.1).round() as i32;
+    let bitrate = (((width as u64) * (height as u64) * (fps as u64)) as f64 * 0.1).round() as i32;
     let bitrate = bitrate.max(1_000_000);
 
     let format = unsafe { AMediaFormat_new() };
@@ -567,7 +571,9 @@ fn open_video_encoder(
     unsafe { AMediaFormat_delete(format) };
     if !media_ok(status) {
         unsafe { AMediaCodec_delete(codec) };
-        return Err(EncodeError::Start("video AMediaCodec_configure failed".into()));
+        return Err(EncodeError::Start(
+            "video AMediaCodec_configure failed".into(),
+        ));
     }
     if !media_ok(unsafe { AMediaCodec_start(codec) }) {
         unsafe { AMediaCodec_delete(codec) };
@@ -590,7 +596,11 @@ fn open_audio_encoder(audio: AudioEncoderConfig) -> Result<*mut AMediaCodec, Enc
     }
     unsafe {
         set_string(format, AMEDIAFORMAT_KEY_MIME, MIME_AAC);
-        AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_SAMPLE_RATE, audio.sample_rate as i32);
+        AMediaFormat_setInt32(
+            format,
+            AMEDIAFORMAT_KEY_SAMPLE_RATE,
+            audio.sample_rate as i32,
+        );
         AMediaFormat_setInt32(
             format,
             AMEDIAFORMAT_KEY_CHANNEL_COUNT,
@@ -612,7 +622,9 @@ fn open_audio_encoder(audio: AudioEncoderConfig) -> Result<*mut AMediaCodec, Enc
     unsafe { AMediaFormat_delete(format) };
     if !media_ok(status) {
         unsafe { AMediaCodec_delete(codec) };
-        return Err(EncodeError::Start("audio AMediaCodec_configure failed".into()));
+        return Err(EncodeError::Start(
+            "audio AMediaCodec_configure failed".into(),
+        ));
     }
     if !media_ok(unsafe { AMediaCodec_start(codec) }) {
         unsafe { AMediaCodec_delete(codec) };

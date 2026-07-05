@@ -160,8 +160,7 @@ fn open_fails_when_media_missing() {
         100,
         false,
     ));
-    let mut engine2 =
-        Engine::with_project(engine_config(), offline_project).expect("engine");
+    let mut engine2 = Engine::with_project(engine_config(), offline_project).expect("engine");
     let offline = dir.path().join("missing_media.cutlass");
     engine2
         .apply(Command::Project(ProjectCommand::Save {
@@ -190,8 +189,7 @@ fn load_tolerates_missing_media() {
     ));
     fixture.add_track(TrackKind::Video, "V1");
 
-    let mut engine =
-        Engine::with_project(engine_config(), fixture).expect("engine");
+    let mut engine = Engine::with_project(engine_config(), fixture).expect("engine");
 
     let project_file = dir.path().join("ghost.cutlass");
     engine

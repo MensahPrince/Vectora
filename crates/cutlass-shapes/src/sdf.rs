@@ -425,7 +425,11 @@ mod tests {
             "stroke alpha should cap coverage, got {}",
             on_edge[3]
         );
-        assert_eq!(img.pixel(cx, cy)[3], 0, "no fill inside a stroke-only shape");
+        assert_eq!(
+            img.pixel(cx, cy)[3],
+            0,
+            "no fill inside a stroke-only shape"
+        );
     }
 
     #[test]

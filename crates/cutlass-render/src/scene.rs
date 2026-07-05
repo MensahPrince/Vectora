@@ -281,7 +281,9 @@ mod tests {
     #[test]
     fn scale_halves_canvas_and_layer_geometry() {
         let mut scene = Scene::empty(1920, 1080, [0, 0, 0, 255]);
-        scene.layers.push(media_layer([960.0, 540.0], [1920.0, 1080.0]));
+        scene
+            .layers
+            .push(media_layer([960.0, 540.0], [1920.0, 1080.0]));
         scene.layers.push(text_layer());
         scene.layers.push(shape_layer());
 
@@ -343,7 +345,9 @@ mod tests {
     fn fit_into_letterboxes_an_aspect_mismatch() {
         // 16:9 content into a square: scaled to 400×225, centered vertically.
         let mut scene = Scene::empty(1920, 1080, [1, 2, 3, 255]);
-        scene.layers.push(media_layer([960.0, 540.0], [1920.0, 1080.0]));
+        scene
+            .layers
+            .push(media_layer([960.0, 540.0], [1920.0, 1080.0]));
 
         scene.fit_into(400, 400);
 
@@ -361,7 +365,9 @@ mod tests {
     #[test]
     fn fit_into_upscales_for_export_overrides() {
         let mut scene = Scene::empty(960, 540, [0, 0, 0, 255]);
-        scene.layers.push(media_layer([480.0, 270.0], [960.0, 540.0]));
+        scene
+            .layers
+            .push(media_layer([480.0, 270.0], [960.0, 540.0]));
         scene.fit_into(1920, 1080);
         assert_eq!((scene.width, scene.height), (1920, 1080));
         assert_eq!(scene.layers[0].center, [960.0, 540.0]);

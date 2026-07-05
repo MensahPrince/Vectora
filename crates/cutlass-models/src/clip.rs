@@ -86,7 +86,9 @@ pub enum Shape {
     Ellipse,
     /// Regular polygon (`sides >= 3`; a triangle is `sides: 3`), fit to the
     /// generator's `width`×`height` box.
-    Polygon { sides: u32 },
+    Polygon {
+        sides: u32,
+    },
     /// Star with `points` spikes (`>= 3`); `inner_ratio` is the inner-vertex
     /// radius as a fraction of the outer (`0..=1` — small is spiky, large is
     /// blunt), animatable.
@@ -243,9 +245,8 @@ impl Generator {
         let Some(preset) = &style.effect_preset else {
             return Ok(());
         };
-        let spec = crate::look::text_effect_spec(preset).ok_or_else(|| {
-            ModelError::InvalidParam(format!("unknown text effect '{preset}'"))
-        })?;
+        let spec = crate::look::text_effect_spec(preset)
+            .ok_or_else(|| ModelError::InvalidParam(format!("unknown text effect '{preset}'")))?;
         style.stroke = spec.stroke;
         style.shadow = spec.shadow;
         style.background = spec.background;
@@ -387,7 +388,8 @@ impl Generator {
                 "shape parameters apply only to shape generator clips".into(),
             ));
         };
-        let scalar = |validate: fn(f32) -> Result<(), ModelError>| ShapeParamKind::Scalar { validate };
+        let scalar =
+            |validate: fn(f32) -> Result<(), ModelError>| ShapeParamKind::Scalar { validate };
         match param {
             ShapeParam::Width => f(ShapeParamTarget::Scalar(width), scalar(validate_shape_dim)),
             ShapeParam::Height => f(ShapeParamTarget::Scalar(height), scalar(validate_shape_dim)),
@@ -978,27 +980,21 @@ impl ParamValue {
     fn scalar(self) -> Result<f32, ModelError> {
         match self {
             ParamValue::Scalar(v) => Ok(v),
-            _ => Err(ModelError::InvalidParam(
-                "expected a scalar value".into(),
-            )),
+            _ => Err(ModelError::InvalidParam("expected a scalar value".into())),
         }
     }
 
     fn vec2(self) -> Result<[f32; 2], ModelError> {
         match self {
             ParamValue::Vec2(v) => Ok(v),
-            _ => Err(ModelError::InvalidParam(
-                "expected a vec2 value".into(),
-            )),
+            _ => Err(ModelError::InvalidParam("expected a vec2 value".into())),
         }
     }
 
     fn color(self) -> Result<[u8; 4], ModelError> {
         match self {
             ParamValue::Color(v) => Ok(v),
-            _ => Err(ModelError::InvalidParam(
-                "expected a color value".into(),
-            )),
+            _ => Err(ModelError::InvalidParam("expected a color value".into())),
         }
     }
 }
@@ -1172,7 +1168,10 @@ impl AnimatedTransform {
                 validate_opacity(v)?;
                 self.opacity.set_keyframe(tick, v, easing);
             }
-            ClipParam::Effect { .. } | ClipParam::Speed | ClipParam::Volume | ClipParam::Shape { .. } => {
+            ClipParam::Effect { .. }
+            | ClipParam::Speed
+            | ClipParam::Volume
+            | ClipParam::Shape { .. } => {
                 return Err(not_a_transform_param());
             }
         }
@@ -1188,7 +1187,10 @@ impl AnimatedTransform {
             ClipParam::Scale => self.scale.remove_keyframe(tick),
             ClipParam::Rotation => self.rotation.remove_keyframe(tick),
             ClipParam::Opacity => self.opacity.remove_keyframe(tick),
-            ClipParam::Effect { .. } | ClipParam::Speed | ClipParam::Volume | ClipParam::Shape { .. } => {
+            ClipParam::Effect { .. }
+            | ClipParam::Speed
+            | ClipParam::Volume
+            | ClipParam::Shape { .. } => {
                 return Err(not_a_transform_param());
             }
         };
@@ -1233,7 +1235,10 @@ impl AnimatedTransform {
                 validate_opacity(v)?;
                 self.opacity.set_constant(v);
             }
-            ClipParam::Effect { .. } | ClipParam::Speed | ClipParam::Volume | ClipParam::Shape { .. } => {
+            ClipParam::Effect { .. }
+            | ClipParam::Speed
+            | ClipParam::Volume
+            | ClipParam::Shape { .. } => {
                 return Err(not_a_transform_param());
             }
         }
@@ -1541,7 +1546,10 @@ pub struct Clip {
     /// Manual color grade (CapCut adjust, Phase I): render-neutral this
     /// milestone. Visual clips — including `Generator::Adjustment` lane
     /// bars; neutral (and absent from saves) when never touched.
-    #[serde(default, skip_serializing_if = "crate::look::ColorAdjustments::is_neutral")]
+    #[serde(
+        default,
+        skip_serializing_if = "crate::look::ColorAdjustments::is_neutral"
+    )]
     pub adjust: crate::look::ColorAdjustments,
     /// Entrance animation preset (CapCut animation In tab, Phase I):
     /// render-neutral this milestone. Visual clips; mutually exclusive with
@@ -3331,13 +3339,27 @@ mod tests {
     fn generator_validate_rejects_bad_shapes() {
         let bad = |shape: Shape| Generator::shape(shape, [255, 255, 255, 255]).validate();
         assert!(bad(Shape::Polygon { sides: 2 }).is_err());
-        assert!(bad(Shape::Star { points: 99, inner_ratio: Param::Constant(0.5) }).is_err());
         assert!(
-            bad(Shape::Star { points: 5, inner_ratio: Param::Constant(1.5) }).is_err(),
+            bad(Shape::Star {
+                points: 99,
+                inner_ratio: Param::Constant(0.5)
+            })
+            .is_err()
+        );
+        assert!(
+            bad(Shape::Star {
+                points: 5,
+                inner_ratio: Param::Constant(1.5)
+            })
+            .is_err(),
             "inner_ratio above 1 must be rejected"
         );
         assert!(
-            bad(Shape::Path(ShapePath { points: vec![ShapePathPoint::corner([0.0, 0.0])], closed: true })).is_err(),
+            bad(Shape::Path(ShapePath {
+                points: vec![ShapePathPoint::corner([0.0, 0.0])],
+                closed: true
+            }))
+            .is_err(),
             "single-point path is not drawable"
         );
         assert!(
@@ -3368,12 +3390,27 @@ mod tests {
     #[test]
     fn shape_param_routing_sets_and_samples() {
         let mut g = Generator::shape(Shape::Rectangle, [255, 255, 255, 255]);
-        g.set_shape_param_keyframe(ShapeParam::Width, 0, ParamValue::Scalar(100.0), Easing::Linear)
-            .unwrap();
-        g.set_shape_param_keyframe(ShapeParam::Width, 10, ParamValue::Scalar(300.0), Easing::Linear)
-            .unwrap();
-        g.set_shape_param_keyframe(ShapeParam::Fill, 0, ParamValue::Color([0, 0, 0, 255]), Easing::Linear)
-            .unwrap();
+        g.set_shape_param_keyframe(
+            ShapeParam::Width,
+            0,
+            ParamValue::Scalar(100.0),
+            Easing::Linear,
+        )
+        .unwrap();
+        g.set_shape_param_keyframe(
+            ShapeParam::Width,
+            10,
+            ParamValue::Scalar(300.0),
+            Easing::Linear,
+        )
+        .unwrap();
+        g.set_shape_param_keyframe(
+            ShapeParam::Fill,
+            0,
+            ParamValue::Color([0, 0, 0, 255]),
+            Easing::Linear,
+        )
+        .unwrap();
         g.set_shape_param_keyframe(
             ShapeParam::Fill,
             10,
@@ -3389,7 +3426,8 @@ mod tests {
 
         // Removing down to zero keyframes collapses to a constant.
         g.remove_shape_param_keyframe(ShapeParam::Width, 0).unwrap();
-        g.remove_shape_param_keyframe(ShapeParam::Width, 10).unwrap();
+        g.remove_shape_param_keyframe(ShapeParam::Width, 10)
+            .unwrap();
         let Generator::Shape { width, .. } = &g else {
             panic!()
         };

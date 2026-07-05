@@ -52,7 +52,11 @@ fn main() {
         let len = step.min(total - start);
         let rgba = hue_sweep(start as f32 / total as f32);
         project
-            .add_generated(track, Generator::SolidColor { rgba }, TimeRange::at_rate(start, len, fps))
+            .add_generated(
+                track,
+                Generator::SolidColor { rgba },
+                TimeRange::at_rate(start, len, fps),
+            )
             .expect("add generated clip");
         start += step;
     }

@@ -52,13 +52,7 @@ pub(crate) fn generator_layer_placement(
     content_h: u32,
     canvas: &CompositorConfig,
 ) -> LayerPlacement {
-    placement_from_size(
-        transform,
-        content_w as f32,
-        content_h as f32,
-        1.0,
-        canvas,
-    )
+    placement_from_size(transform, content_w as f32, content_h as f32, 1.0, canvas)
 }
 
 /// Shared geometry: place content of size `w × h` at `fit · transform.scale`,
@@ -233,8 +227,7 @@ mod tests {
         let t = ClipTransform::IDENTITY;
         let c = canvas();
         let p = media_layer_placement(&t, 1920, 1080, &c);
-        let (anchor_point, position) =
-            reposition_anchor([480.0, 270.0], p.center, p.size, 0.0, &c);
+        let (anchor_point, position) = reposition_anchor([480.0, 270.0], p.center, p.size, 0.0, &c);
         let moved = ClipTransform {
             position,
             anchor_point,

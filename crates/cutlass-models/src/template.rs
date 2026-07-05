@@ -232,7 +232,10 @@ impl Template {
             .flat_map(|track| track.clips())
             .filter(|clip| {
                 clip.text_editable
-                    && matches!(clip.content, crate::ClipSource::Generated(Generator::Text { .. }))
+                    && matches!(
+                        clip.content,
+                        crate::ClipSource::Generated(Generator::Text { .. })
+                    )
             })
             .collect();
         texts.sort_by_key(|clip| (clip.timeline.start.value, clip.id.raw()));
@@ -386,16 +389,13 @@ fn slot_source(
     // rate — assembled as a single i128 fraction and ceiled.
     let tl_dur = i128::from(slot.timeline.duration.value);
     let speed = slot.speed;
-    let numer = tl_dur
-        * i128::from(tl_rate.den)
-        * i128::from(speed.num)
-        * i128::from(media.frame_rate.num);
-    let denom = i128::from(tl_rate.num)
-        * i128::from(speed.den)
-        * i128::from(media.frame_rate.den);
+    let numer =
+        tl_dur * i128::from(tl_rate.den) * i128::from(speed.num) * i128::from(media.frame_rate.num);
+    let denom = i128::from(tl_rate.num) * i128::from(speed.den) * i128::from(media.frame_rate.den);
     // Positive by construction: durations, speeds, and rates are validated
     // positive at their entry points.
-    let src_dur = (numer.div_euclid(denom) + i128::from(numer.rem_euclid(denom) != 0)).max(1) as i64;
+    let src_dur =
+        (numer.div_euclid(denom) + i128::from(numer.rem_euclid(denom) != 0)).max(1) as i64;
 
     let start = match source_in {
         Some(rt) => resample(rt, media.frame_rate).value,
@@ -427,10 +427,20 @@ mod tests {
         let text = project.add_track(TrackKind::Text, "T1");
 
         let slot_a = project
-            .add_clip(video, sample, TimeRange::at_rate(0, 24, R24), RationalTime::new(0, R24))
+            .add_clip(
+                video,
+                sample,
+                TimeRange::at_rate(0, 24, R24),
+                RationalTime::new(0, R24),
+            )
             .unwrap();
         let slot_b = project
-            .add_clip(video, sample, TimeRange::at_rate(0, 24, R24), RationalTime::new(24, R24))
+            .add_clip(
+                video,
+                sample,
+                TimeRange::at_rate(0, 24, R24),
+                RationalTime::new(24, R24),
+            )
             .unwrap();
         let title = project
             .add_generated(
@@ -494,7 +504,9 @@ mod tests {
             _ => unreachable!(),
         };
         let out = template
-            .apply(&[Pick::new(MediaSource::new("a.mp4", 1920, 1080, R24, 120, true))])
+            .apply(&[Pick::new(MediaSource::new(
+                "a.mp4", 1920, 1080, R24, 120, true,
+            ))])
             .unwrap();
         // slot_b was not picked: it keeps the author's sample media.
         match &out.clip(slot_b).unwrap().content {
@@ -517,7 +529,10 @@ mod tests {
             )
             .unwrap();
         project
-            .set_replaceable(slot, Some(Replaceable::new(0).with_accepts(SlotMedia::ImageOnly)))
+            .set_replaceable(
+                slot,
+                Some(Replaceable::new(0).with_accepts(SlotMedia::ImageOnly)),
+            )
             .unwrap();
         let template = Template::from_project(project, TemplateMeta::new("Photo Slot"));
 

@@ -88,7 +88,13 @@ fn still_alpha_composites_over_the_canvas_background() {
     let png_path = dir.path().join("translucent.png");
     // 50%-alpha white over a black canvas must land mid-gray: wrong alpha
     // handling (double premultiply) would show up darker.
-    write_png(&png_path, 320, 180, [255, 255, 255, 128], [255, 255, 255, 128]);
+    write_png(
+        &png_path,
+        320,
+        180,
+        [255, 255, 255, 128],
+        [255, 255, 255, 128],
+    );
 
     let mut project = Project::new("p", FPS_24);
     let media = project.add_media(MediaSource::image(&png_path, 320, 180));
@@ -118,5 +124,9 @@ fn missing_still_file_errors_instead_of_rendering_garbage() {
         eprintln!("skipping: no headless GPU available");
         return;
     };
-    assert!(renderer.render_frame_fit(&project, rt(0), 320, 320).is_err());
+    assert!(
+        renderer
+            .render_frame_fit(&project, rt(0), 320, 320)
+            .is_err()
+    );
 }

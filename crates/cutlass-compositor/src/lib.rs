@@ -37,4 +37,6 @@ pub use cutlass_core::RgbaImage;
 pub use cutlass_shapes::{SdfParams, SdfShape, Stroke};
 pub use error::CompositorError;
 pub use gpu::GpuContext;
-pub use layer::{CompositeLayer, CompositorConfig, FULL_UV, LayerContent, LayerPlacement, SdfLayer};
+pub use layer::{
+    CompositeLayer, CompositorConfig, FULL_UV, LayerContent, LayerPlacement, SdfLayer,
+};

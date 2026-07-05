@@ -74,6 +74,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         export(&mut renderer, &project, &mut encoder)?
     };
 
-    println!("exported {written} frame(s) at 1920x1080 to {}", out.display());
+    println!(
+        "exported {written} frame(s) at 1920x1080 to {}",
+        out.display()
+    );
     Ok(())
 }
