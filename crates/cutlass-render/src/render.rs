@@ -30,10 +30,16 @@ pub struct Renderer {
     /// Pen-path rasterizer (memoized, like `text`). Parametric shapes never
     /// touch it — they realize as GPU SDF layers.
     paths: PathRaster,
-    /// One open decoder per media source, reused across frames. Decoders are
-    /// stateful (seek + walk), so keeping them warm makes sequential export and
-    /// nearby scrubbing cheap.
-    decoders: HashMap<MediaId, Box<dyn VideoDecoder>>,
+    /// One open decoder per **on-screen use** of a media source, reused
+    /// across frames. Decoders are stateful (seek + walk), so keeping them
+    /// warm makes sequential export and nearby scrubbing cheap. Keyed by
+    /// `(media, occurrence slot)` — the per-scene index of that media in the
+    /// layer walk — because two simultaneously visible clips of the same
+    /// file sit at *different* source times: sharing one decoder cursor
+    /// would ping-pong it between them, paying a seek plus GOP-prefix
+    /// re-decode per layer per frame. Slots are stable while the stack is
+    /// (same walk order), so each clip keeps its warm decoder.
+    decoders: HashMap<(MediaId, u32), Box<dyn VideoDecoder>>,
     /// Decode-once cache for still images: one straight-alpha RGBA bitmap per
     /// media source, reused for every frame the still is on screen. Bounded by
     /// the project's still count, with each entry capped at
@@ -230,6 +236,9 @@ impl Renderer {
         // placement. Held in `realized` so the borrowed `CompositeLayer`s built
         // below stay valid through the composite call.
         let mut realized: Vec<Realized> = Vec::with_capacity(scene.layers.len());
+        // Per-scene occurrence index of each media source: the decoder-cache
+        // slot for repeated uses of one file (see `decoders`).
+        let mut occurrence: HashMap<MediaId, u32> = HashMap::new();
         for layer in &scene.layers {
             // The layer carries the anchor position; the quad center falls out
             // of the final pixel size (bitmap sizes only exist after raster).
@@ -264,7 +273,9 @@ impl Renderer {
                     });
                 }
                 LayerSource::Media { media, source_time } => {
-                    let frame = self.decode(project, *media, *source_time)?;
+                    let slot = occurrence.entry(*media).or_insert(0);
+                    let frame = self.decode(project, *media, *slot, *source_time)?;
+                    *slot += 1;
                     let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
                     realized.push(Realized::Frame {
                         frame,
@@ -364,15 +375,16 @@ impl Renderer {
     }
 
     /// Decode the frame of `media` at `source_time`, opening (and caching) a
-    /// decoder for the source on first use.
+    /// decoder for this `(media, slot)` use on first sight.
     fn decode(
         &mut self,
         project: &Project,
         media: MediaId,
+        slot: u32,
         source_time: RationalTime,
     ) -> Result<VideoFrame, RenderError> {
         let mode = self.decode_mode;
-        let decoder = match self.decoders.entry(media) {
+        let decoder = match self.decoders.entry((media, slot)) {
             std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 let src = project
