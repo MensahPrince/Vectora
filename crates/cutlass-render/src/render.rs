@@ -19,7 +19,7 @@ use cutlass_shapes::{PathRaster, ShapeStyle};
 use cutlass_text::TextRenderer;
 
 use crate::error::RenderError;
-use crate::resolve::resolve;
+use crate::resolve::{ResolveOverrides, resolve, resolve_with};
 use crate::scene::{LayerSource, Scene, SizeSpec};
 
 /// Renders project frames on a headless (or shared) GPU.
@@ -80,6 +80,18 @@ impl Renderer {
         self.render_scene(project, &scene)
     }
 
+    /// [`render_frame`](Self::render_frame) with live-preview
+    /// [`ResolveOverrides`] applied — the gesture/inspector preview path.
+    pub fn render_frame_with(
+        &mut self,
+        project: &Project,
+        t: RationalTime,
+        overrides: ResolveOverrides<'_>,
+    ) -> Result<RgbaImage, RenderError> {
+        let scene = resolve_with(project, t, overrides)?;
+        self.render_scene(project, &scene)
+    }
+
     /// [`render_frame`](Self::render_frame) scaled to fit within
     /// `max_width`×`max_height` (aspect preserved, never upscaled) — the
     /// interactive-preview path, where compositing and reading back a full
@@ -91,7 +103,20 @@ impl Renderer {
         max_width: u32,
         max_height: u32,
     ) -> Result<RgbaImage, RenderError> {
-        let mut scene = resolve(project, t)?;
+        self.render_frame_fit_with(project, t, max_width, max_height, ResolveOverrides::default())
+    }
+
+    /// [`render_frame_fit`](Self::render_frame_fit) with live-preview
+    /// [`ResolveOverrides`] applied.
+    pub fn render_frame_fit_with(
+        &mut self,
+        project: &Project,
+        t: RationalTime,
+        max_width: u32,
+        max_height: u32,
+        overrides: ResolveOverrides<'_>,
+    ) -> Result<RgbaImage, RenderError> {
+        let mut scene = resolve_with(project, t, overrides)?;
         scene.fit_within(max_width, max_height);
         self.render_scene(project, &scene)
     }
@@ -297,6 +322,57 @@ impl Renderer {
                 media,
                 time: source_time,
             })
+    }
+
+    /// Tight size (canvas px, at transform scale 1.0) of the content
+    /// `generator` draws on a `canvas_w`×`canvas_h` canvas — what a preview
+    /// selection box should hug. Animated params sample at clip-local `tick`.
+    /// `None` for generators that draw nothing (empty text, degenerate
+    /// shapes, kinds the compositor doesn't draw yet).
+    ///
+    /// `&mut self`: text and pen-path sizes come from the memoized
+    /// rasterizers, so a miss here warms the composite path too.
+    pub fn generator_content_size(
+        &mut self,
+        generator: &cutlass_models::Generator,
+        canvas_w: u32,
+        canvas_h: u32,
+        tick: i64,
+    ) -> Option<(u32, u32)> {
+        let layer = crate::resolve::resolve_generator(
+            generator,
+            [0.0, 0.0],
+            0.0,
+            1.0,
+            [0.0, 0.0, 1.0, 1.0],
+            canvas_w as f32,
+            canvas_h as f32,
+            1.0,
+            tick,
+        )?;
+        match layer.size {
+            SizeSpec::Fixed(size) => Some((size[0].round() as u32, size[1].round() as u32)),
+            // Bitmap layers (text, pen paths) size to their raster.
+            SizeSpec::BitmapScaled(_) => {
+                let image = match &layer.source {
+                    LayerSource::Text { content, style } => self.text.rasterize(content, style),
+                    LayerSource::PathShape {
+                        path,
+                        fill,
+                        stroke,
+                        raster_scale,
+                    } => {
+                        let style = ShapeStyle {
+                            fill: Some(*fill).filter(|c| c[3] > 0),
+                            stroke: *stroke,
+                        };
+                        self.paths.rasterize(path, &style, *raster_scale)
+                    }
+                    _ => return None,
+                };
+                (image.width > 0 && image.height > 0).then_some((image.width, image.height))
+            }
+        }
     }
 
     /// Decode `media`'s single still frame into the cache on first use.

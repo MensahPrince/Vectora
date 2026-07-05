@@ -7,8 +7,8 @@
 use std::path::PathBuf;
 
 use cutlass_commands::{Command, ProjectCommand};
-use cutlass_models::{Project, Rational, RationalTime};
-use cutlass_render::{Renderer, RgbaImage, export_to_file};
+use cutlass_models::{ClipId, ClipTransform, Generator, Project, Rational, RationalTime};
+use cutlass_render::{Renderer, ResolveOverrides, RgbaImage, export_to_file};
 
 use crate::action::{ApplyContext, ApplyOutcome, EditAction, History, dispatch};
 use crate::error::EngineError;
@@ -40,6 +40,13 @@ pub struct Engine {
     /// Revision last written to (or read from) disk; with `revision` this is
     /// the dirty flag (see [`is_dirty`](Self::is_dirty)).
     saved_revision: u64,
+    /// Live gesture transform for one clip: preview frames render it instead
+    /// of the committed transform until cleared. Session state only — never
+    /// in the project, history, or export.
+    transform_override: Option<(ClipId, ClipTransform)>,
+    /// Live generator content for one clip (inspector slider preview), same
+    /// session-only semantics as `transform_override`.
+    generator_override: Option<(ClipId, Generator)>,
 }
 
 impl Engine {
@@ -60,6 +67,8 @@ impl Engine {
             renderer,
             revision: 0,
             saved_revision: 0,
+            transform_override: None,
+            generator_override: None,
         })
     }
 
@@ -130,6 +139,8 @@ impl Engine {
         self.project = project;
         self.history.clear();
         self.project_path = None;
+        self.transform_override = None;
+        self.generator_override = None;
         self.revision += 1;
         self.saved_revision = self.revision;
     }
@@ -173,9 +184,45 @@ impl Engine {
         Ok(outcome)
     }
 
+    /// Set (or clear with `None`) the live gesture transform for one clip.
+    ///
+    /// While set, preview frames render this transform in place of the clip's
+    /// committed one; the project, history, and export are untouched. Release
+    /// commits a real `SetClipTransform` and clears the override.
+    pub fn set_transform_override(&mut self, value: Option<(ClipId, ClipTransform)>) {
+        self.transform_override = value;
+    }
+
+    /// Set (or clear with `None`) the live generator content for one clip —
+    /// the inspector-slider analogue of
+    /// [`set_transform_override`](Self::set_transform_override).
+    pub fn set_generator_override(&mut self, value: Option<(ClipId, Generator)>) {
+        self.generator_override = value;
+    }
+
+    /// Tight size (canvas px, at transform scale 1.0) of the content
+    /// `generator` draws on the current canvas — what a preview selection box
+    /// should hug, since text/path rasters are mostly transparent padding.
+    /// Animated params sample at clip-local `tick`. `None` for generators the
+    /// compositor doesn't draw. Served from the renderer's raster caches
+    /// (`&mut self`: a miss rasterizes once, warming preview too).
+    pub fn generator_content_size(
+        &mut self,
+        generator: &Generator,
+        tick: i64,
+    ) -> Option<(u32, u32)> {
+        let (width, height) = cutlass_render::canvas_size(&self.project);
+        self.renderer
+            .generator_content_size(generator, width, height, tick)
+    }
+
     /// Composite enabled visual layers at `time` into an RGBA preview frame.
     pub fn get_frame(&mut self, time: RationalTime) -> Result<RgbaImage, EngineError> {
-        Ok(self.renderer.render_frame(&self.project, time)?)
+        let overrides = ResolveOverrides {
+            transform: self.transform_override,
+            generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+        };
+        Ok(self.renderer.render_frame_with(&self.project, time, overrides)?)
     }
 
     /// [`get_frame`](Self::get_frame) scaled to fit within
@@ -188,9 +235,13 @@ impl Engine {
         max_width: u32,
         max_height: u32,
     ) -> Result<RgbaImage, EngineError> {
+        let overrides = ResolveOverrides {
+            transform: self.transform_override,
+            generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+        };
         Ok(self
             .renderer
-            .render_frame_fit(&self.project, time, max_width, max_height)?)
+            .render_frame_fit_with(&self.project, time, max_width, max_height, overrides)?)
     }
 
     pub fn undo(&mut self) -> bool {

@@ -29,5 +29,5 @@ pub use export::{
 };
 pub use export_audio::{EXPORT_AUDIO_CHANNELS, EXPORT_AUDIO_RATE, ExportAudioMixer};
 pub use render::Renderer;
-pub use resolve::{canvas_size, resolve};
+pub use resolve::{ResolveOverrides, canvas_size, resolve, resolve_with};
 pub use scene::{LayerSource, Scene, SceneLayer, SizeSpec};

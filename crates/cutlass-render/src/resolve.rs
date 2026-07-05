@@ -20,8 +20,8 @@
 
 use cutlass_core::{RationalTime, resample};
 use cutlass_models::{
-    ClipSource, Generator, MediaKind, Param, Project, Shape, ShapePath, ShapeStroke, TextAlignH,
-    TextStyle as ModelTextStyle,
+    ClipId, ClipSource, ClipTransform, Generator, MediaKind, Param, Project, Shape, ShapePath,
+    ShapeStroke, TextAlignH, TextStyle as ModelTextStyle,
 };
 use cutlass_shapes::{BezierPath, PathPoint, SDF_AA, SdfParams, Stroke};
 use cutlass_text::{FontFamily, TextAlign, TextStyle};
@@ -36,11 +36,32 @@ const REFERENCE_HEIGHT: f32 = 1080.0;
 /// Fallback canvas size when `Auto` aspect can't find any video media.
 const DEFAULT_CANVAS: (u32, u32) = (1920, 1080);
 
+/// Live-preview substitutions resolved in place of committed clip state.
+///
+/// A drag/scale/rotate gesture overrides one clip's transform; a live
+/// inspector edit (font-size slider, shape color) overrides one clip's
+/// generator. Both are session-side only: the project, history, and export
+/// never see them — release commits one real edit and clears the override.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ResolveOverrides<'a> {
+    pub transform: Option<(ClipId, ClipTransform)>,
+    pub generator: Option<(ClipId, &'a Generator)>,
+}
+
 /// Resolve `project` at timeline instant `t` into a [`Scene`].
 ///
 /// `t` is interpreted at the timeline frame rate (it is resampled to it first),
 /// so callers may pass a tick at any rate.
 pub fn resolve(project: &Project, t: RationalTime) -> Result<Scene, cutlass_models::ModelError> {
+    resolve_with(project, t, ResolveOverrides::default())
+}
+
+/// [`resolve`] with live-preview [`ResolveOverrides`] applied.
+pub fn resolve_with(
+    project: &Project,
+    t: RationalTime,
+    overrides: ResolveOverrides<'_>,
+) -> Result<Scene, cutlass_models::ModelError> {
     let timeline = project.timeline();
     let rate = timeline.frame_rate;
     let t = resample(t, rate);
@@ -59,7 +80,7 @@ pub fn resolve(project: &Project, t: RationalTime) -> Result<Scene, cutlass_mode
         let Some(clip) = track.clip_at(t)? else {
             continue;
         };
-        if let Some(layer) = resolve_clip(project, clip, t, cw, ch)? {
+        if let Some(layer) = resolve_clip(project, clip, t, cw, ch, overrides)? {
             scene.layers.push(layer);
         }
     }
@@ -124,11 +145,16 @@ fn resolve_clip(
     t: RationalTime,
     cw: f32,
     ch: f32,
+    overrides: ResolveOverrides<'_>,
 ) -> Result<Option<SceneLayer>, cutlass_models::ModelError> {
     // Clip-relative tick at the timeline rate (both `t` and the clip start are
     // expressed at it), which is what animated transforms key against.
     let local_tick = t.value - clip.timeline.start.value;
-    let xf = clip.transform.sample(local_tick);
+    // A live gesture replaces the whole sampled transform for its clip.
+    let xf = match overrides.transform {
+        Some((id, xf)) if id == clip.id => xf,
+        _ => clip.transform.sample(local_tick),
+    };
 
     // `position` is the anchor's offset from the canvas center, as a fraction of
     // canvas width/height. With the default center anchor (the common case) this
@@ -174,14 +200,21 @@ fn resolve_clip(
                 uv,
             }))
         }
-        ClipSource::Generated(generator) => Ok(resolve_generator(
-            generator, center, rotation, opacity, uv, cw, ch, xf.scale, local_tick,
-        )),
+        ClipSource::Generated(generator) => {
+            // A live inspector edit replaces the clip's generator content.
+            let generator = match overrides.generator {
+                Some((id, live)) if id == clip.id => live,
+                _ => generator,
+            };
+            Ok(resolve_generator(
+                generator, center, rotation, opacity, uv, cw, ch, xf.scale, local_tick,
+            ))
+        }
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn resolve_generator(
+pub(crate) fn resolve_generator(
     generator: &Generator,
     center: [f32; 2],
     rotation: f32,
