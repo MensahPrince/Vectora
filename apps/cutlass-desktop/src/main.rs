@@ -1,10 +1,12 @@
 mod drafts;
-// Sampling/easing helpers go quiet until their consumers (projection,
-// inspector) land in Phases 1–2.
-#[allow(dead_code)]
+mod inspector;
 mod params;
 mod paths;
+mod placement;
 mod preview;
+mod preview_gesture;
+mod preview_select;
+mod preview_view;
 mod preview_worker;
 mod projection;
 mod ruler;

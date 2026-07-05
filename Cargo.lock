@@ -1168,10 +1168,12 @@ version = "0.5.3-alpha.0"
 dependencies = [
  "crossbeam-channel",
  "cutlass-commands",
+ "cutlass-compositor",
  "cutlass-engine",
  "cutlass-models",
  "cutlass-render",
  "cutlass-settings",
+ "cutlass-text",
  "dirs",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
