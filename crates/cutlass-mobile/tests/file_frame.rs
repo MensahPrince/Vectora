@@ -46,8 +46,22 @@ fn export_solid_clip(path: &Path) {
     assert_eq!(frames, 3);
 }
 
+/// Whether this host has a native encoder/decoder. Only Apple/Windows/Android
+/// do; Linux CI has none, so the round-trip below (encode fixture, decode it
+/// back) skips there rather than failing on an unsupported codec.
+fn native_av() -> bool {
+    cfg!(any(
+        target_vendor = "apple",
+        target_os = "windows",
+        target_os = "android"
+    ))
+}
+
 #[test]
 fn decodes_exported_clip_through_ffi() {
+    if !native_av() {
+        return; // no native encoder/decoder for the mp4 round-trip (e.g. Linux CI)
+    }
     if GpuContext::new_headless_blocking().is_err() {
         eprintln!("skipping: no GPU adapter");
         return;

@@ -233,8 +233,22 @@ fn temp_media_clip() -> std::path::PathBuf {
     path
 }
 
+/// Whether this host has a native encoder/decoder. Only Apple/Windows/Android
+/// do; Linux CI has none, so tests that build and import a real media clip skip
+/// there. The solid/text/undo/save tests use no media and run everywhere.
+fn native_av() -> bool {
+    cfg!(any(
+        target_vendor = "apple",
+        target_os = "windows",
+        target_os = "android"
+    ))
+}
+
 #[test]
 fn lifting_a_main_clip_to_a_lane_closes_the_hole() {
+    if !native_av() {
+        return; // no native encoder/decoder for the media fixture (e.g. Linux CI)
+    }
     let media = temp_media_clip();
     let media_str = media.to_str().expect("utf8 path");
 
@@ -286,6 +300,9 @@ fn lifting_a_main_clip_to_a_lane_closes_the_hole() {
 
 #[test]
 fn freeze_splits_the_clip_around_a_three_second_still() {
+    if !native_av() {
+        return; // no native encoder/decoder for the media fixture (e.g. Linux CI)
+    }
     let media = temp_media_clip();
     let media_str = media.to_str().expect("utf8 path");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -333,6 +350,9 @@ fn freeze_splits_the_clip_around_a_three_second_still() {
 
 #[test]
 fn freeze_at_the_clip_edge_inserts_without_splitting() {
+    if !native_av() {
+        return; // no native encoder/decoder for the media fixture (e.g. Linux CI)
+    }
     let media = temp_media_clip();
     let media_str = media.to_str().expect("utf8 path");
     let dir = tempfile::tempdir().expect("tempdir");

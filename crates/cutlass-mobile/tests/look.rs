@@ -116,6 +116,17 @@ fn temp_wav() -> std::path::PathBuf {
     path
 }
 
+/// Whether this host has a native encoder/decoder for the media fixtures. Only
+/// Apple/Windows/Android do; Linux CI has none, so tests that import real
+/// audio/video skip there. The catalog test needs no media and runs everywhere.
+fn native_av() -> bool {
+    cfg!(any(
+        target_vendor = "apple",
+        target_os = "windows",
+        target_os = "android"
+    ))
+}
+
 #[test]
 fn catalogs_ffi_returns_every_vocabulary() {
     let doc = take_json(cutlass_catalogs());
@@ -141,6 +152,9 @@ fn catalogs_ffi_returns_every_vocabulary() {
 
 #[test]
 fn look_commands_surface_in_ui_state() {
+    if !native_av() {
+        return; // no native encoder/decoder for the media fixture (e.g. Linux CI)
+    }
     let media = temp_media_clip();
     let media_str = media.to_str().expect("utf8 path");
     let session = cutlass_session_new(30, 1);
@@ -194,6 +208,9 @@ fn look_commands_surface_in_ui_state() {
 
 #[test]
 fn speed_preset_intent_applies_and_clears_catalog_curves() {
+    if !native_av() {
+        return; // no native encoder/decoder for the media fixture (e.g. Linux CI)
+    }
     let media = temp_media_clip();
     let media_str = media.to_str().expect("utf8 path");
     let session = cutlass_session_new(30, 1);
@@ -238,6 +255,9 @@ fn speed_preset_intent_applies_and_clears_catalog_curves() {
 
 #[test]
 fn add_audio_role_lands_on_the_lane_clip() {
+    if !native_av() {
+        return; // no native decoder to import the WAV (e.g. Linux CI)
+    }
     let wav = temp_wav();
     let wav_str = wav.to_str().expect("utf8 path");
     let session = cutlass_session_new(30, 1);
@@ -266,6 +286,9 @@ fn add_audio_role_lands_on_the_lane_clip() {
 
 #[test]
 fn duplicate_carries_the_look_onto_the_copy() {
+    if !native_av() {
+        return; // no native encoder/decoder for the media fixture (e.g. Linux CI)
+    }
     let media = temp_media_clip();
     let media_str = media.to_str().expect("utf8 path");
     let session = cutlass_session_new(30, 1);

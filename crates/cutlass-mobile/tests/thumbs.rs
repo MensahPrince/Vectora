@@ -64,8 +64,23 @@ fn temp_png(dir: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
+/// Whether this host has a native encoder/decoder. Only Apple/Windows/Android
+/// do; Linux CI has none, so the video filmstrip test (which encodes an mp4
+/// fixture, then decodes it) skips there. Still thumbnails decode PNGs in pure
+/// Rust, so that test runs everywhere.
+fn native_av() -> bool {
+    cfg!(any(
+        target_vendor = "apple",
+        target_os = "windows",
+        target_os = "android"
+    ))
+}
+
 #[test]
 fn video_filmstrip_thumbs_fit_the_requested_box() {
+    if !native_av() {
+        return; // no native encoder/decoder for the mp4 round-trip (e.g. Linux CI)
+    }
     if !has_gpu() {
         eprintln!("skipping: no GPU adapter");
         return;

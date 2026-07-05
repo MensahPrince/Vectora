@@ -94,6 +94,18 @@ fn assert_stereo_levels(block: &[f32], left: f32, right: f32, tolerance: f32) {
     }
 }
 
+/// Whether this host decodes media with a native backend. Only Apple/Windows/
+/// Android ship one; Linux CI has none, so the tests that import a real audio
+/// file skip there instead of asserting on an empty decoder — they still run on
+/// every platform the Swift/Kotlin shells actually target.
+fn native_av() -> bool {
+    cfg!(any(
+        target_vendor = "apple",
+        target_os = "windows",
+        target_os = "android"
+    ))
+}
+
 #[test]
 fn format_constants_match_the_mixer() {
     assert_eq!(cutlass_audio_rate(), 48_000);
@@ -121,6 +133,9 @@ fn a_silent_timeline_opens_no_reader() {
 
 #[test]
 fn reads_mixed_pcm_and_snapshots_the_project() {
+    if !native_av() {
+        return; // no native decoder to import the WAV (e.g. Linux CI)
+    }
     let wav = temp_wav();
     let wav_str = wav.to_str().expect("utf8 path");
 
@@ -161,6 +176,9 @@ fn reads_mixed_pcm_and_snapshots_the_project() {
 
 #[test]
 fn reads_stop_at_the_timeline_end() {
+    if !native_av() {
+        return; // no native decoder to import the WAV (e.g. Linux CI)
+    }
     let wav = temp_wav();
     let wav_str = wav.to_str().expect("utf8 path");
 
