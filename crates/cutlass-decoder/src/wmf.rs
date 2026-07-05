@@ -167,6 +167,18 @@ impl WmfDecoder {
         self.d3d.is_some()
     }
 
+    /// Whether the source also carries an audio track, queried from this
+    /// decoder's own reader — so the probe doesn't open the file a second
+    /// time just to answer it. Stream selection doesn't matter here:
+    /// `GetNativeMediaType` reads the presentation descriptor.
+    pub(crate) fn has_audio_track(&self) -> bool {
+        unsafe {
+            self.reader
+                .GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0)
+                .is_ok()
+        }
+    }
+
     /// Turn one decoded [`IMFSample`] into a [`VideoFrame`].
     fn sample_to_frame(
         &self,
@@ -309,27 +321,6 @@ pub(crate) fn ensure_mf_platform() {
     MF_PLATFORM.call_once(|| unsafe {
         let _ = MFStartup(MF_VERSION, MFSTARTUP_FULL);
     });
-}
-
-/// Whether the file at `path` carries at least one audio stream. Used by the
-/// probe to set [`crate::MediaProbe::has_audio`]; `false` on any error.
-///
-/// Opens a throwaway source reader and asks for the first audio stream's
-/// native media type — present iff the container has an audio stream. No
-/// decoder is spun up (no output type is set, nothing is read).
-pub(crate) fn has_audio_track(path: &Path) -> bool {
-    ensure_mf_platform();
-    unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-    }
-    let Ok(reader) = open_source_reader(path, None) else {
-        return false;
-    };
-    unsafe {
-        reader
-            .GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0)
-            .is_ok()
-    }
 }
 
 /// Duration of the first audio track of `path`, for the audio-only probe
