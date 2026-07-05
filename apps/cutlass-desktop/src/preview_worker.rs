@@ -30,6 +30,10 @@ use crate::{EditorStore, PreviewStore};
 /// projected timeline.
 struct UiSink {
     editor: slint::Weak<EditorStore<'static>>,
+    /// Audio mixer inbox: every projection republish also publishes the
+    /// project snapshot here, so mid-playback edits become audible (the
+    /// mixer reopens over the new snapshot at its current position).
+    audio: crate::audio::AudioHandle,
 }
 
 pub struct PreviewSession {
@@ -822,6 +826,7 @@ impl PreviewWorker {
         config: EngineConfig,
         preview_weak: slint::Weak<PreviewStore<'static>>,
         editor_weak: slint::Weak<EditorStore<'static>>,
+        audio: crate::audio::AudioHandle,
     ) -> Result<(Self, PreviewSession), String> {
         let (ready_tx, ready_rx) = bounded(1);
         let (req_tx, req_rx) = unbounded();
@@ -829,7 +834,9 @@ impl PreviewWorker {
         let join = std::thread::Builder::new()
             .name("cutlass-preview".into())
             .spawn(move || {
-                if let Err(e) = worker_main(config, preview_weak, editor_weak, req_rx, ready_tx) {
+                if let Err(e) =
+                    worker_main(config, preview_weak, editor_weak, audio, req_rx, ready_tx)
+                {
                     error!("preview worker exited: {e}");
                 }
             })
@@ -859,6 +866,7 @@ fn worker_main(
     config: EngineConfig,
     preview_weak: slint::Weak<PreviewStore<'static>>,
     editor_weak: slint::Weak<EditorStore<'static>>,
+    audio: crate::audio::AudioHandle,
     req_rx: Receiver<WorkerMsg>,
     ready_tx: Sender<Result<PreviewSession, String>>,
 ) -> Result<(), String> {
@@ -886,6 +894,7 @@ fn worker_main(
     // from the first frame (rather than any Slint-side placeholder).
     let ui = UiSink {
         editor: editor_weak,
+        audio,
     };
     publish_projection(&mut engine, &ui);
 
@@ -4105,6 +4114,9 @@ fn publish_projection(engine: &mut Engine, ui: &UiSink) {
         .map(|m| m.id.raw())
         .collect();
     let project = engine.project().clone();
+    // The audio mixer hears every edit through the same chokepoint that
+    // republishes the view model, so sound and picture can't drift apart.
+    ui.audio.publish_snapshot(project.clone());
     let can_undo = engine.can_undo();
     let can_redo = engine.can_redo();
     // Session save state rides the same chokepoint as the project view, so

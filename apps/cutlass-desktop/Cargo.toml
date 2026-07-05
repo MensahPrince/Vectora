@@ -28,6 +28,7 @@ cutlass-text = { path = "../../crates/cutlass-text" }
 cutlass-models = { path = "../../crates/cutlass-models" }
 cutlass-render = { path = "../../crates/cutlass-render" }
 cutlass-settings = { path = "../../crates/cutlass-settings" }
+cpal = "0.18.1"
 crossbeam-channel = "0.5"
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -59,6 +60,7 @@ windows = { version = "0.62", features = [
 ] }
 
 [dev-dependencies]
+cutlass-decoder = { path = "../../crates/cutlass-decoder" }
 tempfile = "3"
 
 [build-dependencies]

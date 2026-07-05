@@ -1,3 +1,4 @@
+mod audio;
 mod drafts;
 mod inspector;
 mod params;
@@ -410,6 +411,11 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // --- engine service (preview worker thread) ---------------------------
 
+    // Audio output + master clock (Phase 3). Starts even before a project
+    // opens; a machine without a usable output device degrades to the
+    // wall-clock transport (`handle.active() == false`).
+    let audio_system = audio::AudioSystem::start();
+
     // The worker thread owns the Engine (decoders aren't Send); the UI talks
     // to it through a message queue and it answers with projection publishes
     // and preview frames via invoke_from_event_loop.
@@ -420,6 +426,7 @@ fn main() -> Result<(), slint::PlatformError> {
         EngineConfig::default(),
         preview_store_weak,
         editor_store_weak,
+        audio_system.handle(),
     )
     .map_err(slint::PlatformError::Other)?;
     tracing::debug!(
@@ -429,10 +436,21 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // Playhead moves (ruler scrub, frame-step keys, Home/End) become preview
     // frame requests; the worker coalesces a burst to the newest tick.
-    // (Scrub audio joins in Phase 3.)
     let frame_handle = preview_worker.handle();
+    let scrub_audio = audio_system.handle();
+    let scrub_weak = app.as_weak();
     editor.on_on_playhead_changed(move |tick| {
         frame_handle.request_frame(i64::from(tick));
+        // Scrub audio: a manual playhead move while paused plays a short
+        // burst of the sound under the playhead. During playback the master
+        // clock drives the playhead, so suppress scrub there — the mixer is
+        // already producing that audio.
+        let playing = scrub_weak
+            .upgrade()
+            .is_some_and(|app| app.global::<TimelineStore>().get_playing());
+        if !playing {
+            scrub_audio.scrub(i64::from(tick));
+        }
     });
 
     // Preview surface size (docked panel or fullscreen) → render fit bound.
@@ -827,31 +845,60 @@ fn main() -> Result<(), slint::PlatformError> {
             ruler::ticks_model(scroll_x, viewport_w, zoom, fps_num, fps_den)
         });
 
-    // Playback clock: no audio device path yet (Phase 3), so every speed
-    // uses the scaled wall clock.
+    // Playback clock (Phases 1 + 3): at speed 1/1 with a live output device,
+    // *consumed audio frames* are the clock — video follows the sound card,
+    // which is what keeps A/V locked. Shuttle speeds and deviceless machines
+    // use the scaled wall clock instead.
+    let clock_audio = audio_system.handle();
     app.global::<TransportBackend>().on_playback_tick(
         move |anchor_tick, anchor_ms, now_ms, fps_num, fps_den, speed_num, speed_den| {
-            transport::playback_tick_scaled(
-                anchor_tick,
-                anchor_ms,
-                now_ms,
-                fps_num,
-                fps_den,
-                speed_num,
-                speed_den,
-            )
+            if clock_audio.active() && speed_num == 1 && speed_den == 1 {
+                clock_audio
+                    .current_tick(fps_num, fps_den)
+                    .clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
+            } else {
+                transport::playback_tick_scaled(
+                    anchor_tick,
+                    anchor_ms,
+                    now_ms,
+                    fps_num,
+                    fps_den,
+                    speed_num,
+                    speed_den,
+                )
+            }
         },
     );
+
+    // Transport intent → audio engine. Play doubles as the mid-playback
+    // seek; non-1x speeds play muted (varispeed audio is a later phase).
+    let play_audio = audio_system.handle();
+    app.global::<TransportBackend>()
+        .on_transport_play(move |tick, speed_num, speed_den| {
+            if speed_num == 1 && speed_den == 1 {
+                play_audio.play(i64::from(tick));
+            } else {
+                play_audio.pause();
+            }
+        });
+
+    let pause_audio = audio_system.handle();
+    app.global::<TransportBackend>()
+        .on_transport_pause(move || {
+            pause_audio.pause();
+        });
 
     // End-of-playback auto-stop, deferred off the playback Timer's own
     // callback. `playback-step` calls this instead of flipping
     // `TimelineStore.playing` (the Timer's `running` binding) inline, which
     // re-enters Slint's timer machinery and panics with "Recursion in timer
-    // code" (slint-ui/slint#6332). The Slint `playing = false` write — which
-    // is what actually stops the Timer — runs on the next event-loop turn,
-    // outside the callback.
+    // code" (slint-ui/slint#6332). Audio stops now (lock-free); the Slint
+    // `playing = false` write — which is what actually stops the Timer — runs
+    // on the next event-loop turn, outside the callback.
+    let stop_audio = audio_system.handle();
     let stop_weak = app.as_weak();
     app.global::<TransportBackend>().on_request_stop(move || {
+        stop_audio.pause();
         let stop_weak = stop_weak.clone();
         defer_main_thread(move || {
             if let Some(app) = stop_weak.upgrade() {
