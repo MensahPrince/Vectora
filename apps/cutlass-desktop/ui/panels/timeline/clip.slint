@@ -231,10 +231,12 @@ export component ClipView inherits Rectangle {
     // clips that actually carry an envelope and are wide enough to read. The
     // path's normalized viewbox stretches across the card; x runs clip
     // start→end, y maps the gain 0..200% top-down (so the dot math matches).
+    // Dim via per-element color alpha, not group `opacity` — this container
+    // spans the whole card, and a group opacity would composite it into a
+    // clip-wide GPU layer texture (the 16384px trap described on `dimmed`).
     if root.show-waveform && root.model.has-volume-envelope && root.width > 40px: Rectangle {
         width: 100%;
         height: 100%;
-        opacity: root.dimmed ? 0.4 : 0.9;
 
         Path {
             width: 100%;
@@ -242,7 +244,7 @@ export component ClipView inherits Rectangle {
             viewbox-width: 1000;
             viewbox-height: 1000;
             commands: root.model.volume-path;
-            stroke: #ffffff;
+            stroke: #ffffff.with-alpha(root.dimmed ? 0.36 : 0.9);
             stroke-width: 1.5px;
             fill: transparent;
         }
@@ -253,9 +255,9 @@ export component ClipView inherits Rectangle {
             width: 6px;
             height: 6px;
             border-radius: 3px;
-            background: AppStore.theme.accent.primary;
+            background: AppStore.theme.accent.primary.with-alpha(root.dimmed ? 0.36 : 0.9);
             border-width: 1px;
-            border-color: #ffffff;
+            border-color: #ffffff.with-alpha(root.dimmed ? 0.36 : 0.9);
         }
     }
 
@@ -264,34 +266,37 @@ export component ClipView inherits Rectangle {
     // this clip's current window as absolute sequence ticks, so the same
     // tick→x mapping as the keyframe dots places them. Shown on any clip that
     // carries beats (audio lanes, or video clips with detected beats).
+    // No group opacity here either (clip-wide container ⇒ GPU layer trap);
+    // the dim rides on each tick's color.
     if root.model.beats.length > 0 && root.width > 24px: Rectangle {
         width: 100%;
         height: 100%;
-        opacity: root.dimmed ? 0.4 : 0.95;
         for beat in root.model.beats: Rectangle {
             x: (beat - root.model.timeline-start.value) * root.zoom * 1px - self.width / 2;
             y: parent.height - self.height - 1px;
             width: 2px;
             height: 8px;
             border-radius: 1px;
-            background: #ffd34d;
+            background: #ffd34d.with-alpha(root.dimmed ? 0.4 : 0.95);
         }
     }
 
     // Audio fade ramps: a darkening triangle over each attenuated corner with
     // a bright edge line. Driven by the projected fade-*-s (or the live drag
-    // width); drawn before the labels so the badges stay legible.
+    // width); drawn before the labels so the badges stay legible. Dim via the
+    // fill/stroke alpha, not group opacity — these containers span the whole
+    // card, so a group opacity would allocate a clip-wide GPU layer texture
+    // and abort past 16384px (the trap described on `dimmed`).
     if root.show-waveform && root.width > 24px && (root.fade-in-w-live > 0.5px || root.fade-drag == 1): Rectangle {
         width: 100%;
         height: 100%;
-        opacity: root.dimmed ? 0.4 : 1.0;
 
         Path {
             width: 100%;
             height: 100%;
             viewbox-width: 100;
             viewbox-height: 100;
-            fill: #00000059;
+            fill: #000000.with-alpha(root.dimmed ? 0.14 : 0.35);
 
             MoveTo { x: 0; y: 0; }
             LineTo { x: root.fade-in-frac * 100; y: 0; }
@@ -303,7 +308,7 @@ export component ClipView inherits Rectangle {
             height: 100%;
             viewbox-width: 100;
             viewbox-height: 100;
-            stroke: #ffffff;
+            stroke: #ffffff.with-alpha(root.dimmed ? 0.4 : 1.0);
             stroke-width: 1px;
             fill: transparent;
 
@@ -314,14 +319,13 @@ export component ClipView inherits Rectangle {
     if root.show-waveform && root.width > 24px && (root.fade-out-w-live > 0.5px || root.fade-drag == 2): Rectangle {
         width: 100%;
         height: 100%;
-        opacity: root.dimmed ? 0.4 : 1.0;
 
         Path {
             width: 100%;
             height: 100%;
             viewbox-width: 100;
             viewbox-height: 100;
-            fill: #00000059;
+            fill: #000000.with-alpha(root.dimmed ? 0.14 : 0.35);
 
             MoveTo { x: 100; y: 0; }
             LineTo { x: 100 - root.fade-out-frac * 100; y: 0; }
@@ -333,7 +337,7 @@ export component ClipView inherits Rectangle {
             height: 100%;
             viewbox-width: 100;
             viewbox-height: 100;
-            stroke: #ffffff;
+            stroke: #ffffff.with-alpha(root.dimmed ? 0.4 : 1.0);
             stroke-width: 1px;
             fill: transparent;
 
