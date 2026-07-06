@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
 
 use cutlass_compositor::{
     CompositeLayer, Compositor, CompositorConfig, CompositorError, FrameSink, GpuContext,
@@ -21,6 +22,11 @@ use cutlass_text::TextRenderer;
 use crate::error::RenderError;
 use crate::resolve::{ResolveOverrides, resolve, resolve_with};
 use crate::scene::{LayerSource, Scene, SizeSpec};
+
+/// A composited frame slower than this logs its stage breakdown at `info`
+/// (default-visible): interactive preview budgets a few frames of latency,
+/// and anything past this is worth attributing to decode vs GPU work.
+const SLOW_FRAME_LOG_MS: f64 = 150.0;
 
 /// Renders project frames on a headless (or shared) GPU.
 pub struct Renderer {
@@ -232,6 +238,10 @@ impl Renderer {
         scene: &Scene,
         sink: &mut dyn FrameSink,
     ) -> Result<(), RenderError> {
+        let realize_started = Instant::now();
+        // Decode time accumulated across media layers — on weak machines this
+        // is where whole-frame seconds hide, so the stage log splits it out.
+        let mut decode_ms = 0.0f64;
         // First pass: decode/rasterize each layer into owned pixels and a final
         // placement. Held in `realized` so the borrowed `CompositeLayer`s built
         // below stay valid through the composite call.
@@ -274,7 +284,9 @@ impl Renderer {
                 }
                 LayerSource::Media { media, source_time } => {
                     let slot = occurrence.entry(*media).or_insert(0);
+                    let decode_started = Instant::now();
                     let frame = self.decode(project, *media, *slot, *source_time)?;
+                    decode_ms += decode_started.elapsed().as_secs_f64() * 1000.0;
                     *slot += 1;
                     let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
                     realized.push(Realized::Frame {
@@ -369,9 +381,38 @@ impl Renderer {
 
         let config =
             CompositorConfig::new(scene.width, scene.height).with_background(scene.background);
-        Ok(self
-            .compositor
-            .render_into(&self.gpu, &config, &layers, sink)?)
+        let realize_ms = realize_started.elapsed().as_secs_f64() * 1000.0;
+        let composite_started = Instant::now();
+        self.compositor
+            .render_into(&self.gpu, &config, &layers, sink)?;
+
+        // Stage breakdown per frame: decode (media layers), raster (text/
+        // shape/still realize minus decode), composite (GPU submit + mapped
+        // readback). Slow frames surface at `info` so a default-filtered log
+        // shows where the seconds go on decode- or GPU-bound machines.
+        let composite_ms = composite_started.elapsed().as_secs_f64() * 1000.0;
+        let raster_ms = (realize_ms - decode_ms).max(0.0);
+        let total_ms = realize_ms + composite_ms;
+        if total_ms > SLOW_FRAME_LOG_MS {
+            tracing::info!(
+                decode_ms = %format_args!("{decode_ms:.1}"),
+                raster_ms = %format_args!("{raster_ms:.1}"),
+                composite_ms = %format_args!("{composite_ms:.1}"),
+                layers = layers.len(),
+                width = scene.width,
+                height = scene.height,
+                "slow frame render: {total_ms:.0} ms"
+            );
+        } else {
+            tracing::trace!(
+                decode_ms = %format_args!("{decode_ms:.1}"),
+                raster_ms = %format_args!("{raster_ms:.1}"),
+                composite_ms = %format_args!("{composite_ms:.1}"),
+                layers = layers.len(),
+                "frame render: {total_ms:.1} ms"
+            );
+        }
+        Ok(())
     }
 
     /// Decode the frame of `media` at `source_time`, opening (and caching) a

@@ -1058,6 +1058,12 @@ fn worker_loop(
     // it current; edits re-render here so the composite reflects a delete,
     // generator change, etc. without waiting for the user to move the playhead.
     let mut last_tick: i64 = 0;
+    // A post-edit repaint owed but deferred: with more requests already
+    // queued, rendering between messages would serialize one slow composite
+    // per edit behind a rapid burst (multi-second stalls on weak iGPUs).
+    // Deferred repaints run once, when the queue drains; any arm that
+    // renders the current state on its own settles the debt too.
+    let mut pending_redraw = false;
     // One export job at a time. `active` outlives jobs (the export thread
     // clears it when it exits); `cancel` flags the running job to stop.
     let export_state = ExportJobState::default();
@@ -1351,6 +1357,12 @@ fn worker_loop(
     };
 
     loop {
+        // Settle a deferred post-edit repaint once the burst has drained —
+        // exactly one composite per burst instead of one per edit.
+        if pending_redraw && req_rx.is_empty() {
+            render_frame(engine, tl_rate, &preview_weak, last_tick, &fit, &cache);
+            pending_redraw = false;
+        }
         let msg = match next_message(&req_rx, persist_deadline) {
             Wake::Stop => break,
             // The debounce elapsed: write the dirty draft to its project file.
@@ -1388,6 +1400,9 @@ fn worker_loop(
                 }
                 let prev_tick = std::mem::replace(&mut last_tick, tick);
                 render_frame(engine, tl_rate, &preview_weak, tick, &fit, &cache);
+                // This render displayed post-edit state at the current tick,
+                // covering any repaint a drained mutation deferred.
+                pending_redraw = false;
                 // Steady forward motion (playback, frame-stepping, a slow
                 // forward drag) requests evenly spaced ticks: with nothing
                 // else queued, render the predicted next tick into the cache
@@ -1452,6 +1467,7 @@ fn worker_loop(
                     apply_transform_override(engine, &clip, transform);
                 }
                 render_frame(engine, tl_rate, &preview_weak, tick, &fit, &cache);
+                pending_redraw = false;
             }
             // Live inspector edits (font-size drag) arrive at pointer-move
             // rate; coalesce to the newest like transform overrides do.
@@ -1496,6 +1512,7 @@ fn worker_loop(
                     apply_generator_override(engine, &clip, generator);
                 }
                 render_frame(engine, tl_rate, &preview_weak, tick, &fit, &cache);
+                pending_redraw = false;
             }
             // Shape resize drags (width/height sliders) arrive at pointer-move
             // rate; coalesce to the newest like the generator/transform
@@ -1548,6 +1565,7 @@ fn worker_loop(
                     apply_generator_override(engine, &clip, generator);
                 }
                 render_frame(engine, tl_rate, &preview_weak, tick, &fit, &cache);
+                pending_redraw = false;
             }
             // The preview panel resized (or first laid out): renders now fit
             // the new bound. Repaint the current frame only when the bucketed
@@ -1555,6 +1573,7 @@ fn worker_loop(
             WorkerMsg::Viewport { width, height } => {
                 if fit.set_viewport(width, height) {
                     render_frame(engine, tl_rate, &preview_weak, last_tick, &fit, &cache);
+                    pending_redraw = false;
                 }
             }
             other => {
@@ -1566,10 +1585,14 @@ fn worker_loop(
                     &mut linkage,
                     other,
                 );
-                // Edits otherwise only repaint when the playhead moves; refresh
-                // the current frame so the change is visible immediately.
+                // Edits otherwise only repaint when the playhead moves; owe a
+                // repaint so the change becomes visible. The loop-top flush
+                // renders it as soon as the queue is idle — immediately for a
+                // lone edit, once per burst for rapid ones instead of one
+                // composite per edit (each is a multi-second stall on weak
+                // iGPUs).
                 if redraw {
-                    render_frame(engine, tl_rate, &preview_weak, last_tick, &fit, &cache);
+                    pending_redraw = true;
                 }
             }
         }
@@ -4807,17 +4830,44 @@ struct FrameFit {
     avg_ms: Cell<f64>,
     /// Index into [`QUALITY_LADDER`].
     tier: Cell<usize>,
+    /// Evidence window backing tier *raises* (reset on every tier change and
+    /// every [`RAISE_WINDOW_SAMPLES`] renders): how many renders it spans,
+    /// the worst cost seen, and when the tier was last changed. Field logs
+    /// showed why raises must demand more than a fast EMA: sequential-decode
+    /// frames render in ~15ms even while seeks cost whole seconds, so one
+    /// cheap frame right after a drop re-raised the tier and the next seek
+    /// slammed it back down — a resolution pop plus a wasted slow frame per
+    /// cycle.
+    samples: Cell<u32>,
+    max_ms: Cell<f64>,
+    changed_at: Cell<Instant>,
 }
 
 /// Resolution multipliers, best first. Tier moves down when renders run slow
-/// and back up when they're comfortably fast.
-const QUALITY_LADDER: [f64; 3] = [1.0, 0.7, 0.5];
+/// and back up when they're comfortably fast. The 0.35 floor exists for weak
+/// iGPUs (128MB-class shared-memory parts): decode cost is resolution-fixed,
+/// but composite + readback scale with output pixels, and at the floor
+/// they're a rounding error next to the decode.
+const QUALITY_LADDER: [f64; 4] = [1.0, 0.7, 0.5, 0.35];
 /// Never request more than this many pixels on the long side — retina
 /// monitors ask for huge viewports whose cost buys invisible detail.
 const MAX_LONG_SIDE: f64 = 1440.0;
 /// EMA above this drops a tier; below `RAISE_BELOW_MS` climbs back.
 const DROP_ABOVE_MS: f64 = 45.0;
 const RAISE_BELOW_MS: f64 = 18.0;
+/// A single render this far past budget skips the EMA and drops straight to
+/// the bottom tier: walking down one tier per render costs one multi-second
+/// frame per step on the machines that need the floor most.
+const HARD_DROP_MS: f64 = 360.0;
+/// Raising a tier requires all of: this long at the current tier, at least
+/// [`RAISE_MIN_SAMPLES`] renders folded in, and no single render in the
+/// evidence window over [`DROP_ABOVE_MS`]. Drops stay immediate — the
+/// asymmetry trades a possibly-conservative resolution for never popping.
+const RAISE_MIN_DWELL: Duration = Duration::from_secs(3);
+const RAISE_MIN_SAMPLES: u32 = 8;
+/// The evidence window turns over after this many renders, so one old spike
+/// can't veto raises forever (e.g. after an export or a burst of seeks).
+const RAISE_WINDOW_SAMPLES: u32 = 32;
 /// Viewport reports quantize to this grid so a live window resize (a report
 /// per frame) doesn't churn re-renders for sub-bucket changes.
 const VIEWPORT_BUCKET: u32 = 64;
@@ -4828,6 +4878,9 @@ impl Default for FrameFit {
             viewport: Cell::new((0, 0)),
             avg_ms: Cell::new(0.0),
             tier: Cell::new(0),
+            samples: Cell::new(0),
+            max_ms: Cell::new(0.0),
+            changed_at: Cell::new(Instant::now()),
         }
     }
 }
@@ -4863,8 +4916,19 @@ impl FrameFit {
 
     /// Fold one render's cost into the EMA and step the quality tier: slow
     /// renders drop a tier immediately (their cost dominates the average),
-    /// sustained fast ones climb back up.
+    /// a catastrophically slow one jumps straight to the floor, and only
+    /// *sustained, uniformly fast* evidence climbs back up (dwell + sample
+    /// floor + no spike in the window — see the struct field docs for the
+    /// thrash this prevents). Tier changes log at `info` — they are rare,
+    /// and on slow machines they're the trace of the ladder doing its job
+    /// (or having hit its floor while decode stays the bottleneck).
     fn note_render_cost(&self, elapsed: Duration) {
+        // Fresh evidence window past the turnover point (tier unchanged).
+        if self.samples.get() >= RAISE_WINDOW_SAMPLES {
+            self.samples.set(0);
+            self.max_ms.set(0.0);
+        }
+
         let ms = elapsed.as_secs_f64() * 1000.0;
         let avg = self.avg_ms.get();
         let next = if avg == 0.0 {
@@ -4873,19 +4937,55 @@ impl FrameFit {
             avg * 0.75 + ms * 0.25
         };
         self.avg_ms.set(next);
+        self.samples.set(self.samples.get() + 1);
+        self.max_ms.set(self.max_ms.get().max(ms));
 
         let tier = self.tier.get();
-        if next > DROP_ABOVE_MS && tier + 1 < QUALITY_LADDER.len() {
-            self.tier.set(tier + 1);
-            self.avg_ms.set(0.0);
-            debug!(tier = tier + 1, avg_ms = next, "preview quality tier down");
-        } else if next < RAISE_BELOW_MS && tier > 0 {
-            self.tier.set(tier - 1);
-            self.avg_ms.set(0.0);
-            debug!(tier = tier - 1, avg_ms = next, "preview quality tier up");
+        let bottom = QUALITY_LADDER.len() - 1;
+        if ms > HARD_DROP_MS && tier < bottom {
+            self.change_tier(bottom);
+            info!(
+                tier = bottom,
+                render_ms = %format_args!("{ms:.0}"),
+                "preview quality floored by a very slow render"
+            );
+        } else if next > DROP_ABOVE_MS && tier + 1 < QUALITY_LADDER.len() {
+            self.change_tier(tier + 1);
+            info!(
+                tier = tier + 1,
+                avg_ms = %format_args!("{next:.0}"),
+                "preview quality tier down"
+            );
+        } else if next < RAISE_BELOW_MS
+            && tier > 0
+            && self.samples.get() >= RAISE_MIN_SAMPLES
+            && self.max_ms.get() < DROP_ABOVE_MS
+            && self.changed_at.get().elapsed() >= RAISE_MIN_DWELL
+        {
+            self.change_tier(tier - 1);
+            info!(
+                tier = tier - 1,
+                avg_ms = %format_args!("{next:.0}"),
+                "preview quality tier up"
+            );
         }
     }
+
+    /// Move to `tier` and restart the cost average and the raise-evidence
+    /// window: costs at the old resolution say nothing about the new one.
+    fn change_tier(&self, tier: usize) {
+        self.tier.set(tier);
+        self.avg_ms.set(0.0);
+        self.samples.set(0);
+        self.max_ms.set(0.0);
+        self.changed_at.set(Instant::now());
+    }
 }
+
+/// A preview render slower than this logs a `warn` (default-visible): at
+/// this point the frame is why the app feels stuck after an edit, so leave
+/// a breadcrumb attributing it (the renderer's stage log tells the rest).
+const SLOW_PREVIEW_WARN_MS: f64 = 250.0;
 
 /// Byte cap for [`FrameCache`]: at a typical fit size (~1280×720 RGBA,
 /// ~3.7 MB) this holds ~70 recently displayed frames — several seconds of
@@ -5041,7 +5141,23 @@ fn render_frame_buffer(
     };
     match result {
         Ok(()) => {
-            fit.note_render_cost(started.elapsed());
+            let elapsed = started.elapsed();
+            fit.note_render_cost(elapsed);
+            // Total preview latency for this frame (decode + composite +
+            // readback + copy). The renderer logs the per-stage split; this
+            // warn is the default-visible "the preview is why edits feel
+            // slow" breadcrumb, with the fit state that produced it.
+            let ms = elapsed.as_secs_f64() * 1000.0;
+            if ms > SLOW_PREVIEW_WARN_MS {
+                warn!(
+                    tick,
+                    ?bound,
+                    tier = fit.tier.get(),
+                    "slow preview render: {ms:.0} ms"
+                );
+            } else {
+                debug!(tick, ?bound, "preview render: {ms:.1} ms");
+            }
             let buffer = sink.buffer.expect("successful render fills the sink");
             if cacheable {
                 cache.insert(key, buffer.clone());
@@ -5075,6 +5191,56 @@ fn deliver_frame(
 mod tests {
     use super::*;
     use cutlass_models::Project;
+
+    /// The ladder drops on one slow render but climbs back only on
+    /// sustained, uniformly fast evidence: dwell elapsed, enough samples,
+    /// and no spike in the window. Guards against the tier-thrash seen in
+    /// field logs (a lone fast sequential-decode frame re-raising the tier
+    /// right before a seek slams it back down).
+    #[test]
+    fn quality_ladder_raises_only_on_sustained_fast_evidence() {
+        let bottom = QUALITY_LADDER.len() - 1;
+        let fit = FrameFit::default();
+
+        // One catastrophically slow render floors the ladder immediately.
+        fit.note_render_cost(Duration::from_millis(500));
+        assert_eq!(fit.tier.get(), bottom);
+
+        // A burst of fast renders alone doesn't raise: dwell hasn't passed.
+        for _ in 0..RAISE_MIN_SAMPLES {
+            fit.note_render_cost(Duration::from_millis(5));
+        }
+        assert_eq!(fit.tier.get(), bottom);
+
+        // With the dwell behind it, the same sustained-fast evidence raises.
+        fit.changed_at.set(Instant::now() - RAISE_MIN_DWELL);
+        for _ in 0..RAISE_MIN_SAMPLES {
+            fit.note_render_cost(Duration::from_millis(5));
+        }
+        assert_eq!(fit.tier.get(), bottom - 1);
+
+        // A single mid-window spike (a seek-cost frame, not slow enough to
+        // move the EMA past the drop bound) vetoes raising even after the
+        // EMA looks fast again…
+        for _ in 0..3 {
+            fit.note_render_cost(Duration::from_millis(5));
+        }
+        fit.note_render_cost(Duration::from_millis(100));
+        assert_eq!(fit.tier.get(), bottom - 1, "spike must not drop the tier");
+        fit.changed_at.set(Instant::now() - RAISE_MIN_DWELL);
+        for _ in 0..RAISE_MIN_SAMPLES {
+            fit.note_render_cost(Duration::from_millis(5));
+        }
+        assert_eq!(fit.tier.get(), bottom - 1);
+
+        // …until the evidence window turns over: a fresh uniformly fast
+        // window raises again (and the raise re-arms the dwell, so exactly
+        // one step happens here).
+        for _ in 0..(RAISE_WINDOW_SAMPLES + RAISE_MIN_SAMPLES) {
+            fit.note_render_cost(Duration::from_millis(5));
+        }
+        assert_eq!(fit.tier.get(), bottom - 2);
+    }
 
     /// `keyframes_at` slices one merged timeline diamond: only the
     /// properties keyframed exactly at the tick, each with its own value

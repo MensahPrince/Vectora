@@ -190,6 +190,19 @@ impl WmfDecoder {
 
         let (info, visible) = probe(&reader, stream, Some(path))?;
 
+        // One line per opened source: which decode path this file actually
+        // got (DXVA hardware MFT vs Microsoft's software one) and the output
+        // mode it will try first — the first thing to check when preview
+        // renders run slow.
+        tracing::info!(
+            path = %path.display(),
+            hardware = d3d.is_some(),
+            mode = ?mode,
+            width = info.coded_size.0,
+            height = info.coded_size.1,
+            "opened video decoder"
+        );
+
         Ok(Self {
             reader,
             stream,
