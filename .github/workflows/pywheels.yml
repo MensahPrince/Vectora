@@ -159,4 +159,9 @@ jobs:
           path: dist
           merge-multiple: true
 
+      # skip-existing makes re-runs recoverable: a partially published
+      # version (wheels landed, sdist rejected) can be completed by a
+      # re-dispatch — already-uploaded files are skipped, not fatal.
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
