@@ -20,7 +20,7 @@ use cutlass_core::{
 
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
-use crate::layer::{CompositeLayer, CompositorConfig, LayerContent, LayerPlacement};
+use crate::layer::{CompositeLayer, CompositorConfig, LayerContent, LayerEffects, LayerPlacement};
 
 /// Canvas pixel format. Plain (non-sRGB) `Unorm`: the YUV shader already emits
 /// gamma-encoded R'G'B', so we store those bytes verbatim (display-ready SDR)
@@ -55,6 +55,19 @@ struct RgbaUniforms {
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
+struct FxEffectsUniform {
+    /// mask_kind, mask_feather, mask_invert, mask_enabled.
+    mask: [f32; 4],
+    /// chroma r/g/b (normalized), chroma_enabled.
+    chroma: [f32; 4],
+    /// chroma_strength, chroma_shadow, pad, pad.
+    chroma_params: [f32; 4],
+    /// quad half-extents (x, y), pad, pad.
+    half: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
 struct SdfUniforms {
     fill: [f32; 4],
     stroke_color: [f32; 4],
@@ -72,6 +85,7 @@ struct SdfUniforms {
 enum LayerPipeline {
     Yuv,
     Rgba,
+    RgbaFx,
     Solid,
     Sdf,
 }
@@ -140,10 +154,12 @@ struct TargetCache {
 pub struct Compositor {
     yuv_pipeline: wgpu::RenderPipeline,
     rgba_pipeline: wgpu::RenderPipeline,
+    rgba_fx_pipeline: wgpu::RenderPipeline,
     solid_pipeline: wgpu::RenderPipeline,
     sdf_pipeline: wgpu::RenderPipeline,
     yuv_layout: wgpu::BindGroupLayout,
     rgba_layout: wgpu::BindGroupLayout,
+    rgba_fx_layout: wgpu::BindGroupLayout,
     solid_layout: wgpu::BindGroupLayout,
     sdf_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
@@ -177,6 +193,16 @@ impl Compositor {
             entries: &[plane_tex_entry(0), sampler_entry(1), uniform_entry(2)],
         });
 
+        let rgba_fx_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cutlass.rgba_fx.bgl"),
+            entries: &[
+                plane_tex_entry(0),
+                sampler_entry(1),
+                uniform_entry(2),
+                uniform_entry(3),
+            ],
+        });
+
         let solid_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cutlass.solid.bgl"),
             entries: &[uniform_entry(0)],
@@ -194,6 +220,16 @@ impl Compositor {
         let rgba_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.rgba.wgsl"),
             source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/rgba.wgsl").into()),
+        });
+        let rgba_fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("cutlass.rgba_fx.wgsl"),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(
+                    include_str!("../shaders/mask.wgsl"),
+                    include_str!("../shaders/rgba_fx.wgsl"),
+                )
+                .into(),
+            ),
         });
         let solid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.solid.wgsl"),
@@ -218,6 +254,13 @@ impl Compositor {
             "cutlass.rgba",
             &rgba_layout,
             &rgba_shader,
+            PREMULTIPLIED_OVER,
+        );
+        let rgba_fx_pipeline = build_pipeline(
+            device,
+            "cutlass.rgba_fx",
+            &rgba_fx_layout,
+            &rgba_fx_shader,
             PREMULTIPLIED_OVER,
         );
         let solid_pipeline = build_pipeline(
@@ -251,10 +294,12 @@ impl Compositor {
         Self {
             yuv_pipeline,
             rgba_pipeline,
+            rgba_fx_pipeline,
             solid_pipeline,
             sdf_pipeline,
             yuv_layout,
             rgba_layout,
+            rgba_fx_layout,
             solid_layout,
             sdf_layout,
             sampler,
@@ -372,6 +417,7 @@ impl Compositor {
                 let pipeline = match layer.pipeline {
                     LayerPipeline::Yuv => &self.yuv_pipeline,
                     LayerPipeline::Rgba => &self.rgba_pipeline,
+                    LayerPipeline::RgbaFx => &self.rgba_fx_pipeline,
                     LayerPipeline::Solid => &self.solid_pipeline,
                     LayerPipeline::Sdf => &self.sdf_pipeline,
                 };
@@ -797,22 +843,68 @@ impl Compositor {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let (linear, trans) = placement_affine(config, &layer.placement, 0.0);
-        let uniforms = RgbaUniforms {
+        let placement_uniforms = RgbaUniforms {
             linear,
             trans_opacity: trans,
             uv_rect: layer.uv,
         };
-        let buffer = gpu
+
+        if layer.effects.is_identity() {
+            let buffer = gpu
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("cutlass.rgba.uniforms"),
+                    contents: bytemuck::bytes_of(&placement_uniforms),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+
+            let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("cutlass.rgba.bg"),
+                layout: &self.rgba_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            return Ok(LayerGpu {
+                pipeline: LayerPipeline::Rgba,
+                bind_group,
+                _textures: vec![texture],
+                _uniform: buffer,
+                _keep_alive: None,
+            });
+        }
+
+        let fx_uniforms = pack_fx_uniforms(&layer.effects, &layer.placement);
+        let placement_buffer = gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("cutlass.rgba.uniforms"),
-                contents: bytemuck::bytes_of(&uniforms),
+                label: Some("cutlass.rgba_fx.placement"),
+                contents: bytemuck::bytes_of(&placement_uniforms),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+        let fx_buffer = gpu
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("cutlass.rgba_fx.effects"),
+                contents: bytemuck::bytes_of(&fx_uniforms),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
 
         let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cutlass.rgba.bg"),
-            layout: &self.rgba_layout,
+            label: Some("cutlass.rgba_fx.bg"),
+            layout: &self.rgba_fx_layout,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -824,18 +916,53 @@ impl Compositor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: buffer.as_entire_binding(),
+                    resource: placement_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: fx_buffer.as_entire_binding(),
                 },
             ],
         });
 
         Ok(LayerGpu {
-            pipeline: LayerPipeline::Rgba,
+            pipeline: LayerPipeline::RgbaFx,
             bind_group,
             _textures: vec![texture],
-            _uniform: buffer,
-            _keep_alive: None,
+            _uniform: placement_buffer,
+            _keep_alive: Some(Box::new(fx_buffer)),
         })
+    }
+}
+
+fn pack_fx_uniforms(effects: &LayerEffects, placement: &LayerPlacement) -> FxEffectsUniform {
+    let mask = effects.mask.map(|m| {
+        [
+            m.kind as f32,
+            m.feather,
+            m.invert as f32,
+            1.0,
+        ]
+    });
+    let chroma = effects.chroma_key.map(|c| {
+        [
+            c.rgb[0],
+            c.rgb[1],
+            c.rgb[2],
+            1.0,
+        ]
+    });
+    let chroma_params = effects.chroma_key.map(|c| [c.strength, c.shadow, 0.0, 0.0]);
+    FxEffectsUniform {
+        mask: mask.unwrap_or([0.0, 0.0, 0.0, 0.0]),
+        chroma: chroma.unwrap_or([0.0, 0.0, 0.0, 0.0]),
+        chroma_params: chroma_params.unwrap_or([0.0, 0.0, 0.0, 0.0]),
+        half: [
+            placement.size[0] * 0.5,
+            placement.size[1] * 0.5,
+            0.0,
+            0.0,
+        ],
     }
 }
 

@@ -7,7 +7,8 @@
 //! If no GPU adapter is available the test skips rather than fails.
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement, RgbaImage,
+    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerEffects, LayerMask, LayerPlacement,
+    RgbaImage, mask_kind,
 };
 use cutlass_core::{
     ColorRange, ColorSpace, CpuImage, FrameData, MatrixCoefficients, PixelFormat, Plane, Rational,
@@ -421,6 +422,31 @@ fn rgba_placement_lands_in_the_right_quadrant() {
     assert_px(&img, 25, 25, [255, 255, 255, 255], 1); // inside, top-left
     assert_px(&img, 75, 25, [0, 0, 0, 255], 1);
     assert_px(&img, 25, 75, [0, 0, 0, 255], 1);
+}
+
+#[test]
+fn circle_mask_cuts_rgba_corners() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(64, 64).with_background([0, 0, 255, 255]);
+    let bmp = rgba_uniform(64, 64, [255, 0, 0, 255]);
+    let placement = LayerPlacement::full_canvas(&config);
+    let effects = LayerEffects {
+        mask: Some(LayerMask {
+            kind: mask_kind::CIRCLE,
+            feather: 0.0,
+            invert: 0,
+        }),
+        chroma_key: None,
+    };
+    let layer = CompositeLayer::rgba(&bmp, placement).with_effects(effects);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+
+    // Center is inside the circle mask.
+    assert_px(&img, 32, 32, [255, 0, 0, 255], 2);
+    // Corners are outside the circle — background shows through.
+    assert_px(&img, 2, 2, [0, 0, 255, 255], 2);
+    assert_px(&img, 61, 61, [0, 0, 255, 255], 2);
 }
 
 #[test]
