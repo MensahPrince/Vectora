@@ -41,7 +41,9 @@ fn decode_mp4_corner(path: &Path, x: u32, y: u32) -> [u8; 4] {
     let mut comp = Compositor::new(&gpu);
     let config = CompositorConfig::new(frame.width(), frame.height());
     let layer = CompositeLayer::frame(&frame, LayerPlacement::full_canvas(&config));
-    let img = comp.render(&gpu, &config, &[layer]).expect("composite decoded");
+    let img = comp
+        .render(&gpu, &config, &[layer])
+        .expect("composite decoded");
     img.pixel(x, y)
 }
 
@@ -113,7 +115,12 @@ fn export_with_mask_and_chroma_differs_from_unmasked() {
     let window = unmasked.media(media).unwrap().full_range();
     let track = unmasked.add_track(TrackKind::Video, "V1");
     unmasked
-        .add_clip(track, media, window, cutlass_core::RationalTime::new(0, fps))
+        .add_clip(
+            track,
+            media,
+            window,
+            cutlass_core::RationalTime::new(0, fps),
+        )
         .unwrap();
 
     let mut masked = Project::new("masked", fps);
@@ -125,7 +132,12 @@ fn export_with_mask_and_chroma_differs_from_unmasked() {
     let window2 = masked.media(media2).unwrap().full_range();
     let track2 = masked.add_track(TrackKind::Video, "V1");
     let clip = masked
-        .add_clip(track2, media2, window2, cutlass_core::RationalTime::new(0, fps))
+        .add_clip(
+            track2,
+            media2,
+            window2,
+            cutlass_core::RationalTime::new(0, fps),
+        )
         .unwrap();
     masked
         .set_clip_mask(clip, Some(Mask::new(MaskKind::Circle)))

@@ -710,7 +710,9 @@ impl Compositor {
             grade1,
         };
 
-        let plane_entries = |layout: &wgpu::BindGroupLayout, placement_buf: &wgpu::Buffer, fx_buf: Option<&wgpu::Buffer>| {
+        let plane_entries = |layout: &wgpu::BindGroupLayout,
+                             placement_buf: &wgpu::Buffer,
+                             fx_buf: Option<&wgpu::Buffer>| {
             let mut entries = vec![
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -1042,33 +1044,18 @@ impl Compositor {
 }
 
 fn pack_fx_uniforms(effects: &LayerEffects, placement: &LayerPlacement) -> FxEffectsUniform {
-    let mask = effects.mask.map(|m| {
-        [
-            m.kind as f32,
-            m.feather,
-            m.invert as f32,
-            1.0,
-        ]
-    });
-    let chroma = effects.chroma_key.map(|c| {
-        [
-            c.rgb[0],
-            c.rgb[1],
-            c.rgb[2],
-            1.0,
-        ]
-    });
+    let mask = effects
+        .mask
+        .map(|m| [m.kind as f32, m.feather, m.invert as f32, 1.0]);
+    let chroma = effects
+        .chroma_key
+        .map(|c| [c.rgb[0], c.rgb[1], c.rgb[2], 1.0]);
     let chroma_params = effects.chroma_key.map(|c| [c.strength, c.shadow, 0.0, 0.0]);
     FxEffectsUniform {
         mask: mask.unwrap_or([0.0, 0.0, 0.0, 0.0]),
         chroma: chroma.unwrap_or([0.0, 0.0, 0.0, 0.0]),
         chroma_params: chroma_params.unwrap_or([0.0, 0.0, 0.0, 0.0]),
-        half: [
-            placement.size[0] * 0.5,
-            placement.size[1] * 0.5,
-            0.0,
-            0.0,
-        ],
+        half: [placement.size[0] * 0.5, placement.size[1] * 0.5, 0.0, 0.0],
     }
 }
 
