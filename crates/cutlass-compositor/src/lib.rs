@@ -38,5 +38,6 @@ pub use cutlass_shapes::{SdfParams, SdfShape, Stroke};
 pub use error::CompositorError;
 pub use gpu::GpuContext;
 pub use layer::{
-    ColorGrade, CompositeLayer, CompositorConfig, FULL_UV, LayerContent, LayerPlacement, SdfLayer,
+    ColorGrade, CompositeLayer, CompositorConfig, FULL_UV, LayerChromaKey, LayerContent,
+    LayerEffects, LayerMask, LayerPlacement, SdfLayer, mask_kind,
 };
