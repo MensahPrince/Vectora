@@ -18,6 +18,7 @@
 //! - **Deferred**: stickers, effects, filters, and adjustment layers are
 //!   skipped (they produce no layer) rather than rendered wrong.
 
+use cutlass_compositor::ColorGrade;
 use cutlass_core::{RationalTime, resample};
 use cutlass_models::{
     ClipId, ClipSource, ClipTransform, EffectInstance, Generator, MediaKind, Param, Project, Shape,
@@ -26,6 +27,7 @@ use cutlass_models::{
 use cutlass_shapes::{BezierPath, PathPoint, SDF_AA, SdfParams, Stroke};
 use cutlass_text::{FontFamily, TextAlign, TextStyle};
 
+use crate::grade::effective_grade;
 use crate::scene::{LayerSource, ResolvedPass, Scene, SceneLayer, SizeSpec};
 
 /// Vertical reference height that a generator's reference-pixel sizes (text
@@ -141,6 +143,7 @@ fn resolve_track_at(
                 opacity: 1.0,
                 uv: [0.0, 0.0, 1.0, 1.0],
                 effects: Vec::new(),
+                grade: ColorGrade::IDENTITY,
             }));
         }
     }
@@ -229,6 +232,7 @@ fn resolve_clip(
     let opacity = xf.opacity.clamp(0.0, 1.0);
     let uv = crop_flip_uv(clip);
     let effects = resolve_effects(clip, local_tick);
+    let grade = effective_grade(clip.filter.as_ref(), &clip.adjust);
 
     match &clip.content {
         ClipSource::Media { media, .. } => {
@@ -266,6 +270,7 @@ fn resolve_clip(
                 opacity,
                 uv,
                 effects,
+                grade,
             }))
         }
         ClipSource::Generated(generator) => {
@@ -281,6 +286,7 @@ fn resolve_clip(
                 rotation,
                 opacity,
                 uv,
+                grade,
                 cw,
                 ch,
                 xf.scale,
@@ -321,6 +327,7 @@ pub(crate) fn resolve_generator(
     rotation: f32,
     opacity: f32,
     uv: [f32; 4],
+    grade: ColorGrade,
     cw: f32,
     ch: f32,
     scale: f32,
@@ -346,6 +353,7 @@ pub(crate) fn resolve_generator(
                 opacity,
                 uv,
                 effects,
+                grade,
             })
         }
         Generator::SolidColor { rgba } => Some(SceneLayer {
@@ -357,6 +365,7 @@ pub(crate) fn resolve_generator(
             opacity,
             uv,
             effects,
+            grade,
         }),
         Generator::Shape {
             shape,
@@ -379,6 +388,7 @@ pub(crate) fn resolve_generator(
             rotation,
             opacity,
             uv,
+            grade,
             scale,
             effects,
         ),
@@ -411,6 +421,7 @@ fn resolve_shape(
     rotation: f32,
     opacity: f32,
     uv: [f32; 4],
+    grade: ColorGrade,
     transform_scale: f32,
     effects: Vec<ResolvedPass>,
 ) -> Option<SceneLayer> {
@@ -452,6 +463,7 @@ fn resolve_shape(
             opacity,
             uv,
             effects,
+            grade,
         });
     }
 
@@ -473,6 +485,7 @@ fn resolve_shape(
             opacity,
             uv,
             effects,
+            grade,
         });
     }
 
@@ -511,6 +524,7 @@ fn resolve_shape(
         opacity,
         uv,
         effects,
+        grade,
     })
 }
 
@@ -583,10 +597,13 @@ fn fit_scale(nw: f32, nh: f32, cw: f32, ch: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grade::effective_grade;
     use crate::scene::{LayerSource, SizeSpec};
+    use cutlass_compositor::ColorGrade;
     use cutlass_models::{
-        CanvasAspect, CanvasSettings, ClipTransform, CropRect, Generator, MediaSource, Project,
-        Rational, RationalTime, Shape, TextStyle as ModelTextStyle, TimeRange, TrackKind,
+        CanvasAspect, CanvasSettings, ClipTransform, ColorAdjustments, CropRect, Filter, Generator,
+        MediaSource, Project, Rational, RationalTime, Shape, TextStyle as ModelTextStyle,
+        TimeRange, TrackKind,
     };
 
     const FPS_24: Rational = Rational::FPS_24;
@@ -868,6 +885,7 @@ mod tests {
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
             effects: Vec::new(),
+            grade: ColorGrade::IDENTITY,
         };
         // to_center (960, 540) rotated 90° cw (+y down) → (-540, 960).
         approx2(layer.quad_center([1920.0, 1080.0]), [420.0, 1500.0]);
@@ -1173,6 +1191,88 @@ mod tests {
         }
         // Transform scale rides the quad, not the raster.
         assert_eq!(layer.size, SizeSpec::BitmapScaled(1.0));
+    }
+
+    #[test]
+    fn untouched_clip_resolves_to_identity_grade() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers[0].grade, ColorGrade::IDENTITY);
+    }
+
+    #[test]
+    fn clip_adjust_and_filter_flow_into_scene_layer_grade() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let adjust_clip = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                adjust_clip,
+                ColorAdjustments {
+                    saturation: -1.0,
+                    ..ColorAdjustments::default()
+                },
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        let expected = effective_grade(
+            None,
+            &ColorAdjustments {
+                saturation: -1.0,
+                ..ColorAdjustments::default()
+            },
+        );
+        assert_eq!(scene.layers[0].grade, expected);
+        assert_eq!(scene.layers[0].grade.saturation, -1.0);
+
+        let filter_track = project.add_track(TrackKind::Sticker, "S2");
+        let filter_clip = project
+            .add_generated(
+                filter_track,
+                Generator::SolidColor {
+                    rgba: [0, 255, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let filter = Filter {
+            id: "mono".into(),
+            intensity: 0.8,
+        };
+        project
+            .set_clip_filter(filter_clip, Some(filter.clone()))
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        let filter_layer = scene
+            .layers
+            .iter()
+            .find(|l| matches!(l.source, LayerSource::Solid([0, 255, 0, 255])))
+            .expect("filter clip layer");
+        assert_eq!(
+            filter_layer.grade,
+            effective_grade(Some(&filter), &ColorAdjustments::default())
+        );
     }
 
     /// The model's validation cap and the evaluator's vertex-buffer bound

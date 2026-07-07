@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, CompositorError, CompositorLayer, GpuContext,
-    LayerPlacement, PassInstance, RgbaImage, SdfLayer,
+    ColorGrade, CompositeLayer, Compositor, CompositorConfig, CompositorError, CompositorLayer,
+    GpuContext, LayerPlacement, PassInstance, RgbaImage, SdfLayer,
 };
 use cutlass_core::{RationalTime, VideoDecoder, VideoFrame};
 use cutlass_decoder::OutputMode;
@@ -210,6 +210,7 @@ impl Renderer {
                         rgba: *rgba,
                         placement: place(size),
                         effects: layer.effects.clone(),
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::Text { content, style } => {
@@ -227,6 +228,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::Media { media, source_time } => {
@@ -237,6 +239,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::Still { media } => {
@@ -247,6 +250,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::Shape {
@@ -270,6 +274,7 @@ impl Renderer {
                         },
                         placement: place(size),
                         effects: layer.effects.clone(),
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::PathShape {
@@ -296,6 +301,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
+                        grade: layer.grade,
                     });
                 }
             }
@@ -436,6 +442,7 @@ impl Renderer {
                     rgba: *rgba,
                     placement: place(size),
                     effects: layer.effects.clone(),
+                    grade: layer.grade,
                 }
             }
             LayerSource::Text { content, style } => {
@@ -453,6 +460,7 @@ impl Renderer {
                     placement: place(size),
                     uv: layer.uv,
                     effects: layer.effects.clone(),
+                    grade: layer.grade,
                 }
             }
             LayerSource::Media { media, source_time } => {
@@ -463,6 +471,7 @@ impl Renderer {
                     placement: place(size),
                     uv: layer.uv,
                     effects: layer.effects.clone(),
+                    grade: layer.grade,
                 }
             }
             LayerSource::Still { media } => {
@@ -473,6 +482,7 @@ impl Renderer {
                     placement: place(size),
                     uv: layer.uv,
                     effects: layer.effects.clone(),
+                    grade: layer.grade,
                 }
             }
             LayerSource::Shape {
@@ -494,6 +504,7 @@ impl Renderer {
                     },
                     placement: place(size),
                     effects: layer.effects.clone(),
+                    grade: layer.grade,
                 }
             }
             LayerSource::PathShape {
@@ -520,6 +531,7 @@ impl Renderer {
                     placement: place(size),
                     uv: layer.uv,
                     effects: layer.effects.clone(),
+                    grade: layer.grade,
                 }
             }
             LayerSource::Transition { .. } => {
@@ -575,6 +587,7 @@ impl Renderer {
             0.0,
             1.0,
             [0.0, 0.0, 1.0, 1.0],
+            ColorGrade::IDENTITY,
             canvas_w as f32,
             canvas_h as f32,
             1.0,
@@ -661,35 +674,51 @@ fn composite_from_realized<'a>(
 ) -> CompositeLayer<'a> {
     match r {
         Realized::Solid {
-            rgba, placement, ..
-        } => CompositeLayer::solid(*rgba, *placement).with_effects(effects),
+            rgba,
+            placement,
+            grade,
+            ..
+        } => CompositeLayer::solid(*rgba, *placement)
+            .with_effects(effects)
+            .with_grade(*grade),
         Realized::Bitmap {
             image,
             placement,
             uv,
+            grade,
             ..
         } => CompositeLayer::rgba(image, *placement)
             .with_uv(*uv)
-            .with_effects(effects),
+            .with_effects(effects)
+            .with_grade(*grade),
         Realized::Frame {
             frame,
             placement,
             uv,
+            grade,
             ..
         } => CompositeLayer::frame(frame, *placement)
             .with_uv(*uv)
-            .with_effects(effects),
+            .with_effects(effects)
+            .with_grade(*grade),
         Realized::Still {
             media,
             placement,
             uv,
+            grade,
             ..
         } => CompositeLayer::rgba(&stills[media], *placement)
             .with_uv(*uv)
-            .with_effects(effects),
+            .with_effects(effects)
+            .with_grade(*grade),
         Realized::Sdf {
-            shape, placement, ..
-        } => CompositeLayer::sdf(*shape, *placement).with_effects(effects),
+            shape,
+            placement,
+            grade,
+            ..
+        } => CompositeLayer::sdf(*shape, *placement)
+            .with_effects(effects)
+            .with_grade(*grade),
         Realized::Transition { .. } => unreachable!("transitions handled separately"),
     }
 }
@@ -707,28 +736,33 @@ enum Realized {
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: Vec<ResolvedPass>,
+        grade: ColorGrade,
     },
     Still {
         media: MediaId,
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: Vec<ResolvedPass>,
+        grade: ColorGrade,
     },
     Bitmap {
         image: RgbaImage,
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: Vec<ResolvedPass>,
+        grade: ColorGrade,
     },
     Solid {
         rgba: [u8; 4],
         placement: LayerPlacement,
         effects: Vec<ResolvedPass>,
+        grade: ColorGrade,
     },
     Sdf {
         shape: SdfLayer,
         placement: LayerPlacement,
         effects: Vec<ResolvedPass>,
+        grade: ColorGrade,
     },
 }
 

@@ -22,6 +22,6 @@ A **MoviePy-style Python library** so the engine can be scripted from Python. Th
 
 - **Shape**: separate optional crate `cutlass-py` (`crate-type = ["cdylib"]`, PyO3 + `maturin`), depending on `cutlass-engine`/`-compositor`/`-models`. Kept off the default workspace build and shipped to PyPI on its own.
 - **API**: thin, Pythonic wrapper over `Engine` (`add_clip`, `split`, `export`, `get_frame`) — do **not** expose the raw `EditCommand` enum to Python.
-- **Prerequisite (do first, in Rust)**: a **timeline → video file exporter**. The pieces exist but aren't joined — `composite()` → `RgbaImage` (`cutlass-compositor`) and the FFmpeg H.264 encoder (`cutlass-encoder`, currently only transcodes an input file into a proxy). Need a "composite every frame `0..duration` → mux to mp4" path, landed in Rust so the future Rust export reuses it.
+- **Prerequisite (landed)**: the **timeline → video file exporter** exists — `export_to_file(_observed)` in `cutlass-render` composites every frame and muxes H.264/AAC via `cutlass-encoder`, wired into the engine, desktop, and mobile.
 - **`get_frame(t) -> numpy`**: easy given `RgbaImage` is already `width/height/Vec<u8>`.
-- **Gap to close**: `CompositeLayer` only handles `Frame`/`Solid` today; text/shape/adjustment generators aren't composited yet, so they'd be dropped on export until filled in.
+- **Gap to close**: `CompositeLayer` handles video frames, RGBA bitmaps (text/stills/pen paths), solids, and SDF shapes, plus per-layer color grades (clip filters/adjustments). Stickers and lane-level effect/filter/adjustment generators aren't composited yet, so they'd be dropped on export until filled in (see `ROADMAP.md`).

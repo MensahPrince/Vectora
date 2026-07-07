@@ -31,6 +31,10 @@ struct Sdf {
     // Star spike count (x), inner-radius fraction (y); quad half-extents px
     // (z, w) — the vertex shader's local-coordinate scale.
     star: vec4<f32>,
+    // Color grade: (exposure, brightness, contrast, saturation).
+    grade0: vec4<f32>,
+    // Color grade: (temperature, tint, pad, pad).
+    grade1: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> s: Sdf;
@@ -233,6 +237,8 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Stroke ring over fill, straight alpha — mirrors `shade` in sdf.rs.
     let sw = s.trans_opacity.w;
+    let fill_rgb = apply_grade(s.fill.rgb, s.grade0, s.grade1);
+    let stroke_rgb = apply_grade(s.stroke_color.rgb, s.grade0, s.grade1);
     let fill_cov = coverage(d) * s.fill.a;
     var stroke_cov = 0.0;
     if sw > 0.0 {
@@ -242,6 +248,6 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
     if a <= 0.0 {
         return vec4(0.0, 0.0, 0.0, 0.0);
     }
-    let rgb = (s.stroke_color.rgb * stroke_cov + s.fill.rgb * fill_cov * (1.0 - stroke_cov)) / a;
+    let rgb = (stroke_rgb * stroke_cov + fill_rgb * fill_cov * (1.0 - stroke_cov)) / a;
     return vec4(rgb, a * s.trans_opacity.z);
 }

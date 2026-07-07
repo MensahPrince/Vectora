@@ -40,8 +40,8 @@ pub use cutlass_shapes::{SdfParams, SdfShape, Stroke};
 pub use error::CompositorError;
 pub use gpu::GpuContext;
 pub use layer::{
-    CompositeLayer, CompositorConfig, CompositorLayer, FULL_UV, LayerContent, LayerPlacement,
-    SdfLayer,
+    ColorGrade, CompositeLayer, CompositorConfig, CompositorLayer, FULL_UV, LayerContent,
+    LayerPlacement, SdfLayer,
 };
 pub use passes::{
     PassCoverage, PassDescriptor, PassInstance, effect_coverage, effect_descriptors,
