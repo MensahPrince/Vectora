@@ -858,7 +858,9 @@ impl WorkerHandle {
     }
 
     pub fn begin_transform_gesture(&self, clip: String, tick: i64) {
-        let _ = self.tx.send(WorkerMsg::BeginTransformGesture { clip, tick });
+        let _ = self
+            .tx
+            .send(WorkerMsg::BeginTransformGesture { clip, tick });
     }
 
     pub fn end_transform_gesture(&self) {
@@ -1229,14 +1231,7 @@ fn worker_loop(
             } => set_canvas_and_publish(engine, aspect_index, background, &ui),
             WorkerMsg::ClearTransformOverride { tick } => {
                 engine.set_transform_override(None);
-                render_frame_exit_sprite(
-                    engine,
-                    tl_rate,
-                    &preview_weak,
-                    tick,
-                    &fit,
-                    &sprite_mode,
-                );
+                render_frame_exit_sprite(engine, tl_rate, &preview_weak, tick, &fit, &sprite_mode);
             }
             WorkerMsg::ClearGeneratorOverride { tick } => {
                 engine.set_generator_override(None);
@@ -1268,14 +1263,7 @@ fn worker_loop(
                 // flattened (M2 compose semantics).
                 let at = RationalTime::new(tick, tl_rate);
                 set_transform_and_publish(engine, &clip, transform, at, &ui);
-                render_frame_exit_sprite(
-                    engine,
-                    tl_rate,
-                    &preview_weak,
-                    tick,
-                    &fit,
-                    &sprite_mode,
-                );
+                render_frame_exit_sprite(engine, tl_rate, &preview_weak, tick, &fit, &sprite_mode);
             }
             WorkerMsg::FitClip { clip, fill, tick } => {
                 fit_clip_and_publish(engine, &clip, fill, tick, tl_rate, &ui);

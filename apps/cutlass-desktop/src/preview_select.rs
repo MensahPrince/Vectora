@@ -14,7 +14,10 @@ use cutlass_models::{ClipTransform, CropRect};
 use slint::Model;
 
 use crate::placement::{anchor_canvas_position, generator_layer_placement, media_layer_placement};
-use crate::{Clip, PreviewDragResolution, PreviewHit, PreviewSelectionBox, PreviewSpritePlacement, Sequence, TrackKind};
+use crate::{
+    Clip, PreviewDragResolution, PreviewHit, PreviewSelectionBox, PreviewSpritePlacement, Sequence,
+    TrackKind,
+};
 
 /// Aspect-fit (`ImageFit.contain`) mapping of the canvas into the viewport:
 /// `(scale, offset_x, offset_y)` such that `view = canvas · scale + offset`.
@@ -444,7 +447,11 @@ fn fitted_frame_rect(
     } else {
         fitted_w
     };
-    let zoom = if zoom.is_finite() { zoom.max(0.01) } else { 1.0 };
+    let zoom = if zoom.is_finite() {
+        zoom.max(0.01)
+    } else {
+        1.0
+    };
     let frame_w = fitted_w * zoom;
     let frame_h = fitted_h * zoom;
     let frame_x = (view_w - frame_w) * 0.5 + pan_x;
@@ -510,14 +517,8 @@ pub fn sprite_placement_in_viewport(
             };
             let p_g = clip_placement(&clip, &canvas);
 
-            let id_center = [
-                ox + p_id.center[0] * scale,
-                oy + p_id.center[1] * scale,
-            ];
-            let ges_center = [
-                ox + p_g.center[0] * scale,
-                oy + p_g.center[1] * scale,
-            ];
+            let id_center = [ox + p_id.center[0] * scale, oy + p_id.center[1] * scale];
+            let ges_center = [ox + p_g.center[0] * scale, oy + p_g.center[1] * scale];
             let size_scale = if p_id.size[0] > f32::EPSILON {
                 p_g.size[0] / p_id.size[0]
             } else {
@@ -1085,9 +1086,8 @@ mod tests {
             opacity: 1.0,
             ..PreviewDragResolution::default()
         };
-        let sprite = sprite_placement_in_viewport(
-            &seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture),
-        );
+        let sprite =
+            sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
         assert!(sprite.visible);
         assert!((sprite.x - 0.0).abs() < 1e-3);
         assert!((sprite.y - 0.0).abs() < 1e-3);
@@ -1116,14 +1116,12 @@ mod tests {
             opacity: 1.0,
             ..PreviewDragResolution::default()
         };
-        let sprite = sprite_placement_in_viewport(
-            &seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture),
-        );
+        let sprite =
+            sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
         assert!(sprite.visible);
         assert!((sprite.scale - 0.5).abs() < 1e-3);
-        let sel_box = selection_box_in_viewport(
-            &seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture),
-        );
+        let sel_box =
+            selection_box_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
         assert!(sel_box.visible);
         // Scaled content sits in the centered quarter of the viewport.
         assert!((sel_box.x0 - 240.0).abs() < 1e-3);
@@ -1152,19 +1150,9 @@ mod tests {
             ..PreviewDragResolution::default()
         };
 
-        let committed =
-            sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, None);
-        let live = sprite_placement_in_viewport(
-            &seq,
-            "A",
-            10,
-            VW,
-            VH,
-            1.0,
-            0.0,
-            0.0,
-            Some(&gesture),
-        );
+        let committed = sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, None);
+        let live =
+            sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
 
         assert!(committed.visible);
         assert!((committed.x - live.x).abs() < 1e-3);
