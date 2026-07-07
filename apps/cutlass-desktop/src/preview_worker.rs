@@ -1374,8 +1374,20 @@ fn worker_loop(
             WorkerMsg::TransformOverride { .. } => {
                 unreachable!("overrides are handled by the drain below")
             }
-            WorkerMsg::BeginTransformGesture { .. } | WorkerMsg::EndTransformGesture => {
-                unreachable!("gesture lifecycle is handled in the main loop")
+            WorkerMsg::BeginTransformGesture { clip, tick } => begin_transform_gesture(
+                engine,
+                &clip,
+                tick,
+                tl_rate,
+                &preview_weak,
+                &fit,
+                &sprite_mode,
+            ),
+            WorkerMsg::EndTransformGesture => {
+                if sprite_mode.get() {
+                    sprite_mode.set(false);
+                    clear_gesture_sprite_ready(&preview_weak);
+                }
             }
         }
     };
