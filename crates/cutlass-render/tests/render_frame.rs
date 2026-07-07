@@ -1,9 +1,11 @@
 //! End-to-end smoke test: resolve a generator-only project and composite it on
 //! a headless GPU. Skips cleanly when no GPU adapter is available (CI).
 
+use std::path::Path;
+
 use cutlass_models::{
-    Generator, Project, Rational, RationalTime, Shape, ShapePath, ShapePathPoint, TimeRange,
-    TrackKind,
+    ChromaKey, Generator, Mask, MaskKind, MediaSource, Project, Rational, RationalTime, Shape,
+    ShapePath, ShapePathPoint, TimeRange, TrackKind,
 };
 use cutlass_render::Renderer;
 
@@ -11,6 +13,69 @@ const FPS_24: Rational = Rational::FPS_24;
 
 fn rt(value: i64) -> RationalTime {
     RationalTime::new(value, FPS_24)
+}
+
+fn write_solid_png(path: &Path, width: u32, height: u32, rgba: [u8; 4]) {
+    let file = std::fs::File::create(path).expect("create png");
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().expect("png header");
+    let flat: Vec<u8> = rgba
+        .iter()
+        .copied()
+        .cycle()
+        .take((width * height * 4) as usize)
+        .collect();
+    writer.write_image_data(&flat).expect("png data");
+}
+
+fn assert_near(actual: [u8; 4], expected: [u8; 4], tolerance: u8, what: &str) {
+    for (a, e) in actual.iter().zip(expected.iter()) {
+        assert!(
+            a.abs_diff(*e) <= tolerance,
+            "{what}: got {actual:?}, expected ~{expected:?} (±{tolerance})"
+        );
+    }
+}
+
+#[test]
+fn renders_still_with_circle_mask_and_chroma_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let png_path = dir.path().join("green.png");
+    write_solid_png(&png_path, 320, 180, [0, 255, 0, 255]);
+
+    let mut project = Project::new("p", FPS_24);
+    let media = project.add_media(MediaSource::image(&png_path, 320, 180));
+    let window = project.media(media).unwrap().full_range();
+    let track = project.add_track(TrackKind::Video, "V1");
+    let clip = project.add_clip(track, media, window, rt(0)).unwrap();
+    project
+        .set_clip_mask(clip, Some(Mask::new(MaskKind::Circle)))
+        .unwrap();
+    project
+        .set_clip_chroma_key(
+            clip,
+            Some(ChromaKey {
+                rgb: [0, 255, 0],
+                strength: 0.5,
+                shadow: 0.0,
+            }),
+        )
+        .unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let frame = renderer
+        .render_frame_fit(&project, rt(0), 640, 640)
+        .expect("render masked still");
+
+    // Center is inside the circle but green is keyed out → black background.
+    assert_near(frame.pixel(320, 180), [0, 0, 0, 255], 8, "center");
+    // Corner is outside the circle → background.
+    assert_near(frame.pixel(10, 10), [0, 0, 0, 255], 8, "corner");
 }
 
 #[test]
