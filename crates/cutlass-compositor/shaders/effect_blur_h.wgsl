@@ -1,4 +1,4 @@
-// Identity copy: input texture → output (for unimplemented catalog effects).
+// Separable horizontal box blur; radius in pixels (params.x).
 
 struct EffectUniforms {
     texel_size: vec4<f32>,
@@ -38,7 +38,25 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+fn sample_at(uv: vec2<f32>) -> vec4<f32> {
+    return textureSample(input_tex, input_sampler, uv);
+}
+
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(input_tex, input_sampler, in.uv);
+    let r = max(uniforms.params.x, 0.0);
+    if (r <= 0.0) {
+        return sample_at(in.uv);
+    }
+    let step = uniforms.texel_size.xy;
+    let taps = min(i32(r), 16);
+    var acc = vec4<f32>(0.0);
+    var wsum = 0.0;
+    for (var i = -taps; i <= taps; i++) {
+        let w = 1.0;
+        let uv = in.uv + vec2<f32>(f32(i) * step.x, 0.0);
+        acc += sample_at(uv) * w;
+        wsum += w;
+    }
+    return acc / wsum;
 }

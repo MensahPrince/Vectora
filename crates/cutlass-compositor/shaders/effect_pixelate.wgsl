@@ -1,4 +1,4 @@
-// Identity copy: input texture → output (for unimplemented catalog effects).
+// Block-average pixelate; cell size in params.x.
 
 struct EffectUniforms {
     texel_size: vec4<f32>,
@@ -17,20 +17,12 @@ struct VsOut {
 @vertex
 fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     var positions = array<vec2<f32>, 6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>(-1.0,  1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>( 1.0,  1.0),
+        vec2<f32>(-1.0, -1.0), vec2<f32>( 1.0, -1.0), vec2<f32>(-1.0,  1.0),
+        vec2<f32>(-1.0,  1.0), vec2<f32>( 1.0, -1.0), vec2<f32>( 1.0,  1.0),
     );
     var uvs = array<vec2<f32>, 6>(
-        vec2<f32>(0.0, 1.0),
-        vec2<f32>(1.0, 1.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(0.0, 0.0),
-        vec2<f32>(1.0, 1.0),
-        vec2<f32>(1.0, 0.0),
+        vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 1.0), vec2<f32>(0.0, 0.0),
+        vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 1.0), vec2<f32>(1.0, 0.0),
     );
     var out: VsOut;
     out.pos = vec4<f32>(positions[vi], 0.0, 1.0);
@@ -40,5 +32,9 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(input_tex, input_sampler, in.uv);
+    let cell = max(uniforms.params.x, 1.0);
+    let dims = vec2<f32>(1.0 / uniforms.texel_size.x, 1.0 / uniforms.texel_size.y);
+    let px = floor(in.uv * dims / cell) * cell + vec2<f32>(cell * 0.5);
+    let sample_uv = px / dims;
+    return textureSample(input_tex, input_sampler, sample_uv);
 }
