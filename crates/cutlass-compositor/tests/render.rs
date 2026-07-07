@@ -7,8 +7,8 @@
 //! If no GPU adapter is available the test skips rather than fails.
 
 use cutlass_compositor::{
-    ColorGrade, CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerChromaKey,
-    LayerEffects, LayerMask, LayerPlacement, RgbaImage, mask_kind,
+    ColorGrade, CompositeLayer, Compositor, CompositorConfig, CompositorLayer, GpuContext,
+    LayerChromaKey, LayerEffects, LayerMask, LayerPlacement, RgbaImage, mask_kind,
 };
 use cutlass_core::{
     ColorRange, ColorSpace, CpuImage, FrameData, MatrixCoefficients, PixelFormat, Plane, Rational,
@@ -824,6 +824,63 @@ fn pixelate_produces_uniform_blocks() {
     assert_ne!(smooth_img.pixel(10, 10), a);
 }
 
+#[test]
+fn canvas_pass_pixelates_the_composited_stack() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(64, 64);
+    let mut pixels = Vec::with_capacity(64 * 64 * 4);
+    for _y in 0..64 {
+        for x in 0..64 {
+            let v = (x * 4) as u8;
+            pixels.extend_from_slice(&[v, 255u8.saturating_sub(v), 32, 255]);
+        }
+    }
+    let bmp = RgbaImage::new(64, 64, pixels);
+    let gradient = CompositeLayer::rgba(&bmp, LayerPlacement::full_canvas(&config));
+    let mut overlay_place = LayerPlacement::full_canvas(&config);
+    overlay_place.opacity = 0.5;
+    let overlay = CompositeLayer::solid([0, 0, 255, 255], overlay_place);
+
+    let baseline = comp
+        .render_compositor_layers(
+            &gpu,
+            &config,
+            &[
+                CompositorLayer::layer(&gradient),
+                CompositorLayer::layer(&overlay),
+            ],
+        )
+        .expect("baseline");
+
+    let pixelate = PassInstance {
+        id: "pixelate",
+        params: &[8.0],
+    };
+    let effects = [pixelate];
+    let blocky = comp
+        .render_compositor_layers(
+            &gpu,
+            &config,
+            &[
+                CompositorLayer::layer(&gradient),
+                CompositorLayer::layer(&overlay),
+                CompositorLayer::CanvasPass {
+                    effects: &effects,
+                    grade: ColorGrade::IDENTITY,
+                },
+            ],
+        )
+        .expect("canvas pass pixelate");
+
+    assert_eq!(
+        blocky.pixel(10, 10),
+        blocky.pixel(11, 10),
+        "canvas pass should flatten local variation"
+    );
+    assert_ne!(baseline.pixel(10, 10), blocky.pixel(10, 10));
+}
+
 // --- Color grade ---------------------------------------------------------
 
 #[test]
@@ -883,6 +940,35 @@ fn solid_exposure_plus_one_brightens_mid_gray() {
     let img = comp.render(&gpu, &config, &[layer]).expect("render");
     let expect = grade_ref_u8(rgba, grade);
     assert_px(&img, 8, 8, expect, 2);
+}
+
+#[test]
+fn canvas_pass_grade_replaces_translucent_canvas() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16).with_background([0, 0, 0, 0]);
+    let translucent = CompositeLayer::solid([255, 0, 0, 128], LayerPlacement::full_canvas(&config));
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+
+    let img = comp
+        .render_compositor_layers(
+            &gpu,
+            &config,
+            &[
+                CompositorLayer::layer(&translucent),
+                CompositorLayer::CanvasPass {
+                    effects: &[],
+                    grade,
+                },
+            ],
+        )
+        .expect("canvas pass grade");
+
+    let expect = grade_ref_u8([128, 0, 0, 128], grade);
+    assert_px(&img, 8, 8, expect, 3);
 }
 
 /// Left half opaque red, right half fully transparent tinted red.

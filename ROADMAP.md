@@ -30,35 +30,41 @@ intensity) now grade pixels in preview and export.
 - Preset id → recipe table and `effective_grade()` in
   `crates/cutlass-render/src/grade.rs`; threaded through
   `resolve_clip` → `SceneLayer.grade` → `Realized` → `with_grade()`.
-- Lane-level `Generator::Filter`/`Adjustment` bars still skipped (item 4).
+- Lane-level `Generator::Filter`/`Adjustment` bars now apply as canvas passes
+  (item 4).
 - Benchmarked with `composite_bench`: compositor timings within run noise.
 
-## 2. Render masks and chroma key
+## 2. Render masks and chroma key — DONE
 
-Next slice of the look system: per-clip alpha work.
+Per-clip masks and chroma key now affect preview and export.
 
-- Mask shapes (rect/ellipse/linear/mirror/…) as an alpha pass; chroma key as a
-  keying pass with the persisted intensity/shadow params.
-- Same files as item 1.
+- `LayerEffects` on `CompositeLayer` carries mask/chroma state into the
+  compositor, with `rgba_fx`/`yuv_fx` shader paths for media and RGBA layers.
+- Mask shapes (linear/mirror/circle/rectangle/heart/star) and chroma key
+  strength/shadow are sampled from persisted clip look data.
 
-## 3. Clip effects and transitions (M4 GPU passes)
+## 3. Clip effects and transitions (M4 GPU passes) — DONE
 
-Model, catalogs, Python API, and drift tests exist; the compositor has no
-effect infrastructure yet — this is greenfield GPU work.
+Clip effects and transitions now flow from the model into preview/export.
 
-- Add effect descriptors + WGSL passes to `cutlass-compositor`; hook clip
-  effects (`crates/cutlass-models/src/effects.rs`) and transitions
-  (`crates/cutlass-models/src/transition.rs`) into the render graph.
-- The deferred test suite in `crates/cutlass-engine/tests/deferred/` sketches
-  the intended API — revive what still makes sense.
+- `ResolvedPass` samples `clip.effects`; the renderer packs them into
+  compositor `PassInstance`s and runs effect chains through offscreen passes.
+- `crossfade`, `wipe_left`, `gaussian_blur`, `vignette`, and `pixelate` have
+  WGSL coverage. Other catalog effects are safe passthroughs for now; remaining
+  transition ids fall back to crossfade.
+- Drift tests keep model and compositor catalogs aligned.
 
-## 4. Lane-level generators: Effect / Filter / Adjustment
+## 4. Lane-level generators: Effect / Filter / Adjustment — DONE
 
-Remove the explicit skip in `crates/cutlass-render/src/resolve.rs`
-(`Generator::Effect | Generator::Filter | Generator::Adjustment => None`) by
-applying the passes from items 1–3 to everything beneath the lane instead of a
-single clip. Desktop UI already projects phantom lanes
-(`apps/cutlass-desktop/src/projection.rs`).
+Effect/filter/adjustment generator bars now apply to everything already
+composited beneath their track.
+
+- `LayerSource::CanvasPass` represents a geometry-free scene layer carrying a
+  sampled effect chain and/or `ColorGrade`.
+- `CompositorLayer::CanvasPass` snapshots the current canvas, runs the existing
+  offscreen effect chain plus a full-canvas grade pass, and replaces the canvas.
+- Resolver, compositor, and render smoke tests cover lane pass ordering,
+  no-op elision, gesture fallback, grade, and effect execution.
 
 ## 5. Stickers
 
@@ -89,5 +95,5 @@ for speed-ramped audio and run RNNoise in the export mix.
 
 ## 10. Docs debt
 
-- `.cursor/rules/overview.mdc` still claims the export pieces "aren't joined";
-  update it (and the `CompositeLayer` gap note) as items above land.
+- Keep `.cursor/rules/overview.mdc` and this roadmap in sync as stickers,
+  look animations, export audio, and Python packaging land.

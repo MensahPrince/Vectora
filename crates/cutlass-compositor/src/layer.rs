@@ -207,6 +207,11 @@ pub struct CompositeLayer<'a> {
 pub enum CompositorLayer<'a> {
     /// A standard layer (optionally with an effect chain).
     Layer(&'a CompositeLayer<'a>),
+    /// Apply an effect chain and grade to the current composited canvas.
+    CanvasPass {
+        effects: &'a [PassInstance<'a>],
+        grade: ColorGrade,
+    },
     /// Blend two independently placed layers by transition progress.
     Transition {
         outgoing: &'a CompositeLayer<'a>,

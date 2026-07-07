@@ -19,8 +19,9 @@ use cutlass_core::{
 };
 
 use crate::effect_render::{
-    OffscreenPool, PassRegistry, blit_premultiplied_to_canvas, draw_layer_to_offscreen,
-    effects_need_offscreen, run_effect_chain, run_transition_pass,
+    OffscreenPool, PassRegistry, blit_premultiplied_to_canvas, blit_replace,
+    draw_layer_to_offscreen, effects_need_offscreen, run_effect_chain, run_grade_pass,
+    run_transition_pass,
 };
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
@@ -399,7 +400,9 @@ impl Compositor {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: CANVAS_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::COPY_SRC
+                | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -555,6 +558,58 @@ impl Compositor {
                         config.height,
                     );
                     blit_premultiplied_to_canvas(
+                        device,
+                        &mut encoder,
+                        &self.pass_registry,
+                        result,
+                        &target.view,
+                    );
+                }
+                CompositorLayer::CanvasPass { effects, grade } => {
+                    if !effects_need_offscreen(effects) && grade.is_identity() {
+                        continue;
+                    }
+
+                    // Snapshot the current canvas, process it as a texture,
+                    // then replace the canvas. Alpha-over blits would double
+                    // the already-drawn stack.
+                    blit_replace(
+                        device,
+                        &mut encoder,
+                        &self.pass_registry,
+                        &target.view,
+                        offscreen.view(0),
+                    );
+                    let mut result = if effects_need_offscreen(effects) {
+                        run_effect_chain(
+                            device,
+                            &mut encoder,
+                            &self.pass_registry,
+                            offscreen,
+                            offscreen.view(0),
+                            effects,
+                            config.width,
+                            config.height,
+                        )
+                    } else {
+                        offscreen.view(0)
+                    };
+                    if !grade.is_identity() {
+                        let grade_output = if std::ptr::eq(result, offscreen.view(0)) {
+                            offscreen.view(1)
+                        } else {
+                            offscreen.view(0)
+                        };
+                        result = run_grade_pass(
+                            device,
+                            &mut encoder,
+                            &self.pass_registry,
+                            result,
+                            grade_output,
+                            *grade,
+                        );
+                    }
+                    blit_replace(
                         device,
                         &mut encoder,
                         &self.pass_registry,

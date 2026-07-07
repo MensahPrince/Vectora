@@ -15,8 +15,10 @@
 //!   shapes resolve to sampled SDF layers (animated geometry/colors are
 //!   sampled per instant here, evaluated on the GPU), pen paths to CPU-raster
 //!   layers.
-//! - **Deferred**: stickers, effects, filters, and adjustment layers are
-//!   skipped (they produce no layer) rather than rendered wrong.
+//! - **Lane passes**: effect, filter, and adjustment generator bars resolve to
+//!   canvas-wide passes over everything below their track.
+//! - **Deferred**: stickers are skipped (they produce no layer) rather than
+//!   rendered wrong.
 
 use cutlass_compositor::ColorGrade;
 use cutlass_core::{RationalTime, resample};
@@ -96,7 +98,16 @@ pub fn resolve_gesture_partitions(
     let Some(index) = index else {
         return Ok(None);
     };
-    if matches!(scene.layers[index].source, LayerSource::Transition { .. }) {
+    if matches!(
+        scene.layers[index].source,
+        LayerSource::Transition { .. } | LayerSource::CanvasPass
+    ) {
+        return Ok(None);
+    }
+    if scene.layers[index + 1..]
+        .iter()
+        .any(|layer| matches!(layer.source, LayerSource::CanvasPass))
+    {
         return Ok(None);
     }
 
@@ -484,10 +495,34 @@ pub(crate) fn resolve_generator(
             scale,
             effects,
         ),
-        // Stickers/effects/filters/adjustment layers are not composited yet.
+        Generator::Effect => canvas_pass(effects, ColorGrade::IDENTITY, cw, ch),
+        Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), grade, cw, ch),
+        // Stickers are not composited yet.
         // Skip rather than draw something wrong.
-        Generator::Sticker | Generator::Effect | Generator::Filter | Generator::Adjustment => None,
+        Generator::Sticker => None,
     }
+}
+
+fn canvas_pass(
+    effects: Vec<ResolvedPass>,
+    grade: ColorGrade,
+    cw: f32,
+    ch: f32,
+) -> Option<SceneLayer> {
+    (!effects.is_empty() || !grade.is_identity()).then_some(SceneLayer {
+        clip: None,
+        source: LayerSource::CanvasPass,
+        center: [cw * 0.5, ch * 0.5],
+        anchor_point: [0.5, 0.5],
+        size: SizeSpec::Fixed([cw, ch]),
+        rotation: 0.0,
+        opacity: 1.0,
+        uv: [0.0, 0.0, 1.0, 1.0],
+        effects,
+        mask: None,
+        chroma_key: None,
+        grade,
+    })
 }
 
 /// Resolve one shape generator at `tick` into a placed layer.
@@ -1498,6 +1533,191 @@ mod tests {
         assert_eq!(scene.layers[0].effects.len(), 1);
         assert_eq!(scene.layers[0].effects[0].id, "gaussian_blur");
         approx(scene.layers[0].effects[0].params[0], 12.0);
+    }
+
+    #[test]
+    fn adjustment_lane_resolves_to_canvas_pass_above_lower_layers() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let adjustment = project.add_track(TrackKind::Adjustment, "A1");
+        let bar = project
+            .add_generated(adjustment, Generator::Adjustment, tr(0, 100))
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                bar,
+                ColorAdjustments {
+                    saturation: -1.0,
+                    ..ColorAdjustments::default()
+                },
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 2);
+        assert!(matches!(scene.layers[0].source, LayerSource::Solid(_)));
+        assert_eq!(scene.layers[1].source, LayerSource::CanvasPass);
+        assert_eq!(scene.layers[1].clip, Some(bar));
+        assert_eq!(scene.layers[1].effects, Vec::<ResolvedPass>::new());
+        assert_eq!(
+            scene.layers[1].grade,
+            effective_grade(
+                None,
+                &ColorAdjustments {
+                    saturation: -1.0,
+                    ..ColorAdjustments::default()
+                },
+            )
+        );
+    }
+
+    #[test]
+    fn filter_lane_resolves_to_canvas_pass_grade() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let filter_track = project.add_track(TrackKind::Filter, "F1");
+        let bar = project
+            .add_generated(filter_track, Generator::Filter, tr(0, 100))
+            .unwrap();
+        let filter = Filter {
+            id: "mono".into(),
+            intensity: 1.0,
+        };
+        project.set_clip_filter(bar, Some(filter.clone())).unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 2);
+        assert_eq!(scene.layers[1].source, LayerSource::CanvasPass);
+        assert_eq!(
+            scene.layers[1].grade,
+            effective_grade(Some(&filter), &ColorAdjustments::default())
+        );
+    }
+
+    #[test]
+    fn effect_lane_resolves_to_canvas_pass_effect_chain() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let effect_track = project.add_track(TrackKind::Effect, "E1");
+        let bar = project
+            .add_generated(effect_track, Generator::Effect, tr(0, 100))
+            .unwrap();
+        project.add_effect(bar, "gaussian_blur").unwrap();
+        project.set_effect_param(bar, 0, 0, 8.0).unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 2);
+        assert_eq!(scene.layers[1].source, LayerSource::CanvasPass);
+        assert_eq!(scene.layers[1].grade, ColorGrade::IDENTITY);
+        assert_eq!(scene.layers[1].effects.len(), 1);
+        assert_eq!(scene.layers[1].effects[0].id, "gaussian_blur");
+        approx(scene.layers[1].effects[0].params[0], 8.0);
+    }
+
+    #[test]
+    fn identity_or_inactive_lane_passes_are_elided() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let adjustment = project.add_track(TrackKind::Adjustment, "A1");
+        project
+            .add_generated(adjustment, Generator::Adjustment, tr(0, 100))
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1, "neutral pass should not render");
+
+        let bar = project
+            .add_generated(adjustment, Generator::Adjustment, tr(120, 10))
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                bar,
+                ColorAdjustments {
+                    exposure: 1.0,
+                    ..ColorAdjustments::default()
+                },
+            )
+            .unwrap();
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1, "out-of-range pass should not render");
+
+        project
+            .timeline_mut()
+            .track_mut(adjustment)
+            .unwrap()
+            .enabled = false;
+        let scene = resolve(&project, rt(125)).unwrap();
+        assert!(
+            scene.layers.is_empty(),
+            "disabled pass track should not render"
+        );
+    }
+
+    #[test]
+    fn gesture_partitions_fall_back_when_canvas_pass_sits_above_clip() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        let clip = project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let adjustment = project.add_track(TrackKind::Adjustment, "A1");
+        let bar = project
+            .add_generated(adjustment, Generator::Adjustment, tr(0, 100))
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                bar,
+                ColorAdjustments {
+                    exposure: 1.0,
+                    ..ColorAdjustments::default()
+                },
+            )
+            .unwrap();
+
+        let partitions = resolve_gesture_partitions(&project, rt(5), clip).unwrap();
+        assert!(partitions.is_none());
     }
 
     #[test]

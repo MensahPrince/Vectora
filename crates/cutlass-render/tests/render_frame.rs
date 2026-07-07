@@ -121,6 +121,55 @@ fn renders_still_with_circle_mask_and_chroma_key() {
     assert_near(frame.pixel(10, 10), [0, 0, 0, 255], 8, "corner");
 }
 
+#[test]
+fn renders_adjustment_lane_over_still_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let png_path = dir.path().join("red.png");
+    write_solid_png(&png_path, 320, 180, [255, 0, 0, 255]);
+
+    let mut project = Project::new("p", FPS_24);
+    let media = project.add_media(MediaSource::image(&png_path, 320, 180));
+    let window = project.media(media).unwrap().full_range();
+    let video = project.add_track(TrackKind::Video, "V1");
+    project.add_clip(video, media, window, rt(0)).unwrap();
+    let adjustment = project.add_track(TrackKind::Adjustment, "A1");
+    let bar = project
+        .add_generated(
+            adjustment,
+            Generator::Adjustment,
+            TimeRange::at_rate(0, 100, FPS_24),
+        )
+        .unwrap();
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+    project
+        .set_clip_adjustments(
+            bar,
+            ColorAdjustments {
+                saturation: -1.0,
+                ..ColorAdjustments::default()
+            },
+        )
+        .unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let frame = renderer
+        .render_frame_fit(&project, rt(0), 320, 180)
+        .expect("render adjustment lane");
+
+    assert_px_close(
+        frame.pixel(160, 90),
+        grade_ref_u8([255, 0, 0, 255], grade),
+        8,
+        "adjusted center",
+    );
+}
+
 fn red_solid_project() -> (Project, cutlass_models::ClipId) {
     let mut project = Project::new("p", FPS_24);
     let track = project.add_track(TrackKind::Sticker, "S1");

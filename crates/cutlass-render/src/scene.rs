@@ -79,7 +79,8 @@ impl Scene {
                 // Path strokes live in path-local pixels folded into the
                 // raster, so scaling the raster factor scales them too.
                 LayerSource::PathShape { raster_scale, .. } => *raster_scale *= factor,
-                LayerSource::Media { .. }
+                LayerSource::CanvasPass
+                | LayerSource::Media { .. }
                 | LayerSource::Still { .. }
                 | LayerSource::Text { .. }
                 | LayerSource::Solid(_)
@@ -215,6 +216,11 @@ pub enum LayerSource {
     Text { content: String, style: TextStyle },
     /// A solid RGBA fill across the placed quad.
     Solid([u8; 4]),
+    /// Apply this layer's effect chain and color grade to the current canvas.
+    ///
+    /// Lane-level effect/filter/adjustment generator bars use this geometry-free
+    /// marker to process everything already drawn below their track.
+    CanvasPass,
     /// A parametric vector shape, every animatable parameter already sampled
     /// at this instant (canvas pixels). Realized as a GPU SDF layer: the
     /// layer's `size` is the *padded quad* (shape + stroke overhang + AA);

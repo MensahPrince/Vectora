@@ -4,6 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::error::CompositorError;
+use crate::layer::ColorGrade;
 use crate::passes::{PassInstance, effect_is_noop, resolve_transition_pass};
 
 const RT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -26,6 +27,13 @@ struct EffectUniforms {
 struct TransitionUniforms {
     texel_size: [f32; 4],
     params: [f32; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct GradeUniforms {
+    grade0: [f32; 4],
+    grade1: [f32; 4],
 }
 
 /// Reused canvas-sized RGBA textures for effect ping-pong and transitions.
@@ -81,11 +89,14 @@ pub(crate) struct PassRegistry {
     pub pixelate: wgpu::RenderPipeline,
     pub crossfade: wgpu::RenderPipeline,
     pub wipe: wgpu::RenderPipeline,
+    pub grade: wgpu::RenderPipeline,
     pub effect_layout: wgpu::BindGroupLayout,
     pub transition_layout: wgpu::BindGroupLayout,
     pub sampler: wgpu::Sampler,
     /// Full-canvas blit of an offscreen texture (premultiplied src-over).
     pub blit_pipeline: wgpu::RenderPipeline,
+    /// Full-canvas replacement blit for canvas-wide passes.
+    pub replace_pipeline: wgpu::RenderPipeline,
     pub blit_layout: wgpu::BindGroupLayout,
 }
 
@@ -162,7 +173,14 @@ impl PassRegistry {
             &transition_layout,
             include_str!("../shaders/transition_wipe.wgsl"),
         );
+        let grade = build_effect_pipeline(
+            device,
+            "cutlass.canvas_grade",
+            &effect_layout,
+            include_str!("../shaders/canvas_grade.wgsl"),
+        );
         let blit_pipeline = build_blit_pipeline(device, &blit_layout);
+        let replace_pipeline = build_replace_pipeline(device, &blit_layout);
 
         Self {
             passthrough,
@@ -172,10 +190,12 @@ impl PassRegistry {
             pixelate,
             crossfade,
             wipe,
+            grade,
             effect_layout,
             transition_layout,
             sampler,
             blit_pipeline,
+            replace_pipeline,
             blit_layout,
         }
     }
@@ -342,6 +362,68 @@ pub(crate) fn run_transition_pass(
     pass.draw(0..6, 0..1);
 }
 
+pub(crate) fn run_grade_pass<'a>(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    registry: &PassRegistry,
+    input: &'a wgpu::TextureView,
+    output: &'a wgpu::TextureView,
+    grade: ColorGrade,
+) -> &'a wgpu::TextureView {
+    let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("cutlass.canvas_grade.uniforms"),
+        contents: bytemuck::bytes_of(&GradeUniforms {
+            grade0: [
+                grade.exposure,
+                grade.brightness,
+                grade.contrast,
+                grade.saturation,
+            ],
+            grade1: [grade.temperature, grade.tint, 0.0, 0.0],
+        }),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cutlass.canvas_grade.bg"),
+        layout: &registry.effect_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(input),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&registry.sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: ubuf.as_entire_binding(),
+            },
+        ],
+    });
+
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("cutlass.canvas_grade.pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: output,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(&registry.grade);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.draw(0..6, 0..1);
+    output
+}
+
 /// Alpha-over a full-canvas offscreen texture onto `canvas_view`.
 pub(crate) fn blit_premultiplied_to_canvas(
     device: &wgpu::Device,
@@ -381,6 +463,49 @@ pub(crate) fn blit_premultiplied_to_canvas(
         multiview_mask: None,
     });
     pass.set_pipeline(&registry.blit_pipeline);
+    pass.set_bind_group(0, &bind_group, &[]);
+    pass.draw(0..6, 0..1);
+}
+
+/// Replace a full-canvas render target with `source`.
+pub(crate) fn blit_replace(
+    device: &wgpu::Device,
+    encoder: &mut wgpu::CommandEncoder,
+    registry: &PassRegistry,
+    source: &wgpu::TextureView,
+    output: &wgpu::TextureView,
+) {
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("cutlass.blit_replace.bg"),
+        layout: &registry.blit_layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(source),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(&registry.sampler),
+            },
+        ],
+    });
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("cutlass.blit_replace.pass"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: output,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    pass.set_pipeline(&registry.replace_pipeline);
     pass.set_bind_group(0, &bind_group, &[]);
     pass.draw(0..6, 0..1);
 }
@@ -578,6 +703,66 @@ struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
 }
 "#;
     build_effect_pipeline(device, "cutlass.blit", layout, source)
+}
+
+fn build_replace_pipeline(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+) -> wgpu::RenderPipeline {
+    let source = r#"
+struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
+    var positions = array<vec2<f32>, 6>(
+        vec2(-1.0,-1.0), vec2(1.0,-1.0), vec2(-1.0,1.0),
+        vec2(-1.0,1.0), vec2(1.0,-1.0), vec2(1.0,1.0));
+    var uvs = array<vec2<f32>, 6>(
+        vec2(0.0,1.0), vec2(1.0,1.0), vec2(0.0,0.0),
+        vec2(0.0,0.0), vec2(1.0,1.0), vec2(1.0,0.0));
+    var o: VsOut;
+    o.pos = vec4(positions[vi], 0.0, 1.0);
+    o.uv = uvs[vi];
+    return o;
+}
+@group(0) @binding(0) var tex: texture_2d<f32>;
+@group(0) @binding(1) var samp: sampler;
+@fragment fn fs(in: VsOut) -> @location(0) vec4<f32> {
+    return textureSample(tex, samp, in.uv);
+}
+"#;
+    let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        label: Some("cutlass.blit_replace"),
+        source: wgpu::ShaderSource::Wgsl(source.into()),
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("cutlass.blit_replace"),
+        bind_group_layouts: &[layout],
+        immediate_size: 0,
+    });
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("cutlass.blit_replace"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: Some("vs"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: Some("fs"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: RT_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        multiview_mask: None,
+        cache: None,
+    })
 }
 
 /// Draw one layer to an offscreen target with a transparent clear.

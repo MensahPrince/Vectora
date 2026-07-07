@@ -234,6 +234,12 @@ impl Renderer {
                 opacity: layer.opacity,
             };
             match &layer.source {
+                LayerSource::CanvasPass => {
+                    realized.push(Realized::CanvasPass {
+                        effects: layer.effects.clone(),
+                        grade: layer.grade,
+                    });
+                }
                 LayerSource::Transition {
                     outgoing,
                     incoming,
@@ -374,6 +380,10 @@ impl Renderer {
             Plain {
                 storage_idx: usize,
             },
+            CanvasPass {
+                effects: &'a [PassInstance<'a>],
+                grade: ColorGrade,
+            },
             Transition {
                 out_idx: usize,
                 in_idx: usize,
@@ -385,6 +395,19 @@ impl Renderer {
 
         for r in &realized {
             match r {
+                Realized::CanvasPass { effects, grade } => {
+                    let effects = if effects.is_empty() {
+                        &[]
+                    } else {
+                        let chain = &instance_store[effect_idx];
+                        effect_idx += 1;
+                        chain.as_slice()
+                    };
+                    jobs.push(LayerJob::CanvasPass {
+                        effects,
+                        grade: *grade,
+                    });
+                }
                 Realized::Transition {
                     outgoing,
                     incoming,
@@ -453,6 +476,10 @@ impl Renderer {
                 LayerJob::Plain { storage_idx } => {
                     CompositorLayer::layer(&layer_storage[*storage_idx])
                 }
+                LayerJob::CanvasPass { effects, grade } => CompositorLayer::CanvasPass {
+                    effects,
+                    grade: *grade,
+                },
                 LayerJob::Transition {
                     out_idx,
                     in_idx,
@@ -594,6 +621,9 @@ impl Renderer {
             }
             LayerSource::Transition { .. } => {
                 return Err(RenderError::unsupported("nested transitions"));
+            }
+            LayerSource::CanvasPass => {
+                return Err(RenderError::unsupported("nested canvas pass"));
             }
         };
         Ok(Box::new(realized))
@@ -787,7 +817,9 @@ fn composite_from_realized<'a>(
             .with_fx(*fx)
             .with_effects(effects)
             .with_grade(*grade),
-        Realized::Transition { .. } => unreachable!("transitions handled separately"),
+        Realized::Transition { .. } | Realized::CanvasPass { .. } => {
+            unreachable!("non-layer realized items handled separately")
+        }
     }
 }
 
@@ -798,6 +830,10 @@ enum Realized {
         incoming: Box<Realized>,
         transition_id: String,
         progress: f32,
+    },
+    CanvasPass {
+        effects: Vec<ResolvedPass>,
+        grade: ColorGrade,
     },
     Frame {
         frame: VideoFrame,
@@ -843,6 +879,7 @@ impl Realized {
     fn effects(&self) -> Option<&[ResolvedPass]> {
         match self {
             Realized::Transition { .. } => None,
+            Realized::CanvasPass { effects, .. } => Some(effects),
             Realized::Frame { effects, .. }
             | Realized::Still { effects, .. }
             | Realized::Bitmap { effects, .. }
