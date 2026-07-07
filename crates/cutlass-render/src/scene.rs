@@ -8,7 +8,7 @@
 //! z-order, transforms, crop) deterministic and unit-testable without a device,
 //! while [`Renderer`](crate::Renderer) does the decode + rasterize + composite.
 
-use cutlass_models::MediaId;
+use cutlass_models::{ChromaKey, Mask, MediaId};
 use cutlass_shapes::{BezierPath, SdfParams, Stroke};
 use cutlass_text::TextStyle;
 
@@ -143,6 +143,10 @@ pub struct SceneLayer {
     /// Sampled UV rect `[u0, v0, u1, v1]` across the visible picture. A sub-rect
     /// crops; a reversed axis mirrors. Ignored by solid fills.
     pub uv: [f32; 4],
+    /// Shaped alpha mask (media clips only).
+    pub mask: Option<Mask>,
+    /// Green-screen keying (media clips only).
+    pub chroma_key: Option<ChromaKey>,
 }
 
 impl SceneLayer {
@@ -240,6 +244,8 @@ mod tests {
             rotation: 0.5,
             opacity: 0.8,
             uv: [0.1, 0.2, 0.9, 0.8],
+            mask: None,
+            chroma_key: None,
         }
     }
 
@@ -260,6 +266,8 @@ mod tests {
             rotation: 0.0,
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            mask: None,
+            chroma_key: None,
         }
     }
 
@@ -275,6 +283,8 @@ mod tests {
             rotation: 0.0,
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            mask: None,
+            chroma_key: None,
         }
     }
 
