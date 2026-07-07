@@ -31,10 +31,10 @@ struct Sdf {
     // Star spike count (x), inner-radius fraction (y); quad half-extents px
     // (z, w) — the vertex shader's local-coordinate scale.
     star: vec4<f32>,
-    // Color grade: (exposure, brightness, contrast, saturation).
-    grade0: vec4<f32>,
-    // Color grade: (temperature, tint, pad, pad).
-    grade1: vec4<f32>,
+    // Color grade: brightness, contrast, saturation, enabled (0 | 1).
+    grade_adj0: vec4<f32>,
+    // Color grade: exposure, temperature, tint, pad.
+    grade_adj1: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> s: Sdf;
@@ -248,6 +248,7 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
     if a <= 0.0 {
         return vec4(0.0, 0.0, 0.0, 0.0);
     }
-    let rgb = (stroke_rgb * stroke_cov + fill_rgb * fill_cov * (1.0 - stroke_cov)) / a;
-    return vec4(rgb, a * s.trans_opacity.z);
+    let rgb = (s.stroke_color.rgb * stroke_cov + s.fill.rgb * fill_cov * (1.0 - stroke_cov)) / a;
+    let graded = apply_color_grade(rgb, s.grade_adj0, s.grade_adj1);
+    return vec4(graded, a * s.trans_opacity.z);
 }

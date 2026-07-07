@@ -4,6 +4,7 @@
 use cutlass_core::{RgbaImage, VideoFrame};
 use cutlass_shapes::{SdfShape, Stroke};
 
+use crate::grade::ColorGrade;
 use crate::passes::PassInstance;
 
 /// Canvas dimensions and background for one composite pass.
@@ -106,50 +107,6 @@ impl LayerEffects {
     }
 }
 
-/// Per-layer color grade applied in the fragment shader on gamma-encoded RGB
-/// before opacity and compositing.
-///
-/// All fields are nominally in `[-1.0, 1.0]` with `0.0` neutral (identity).
-/// Values outside that range are not clamped on the CPU; the shader clamps the
-/// final RGB to `[0, 1]`.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
-pub struct ColorGrade {
-    /// Photographic exposure: `±1.0` nominally maps to `±2` stops via `exp2(2·x)`.
-    pub exposure: f32,
-    /// Additive brightness offset (shader adds `0.25·x` to each channel).
-    pub brightness: f32,
-    /// Contrast pivoting at mid-gray `0.5`: `(rgb − 0.5)·(1 + x) + 0.5`.
-    pub contrast: f32,
-    /// Saturation: `-1` desaturates to luma, `+1` doubles color vs luma.
-    pub saturation: f32,
-    /// White-balance temperature: positive warms (R up, B down).
-    pub temperature: f32,
-    /// White-balance tint on the green/magenta axis.
-    pub tint: f32,
-}
-
-impl ColorGrade {
-    /// Identity grade: all zeros; leaves gamma-encoded RGB unchanged.
-    pub const IDENTITY: Self = Self {
-        exposure: 0.0,
-        brightness: 0.0,
-        contrast: 0.0,
-        saturation: 0.0,
-        temperature: 0.0,
-        tint: 0.0,
-    };
-
-    /// Whether every control is at its neutral value.
-    pub const fn is_identity(&self) -> bool {
-        self.exposure == 0.0
-            && self.brightness == 0.0
-            && self.contrast == 0.0
-            && self.saturation == 0.0
-            && self.temperature == 0.0
-            && self.tint == 0.0
-    }
-}
-
 /// A parametric vector shape drawn as a signed-distance field by the shape
 /// pipeline: no texture, no rasterization — geometry parameters ride in the
 /// layer's uniform block, so animated shapes cost a uniform update per frame
@@ -175,7 +132,7 @@ pub struct SdfLayer {
 /// Frames are borrowed: the engine pulls a [`VideoFrame`] from the decoder for
 /// the current tick and hands it to the compositor without copying the planes.
 pub enum LayerContent<'a> {
-    /// A decoded video frame (CPU planes; GPU-surface import is a follow-up).
+    /// A decoded video frame (CPU planes or imported GPU surfaces).
     Frame(&'a VideoFrame),
     /// A pre-rasterized straight-alpha RGBA bitmap: text, pen-tool shape
     /// paths, stickers, or a decoded still. The compositor premultiplies it
@@ -199,18 +156,18 @@ pub struct CompositeLayer<'a> {
     pub effects: &'a [PassInstance<'a>],
     /// Mask/chroma-key state; identity uses the fast path pipelines.
     pub fx: LayerEffects,
-    /// Color grade applied to the layer's RGB before opacity and compositing.
-    pub grade: ColorGrade,
+    /// Resolved color grade for this layer; `None` is the identity fast path.
+    pub color_grade: Option<ColorGrade>,
 }
 
-/// A layer or a dual-source transition submitted to the compositor.
+/// A layer, a canvas-wide pass, or a dual-source transition submitted to the compositor.
 pub enum CompositorLayer<'a> {
     /// A standard layer (optionally with an effect chain).
     Layer(&'a CompositeLayer<'a>),
     /// Apply an effect chain and grade to the current composited canvas.
     CanvasPass {
         effects: &'a [PassInstance<'a>],
-        grade: ColorGrade,
+        grade: Option<ColorGrade>,
     },
     /// Blend two independently placed layers by transition progress.
     Transition {
@@ -236,7 +193,7 @@ impl<'a> CompositeLayer<'a> {
             uv: FULL_UV,
             effects: &[],
             fx: LayerEffects::IDENTITY,
-            grade: ColorGrade::IDENTITY,
+            color_grade: None,
         }
     }
 
@@ -248,7 +205,7 @@ impl<'a> CompositeLayer<'a> {
             uv: FULL_UV,
             effects: &[],
             fx: LayerEffects::IDENTITY,
-            grade: ColorGrade::IDENTITY,
+            color_grade: None,
         }
     }
 
@@ -260,7 +217,7 @@ impl<'a> CompositeLayer<'a> {
             uv: FULL_UV,
             effects: &[],
             fx: LayerEffects::IDENTITY,
-            grade: ColorGrade::IDENTITY,
+            color_grade: None,
         }
     }
 
@@ -272,7 +229,7 @@ impl<'a> CompositeLayer<'a> {
             uv: FULL_UV,
             effects: &[],
             fx: LayerEffects::IDENTITY,
-            grade: ColorGrade::IDENTITY,
+            color_grade: None,
         }
     }
 
@@ -296,7 +253,13 @@ impl<'a> CompositeLayer<'a> {
 
     /// Replace the per-layer color grade.
     pub fn with_grade(mut self, grade: ColorGrade) -> Self {
-        self.grade = grade;
+        self.color_grade = (!grade.is_identity()).then_some(grade);
+        self
+    }
+
+    /// Attach a resolved color grade (filter preset + manual adjustments).
+    pub fn with_color_grade(mut self, grade: Option<ColorGrade>) -> Self {
+        self.color_grade = grade.filter(|g| !g.is_identity());
         self
     }
 }

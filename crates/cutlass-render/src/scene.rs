@@ -163,9 +163,9 @@ pub struct SceneLayer {
     pub mask: Option<Mask>,
     /// Green-screen keying (media clips only).
     pub chroma_key: Option<ChromaKey>,
-    /// Per-clip color grade (filter preset × intensity + manual adjustments).
-    /// Identity leaves gamma-encoded RGB unchanged in the compositor.
-    pub grade: ColorGrade,
+    /// Resolved color grade (filter preset + manual adjustments); `None` when
+    /// the clip's look is identity.
+    pub color_grade: Option<ColorGrade>,
 }
 
 impl SceneLayer {
@@ -280,7 +280,7 @@ mod tests {
             effects: Vec::new(),
             mask: None,
             chroma_key: None,
-            grade: ColorGrade::IDENTITY,
+            color_grade: None,
         }
     }
 
@@ -305,7 +305,7 @@ mod tests {
             effects: Vec::new(),
             mask: None,
             chroma_key: None,
-            grade: ColorGrade::IDENTITY,
+            color_grade: None,
         }
     }
 
@@ -325,7 +325,7 @@ mod tests {
             effects: Vec::new(),
             mask: None,
             chroma_key: None,
-            grade: ColorGrade::IDENTITY,
+            color_grade: None,
         }
     }
 

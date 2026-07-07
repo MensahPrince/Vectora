@@ -8,7 +8,7 @@
 
 use cutlass_compositor::{
     ColorGrade, CompositeLayer, Compositor, CompositorConfig, CompositorLayer, GpuContext,
-    LayerChromaKey, LayerEffects, LayerMask, LayerPlacement, RgbaImage, mask_kind,
+    LayerChromaKey, LayerEffects, LayerMask, LayerPlacement, PassInstance, RgbaImage, mask_kind,
 };
 use cutlass_core::{
     ColorRange, ColorSpace, CpuImage, FrameData, MatrixCoefficients, PixelFormat, Plane, Rational,
@@ -760,8 +760,6 @@ fn sdf_quad_padding_keeps_stroke_unclipped() {
 
 // --- effects (M4) -------------------------------------------------------
 
-use cutlass_compositor::PassInstance;
-
 #[test]
 fn vignette_darkens_corners_vs_center() {
     let gpu = gpu_or_skip!();
@@ -867,7 +865,7 @@ fn canvas_pass_pixelates_the_composited_stack() {
                 CompositorLayer::layer(&overlay),
                 CompositorLayer::CanvasPass {
                     effects: &effects,
-                    grade: ColorGrade::IDENTITY,
+                    grade: None,
                 },
             ],
         )
@@ -961,7 +959,7 @@ fn canvas_pass_grade_replaces_translucent_canvas() {
                 CompositorLayer::layer(&translucent),
                 CompositorLayer::CanvasPass {
                     effects: &[],
-                    grade,
+                    grade: Some(grade),
                 },
             ],
         )

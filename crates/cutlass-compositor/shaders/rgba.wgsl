@@ -15,10 +15,10 @@ struct Placement {
     trans_opacity: vec4<f32>,
     // Sampled UV rect (u0, v0, u1, v1) across the quad.
     uv_rect: vec4<f32>,
-    // Color grade: (exposure, brightness, contrast, saturation).
-    grade0: vec4<f32>,
-    // Color grade: (temperature, tint, pad, pad).
-    grade1: vec4<f32>,
+    // Color grade: brightness, contrast, saturation, enabled (0 | 1).
+    grade_adj0: vec4<f32>,
+    // Color grade: exposure, temperature, tint, pad.
+    grade_adj1: vec4<f32>,
 }
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
@@ -56,13 +56,16 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Premultiplied sample: un-premultiply, grade, re-premultiply, then opacity.
+    // Premultiplied sample; grade in straight-alpha space, then re-premultiply.
     let premul = textureSample(tex, samp, in.uv);
-    var rgb = premul.rgb;
-    let a = premul.a;
-    if (a > 0.0) {
-        rgb = apply_grade(rgb / a, p.grade0, p.grade1);
-        rgb = rgb * a;
+    let layer_a = premul.a * p.trans_opacity.z;
+    if layer_a <= 0.0 {
+        return vec4(0.0, 0.0, 0.0, 0.0);
     }
-    return vec4(rgb, a) * p.trans_opacity.z;
+    var rgb = premul.rgb;
+    if premul.a > 0.0 {
+        rgb = rgb / premul.a;
+    }
+    rgb = apply_color_grade(rgb, p.grade_adj0, p.grade_adj1);
+    return vec4(rgb * layer_a, layer_a);
 }

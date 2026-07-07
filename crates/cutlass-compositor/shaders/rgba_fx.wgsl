@@ -4,10 +4,10 @@ struct Placement {
     linear: vec4<f32>,
     trans_opacity: vec4<f32>,
     uv_rect: vec4<f32>,
-    // Color grade: (exposure, brightness, contrast, saturation).
-    grade0: vec4<f32>,
-    // Color grade: (temperature, tint, pad, pad).
-    grade1: vec4<f32>,
+    // Color grade: brightness, contrast, saturation, enabled (0 | 1).
+    grade_adj0: vec4<f32>,
+    // Color grade: exposure, temperature, tint, pad.
+    grade_adj1: vec4<f32>,
 }
 
 struct Effects {
@@ -74,7 +74,7 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
     // Grade the straight-alpha color after chroma keying (the key targets the
     // source footage), before mask/opacity shape the alpha.
     if premul.a > 0.0 {
-        let graded = apply_grade(premul.rgb / premul.a, p.grade0, p.grade1);
+        let graded = apply_color_grade(premul.rgb / premul.a, p.grade_adj0, p.grade_adj1);
         premul = vec4(graded * premul.a, premul.a);
     }
 

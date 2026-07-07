@@ -1,18 +1,12 @@
-//! Per-clip color grade: filter presets plus manual adjustments → [`ColorGrade`].
-//!
-//! [`resolve`](crate::resolve) samples a clip's [`Filter`] and
-//! [`ColorAdjustments`] at resolve time and folds them into a single
-//! [`ColorGrade`] on each [`SceneLayer`](crate::scene::SceneLayer). The
-//! compositor applies that grade in the fragment shaders (Stage A); this module
-//! is the model→shader bridge (Stage B).
+//! Resolve persisted clip look fields into compositor [`ColorGrade`] values.
 
 use cutlass_compositor::ColorGrade;
 use cutlass_models::{ColorAdjustments, Filter};
 
 /// Hand-tuned [`ColorGrade`] recipe for one filter-catalog id.
 ///
-/// Returns `None` for unknown ids so [`effective_grade`] can treat them as
-/// identity on the preset side (manual adjustments still apply).
+/// Returns `None` for unknown ids so unknown presets behave as identity while
+/// manual adjustments still apply.
 fn preset_recipe(id: &str) -> Option<ColorGrade> {
     Some(match id {
         "vivid" => ColorGrade {
@@ -75,33 +69,8 @@ fn preset_recipe(id: &str) -> Option<ColorGrade> {
 }
 
 /// Fold a clip's filter preset and manual adjustments into one compositor grade.
-///
-/// # Preset × intensity
-///
-/// When a filter is present, its catalog recipe is scaled by `filter.intensity`
-/// (clamped to `[0, 1]`). Multiplying each recipe component by intensity is a
-/// **parameter-space approximation** of blending the graded result over the
-/// original: for the small control values these presets use, `recipe × intensity`
-/// tracks `mix(identity, recipe, intensity)` closely without re-running the
-/// non-linear shader per blend weight.
-///
-/// Unknown filter ids contribute nothing on the preset side (identity recipe).
-///
-/// # Manual adjustments
-///
-/// [`ColorAdjustments`] fields are added component-wise after the scaled preset.
-/// Adjustments have no tint control; any tint from the preset is left as scaled
-/// above and is not modified by adjustments.
-///
-/// # Defensive clamping
-///
-/// JSON project loads are not re-validated here — only engine setters run
-/// `validate`. Non-finite inputs are treated as `0`; intensity is clamped to
-/// `[0, 1]`; every adjustment field and every output component is clamped to
-/// `[-1, 1]`.
 pub(crate) fn effective_grade(filter: Option<&Filter>, adjust: &ColorAdjustments) -> ColorGrade {
     let intensity = filter.map(|f| clamp_unit(f.intensity)).unwrap_or(0.0);
-
     let preset = filter
         .and_then(|f| preset_recipe(&f.id))
         .unwrap_or(ColorGrade::IDENTITY);
@@ -115,7 +84,15 @@ pub(crate) fn effective_grade(filter: Option<&Filter>, adjust: &ColorAdjustments
     clamp_grade(grade)
 }
 
-/// Scale every grade component (including tint) by `intensity`.
+/// Resolve a grade for compositor submission. `None` is the identity fast path.
+pub(crate) fn resolve_color_grade(
+    filter: Option<&Filter>,
+    adjust: &ColorAdjustments,
+) -> Option<ColorGrade> {
+    let grade = effective_grade(filter, adjust);
+    (!grade.is_identity()).then_some(grade)
+}
+
 fn scale_grade(grade: ColorGrade, intensity: f32) -> ColorGrade {
     ColorGrade {
         exposure: grade.exposure * intensity,
@@ -157,6 +134,11 @@ mod tests {
     use cutlass_models::filter_catalog;
 
     #[test]
+    fn neutral_look_resolves_to_none() {
+        assert!(resolve_color_grade(None, &ColorAdjustments::default()).is_none());
+    }
+
+    #[test]
     fn identity_when_no_filter_and_neutral_adjust() {
         let grade = effective_grade(None, &ColorAdjustments::default());
         assert_eq!(grade, ColorGrade::IDENTITY);
@@ -171,6 +153,7 @@ mod tests {
         };
         let grade = effective_grade(Some(&filter), &ColorAdjustments::default());
         assert_eq!(grade, ColorGrade::IDENTITY);
+        assert!(resolve_color_grade(Some(&filter), &ColorAdjustments::default()).is_none());
     }
 
     #[test]
@@ -205,7 +188,6 @@ mod tests {
             temperature: 1.5,
         };
         let grade = effective_grade(Some(&filter), &adjust);
-        // NaN intensity zeroes the preset; adjustments clamp individually.
         assert_eq!(grade.brightness, 1.0);
         assert_eq!(grade.contrast, -1.0);
         assert_eq!(grade.temperature, 1.0);
@@ -238,5 +220,18 @@ mod tests {
         let grade = effective_grade(Some(&filter), &adjust);
         assert!((grade.temperature - 0.2).abs() < 1e-6);
         assert!((grade.brightness - 0.125).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolve_color_grade_returns_some_for_non_identity() {
+        let grade = resolve_color_grade(
+            Some(&Filter {
+                id: "mono".into(),
+                intensity: 0.5,
+            }),
+            &ColorAdjustments::default(),
+        )
+        .unwrap();
+        assert!((grade.saturation - (-0.5)).abs() < 1e-5);
     }
 }

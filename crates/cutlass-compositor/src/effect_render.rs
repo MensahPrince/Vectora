@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::error::CompositorError;
-use crate::layer::ColorGrade;
+use crate::grade::ColorGrade;
 use crate::passes::{PassInstance, effect_is_noop, resolve_transition_pass};
 
 const RT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;

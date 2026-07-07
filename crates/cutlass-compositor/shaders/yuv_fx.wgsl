@@ -5,10 +5,10 @@ struct Placement {
     trans_opacity: vec4<f32>,
     uv_rect: vec4<f32>,
     coeffs: vec4<f32>,
-    // Color grade: (exposure, brightness, contrast, saturation).
-    grade0: vec4<f32>,
-    // Color grade: (temperature, tint, pad, pad).
-    grade1: vec4<f32>,
+    // Color grade: brightness, contrast, saturation, enabled (0 | 1).
+    grade_adj0: vec4<f32>,
+    // Color grade: exposure, temperature, tint, pad.
+    grade_adj1: vec4<f32>,
 }
 
 struct Effects {
@@ -98,7 +98,7 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
         alpha = alpha * chroma_alpha(rgb, fx.chroma.rgb, fx.chroma_params.x, fx.chroma_params.y);
     }
 
-    rgb = apply_grade(rgb, p.grade0, p.grade1);
+    rgb = apply_color_grade(rgb, p.grade_adj0, p.grade_adj1);
 
     if fx.mask.w > 0.5 {
         let malpha = mask_alpha(

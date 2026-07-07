@@ -25,15 +25,50 @@ use crate::effect_render::{
 };
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
+use crate::grade::ColorGrade;
 use crate::layer::{
-    ColorGrade, CompositeLayer, CompositorConfig, CompositorLayer, LayerContent, LayerEffects,
-    LayerPlacement,
+    CompositeLayer, CompositorConfig, CompositorLayer, LayerContent, LayerEffects, LayerPlacement,
 };
 
 /// Canvas pixel format. Plain (non-sRGB) `Unorm`: the YUV shader already emits
 /// gamma-encoded R'G'B', so we store those bytes verbatim (display-ready SDR)
 /// and read them straight back into PNG/export without an extra transfer.
 const CANVAS_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
+const GRADE_WGSL: &str = include_str!("../shaders/grade.wgsl");
+
+/// Caller-provided destination for a composited frame's pixels, so a render
+/// can write its readback rows straight into storage the caller owns (a UI
+/// framebuffer) instead of allocating an [`RgbaImage`] and copying again.
+pub trait FrameSink {
+    /// Called **once per successful render**, after the GPU work and buffer
+    /// map succeeded, with the output dimensions. Must return exactly
+    /// `width * height * 4` bytes; the compositor fills them with tightly
+    /// packed row-major RGBA. A failed render never calls this.
+    fn pixels(&mut self, width: u32, height: u32) -> &mut [u8];
+}
+
+/// The [`FrameSink`] behind the [`RgbaImage`]-returning render paths: it
+/// allocates the image at the reported size and hands out its bytes.
+#[derive(Default)]
+pub struct ImageSink(Option<RgbaImage>);
+
+impl ImageSink {
+    /// The rendered image; `None` until a render succeeded into this sink.
+    pub fn into_image(self) -> Option<RgbaImage> {
+        self.0
+    }
+}
+
+impl FrameSink for ImageSink {
+    fn pixels(&mut self, width: u32, height: u32) -> &mut [u8] {
+        let image = self.0.insert(RgbaImage::new(
+            width,
+            height,
+            vec![0; (width as usize) * (height as usize) * 4],
+        ));
+        &mut image.pixels
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -41,10 +76,9 @@ struct YuvUniforms {
     linear: [f32; 4],
     trans_opacity: [f32; 4],
     uv_rect: [f32; 4],
-    /// Kr, Kb, full-range flag, plane mode (0 = planar I420, 1 = biplanar NV12).
     coeffs: [f32; 4],
-    grade0: [f32; 4],
-    grade1: [f32; 4],
+    grade_adj0: [f32; 4],
+    grade_adj1: [f32; 4],
 }
 
 #[repr(C)]
@@ -53,8 +87,8 @@ struct SolidUniforms {
     color: [f32; 4],
     linear: [f32; 4],
     trans_opacity: [f32; 4],
-    grade0: [f32; 4],
-    grade1: [f32; 4],
+    grade_adj0: [f32; 4],
+    grade_adj1: [f32; 4],
 }
 
 #[repr(C)]
@@ -63,8 +97,8 @@ struct RgbaUniforms {
     linear: [f32; 4],
     trans_opacity: [f32; 4],
     uv_rect: [f32; 4],
-    grade0: [f32; 4],
-    grade1: [f32; 4],
+    grade_adj0: [f32; 4],
+    grade_adj1: [f32; 4],
 }
 
 #[repr(C)]
@@ -92,8 +126,8 @@ struct SdfUniforms {
     geo: [f32; 4],
     /// Star points (x), inner fraction (y); quad half-extents px (z, w).
     star: [f32; 4],
-    grade0: [f32; 4],
-    grade1: [f32; 4],
+    grade_adj0: [f32; 4],
+    grade_adj1: [f32; 4],
 }
 
 /// Which pipeline draws a built layer.
@@ -191,6 +225,13 @@ pub struct Compositor {
     /// and the caller can decode in CPU mode instead.
     #[cfg(target_vendor = "apple")]
     metal_import: Option<crate::metal_import::MetalSurfaceImporter>,
+    /// Maps Windows shared D3D11 NV12 textures into `wgpu` textures with no
+    /// CPU copy. `None` when the device isn't the D3D12 backend or lacks
+    /// `TEXTURE_FORMAT_NV12` — GPU frames then fall back to
+    /// [`CompositorError::UnsupportedFormat`] and the caller can decode in CPU
+    /// mode instead.
+    #[cfg(target_os = "windows")]
+    dx12_import: Option<crate::dx12_import::Dx12SurfaceImporter>,
 }
 
 impl Compositor {
@@ -246,18 +287,16 @@ impl Compositor {
             entries: &[uniform_entry(0)],
         });
 
-        let grade = include_str!("../shaders/grade.wgsl");
         let yuv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.yuv.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{grade}\n{}", include_str!("../shaders/yuv.wgsl")).into(),
-            ),
+            source: wgsl_with_grade(include_str!("../shaders/yuv.wgsl")),
         });
         let yuv_fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.yuv_fx.wgsl"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "{grade}\n{}{}",
+                    "{GRADE_WGSL}
+{}{}",
                     include_str!("../shaders/mask.wgsl"),
                     include_str!("../shaders/yuv_fx.wgsl"),
                 )
@@ -266,15 +305,14 @@ impl Compositor {
         });
         let rgba_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.rgba.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{grade}\n{}", include_str!("../shaders/rgba.wgsl")).into(),
-            ),
+            source: wgsl_with_grade(include_str!("../shaders/rgba.wgsl")),
         });
         let rgba_fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.rgba_fx.wgsl"),
             source: wgpu::ShaderSource::Wgsl(
                 format!(
-                    "{grade}\n{}{}",
+                    "{GRADE_WGSL}
+{}{}",
                     include_str!("../shaders/mask.wgsl"),
                     include_str!("../shaders/rgba_fx.wgsl"),
                 )
@@ -283,15 +321,11 @@ impl Compositor {
         });
         let solid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.solid.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{grade}\n{}", include_str!("../shaders/solid.wgsl")).into(),
-            ),
+            source: wgsl_with_grade(include_str!("../shaders/solid.wgsl")),
         });
         let sdf_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.shape.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(
-                format!("{grade}\n{}", include_str!("../shaders/shape.wgsl")).into(),
-            ),
+            source: wgsl_with_grade(include_str!("../shaders/shape.wgsl")),
         });
 
         // Opaque video and solids use straight-alpha src-over; RGBA bitmaps
@@ -371,6 +405,8 @@ impl Compositor {
             offscreen: None,
             #[cfg(target_vendor = "apple")]
             metal_import: crate::metal_import::MetalSurfaceImporter::new(gpu),
+            #[cfg(target_os = "windows")]
+            dx12_import: crate::dx12_import::Dx12SurfaceImporter::new(gpu),
         }
     }
 
@@ -443,17 +479,47 @@ impl Compositor {
         config: &CompositorConfig,
         layers: &[CompositeLayer<'_>],
     ) -> Result<RgbaImage, CompositorError> {
-        let items: Vec<CompositorLayer<'_>> = layers.iter().map(CompositorLayer::layer).collect();
-        self.render_compositor_layers(gpu, config, &items)
+        let mut sink = ImageSink::default();
+        self.render_into(gpu, config, layers, &mut sink)?;
+        Ok(sink
+            .into_image()
+            .expect("render_into fills the sink on success"))
     }
 
-    /// Composite with effect chains and transitions.
+    /// [`render`](Self::render) writing the readback rows directly into sink-provided storage.
+    pub fn render_into(
+        &mut self,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+        layers: &[CompositeLayer<'_>],
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), CompositorError> {
+        let items: Vec<CompositorLayer<'_>> = layers.iter().map(CompositorLayer::layer).collect();
+        self.render_compositor_layers_into(gpu, config, &items, sink)
+    }
+
+    /// Composite with effect chains, canvas passes, and transitions.
     pub fn render_compositor_layers(
         &mut self,
         gpu: &GpuContext,
         config: &CompositorConfig,
         layers: &[CompositorLayer<'_>],
     ) -> Result<RgbaImage, CompositorError> {
+        let mut sink = ImageSink::default();
+        self.render_compositor_layers_into(gpu, config, layers, &mut sink)?;
+        Ok(sink
+            .into_image()
+            .expect("render_compositor_layers_into fills the sink on success"))
+    }
+
+    /// [`render_compositor_layers`](Self::render_compositor_layers) writing rows directly into sink-provided storage.
+    pub fn render_compositor_layers_into(
+        &mut self,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+        layers: &[CompositorLayer<'_>],
+        sink: &mut dyn FrameSink,
+    ) -> Result<(), CompositorError> {
         if config.width == 0 || config.height == 0 {
             return Err(CompositorError::InvalidDimensions {
                 width: config.width,
@@ -566,7 +632,7 @@ impl Compositor {
                     );
                 }
                 CompositorLayer::CanvasPass { effects, grade } => {
-                    if !effects_need_offscreen(effects) && grade.is_identity() {
+                    if !effects_need_offscreen(effects) && grade.is_none() {
                         continue;
                     }
 
@@ -594,7 +660,7 @@ impl Compositor {
                     } else {
                         offscreen.view(0)
                     };
-                    if !grade.is_identity() {
+                    if let Some(grade) = grade {
                         let grade_output = if std::ptr::eq(result, offscreen.view(0)) {
                             offscreen.view(1)
                         } else {
@@ -717,6 +783,7 @@ impl Compositor {
             target.padded_bytes_per_row,
             config.width,
             config.height,
+            sink,
         );
         if result.is_err() {
             self.target = None;
@@ -730,11 +797,12 @@ impl Compositor {
         config: &CompositorConfig,
         layer: &CompositeLayer<'_>,
     ) -> Result<LayerGpu, CompositorError> {
+        let grade = layer.color_grade;
         match &layer.content {
-            LayerContent::Solid(rgba) => self.build_solid(gpu, config, layer, *rgba),
-            LayerContent::Frame(frame) => self.build_frame(gpu, config, layer, frame),
-            LayerContent::Rgba(image) => self.build_rgba(gpu, config, layer, image),
-            LayerContent::Sdf(shape) => self.build_sdf(gpu, config, layer, shape),
+            LayerContent::Solid(rgba) => self.build_solid(gpu, config, layer, *rgba, grade),
+            LayerContent::Frame(frame) => self.build_frame(gpu, config, layer, frame, grade),
+            LayerContent::Rgba(image) => self.build_rgba(gpu, config, layer, image, grade),
+            LayerContent::Sdf(shape) => self.build_sdf(gpu, config, layer, shape, grade),
         }
     }
 
@@ -744,11 +812,12 @@ impl Compositor {
         config: &CompositorConfig,
         layer: &CompositeLayer<'_>,
         shape: &crate::layer::SdfLayer,
+        color_grade: Option<ColorGrade>,
     ) -> Result<LayerGpu, CompositorError> {
         use cutlass_shapes::SdfParams;
 
         let placement = &layer.placement;
-        let (linear, mut trans) = placement_affine(config, placement, 0.0);
+        let (linear, mut trans) = placement_affine(config, &layer.placement, 0.0);
         let stroke = shape.stroke.filter(|s| s.width > 0.0);
         trans[3] = stroke.map_or(0.0, |s| s.width);
 
@@ -775,7 +844,7 @@ impl Compositor {
                 f32::from(rgba[3]) / 255.0,
             ]
         };
-        let (grade0, grade1) = grade_uniforms(layer.grade);
+        let (grade_adj0, grade_adj1) = pack_grade(color_grade);
         let uniforms = SdfUniforms {
             fill: color(shape.fill),
             stroke_color: stroke.map_or([0.0; 4], |s| color(s.rgba)),
@@ -788,8 +857,8 @@ impl Compositor {
                 placement.size[0] * 0.5,
                 placement.size[1] * 0.5,
             ],
-            grade0,
-            grade1,
+            grade_adj0,
+            grade_adj1,
         };
         let buffer = gpu
             .device
@@ -821,9 +890,10 @@ impl Compositor {
         config: &CompositorConfig,
         layer: &CompositeLayer<'_>,
         rgba: [u8; 4],
+        color_grade: Option<ColorGrade>,
     ) -> Result<LayerGpu, CompositorError> {
         let (linear, trans) = placement_affine(config, &layer.placement, 0.0);
-        let (grade0, grade1) = grade_uniforms(layer.grade);
+        let (grade_adj0, grade_adj1) = pack_grade(color_grade);
         let uniforms = SolidUniforms {
             color: [
                 f32::from(rgba[0]) / 255.0,
@@ -833,8 +903,8 @@ impl Compositor {
             ],
             linear,
             trans_opacity: trans,
-            grade0,
-            grade1,
+            grade_adj0,
+            grade_adj1,
         };
         let buffer = gpu
             .device
@@ -866,6 +936,7 @@ impl Compositor {
         config: &CompositorConfig,
         layer: &CompositeLayer<'_>,
         frame: &VideoFrame,
+        color_grade: Option<ColorGrade>,
     ) -> Result<LayerGpu, CompositorError> {
         let (cw, ch) = frame.coded_size;
         if cw == 0 || ch == 0 {
@@ -901,14 +972,14 @@ impl Compositor {
         let (linear, trans) = placement_affine_rot(config, &layer.placement, rotation);
         let uv_rect = visible_uv_rect(frame, layer.uv);
 
-        let (grade0, grade1) = grade_uniforms(layer.grade);
-        let placement_uniforms = YuvUniforms {
+        let (grade_adj0, grade_adj1) = pack_grade(color_grade);
+        let uniforms = YuvUniforms {
             linear,
             trans_opacity: trans,
             uv_rect,
             coeffs: [kr, kb, full, plane_mode],
-            grade0,
-            grade1,
+            grade_adj0,
+            grade_adj1,
         };
 
         let plane_entries = |layout: &wgpu::BindGroupLayout,
@@ -954,7 +1025,7 @@ impl Compositor {
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("cutlass.yuv.uniforms"),
-                    contents: bytemuck::bytes_of(&placement_uniforms),
+                    contents: bytemuck::bytes_of(&uniforms),
                     usage: wgpu::BufferUsages::UNIFORM,
                 });
             let bind_group = plane_entries(&self.yuv_layout, &buffer, None);
@@ -972,7 +1043,7 @@ impl Compositor {
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("cutlass.yuv_fx.placement"),
-                contents: bytemuck::bytes_of(&placement_uniforms),
+                contents: bytemuck::bytes_of(&uniforms),
                 usage: wgpu::BufferUsages::UNIFORM,
             });
         let fx_buffer = gpu
@@ -1038,9 +1109,37 @@ impl Compositor {
                 ))),
             }
         }
-        // Android (`AHardwareBuffer`) and Windows (`D3D11Texture2D`) import are
-        // not wired yet; the decoders deliver CPU planes on those platforms, so
-        // this branch is currently unreachable in practice.
+        #[cfg(target_os = "windows")]
+        {
+            use cutlass_core::GpuSurfaceKind;
+            match surface.kind() {
+                GpuSurfaceKind::D3D11Texture2D => {
+                    if frame.format != PixelFormat::Nv12 {
+                        return Err(CompositorError::UnsupportedFormat(format!(
+                            "zero-copy import supports NV12 D3D11 surfaces; got {:?}",
+                            frame.format
+                        )));
+                    }
+                    let importer = self.dx12_import.as_ref().ok_or_else(|| {
+                        CompositorError::UnsupportedFormat(
+                            "D3D12 surface import is unavailable on this device".into(),
+                        )
+                    })?;
+                    let textures = importer.import_nv12(gpu, surface, (cw, ch))?;
+                    // No compositor-side keep-alive needed: the wgpu texture
+                    // holds the opened ID3D12Resource, and the decoder-side
+                    // pool slot rides in the *frame's* keep-alive, which the
+                    // renderer holds until the pass completes.
+                    Ok((textures, true, None))
+                }
+                other => Err(CompositorError::UnsupportedFormat(format!(
+                    "GPU surface kind {other:?} import is not implemented yet"
+                ))),
+            }
+        }
+        // Android (`AHardwareBuffer`) import is not wired yet; the decoder
+        // delivers CPU planes there, so this branch is currently unreachable
+        // in practice.
         //
         // Android plan: decode into a `Surface`/`ImageReader` to obtain an
         // `AHardwareBuffer`, then import on the Vulkan backend via
@@ -1067,7 +1166,7 @@ impl Compositor {
         // copy, but not a single-sample import. Until that lands, Android stays
         // on the hardware-decode + CPU-plane path (one plane copy/frame), which
         // is already wired and correct.
-        #[cfg(not(target_vendor = "apple"))]
+        #[cfg(not(any(target_vendor = "apple", target_os = "windows")))]
         {
             let _ = (gpu, frame, surface, cw, ch);
             Err(CompositorError::UnsupportedFormat(
@@ -1082,6 +1181,7 @@ impl Compositor {
         config: &CompositorConfig,
         layer: &CompositeLayer<'_>,
         image: &RgbaImage,
+        color_grade: Option<ColorGrade>,
     ) -> Result<LayerGpu, CompositorError> {
         if image.width == 0 || image.height == 0 {
             return Err(CompositorError::MalformedFrame(format!(
@@ -1149,13 +1249,13 @@ impl Compositor {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let (linear, trans) = placement_affine(config, &layer.placement, 0.0);
-        let (grade0, grade1) = grade_uniforms(layer.grade);
+        let (grade_adj0, grade_adj1) = pack_grade(color_grade);
         let placement_uniforms = RgbaUniforms {
             linear,
             trans_opacity: trans,
             uv_rect: layer.uv,
-            grade0,
-            grade1,
+            grade_adj0,
+            grade_adj1,
         };
 
         if layer.fx.is_identity() {
@@ -1273,13 +1373,17 @@ fn pipeline_for<'a>(kind: &LayerPipeline, comp: &'a Compositor) -> &'a wgpu::Ren
     }
 }
 
+/// Map the (already-submitted) readback buffer and copy its rows — stripped
+/// of the per-row copy padding — into `sink`-provided storage. The sink is
+/// only consulted once the map succeeded.
 fn map_readback(
     gpu: &GpuContext,
     buffer: &wgpu::Buffer,
     padded: u32,
     width: u32,
     height: u32,
-) -> Result<RgbaImage, CompositorError> {
+    sink: &mut dyn FrameSink,
+) -> Result<(), CompositorError> {
     let slice = buffer.slice(..);
     let (tx, rx) = std::sync::mpsc::channel();
     slice.map_async(wgpu::MapMode::Read, move |res| {
@@ -1294,7 +1398,8 @@ fn map_readback(
 
     let unpadded = (width * 4) as usize;
     let mapped = slice.get_mapped_range();
-    let mut pixels = vec![0u8; unpadded * height as usize];
+    let pixels = sink.pixels(width, height);
+    debug_assert_eq!(pixels.len(), unpadded * height as usize);
     for row in 0..height as usize {
         let src = row * padded as usize;
         let dst = row * unpadded;
@@ -1303,7 +1408,7 @@ fn map_readback(
     drop(mapped);
     buffer.unmap();
 
-    Ok(RgbaImage::new(width, height, pixels))
+    Ok(())
 }
 
 fn plane_tex_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
@@ -1586,15 +1691,16 @@ fn placement_affine_rot(
     (linear, trans)
 }
 
-/// Pack a [`ColorGrade`] into the two `vec4` slots the shaders read.
-fn grade_uniforms(grade: ColorGrade) -> ([f32; 4], [f32; 4]) {
-    (
-        [
-            grade.exposure,
-            grade.brightness,
-            grade.contrast,
-            grade.saturation,
-        ],
-        [grade.temperature, grade.tint, 0.0, 0.0],
-    )
+fn wgsl_with_grade(shader: &str) -> wgpu::ShaderSource<'static> {
+    wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(format!("{GRADE_WGSL}\n{shader}")))
+}
+
+fn pack_grade(grade: Option<ColorGrade>) -> ([f32; 4], [f32; 4]) {
+    match grade.filter(|g| !g.is_identity()) {
+        Some(g) => (
+            [g.brightness, g.contrast, g.saturation, 1.0],
+            [g.exposure, g.temperature, g.tint, 0.0],
+        ),
+        None => ([0.0; 4], [0.0; 4]),
+    }
 }

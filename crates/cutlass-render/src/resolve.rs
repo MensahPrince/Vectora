@@ -30,7 +30,7 @@ use cutlass_models::{
 use cutlass_shapes::{BezierPath, PathPoint, SDF_AA, SdfParams, Stroke};
 use cutlass_text::{FontFamily, TextAlign, TextStyle};
 
-use crate::grade::effective_grade;
+use crate::grade::resolve_color_grade;
 use crate::scene::{LayerSource, ResolvedPass, Scene, SceneLayer, SizeSpec};
 
 /// Vertical reference height that a generator's reference-pixel sizes (text
@@ -229,7 +229,7 @@ fn resolve_track_at(
                 effects: Vec::new(),
                 mask: None,
                 chroma_key: None,
-                grade: ColorGrade::IDENTITY,
+                color_grade: None,
             }));
         }
     }
@@ -322,9 +322,9 @@ fn resolve_clip(
         Some((id, filter, adjust)) if id == clip.id => (filter, adjust),
         _ => (clip.filter.as_ref(), &clip.adjust),
     };
-    let grade = effective_grade(filter, adjust);
+    let color_grade = resolve_color_grade(filter, adjust);
 
-    match &clip.content {
+    let layer = match &clip.content {
         ClipSource::Media { media, .. } => {
             let Some(src) = project.media(*media) else {
                 return Ok(None);
@@ -363,7 +363,7 @@ fn resolve_clip(
                 effects,
                 mask: clip.mask,
                 chroma_key: clip.chroma_key,
-                grade,
+                color_grade,
             }))
         }
         ClipSource::Generated(generator) => {
@@ -379,7 +379,7 @@ fn resolve_clip(
                 rotation,
                 opacity,
                 uv,
-                grade,
+                color_grade,
                 cw,
                 ch,
                 xf.scale,
@@ -391,7 +391,8 @@ fn resolve_clip(
                 layer
             }))
         }
-    }
+    };
+    layer
 }
 
 /// Sample `clip.effects` at clip-local `tick` into compositor-ready passes.
@@ -424,7 +425,7 @@ pub(crate) fn resolve_generator(
     rotation: f32,
     opacity: f32,
     uv: [f32; 4],
-    grade: ColorGrade,
+    color_grade: Option<ColorGrade>,
     cw: f32,
     ch: f32,
     scale: f32,
@@ -453,7 +454,7 @@ pub(crate) fn resolve_generator(
                 effects,
                 mask: None,
                 chroma_key: None,
-                grade,
+                color_grade,
             })
         }
         Generator::SolidColor { rgba } => Some(SceneLayer {
@@ -468,7 +469,7 @@ pub(crate) fn resolve_generator(
             effects,
             mask: None,
             chroma_key: None,
-            grade,
+            color_grade,
         }),
         Generator::Shape {
             shape,
@@ -491,12 +492,12 @@ pub(crate) fn resolve_generator(
             rotation,
             opacity,
             uv,
-            grade,
+            color_grade,
             scale,
             effects,
         ),
-        Generator::Effect => canvas_pass(effects, ColorGrade::IDENTITY, cw, ch),
-        Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), grade, cw, ch),
+        Generator::Effect => canvas_pass(effects, None, cw, ch),
+        Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), color_grade, cw, ch),
         // Stickers are not composited yet.
         // Skip rather than draw something wrong.
         Generator::Sticker => None,
@@ -505,11 +506,11 @@ pub(crate) fn resolve_generator(
 
 fn canvas_pass(
     effects: Vec<ResolvedPass>,
-    grade: ColorGrade,
+    color_grade: Option<ColorGrade>,
     cw: f32,
     ch: f32,
 ) -> Option<SceneLayer> {
-    (!effects.is_empty() || !grade.is_identity()).then_some(SceneLayer {
+    (!effects.is_empty() || color_grade.is_some()).then_some(SceneLayer {
         clip: None,
         source: LayerSource::CanvasPass,
         center: [cw * 0.5, ch * 0.5],
@@ -521,7 +522,7 @@ fn canvas_pass(
         effects,
         mask: None,
         chroma_key: None,
-        grade,
+        color_grade,
     })
 }
 
@@ -548,7 +549,7 @@ fn resolve_shape(
     rotation: f32,
     opacity: f32,
     uv: [f32; 4],
-    grade: ColorGrade,
+    color_grade: Option<ColorGrade>,
     transform_scale: f32,
     effects: Vec<ResolvedPass>,
 ) -> Option<SceneLayer> {
@@ -593,7 +594,7 @@ fn resolve_shape(
             effects,
             mask: None,
             chroma_key: None,
-            grade,
+            color_grade,
         });
     }
 
@@ -618,7 +619,7 @@ fn resolve_shape(
             effects,
             mask: None,
             chroma_key: None,
-            grade,
+            color_grade,
         });
     }
 
@@ -660,7 +661,7 @@ fn resolve_shape(
         effects,
         mask: None,
         chroma_key: None,
-        grade,
+        color_grade,
     })
 }
 
@@ -734,6 +735,7 @@ fn fit_scale(nw: f32, nh: f32, cw: f32, ch: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::grade::effective_grade;
+    use crate::grade::resolve_color_grade;
     use crate::scene::{LayerSource, SizeSpec};
     use cutlass_compositor::ColorGrade;
     use cutlass_models::{
@@ -1024,7 +1026,7 @@ mod tests {
             effects: Vec::new(),
             mask: None,
             chroma_key: None,
-            grade: ColorGrade::IDENTITY,
+            color_grade: None,
         };
         // to_center (960, 540) rotated 90° cw (+y down) → (-540, 960).
         approx2(layer.quad_center([1920.0, 1080.0]), [420.0, 1500.0]);
@@ -1072,14 +1074,14 @@ mod tests {
         let layer = &scene.layers[0];
         assert_eq!(layer.source, LayerSource::Solid([0, 255, 0, 255]));
         assert_eq!(
-            layer.grade,
-            effective_grade(
+            layer.color_grade,
+            Some(effective_grade(
                 None,
                 &ColorAdjustments {
                     brightness: 0.25,
                     ..ColorAdjustments::default()
                 }
-            )
+            ))
         );
         approx2(layer.center, [1920.0 * 0.75, 540.0]);
         match layer.size {
@@ -1090,7 +1092,7 @@ mod tests {
         // Plain resolve still sees only committed state.
         let scene = resolve(&project, rt(5)).unwrap();
         assert_eq!(scene.layers[0].source, LayerSource::Solid([255, 0, 0, 255]));
-        assert_eq!(scene.layers[0].grade, ColorGrade::IDENTITY);
+        assert_eq!(scene.layers[0].color_grade, None);
         approx2(scene.layers[0].center, [960.0, 540.0]);
     }
 
@@ -1366,7 +1368,7 @@ mod tests {
             .unwrap();
 
         let scene = resolve(&project, rt(5)).unwrap();
-        assert_eq!(scene.layers[0].grade, ColorGrade::IDENTITY);
+        assert_eq!(scene.layers[0].color_grade, None);
     }
 
     #[test]
@@ -1400,8 +1402,8 @@ mod tests {
                 ..ColorAdjustments::default()
             },
         );
-        assert_eq!(scene.layers[0].grade, expected);
-        assert_eq!(scene.layers[0].grade.saturation, -1.0);
+        assert_eq!(scene.layers[0].color_grade, Some(expected));
+        assert_eq!(scene.layers[0].color_grade.unwrap().saturation, -1.0);
 
         let filter_track = project.add_track(TrackKind::Sticker, "S2");
         let filter_clip = project
@@ -1428,8 +1430,8 @@ mod tests {
             .find(|l| matches!(l.source, LayerSource::Solid([0, 255, 0, 255])))
             .expect("filter clip layer");
         assert_eq!(
-            filter_layer.grade,
-            effective_grade(Some(&filter), &ColorAdjustments::default())
+            filter_layer.color_grade,
+            Some(effective_grade(Some(&filter), &ColorAdjustments::default()))
         );
     }
 
@@ -1569,14 +1571,14 @@ mod tests {
         assert_eq!(scene.layers[1].clip, Some(bar));
         assert_eq!(scene.layers[1].effects, Vec::<ResolvedPass>::new());
         assert_eq!(
-            scene.layers[1].grade,
-            effective_grade(
+            scene.layers[1].color_grade,
+            Some(effective_grade(
                 None,
                 &ColorAdjustments {
                     saturation: -1.0,
                     ..ColorAdjustments::default()
                 },
-            )
+            ))
         );
     }
 
@@ -1607,8 +1609,8 @@ mod tests {
         assert_eq!(scene.layers.len(), 2);
         assert_eq!(scene.layers[1].source, LayerSource::CanvasPass);
         assert_eq!(
-            scene.layers[1].grade,
-            effective_grade(Some(&filter), &ColorAdjustments::default())
+            scene.layers[1].color_grade,
+            Some(effective_grade(Some(&filter), &ColorAdjustments::default()))
         );
     }
 
@@ -1635,7 +1637,7 @@ mod tests {
         let scene = resolve(&project, rt(5)).unwrap();
         assert_eq!(scene.layers.len(), 2);
         assert_eq!(scene.layers[1].source, LayerSource::CanvasPass);
-        assert_eq!(scene.layers[1].grade, ColorGrade::IDENTITY);
+        assert_eq!(scene.layers[1].color_grade, None);
         assert_eq!(scene.layers[1].effects.len(), 1);
         assert_eq!(scene.layers[1].effects[0].id, "gaussian_blur");
         approx(scene.layers[1].effects[0].params[0], 8.0);
