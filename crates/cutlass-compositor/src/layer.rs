@@ -62,6 +62,50 @@ impl LayerPlacement {
     }
 }
 
+/// Mask shape kind ids shared with WGSL (`mask.wgsl`).
+pub mod mask_kind {
+    pub const LINEAR: u32 = 0;
+    pub const MIRROR: u32 = 1;
+    pub const CIRCLE: u32 = 2;
+    pub const RECTANGLE: u32 = 3;
+    pub const HEART: u32 = 4;
+    pub const STAR: u32 = 5;
+}
+
+/// GPU-ready mask parameters (no `cutlass-models` dependency).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerMask {
+    pub kind: u32,
+    pub feather: f32,
+    pub invert: u32,
+}
+
+/// GPU-ready chroma-key parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerChromaKey {
+    pub rgb: [f32; 3],
+    pub strength: f32,
+    pub shadow: f32,
+}
+
+/// Per-layer mask and chroma-key state for the fx pipelines.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LayerEffects {
+    pub mask: Option<LayerMask>,
+    pub chroma_key: Option<LayerChromaKey>,
+}
+
+impl LayerEffects {
+    pub const IDENTITY: Self = Self {
+        mask: None,
+        chroma_key: None,
+    };
+
+    pub fn is_identity(&self) -> bool {
+        self.mask.is_none() && self.chroma_key.is_none()
+    }
+}
+
 /// Per-layer color grade applied in the fragment shader on gamma-encoded RGB
 /// before opacity and compositing.
 ///
@@ -153,6 +197,8 @@ pub struct CompositeLayer<'a> {
     pub uv: [f32; 4],
     /// Optional GPU effect chain applied after the base content is realized.
     pub effects: &'a [PassInstance<'a>],
+    /// Mask/chroma-key state; identity uses the fast path pipelines.
+    pub fx: LayerEffects,
     /// Color grade applied to the layer's RGB before opacity and compositing.
     pub grade: ColorGrade,
 }
@@ -184,6 +230,7 @@ impl<'a> CompositeLayer<'a> {
             placement,
             uv: FULL_UV,
             effects: &[],
+            fx: LayerEffects::IDENTITY,
             grade: ColorGrade::IDENTITY,
         }
     }
@@ -195,6 +242,7 @@ impl<'a> CompositeLayer<'a> {
             placement,
             uv: FULL_UV,
             effects: &[],
+            fx: LayerEffects::IDENTITY,
             grade: ColorGrade::IDENTITY,
         }
     }
@@ -206,6 +254,7 @@ impl<'a> CompositeLayer<'a> {
             placement,
             uv: FULL_UV,
             effects: &[],
+            fx: LayerEffects::IDENTITY,
             grade: ColorGrade::IDENTITY,
         }
     }
@@ -217,6 +266,7 @@ impl<'a> CompositeLayer<'a> {
             placement,
             uv: FULL_UV,
             effects: &[],
+            fx: LayerEffects::IDENTITY,
             grade: ColorGrade::IDENTITY,
         }
     }
@@ -230,6 +280,12 @@ impl<'a> CompositeLayer<'a> {
     /// Replace the sampled UV rect (crop / mirror).
     pub fn with_uv(mut self, uv: [f32; 4]) -> Self {
         self.uv = uv;
+        self
+    }
+
+    /// Attach mask/chroma-key fx (routes to the fx pipelines when non-identity).
+    pub fn with_fx(mut self, fx: LayerEffects) -> Self {
+        self.fx = fx;
         self
     }
 

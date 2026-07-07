@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement, PassInstance,
+    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerChromaKey, LayerEffects,
+    LayerMask, LayerPlacement, PassInstance, mask_kind,
 };
 use cutlass_core::RationalTime;
 use cutlass_decoder::{OutputMode, open_video_decoder, probe};
@@ -151,27 +152,47 @@ fn bench_compositor_only(
     import: &str,
 ) {
     println!("compositor-only ({import}):");
+    let fx_effects = LayerEffects {
+        mask: Some(LayerMask {
+            kind: mask_kind::CIRCLE,
+            feather: 0.0,
+            invert: 0,
+        }),
+        chroma_key: Some(LayerChromaKey {
+            rgb: [0.0, 1.0, 0.0],
+            strength: 0.5,
+            shadow: 0.0,
+        }),
+    };
     let mut comp = Compositor::new(gpu);
     for &(label, w, h) in sizes {
-        // Prime pipeline + target cache.
         let config = CompositorConfig::new(w, h);
         let placement = LayerPlacement::full_canvas(&config);
-        let _ = comp
-            .render(gpu, &config, &[CompositeLayer::frame(frame, placement)])
-            .expect("prime");
+        for tag in ["baseline", "fx"] {
+            let layer = if tag == "baseline" {
+                CompositeLayer::frame(frame, placement)
+            } else {
+                CompositeLayer::frame(frame, placement).with_fx(fx_effects)
+            };
+            // Prime pipeline + target cache.
+            let _ = comp.render(gpu, &config, &[layer]).expect("prime");
 
-        let mut samples = Vec::with_capacity(iters as usize);
-        let total = Instant::now();
-        for _ in 0..iters {
-            let start = Instant::now();
-            let img = comp
-                .render(gpu, &config, &[CompositeLayer::frame(frame, placement)])
-                .expect("render");
-            samples.push(start.elapsed().as_secs_f64() * 1000.0);
-            std::hint::black_box(img.pixel(0, 0));
+            let mut samples = Vec::with_capacity(iters as usize);
+            let total = Instant::now();
+            for _ in 0..iters {
+                let start = Instant::now();
+                let layer = if tag == "baseline" {
+                    CompositeLayer::frame(frame, placement)
+                } else {
+                    CompositeLayer::frame(frame, placement).with_fx(fx_effects)
+                };
+                let img = comp.render(gpu, &config, &[layer]).expect("render");
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                std::hint::black_box(img.pixel(0, 0));
+            }
+            let stats = Stats::from_samples(samples, total.elapsed().as_secs_f64());
+            stats.print(&format!("  composite {label} {w}x{h} ({tag})"));
         }
-        let stats = Stats::from_samples(samples, total.elapsed().as_secs_f64());
-        stats.print(&format!("  composite {label} {w}x{h}"));
     }
 }
 

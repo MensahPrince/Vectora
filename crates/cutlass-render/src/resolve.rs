@@ -143,6 +143,8 @@ fn resolve_track_at(
                 opacity: 1.0,
                 uv: [0.0, 0.0, 1.0, 1.0],
                 effects: Vec::new(),
+                mask: None,
+                chroma_key: None,
                 grade: ColorGrade::IDENTITY,
             }));
         }
@@ -270,6 +272,8 @@ fn resolve_clip(
                 opacity,
                 uv,
                 effects,
+                mask: clip.mask,
+                chroma_key: clip.chroma_key,
                 grade,
             }))
         }
@@ -353,6 +357,8 @@ pub(crate) fn resolve_generator(
                 opacity,
                 uv,
                 effects,
+                mask: None,
+                chroma_key: None,
                 grade,
             })
         }
@@ -365,6 +371,8 @@ pub(crate) fn resolve_generator(
             opacity,
             uv,
             effects,
+            mask: None,
+            chroma_key: None,
             grade,
         }),
         Generator::Shape {
@@ -463,6 +471,8 @@ fn resolve_shape(
             opacity,
             uv,
             effects,
+            mask: None,
+            chroma_key: None,
             grade,
         });
     }
@@ -485,6 +495,8 @@ fn resolve_shape(
             opacity,
             uv,
             effects,
+            mask: None,
+            chroma_key: None,
             grade,
         });
     }
@@ -524,6 +536,8 @@ fn resolve_shape(
         opacity,
         uv,
         effects,
+        mask: None,
+        chroma_key: None,
         grade,
     })
 }
@@ -885,6 +899,8 @@ mod tests {
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
             effects: Vec::new(),
+            mask: None,
+            chroma_key: None,
             grade: ColorGrade::IDENTITY,
         };
         // to_center (960, 540) rotated 90° cw (+y down) → (-540, 960).
@@ -1277,6 +1293,73 @@ mod tests {
 
     /// The model's validation cap and the evaluator's vertex-buffer bound
     /// must agree, or a valid project could hold a star the renderer clamps.
+    #[test]
+    fn mask_and_chroma_key_reach_media_layer() {
+        use cutlass_models::{ChromaKey, Mask, MaskKind};
+
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_mask(clip, Some(Mask::new(MaskKind::Circle)))
+            .unwrap();
+        project
+            .set_clip_chroma_key(
+                clip,
+                Some(ChromaKey {
+                    rgb: [0, 255, 0],
+                    strength: 0.5,
+                    shadow: 0.0,
+                }),
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        let layer = &scene.layers[0];
+        assert_eq!(layer.mask.unwrap().kind, MaskKind::Circle);
+        assert_eq!(layer.chroma_key.unwrap().rgb, [0, 255, 0]);
+        assert!((layer.chroma_key.unwrap().strength - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn generated_clip_has_no_look_fields() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        assert!(scene.layers[0].mask.is_none());
+        assert!(scene.layers[0].chroma_key.is_none());
+    }
+
+    #[test]
+    fn cleared_mask_is_none_on_layer() {
+        use cutlass_models::{Mask, MaskKind};
+
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_mask(clip, Some(Mask::new(MaskKind::Rectangle)))
+            .unwrap();
+        project.set_clip_mask(clip, None).unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert!(scene.layers[0].mask.is_none());
+    }
+
     #[test]
     fn star_point_cap_matches_the_shapes_crate() {
         assert_eq!(

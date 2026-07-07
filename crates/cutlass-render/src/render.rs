@@ -10,11 +10,12 @@ use std::path::Path;
 
 use cutlass_compositor::{
     ColorGrade, CompositeLayer, Compositor, CompositorConfig, CompositorError, CompositorLayer,
-    GpuContext, LayerPlacement, PassInstance, RgbaImage, SdfLayer,
+    GpuContext, LayerChromaKey, LayerEffects, LayerMask, LayerPlacement, PassInstance, RgbaImage,
+    SdfLayer, mask_kind,
 };
 use cutlass_core::{RationalTime, VideoDecoder, VideoFrame};
 use cutlass_decoder::OutputMode;
-use cutlass_models::{MediaId, Project};
+use cutlass_models::{MaskKind, MediaId, Project};
 use cutlass_shapes::{PathRaster, ShapeStyle};
 use cutlass_text::TextRenderer;
 
@@ -180,6 +181,7 @@ impl Renderer {
         let mut realized: Vec<Realized> = Vec::with_capacity(scene.layers.len());
         let mut effect_store: Vec<EffectChain> = Vec::new();
         for layer in &scene.layers {
+            let fx = layer_effects(layer);
             // The layer carries the anchor position; the quad center falls out
             // of the final pixel size (bitmap sizes only exist after raster).
             let place = |size: [f32; 2]| LayerPlacement {
@@ -210,6 +212,7 @@ impl Renderer {
                         rgba: *rgba,
                         placement: place(size),
                         effects: layer.effects.clone(),
+                        fx,
                         grade: layer.grade,
                     });
                 }
@@ -228,6 +231,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
+                        fx,
                         grade: layer.grade,
                     });
                 }
@@ -239,6 +243,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
+                        fx,
                         grade: layer.grade,
                     });
                 }
@@ -250,6 +255,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
+                        fx,
                         grade: layer.grade,
                     });
                 }
@@ -274,6 +280,7 @@ impl Renderer {
                         },
                         placement: place(size),
                         effects: layer.effects.clone(),
+                        fx,
                         grade: layer.grade,
                     });
                 }
@@ -301,6 +308,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
+                        fx,
                         grade: layer.grade,
                     });
                 }
@@ -435,6 +443,7 @@ impl Renderer {
             rotation: layer.rotation,
             opacity: layer.opacity,
         };
+        let fx = layer_effects(layer);
         let realized = match &layer.source {
             LayerSource::Solid(rgba) => {
                 let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
@@ -442,6 +451,7 @@ impl Renderer {
                     rgba: *rgba,
                     placement: place(size),
                     effects: layer.effects.clone(),
+                    fx,
                     grade: layer.grade,
                 }
             }
@@ -460,6 +470,7 @@ impl Renderer {
                     placement: place(size),
                     uv: layer.uv,
                     effects: layer.effects.clone(),
+                    fx,
                     grade: layer.grade,
                 }
             }
@@ -471,6 +482,7 @@ impl Renderer {
                     placement: place(size),
                     uv: layer.uv,
                     effects: layer.effects.clone(),
+                    fx,
                     grade: layer.grade,
                 }
             }
@@ -482,6 +494,7 @@ impl Renderer {
                     placement: place(size),
                     uv: layer.uv,
                     effects: layer.effects.clone(),
+                    fx,
                     grade: layer.grade,
                 }
             }
@@ -504,6 +517,7 @@ impl Renderer {
                     },
                     placement: place(size),
                     effects: layer.effects.clone(),
+                    fx,
                     grade: layer.grade,
                 }
             }
@@ -531,6 +545,7 @@ impl Renderer {
                     placement: place(size),
                     uv: layer.uv,
                     effects: layer.effects.clone(),
+                    fx,
                     grade: layer.grade,
                 }
             }
@@ -676,47 +691,57 @@ fn composite_from_realized<'a>(
         Realized::Solid {
             rgba,
             placement,
+            fx,
             grade,
             ..
         } => CompositeLayer::solid(*rgba, *placement)
+            .with_fx(*fx)
             .with_effects(effects)
             .with_grade(*grade),
         Realized::Bitmap {
             image,
             placement,
             uv,
+            fx,
             grade,
             ..
         } => CompositeLayer::rgba(image, *placement)
             .with_uv(*uv)
+            .with_fx(*fx)
             .with_effects(effects)
             .with_grade(*grade),
         Realized::Frame {
             frame,
             placement,
             uv,
+            fx,
             grade,
             ..
         } => CompositeLayer::frame(frame, *placement)
             .with_uv(*uv)
+            .with_fx(*fx)
             .with_effects(effects)
             .with_grade(*grade),
         Realized::Still {
             media,
             placement,
             uv,
+            fx,
             grade,
             ..
         } => CompositeLayer::rgba(&stills[media], *placement)
             .with_uv(*uv)
+            .with_fx(*fx)
             .with_effects(effects)
             .with_grade(*grade),
         Realized::Sdf {
             shape,
             placement,
+            fx,
             grade,
             ..
         } => CompositeLayer::sdf(*shape, *placement)
+            .with_fx(*fx)
             .with_effects(effects)
             .with_grade(*grade),
         Realized::Transition { .. } => unreachable!("transitions handled separately"),
@@ -736,6 +761,7 @@ enum Realized {
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
         grade: ColorGrade,
     },
     Still {
@@ -743,6 +769,7 @@ enum Realized {
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
         grade: ColorGrade,
     },
     Bitmap {
@@ -750,18 +777,21 @@ enum Realized {
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
         grade: ColorGrade,
     },
     Solid {
         rgba: [u8; 4],
         placement: LayerPlacement,
         effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
         grade: ColorGrade,
     },
     Sdf {
         shape: SdfLayer,
         placement: LayerPlacement,
         effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
         grade: ColorGrade,
     },
 }
@@ -776,6 +806,35 @@ impl Realized {
             | Realized::Solid { effects, .. }
             | Realized::Sdf { effects, .. } => Some(effects),
         }
+    }
+}
+
+fn layer_effects(layer: &crate::scene::SceneLayer) -> LayerEffects {
+    let mask = layer.mask.map(|m| LayerMask {
+        kind: mask_kind_id(m.kind),
+        feather: m.feather,
+        invert: u32::from(m.invert),
+    });
+    let chroma_key = layer.chroma_key.map(|c| LayerChromaKey {
+        rgb: [
+            f32::from(c.rgb[0]) / 255.0,
+            f32::from(c.rgb[1]) / 255.0,
+            f32::from(c.rgb[2]) / 255.0,
+        ],
+        strength: c.strength,
+        shadow: c.shadow,
+    });
+    LayerEffects { mask, chroma_key }
+}
+
+fn mask_kind_id(kind: MaskKind) -> u32 {
+    match kind {
+        MaskKind::Linear => mask_kind::LINEAR,
+        MaskKind::Mirror => mask_kind::MIRROR,
+        MaskKind::Circle => mask_kind::CIRCLE,
+        MaskKind::Rectangle => mask_kind::RECTANGLE,
+        MaskKind::Heart => mask_kind::HEART,
+        MaskKind::Star => mask_kind::STAR,
     }
 }
 
