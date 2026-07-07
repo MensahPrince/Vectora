@@ -179,6 +179,7 @@ impl Renderer {
         // below stay valid through the composite call.
         let mut realized: Vec<Realized> = Vec::with_capacity(scene.layers.len());
         for layer in &scene.layers {
+            let color_grade = layer.color_grade;
             // The layer carries the anchor position; the quad center falls out
             // of the final pixel size (bitmap sizes only exist after raster).
             let place = |size: [f32; 2]| LayerPlacement {
@@ -193,6 +194,7 @@ impl Renderer {
                     realized.push(Realized::Solid {
                         rgba: *rgba,
                         placement: place(size),
+                        color_grade,
                     });
                 }
                 LayerSource::Text { content, style } => {
@@ -209,6 +211,7 @@ impl Renderer {
                         image,
                         placement: place(size),
                         uv: layer.uv,
+                        color_grade,
                     });
                 }
                 LayerSource::Media { media, source_time } => {
@@ -218,6 +221,7 @@ impl Renderer {
                         frame,
                         placement: place(size),
                         uv: layer.uv,
+                        color_grade,
                     });
                 }
                 LayerSource::Still { media } => {
@@ -227,6 +231,7 @@ impl Renderer {
                         media: *media,
                         placement: place(size),
                         uv: layer.uv,
+                        color_grade,
                     });
                 }
                 LayerSource::Shape {
@@ -249,6 +254,7 @@ impl Renderer {
                             stroke: *stroke,
                         },
                         placement: place(size),
+                        color_grade,
                     });
                 }
                 LayerSource::PathShape {
@@ -274,6 +280,7 @@ impl Renderer {
                         image,
                         placement: place(size),
                         uv: layer.uv,
+                        color_grade,
                     });
                 }
             }
@@ -283,24 +290,41 @@ impl Renderer {
         let layers: Vec<CompositeLayer> = realized
             .iter()
             .map(|r| match r {
-                Realized::Solid { rgba, placement } => CompositeLayer::solid(*rgba, *placement),
+                Realized::Solid {
+                    rgba,
+                    placement,
+                    color_grade,
+                } => CompositeLayer::solid(*rgba, *placement).with_color_grade(*color_grade),
                 Realized::Bitmap {
                     image,
                     placement,
                     uv,
-                } => CompositeLayer::rgba(image, *placement).with_uv(*uv),
+                    color_grade,
+                } => CompositeLayer::rgba(image, *placement)
+                    .with_uv(*uv)
+                    .with_color_grade(*color_grade),
                 Realized::Frame {
                     frame,
                     placement,
                     uv,
-                } => CompositeLayer::frame(frame, *placement).with_uv(*uv),
+                    color_grade,
+                } => CompositeLayer::frame(frame, *placement)
+                    .with_uv(*uv)
+                    .with_color_grade(*color_grade),
                 // `ensure_still` populated the cache in the first pass.
                 Realized::Still {
                     media,
                     placement,
                     uv,
-                } => CompositeLayer::rgba(&self.stills[media], *placement).with_uv(*uv),
-                Realized::Sdf { shape, placement } => CompositeLayer::sdf(*shape, *placement),
+                    color_grade,
+                } => CompositeLayer::rgba(&self.stills[media], *placement)
+                    .with_uv(*uv)
+                    .with_color_grade(*color_grade),
+                Realized::Sdf {
+                    shape,
+                    placement,
+                    color_grade,
+                } => CompositeLayer::sdf(*shape, *placement).with_color_grade(*color_grade),
             })
             .collect();
 
@@ -405,6 +429,7 @@ enum Realized {
         frame: VideoFrame,
         placement: LayerPlacement,
         uv: [f32; 4],
+        color_grade: Option<cutlass_compositor::ColorGrade>,
     },
     /// A still image already decoded into the renderer's cache; the composite
     /// pass borrows the pixels from there instead of cloning them per frame.
@@ -412,19 +437,23 @@ enum Realized {
         media: MediaId,
         placement: LayerPlacement,
         uv: [f32; 4],
+        color_grade: Option<cutlass_compositor::ColorGrade>,
     },
     Bitmap {
         image: RgbaImage,
         placement: LayerPlacement,
         uv: [f32; 4],
+        color_grade: Option<cutlass_compositor::ColorGrade>,
     },
     Solid {
         rgba: [u8; 4],
         placement: LayerPlacement,
+        color_grade: Option<cutlass_compositor::ColorGrade>,
     },
     Sdf {
         shape: SdfLayer,
         placement: LayerPlacement,
+        color_grade: Option<cutlass_compositor::ColorGrade>,
     },
 }
 

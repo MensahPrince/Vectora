@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement,
+    ColorGrade, CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement,
 };
 use cutlass_core::RationalTime;
 use cutlass_decoder::{OutputMode, open_video_decoder, probe};
@@ -63,6 +63,7 @@ fn main() {
         println!("--- {label} ---");
         if let Some(frame) = prime_frame(&path, mode) {
             bench_compositor_only(&gpu, &frame, &canvas_sizes, frames, label);
+            bench_compositor_with_look(&gpu, &frame, &canvas_sizes, frames, label);
         }
         bench_decode_and_composite(
             &gpu,
@@ -171,6 +172,42 @@ fn bench_compositor_only(
         }
         let stats = Stats::from_samples(samples, total.elapsed().as_secs_f64());
         stats.print(&format!("  composite {label} {w}x{h}"));
+    }
+}
+
+/// Same as compositor-only, but every layer carries a non-identity color grade.
+fn bench_compositor_with_look(
+    gpu: &GpuContext,
+    frame: &cutlass_core::VideoFrame,
+    sizes: &[(&str, u32, u32)],
+    iters: i64,
+    import: &str,
+) {
+    println!("compositor-only with look ({import}):");
+    let grade = ColorGrade {
+        saturation: 0.35,
+        contrast: 0.2,
+        exposure: 0.05,
+        ..ColorGrade::default()
+    };
+    let mut comp = Compositor::new(gpu);
+    for &(label, w, h) in sizes {
+        let config = CompositorConfig::new(w, h);
+        let placement = LayerPlacement::full_canvas(&config);
+        let make_layer =
+            || CompositeLayer::frame(frame, placement).with_color_grade(Some(grade));
+        let _ = comp.render(gpu, &config, &[make_layer()]).expect("prime");
+
+        let mut samples = Vec::with_capacity(iters as usize);
+        let total = Instant::now();
+        for _ in 0..iters {
+            let start = Instant::now();
+            let img = comp.render(gpu, &config, &[make_layer()]).expect("render");
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(img.pixel(0, 0));
+        }
+        let stats = Stats::from_samples(samples, total.elapsed().as_secs_f64());
+        stats.print(&format!("  composite+look {label} {w}x{h}"));
     }
 }
 

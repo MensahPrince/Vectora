@@ -2,11 +2,10 @@
 //! stabilization, filter presets, color adjustments, entrance/exit
 //! animations, and the audio role tag.
 //!
-//! These persist and validate like every other clip property but are
-//! **render-neutral this milestone** — the renderer ignores them exactly like
-//! stickers, so projects round-trip the user's choices until the GPU passes
-//! land. Every field is `#[serde(default)]` + skipped when unset, so v2
-//! project files load unchanged and untouched projects stay byte-identical.
+//! These persist and validate like every other clip property. Color
+//! adjustments and filter presets are composited per-clip (see
+//! `cutlass-render` / `cutlass-compositor`); mask, chroma key,
+//! stabilization, and animations remain render-neutral this milestone.
 //!
 //! The catalogs here follow the effect-catalog pattern: they are the
 //! validation *and* UI source of truth (stable ids, display labels), so the

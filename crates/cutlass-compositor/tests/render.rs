@@ -7,7 +7,7 @@
 //! If no GPU adapter is available the test skips rather than fails.
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement, RgbaImage,
+    ColorGrade, CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement, RgbaImage,
 };
 use cutlass_core::{
     ColorRange, ColorSpace, CpuImage, FrameData, MatrixCoefficients, PixelFormat, Plane, Rational,
@@ -637,4 +637,33 @@ fn sdf_quad_padding_keeps_stroke_unclipped() {
     assert_px(&g, cx + 23, cy, [0, 255, 0, 255], 3);
     // At the canvas corner: untouched background.
     assert_px(&g, 0, 0, [40, 60, 80, 255], 1);
+}
+
+#[test]
+fn color_grade_desaturates_a_solid_layer() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16).with_background([0, 0, 0, 255]);
+    let placement = LayerPlacement::full_canvas(&config);
+    let neutral = CompositeLayer::solid([200, 40, 40, 255], placement);
+    let graded =
+        CompositeLayer::solid([200, 40, 40, 255], placement).with_color_grade(Some(ColorGrade {
+            saturation: -1.0,
+            ..ColorGrade::default()
+        }));
+
+    let plain = comp.render(&gpu, &config, &[neutral]).expect("plain");
+    let mono = comp.render(&gpu, &config, &[graded]).expect("graded");
+    let plain_px = plain.pixel(8, 8);
+    let mono_px = mono.pixel(8, 8);
+    // Full desaturation: R/G/B channels converge; red channel drops vs the source.
+    assert!(
+        mono_px[0] < plain_px[0],
+        "red should fall: {mono_px:?} vs {plain_px:?}"
+    );
+    let spread = mono_px[0].abs_diff(mono_px[1]) + mono_px[1].abs_diff(mono_px[2]);
+    assert!(
+        spread <= 2,
+        "channels should match in mono, got {mono_px:?}"
+    );
 }

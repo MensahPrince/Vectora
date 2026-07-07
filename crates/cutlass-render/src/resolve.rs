@@ -15,8 +15,10 @@
 //!   shapes resolve to sampled SDF layers (animated geometry/colors are
 //!   sampled per instant here, evaluated on the GPU), pen paths to CPU-raster
 //!   layers.
-//! - **Deferred**: stickers, effects, filters, and adjustment layers are
-//!   skipped (they produce no layer) rather than rendered wrong.
+//! - **Look**: per-clip color adjustments and filter presets flow into each
+//!   layer's `color_grade` and are applied in the compositor shader.
+//! - **Deferred**: stickers, effects, and adjustment *track* layers are skipped
+//!   (they produce no layer) rather than rendered wrong.
 
 use cutlass_core::{RationalTime, resample};
 use cutlass_models::{
@@ -26,6 +28,7 @@ use cutlass_models::{
 use cutlass_shapes::{BezierPath, PathPoint, SDF_AA, SdfParams, Stroke};
 use cutlass_text::{FontFamily, TextAlign, TextStyle};
 
+use crate::grade::resolve_color_grade;
 use crate::scene::{LayerSource, Scene, SceneLayer, SizeSpec};
 
 /// Vertical reference height that a generator's reference-pixel sizes (text
@@ -166,7 +169,7 @@ fn resolve_clip(
     let opacity = xf.opacity.clamp(0.0, 1.0);
     let uv = crop_flip_uv(clip);
 
-    match &clip.content {
+    let layer = match &clip.content {
         ClipSource::Media { media, .. } => {
             let Some(src) = project.media(*media) else {
                 return Ok(None);
@@ -193,7 +196,7 @@ fn resolve_clip(
                 src.width as f32 * fit * xf.scale,
                 src.height as f32 * fit * xf.scale,
             ]);
-            Ok(Some(SceneLayer {
+            Some(SceneLayer {
                 source,
                 center,
                 anchor_point,
@@ -201,7 +204,8 @@ fn resolve_clip(
                 rotation,
                 opacity,
                 uv,
-            }))
+                color_grade: None,
+            })
         }
         ClipSource::Generated(generator) => {
             // A live inspector edit replaces the clip's generator content.
@@ -209,7 +213,7 @@ fn resolve_clip(
                 Some((id, live)) if id == clip.id => live,
                 _ => generator,
             };
-            Ok(resolve_generator(
+            resolve_generator(
                 generator,
                 center,
                 anchor_point,
@@ -220,9 +224,14 @@ fn resolve_clip(
                 ch,
                 xf.scale,
                 local_tick,
-            ))
+            )
         }
     }
+    .map(|mut layer| {
+        layer.color_grade = resolve_color_grade(clip.filter.as_ref(), &clip.adjust);
+        layer
+    });
+    Ok(layer)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -256,6 +265,7 @@ pub(crate) fn resolve_generator(
                 rotation,
                 opacity,
                 uv,
+                color_grade: None,
             })
         }
         Generator::SolidColor { rgba } => Some(SceneLayer {
@@ -266,6 +276,7 @@ pub(crate) fn resolve_generator(
             rotation,
             opacity,
             uv,
+            color_grade: None,
         }),
         Generator::Shape {
             shape,
@@ -358,6 +369,7 @@ fn resolve_shape(
             rotation,
             opacity,
             uv,
+            color_grade: None,
         });
     }
 
@@ -378,6 +390,7 @@ fn resolve_shape(
             rotation,
             opacity,
             uv,
+            color_grade: None,
         });
     }
 
@@ -415,6 +428,7 @@ fn resolve_shape(
         rotation,
         opacity,
         uv,
+        color_grade: None,
     })
 }
 
@@ -771,6 +785,7 @@ mod tests {
             rotation: std::f32::consts::FRAC_PI_2, // 90° clockwise
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            color_grade: None,
         };
         // to_center (960, 540) rotated 90° cw (+y down) → (-540, 960).
         approx2(layer.quad_center([1920.0, 1080.0]), [420.0, 1500.0]);
@@ -1086,5 +1101,45 @@ mod tests {
             cutlass_models::MAX_STAR_POINTS,
             cutlass_shapes::MAX_STAR_POINTS
         );
+    }
+
+    #[test]
+    fn look_data_reaches_the_resolved_layer() {
+        use cutlass_models::{ColorAdjustments, Filter};
+
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_filter(clip, Some(Filter::new("warm")))
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                clip,
+                ColorAdjustments {
+                    exposure: 0.25,
+                    ..ColorAdjustments::default()
+                },
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        let grade = scene.layers[0]
+            .color_grade
+            .expect("filter + adjust should resolve to a grade");
+        assert!(grade.temperature > 0.0);
+        assert_eq!(grade.exposure, 0.25);
+    }
+
+    #[test]
+    fn neutral_look_stays_none_on_the_layer() {
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert!(scene.layers[0].color_grade.is_none());
     }
 }

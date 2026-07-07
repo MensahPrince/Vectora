@@ -4,6 +4,8 @@
 use cutlass_core::{RgbaImage, VideoFrame};
 use cutlass_shapes::{SdfShape, Stroke};
 
+use crate::grade::ColorGrade;
+
 /// Canvas dimensions and background for one composite pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CompositorConfig {
@@ -105,6 +107,8 @@ pub struct CompositeLayer<'a> {
     /// (`(0,0)`=top-left, `(1,1)`=bottom-right of the frame's visible region).
     /// A sub-rect crops; a reversed axis mirrors. Ignored by solid fills.
     pub uv: [f32; 4],
+    /// Resolved color grade for this layer; `None` is the identity fast path.
+    pub color_grade: Option<ColorGrade>,
 }
 
 impl<'a> CompositeLayer<'a> {
@@ -114,6 +118,7 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Frame(frame),
             placement,
             uv: FULL_UV,
+            color_grade: None,
         }
     }
 
@@ -123,6 +128,7 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Rgba(image),
             placement,
             uv: FULL_UV,
+            color_grade: None,
         }
     }
 
@@ -132,6 +138,7 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Solid(rgba),
             placement,
             uv: FULL_UV,
+            color_grade: None,
         }
     }
 
@@ -141,12 +148,19 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Sdf(shape),
             placement,
             uv: FULL_UV,
+            color_grade: None,
         }
     }
 
     /// Replace the sampled UV rect (crop / mirror).
     pub fn with_uv(mut self, uv: [f32; 4]) -> Self {
         self.uv = uv;
+        self
+    }
+
+    /// Attach a resolved color grade (filter preset + manual adjustments).
+    pub fn with_color_grade(mut self, grade: Option<ColorGrade>) -> Self {
+        self.color_grade = grade;
         self
     }
 }

@@ -120,3 +120,41 @@ fn renders_a_pen_path_through_the_bitmap_pipeline() {
         "outside the diamond should be background, got {outside:?}"
     );
 }
+
+#[test]
+fn color_adjustments_change_a_solid_generator_render() {
+    use cutlass_models::ColorAdjustments;
+
+    let mut project = Project::new("p", FPS_24);
+    let track = project.add_track(TrackKind::Sticker, "S1");
+    let clip = project
+        .add_generated(
+            track,
+            Generator::SolidColor {
+                rgba: [200, 40, 40, 255],
+            },
+            TimeRange::at_rate(0, 100, FPS_24),
+        )
+        .unwrap();
+    project
+        .set_clip_adjustments(
+            clip,
+            ColorAdjustments {
+                saturation: -1.0,
+                ..ColorAdjustments::default()
+            },
+        )
+        .unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let image = renderer.render_frame(&project, rt(0)).expect("render");
+    let px = image.pixel(960, 540);
+    let spread = px[0].abs_diff(px[1]) + px[1].abs_diff(px[2]);
+    assert!(
+        spread <= 2,
+        "full desaturation should gray out the red, got {px:?}"
+    );
+}

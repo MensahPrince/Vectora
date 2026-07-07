@@ -28,6 +28,7 @@
 mod compositor;
 mod error;
 mod gpu;
+mod grade;
 mod layer;
 #[cfg(target_vendor = "apple")]
 mod metal_import;
@@ -37,6 +38,7 @@ pub use cutlass_core::RgbaImage;
 pub use cutlass_shapes::{SdfParams, SdfShape, Stroke};
 pub use error::CompositorError;
 pub use gpu::GpuContext;
+pub use grade::ColorGrade;
 pub use layer::{
     CompositeLayer, CompositorConfig, FULL_UV, LayerContent, LayerPlacement, SdfLayer,
 };
