@@ -15,6 +15,10 @@ struct Placement {
     trans_opacity: vec4<f32>,
     // Sampled UV rect (u0, v0, u1, v1) across the quad.
     uv_rect: vec4<f32>,
+    // Color grade: (exposure, brightness, contrast, saturation).
+    grade0: vec4<f32>,
+    // Color grade: (temperature, tint, pad, pad).
+    grade1: vec4<f32>,
 }
 
 @group(0) @binding(0) var tex: texture_2d<f32>;
@@ -52,7 +56,13 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 
 @fragment
 fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Premultiplied sample; scaling all four channels by opacity keeps it so.
+    // Premultiplied sample: un-premultiply, grade, re-premultiply, then opacity.
     let premul = textureSample(tex, samp, in.uv);
-    return premul * p.trans_opacity.z;
+    var rgb = premul.rgb;
+    let a = premul.a;
+    if (a > 0.0) {
+        rgb = apply_grade(rgb / a, p.grade0, p.grade1);
+        rgb = rgb * a;
+    }
+    return vec4(rgb, a) * p.trans_opacity.z;
 }

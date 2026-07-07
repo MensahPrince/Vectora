@@ -20,7 +20,9 @@ use cutlass_core::{
 
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
-use crate::layer::{CompositeLayer, CompositorConfig, LayerContent, LayerEffects, LayerPlacement};
+use crate::layer::{
+    ColorGrade, CompositeLayer, CompositorConfig, LayerContent, LayerEffects, LayerPlacement,
+};
 
 /// Canvas pixel format. Plain (non-sRGB) `Unorm`: the YUV shader already emits
 /// gamma-encoded R'G'B', so we store those bytes verbatim (display-ready SDR)
@@ -35,6 +37,8 @@ struct YuvUniforms {
     uv_rect: [f32; 4],
     /// Kr, Kb, full-range flag, plane mode (0 = planar I420, 1 = biplanar NV12).
     coeffs: [f32; 4],
+    grade0: [f32; 4],
+    grade1: [f32; 4],
 }
 
 #[repr(C)]
@@ -43,6 +47,8 @@ struct SolidUniforms {
     color: [f32; 4],
     linear: [f32; 4],
     trans_opacity: [f32; 4],
+    grade0: [f32; 4],
+    grade1: [f32; 4],
 }
 
 #[repr(C)]
@@ -51,6 +57,8 @@ struct RgbaUniforms {
     linear: [f32; 4],
     trans_opacity: [f32; 4],
     uv_rect: [f32; 4],
+    grade0: [f32; 4],
+    grade1: [f32; 4],
 }
 
 #[repr(C)]
@@ -78,6 +86,8 @@ struct SdfUniforms {
     geo: [f32; 4],
     /// Star points (x), inner fraction (y); quad half-extents px (z, w).
     star: [f32; 4],
+    grade0: [f32; 4],
+    grade1: [f32; 4],
 }
 
 /// Which pipeline draws a built layer.
@@ -228,14 +238,18 @@ impl Compositor {
             entries: &[uniform_entry(0)],
         });
 
+        let grade = include_str!("../shaders/grade.wgsl");
         let yuv_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.yuv.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/yuv.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{grade}\n{}", include_str!("../shaders/yuv.wgsl")).into(),
+            ),
         });
         let yuv_fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.yuv_fx.wgsl"),
             source: wgpu::ShaderSource::Wgsl(
-                concat!(
+                format!(
+                    "{grade}\n{}{}",
                     include_str!("../shaders/mask.wgsl"),
                     include_str!("../shaders/yuv_fx.wgsl"),
                 )
@@ -244,12 +258,15 @@ impl Compositor {
         });
         let rgba_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.rgba.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/rgba.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{grade}\n{}", include_str!("../shaders/rgba.wgsl")).into(),
+            ),
         });
         let rgba_fx_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.rgba_fx.wgsl"),
             source: wgpu::ShaderSource::Wgsl(
-                concat!(
+                format!(
+                    "{grade}\n{}{}",
                     include_str!("../shaders/mask.wgsl"),
                     include_str!("../shaders/rgba_fx.wgsl"),
                 )
@@ -258,11 +275,15 @@ impl Compositor {
         });
         let solid_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.solid.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/solid.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{grade}\n{}", include_str!("../shaders/solid.wgsl")).into(),
+            ),
         });
         let sdf_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("cutlass.shape.wgsl"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("../shaders/shape.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                format!("{grade}\n{}", include_str!("../shaders/shape.wgsl")).into(),
+            ),
         });
 
         // Opaque video and solids use straight-alpha src-over; RGBA bitmaps
@@ -509,10 +530,10 @@ impl Compositor {
         layer: &CompositeLayer<'_>,
     ) -> Result<LayerGpu, CompositorError> {
         match &layer.content {
-            LayerContent::Solid(rgba) => self.build_solid(gpu, config, &layer.placement, *rgba),
+            LayerContent::Solid(rgba) => self.build_solid(gpu, config, layer, *rgba),
             LayerContent::Frame(frame) => self.build_frame(gpu, config, layer, frame),
             LayerContent::Rgba(image) => self.build_rgba(gpu, config, layer, image),
-            LayerContent::Sdf(shape) => self.build_sdf(gpu, config, &layer.placement, shape),
+            LayerContent::Sdf(shape) => self.build_sdf(gpu, config, layer, shape),
         }
     }
 
@@ -520,11 +541,12 @@ impl Compositor {
         &self,
         gpu: &GpuContext,
         config: &CompositorConfig,
-        placement: &LayerPlacement,
+        layer: &CompositeLayer<'_>,
         shape: &crate::layer::SdfLayer,
     ) -> Result<LayerGpu, CompositorError> {
         use cutlass_shapes::SdfParams;
 
+        let placement = &layer.placement;
         let (linear, mut trans) = placement_affine(config, placement, 0.0);
         let stroke = shape.stroke.filter(|s| s.width > 0.0);
         trans[3] = stroke.map_or(0.0, |s| s.width);
@@ -552,6 +574,7 @@ impl Compositor {
                 f32::from(rgba[3]) / 255.0,
             ]
         };
+        let (grade0, grade1) = grade_uniforms(layer.grade);
         let uniforms = SdfUniforms {
             fill: color(shape.fill),
             stroke_color: stroke.map_or([0.0; 4], |s| color(s.rgba)),
@@ -564,6 +587,8 @@ impl Compositor {
                 placement.size[0] * 0.5,
                 placement.size[1] * 0.5,
             ],
+            grade0,
+            grade1,
         };
         let buffer = gpu
             .device
@@ -593,10 +618,11 @@ impl Compositor {
         &self,
         gpu: &GpuContext,
         config: &CompositorConfig,
-        placement: &LayerPlacement,
+        layer: &CompositeLayer<'_>,
         rgba: [u8; 4],
     ) -> Result<LayerGpu, CompositorError> {
-        let (linear, trans) = placement_affine(config, placement, 0.0);
+        let (linear, trans) = placement_affine(config, &layer.placement, 0.0);
+        let (grade0, grade1) = grade_uniforms(layer.grade);
         let uniforms = SolidUniforms {
             color: [
                 f32::from(rgba[0]) / 255.0,
@@ -606,6 +632,8 @@ impl Compositor {
             ],
             linear,
             trans_opacity: trans,
+            grade0,
+            grade1,
         };
         let buffer = gpu
             .device
@@ -672,11 +700,14 @@ impl Compositor {
         let (linear, trans) = placement_affine_rot(config, &layer.placement, rotation);
         let uv_rect = visible_uv_rect(frame, layer.uv);
 
+        let (grade0, grade1) = grade_uniforms(layer.grade);
         let placement_uniforms = YuvUniforms {
             linear,
             trans_opacity: trans,
             uv_rect,
             coeffs: [kr, kb, full, plane_mode],
+            grade0,
+            grade1,
         };
 
         let plane_entries = |layout: &wgpu::BindGroupLayout, placement_buf: &wgpu::Buffer, fx_buf: Option<&wgpu::Buffer>| {
@@ -915,10 +946,13 @@ impl Compositor {
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let (linear, trans) = placement_affine(config, &layer.placement, 0.0);
+        let (grade0, grade1) = grade_uniforms(layer.grade);
         let placement_uniforms = RgbaUniforms {
             linear,
             trans_opacity: trans,
             uv_rect: layer.uv,
+            grade0,
+            grade1,
         };
 
         if layer.effects.is_identity() {
@@ -1351,4 +1385,17 @@ fn placement_affine_rot(
         0.0,
     ];
     (linear, trans)
+}
+
+/// Pack a [`ColorGrade`] into the two `vec4` slots the shaders read.
+fn grade_uniforms(grade: ColorGrade) -> ([f32; 4], [f32; 4]) {
+    (
+        [
+            grade.exposure,
+            grade.brightness,
+            grade.contrast,
+            grade.saturation,
+        ],
+        [grade.temperature, grade.tint, 0.0, 0.0],
+    )
 }

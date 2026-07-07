@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, CompositorError, GpuContext, LayerChromaKey,
-    LayerEffects, LayerMask, LayerPlacement, RgbaImage, SdfLayer, mask_kind,
+    ColorGrade, CompositeLayer, Compositor, CompositorConfig, CompositorError, GpuContext,
+    LayerChromaKey, LayerEffects, LayerMask, LayerPlacement, RgbaImage, SdfLayer, mask_kind,
 };
 use cutlass_core::{RationalTime, VideoDecoder, VideoFrame};
 use cutlass_decoder::OutputMode;
@@ -195,6 +195,7 @@ impl Renderer {
                         rgba: *rgba,
                         placement: place(size),
                         effects,
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::Text { content, style } => {
@@ -212,6 +213,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects,
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::Media { media, source_time } => {
@@ -222,6 +224,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects,
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::Still { media } => {
@@ -232,6 +235,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects,
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::Shape {
@@ -255,6 +259,7 @@ impl Renderer {
                         },
                         placement: place(size),
                         effects,
+                        grade: layer.grade,
                     });
                 }
                 LayerSource::PathShape {
@@ -281,6 +286,7 @@ impl Renderer {
                         placement: place(size),
                         uv: layer.uv,
                         effects,
+                        grade: layer.grade,
                     });
                 }
             }
@@ -294,36 +300,49 @@ impl Renderer {
                     rgba,
                     placement,
                     effects,
-                } => CompositeLayer::solid(*rgba, *placement).with_effects(*effects),
+                    grade,
+                } => CompositeLayer::solid(*rgba, *placement)
+                    .with_effects(*effects)
+                    .with_grade(*grade),
                 Realized::Bitmap {
                     image,
                     placement,
                     uv,
                     effects,
+                    grade,
                 } => CompositeLayer::rgba(image, *placement)
                     .with_uv(*uv)
-                    .with_effects(*effects),
+                    .with_effects(*effects)
+                    .with_grade(*grade),
                 Realized::Frame {
                     frame,
                     placement,
                     uv,
                     effects,
+                    grade,
                 } => CompositeLayer::frame(frame, *placement)
                     .with_uv(*uv)
-                    .with_effects(*effects),
+                    .with_effects(*effects)
+                    .with_grade(*grade),
+                // `ensure_still` populated the cache in the first pass.
                 Realized::Still {
                     media,
                     placement,
                     uv,
                     effects,
+                    grade,
                 } => CompositeLayer::rgba(&self.stills[media], *placement)
                     .with_uv(*uv)
-                    .with_effects(*effects),
+                    .with_effects(*effects)
+                    .with_grade(*grade),
                 Realized::Sdf {
                     shape,
                     placement,
                     effects,
-                } => CompositeLayer::sdf(*shape, *placement).with_effects(*effects),
+                    grade,
+                } => CompositeLayer::sdf(*shape, *placement)
+                    .with_effects(*effects)
+                    .with_grade(*grade),
             })
             .collect();
 
@@ -378,6 +397,7 @@ impl Renderer {
             0.0,
             1.0,
             [0.0, 0.0, 1.0, 1.0],
+            ColorGrade::IDENTITY,
             canvas_w as f32,
             canvas_h as f32,
             1.0,
@@ -429,6 +449,7 @@ enum Realized {
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: LayerEffects,
+        grade: ColorGrade,
     },
     /// A still image already decoded into the renderer's cache; the composite
     /// pass borrows the pixels from there instead of cloning them per frame.
@@ -437,22 +458,26 @@ enum Realized {
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: LayerEffects,
+        grade: ColorGrade,
     },
     Bitmap {
         image: RgbaImage,
         placement: LayerPlacement,
         uv: [f32; 4],
         effects: LayerEffects,
+        grade: ColorGrade,
     },
     Solid {
         rgba: [u8; 4],
         placement: LayerPlacement,
         effects: LayerEffects,
+        grade: ColorGrade,
     },
     Sdf {
         shape: SdfLayer,
         placement: LayerPlacement,
         effects: LayerEffects,
+        grade: ColorGrade,
     },
 }
 

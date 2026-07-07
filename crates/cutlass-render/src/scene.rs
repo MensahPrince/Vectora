@@ -8,6 +8,7 @@
 //! z-order, transforms, crop) deterministic and unit-testable without a device,
 //! while [`Renderer`](crate::Renderer) does the decode + rasterize + composite.
 
+use cutlass_compositor::ColorGrade;
 use cutlass_models::{ChromaKey, Mask, MediaId};
 use cutlass_shapes::{BezierPath, SdfParams, Stroke};
 use cutlass_text::TextStyle;
@@ -147,6 +148,9 @@ pub struct SceneLayer {
     pub mask: Option<Mask>,
     /// Green-screen keying (media clips only).
     pub chroma_key: Option<ChromaKey>,
+    /// Per-clip color grade (filter preset × intensity + manual adjustments).
+    /// Identity leaves gamma-encoded RGB unchanged in the compositor.
+    pub grade: ColorGrade,
 }
 
 impl SceneLayer {
@@ -246,6 +250,7 @@ mod tests {
             uv: [0.1, 0.2, 0.9, 0.8],
             mask: None,
             chroma_key: None,
+            grade: ColorGrade::IDENTITY,
         }
     }
 
@@ -268,6 +273,7 @@ mod tests {
             uv: [0.0, 0.0, 1.0, 1.0],
             mask: None,
             chroma_key: None,
+            grade: ColorGrade::IDENTITY,
         }
     }
 
@@ -285,6 +291,7 @@ mod tests {
             uv: [0.0, 0.0, 1.0, 1.0],
             mask: None,
             chroma_key: None,
+            grade: ColorGrade::IDENTITY,
         }
     }
 

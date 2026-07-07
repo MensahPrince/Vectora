@@ -5,6 +5,10 @@ struct Placement {
     trans_opacity: vec4<f32>,
     uv_rect: vec4<f32>,
     coeffs: vec4<f32>,
+    // Color grade: (exposure, brightness, contrast, saturation).
+    grade0: vec4<f32>,
+    // Color grade: (temperature, tint, pad, pad).
+    grade1: vec4<f32>,
 }
 
 struct Effects {
@@ -85,12 +89,16 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
         cbs = textureSample(u_tex, samp, in.uv).r;
         crs = textureSample(v_tex, samp, in.uv).r;
     }
-    let rgb = yuv_to_rgb(ys, cbs, crs, p.coeffs.x, p.coeffs.y, p.coeffs.z);
+    var rgb = yuv_to_rgb(ys, cbs, crs, p.coeffs.x, p.coeffs.y, p.coeffs.z);
     var alpha = p.trans_opacity.z;
 
+    // Chroma-key on the ungraded color (the key targets the source footage),
+    // then grade the RGB, then mask/opacity shape the alpha.
     if fx.chroma.w > 0.5 {
         alpha = alpha * chroma_alpha(rgb, fx.chroma.rgb, fx.chroma_params.x, fx.chroma_params.y);
     }
+
+    rgb = apply_grade(rgb, p.grade0, p.grade1);
 
     if fx.mask.w > 0.5 {
         let malpha = mask_alpha(
