@@ -7,7 +7,9 @@
 use std::path::PathBuf;
 
 use cutlass_commands::{Command, ProjectCommand};
-use cutlass_models::{ClipId, ClipTransform, Generator, Project, Rational, RationalTime};
+use cutlass_models::{
+    ClipId, ClipTransform, ColorAdjustments, Filter, Generator, Project, Rational, RationalTime,
+};
 use cutlass_render::{Renderer, ResolveOverrides, RgbaImage, export_to_file};
 
 use crate::action::{ApplyContext, ApplyOutcome, EditAction, History, dispatch};
@@ -47,6 +49,9 @@ pub struct Engine {
     /// Live generator content for one clip (inspector slider preview), same
     /// session-only semantics as `transform_override`.
     generator_override: Option<(ClipId, Generator)>,
+    /// Live filter/adjustment look for one clip (inspector slider preview),
+    /// same session-only semantics as `transform_override`.
+    look_override: Option<(ClipId, Option<Filter>, ColorAdjustments)>,
 }
 
 impl Engine {
@@ -69,6 +74,7 @@ impl Engine {
             saved_revision: 0,
             transform_override: None,
             generator_override: None,
+            look_override: None,
         })
     }
 
@@ -141,6 +147,7 @@ impl Engine {
         self.project_path = None;
         self.transform_override = None;
         self.generator_override = None;
+        self.look_override = None;
         self.revision += 1;
         self.saved_revision = self.revision;
     }
@@ -200,6 +207,13 @@ impl Engine {
         self.generator_override = value;
     }
 
+    /// Set (or clear with `None`) the live look for one clip — the
+    /// color-grading analogue of
+    /// [`set_transform_override`](Self::set_transform_override).
+    pub fn set_look_override(&mut self, value: Option<(ClipId, Option<Filter>, ColorAdjustments)>) {
+        self.look_override = value;
+    }
+
     /// Tight size (canvas px, at transform scale 1.0) of the content
     /// `generator` draws on the current canvas — what a preview selection box
     /// should hug, since text/path rasters are mostly transparent padding.
@@ -221,6 +235,10 @@ impl Engine {
         let overrides = ResolveOverrides {
             transform: self.transform_override,
             generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+            look: self
+                .look_override
+                .as_ref()
+                .map(|(id, filter, adjust)| (*id, filter.as_ref(), adjust)),
         };
         Ok(self
             .renderer
@@ -240,6 +258,10 @@ impl Engine {
         let overrides = ResolveOverrides {
             transform: self.transform_override,
             generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+            look: self
+                .look_override
+                .as_ref()
+                .map(|(id, filter, adjust)| (*id, filter.as_ref(), adjust)),
         };
         Ok(self.renderer.render_frame_fit_with(
             &self.project,

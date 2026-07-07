@@ -21,8 +21,9 @@
 use cutlass_compositor::ColorGrade;
 use cutlass_core::{RationalTime, resample};
 use cutlass_models::{
-    ClipId, ClipSource, ClipTransform, EffectInstance, Generator, MediaKind, Param, Project, Shape,
-    ShapePath, ShapeStroke, TextAlignH, TextStyle as ModelTextStyle,
+    ClipId, ClipSource, ClipTransform, ColorAdjustments, EffectInstance, Filter, Generator,
+    MediaKind, Param, Project, Shape, ShapePath, ShapeStroke, TextAlignH,
+    TextStyle as ModelTextStyle,
 };
 use cutlass_shapes::{BezierPath, PathPoint, SDF_AA, SdfParams, Stroke};
 use cutlass_text::{FontFamily, TextAlign, TextStyle};
@@ -48,6 +49,7 @@ const DEFAULT_CANVAS: (u32, u32) = (1920, 1080);
 pub struct ResolveOverrides<'a> {
     pub transform: Option<(ClipId, ClipTransform)>,
     pub generator: Option<(ClipId, &'a Generator)>,
+    pub look: Option<(ClipId, Option<&'a Filter>, &'a ColorAdjustments)>,
 }
 
 /// Identity transform used when rasterizing the gesture sprite: the clip's
@@ -84,6 +86,7 @@ pub fn resolve_gesture_partitions(
     let overrides = ResolveOverrides {
         transform: Some((clip_id, GESTURE_IDENTITY_TRANSFORM)),
         generator: None,
+        look: None,
     };
     let scene = resolve_with(project, t, overrides)?;
     let index = scene
@@ -93,10 +96,7 @@ pub fn resolve_gesture_partitions(
     let Some(index) = index else {
         return Ok(None);
     };
-    if matches!(
-        scene.layers[index].source,
-        LayerSource::Transition { .. }
-    ) {
+    if matches!(scene.layers[index].source, LayerSource::Transition { .. }) {
         return Ok(None);
     }
 
@@ -307,7 +307,11 @@ fn resolve_clip(
     let opacity = xf.opacity.clamp(0.0, 1.0);
     let uv = crop_flip_uv(clip);
     let effects = resolve_effects(clip, local_tick);
-    let grade = effective_grade(clip.filter.as_ref(), &clip.adjust);
+    let (filter, adjust) = match overrides.look {
+        Some((id, filter, adjust)) if id == clip.id => (filter, adjust),
+        _ => (clip.filter.as_ref(), &clip.adjust),
+    };
+    let grade = effective_grade(filter, adjust);
 
     match &clip.content {
         ClipSource::Media { media, .. } => {
@@ -1020,10 +1024,28 @@ mod tests {
                     rgba: [0, 255, 0, 255],
                 },
             )),
+            look: Some((
+                clip,
+                None,
+                &ColorAdjustments {
+                    brightness: 0.25,
+                    ..ColorAdjustments::default()
+                },
+            )),
         };
         let scene = resolve_with(&project, rt(5), overrides).unwrap();
         let layer = &scene.layers[0];
         assert_eq!(layer.source, LayerSource::Solid([0, 255, 0, 255]));
+        assert_eq!(
+            layer.grade,
+            effective_grade(
+                None,
+                &ColorAdjustments {
+                    brightness: 0.25,
+                    ..ColorAdjustments::default()
+                }
+            )
+        );
         approx2(layer.center, [1920.0 * 0.75, 540.0]);
         match layer.size {
             SizeSpec::Fixed(size) => approx2(size, [960.0, 540.0]),
@@ -1033,6 +1055,7 @@ mod tests {
         // Plain resolve still sees only committed state.
         let scene = resolve(&project, rt(5)).unwrap();
         assert_eq!(scene.layers[0].source, LayerSource::Solid([255, 0, 0, 255]));
+        assert_eq!(scene.layers[0].grade, ColorGrade::IDENTITY);
         approx2(scene.layers[0].center, [960.0, 540.0]);
     }
 
