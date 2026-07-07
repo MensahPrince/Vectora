@@ -1,0 +1,377 @@
+// Clip-level color grading: catalog filters plus manual adjustments. Values
+// are projected from the engine; slider drags preview through the worker's
+// session-only look override and release commits one undoable edit.
+
+import { CutlassText, CutlassScrollView } from "../../components/index.slint";
+import { AppState } from "../../state.slint";
+import { AppStore, TimelineStore } from "../../store/index.slint";
+import { InspectorBackend } from "../../lib/inspector-backend.slint";
+import { Clip } from "../../models/index.slint";
+import { LabelCell, SectionHeader, SliderRow } from "inspector-widgets.slint";
+
+component FilterRow inherits Rectangle {
+    in property <string> label;
+    in property <string> id;
+    in property <bool> selected;
+    callback picked(id: string, label: string);
+
+    height: 26px;
+    border-radius: AppStore.theme.metrics.radius.sm;
+    background: root.selected
+        ? AppStore.theme.accent.primary.with-alpha(0.12)
+        : (ta.has-hover ? #ffffff10 : transparent);
+
+    CutlassText {
+        x: AppStore.theme.metrics.spacing.sm;
+        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.label;
+        style: AppStore.theme.typography.body;
+        foreground: root.selected ? AppStore.theme.accent.primary : AppStore.theme.text.primary;
+        overflow: TextOverflow.elide;
+    }
+
+    ta := TouchArea {
+        clicked => {
+            root.picked(root.id, root.label);
+            AppState.refocus-shortcuts();
+        }
+    }
+}
+
+component FilterDropdown inherits Rectangle {
+    in property <string> current-id;
+    in property <string> current-label;
+
+    callback selected(id: string);
+
+    height: 28px;
+    horizontal-stretch: 1;
+    border-radius: AppStore.theme.metrics.radius.sm;
+    background: trigger.has-hover ? #232323 : #1a1a1a;
+
+    HorizontalLayout {
+        padding-left: AppStore.theme.metrics.spacing.sm;
+        padding-right: AppStore.theme.metrics.spacing.sm;
+        spacing: AppStore.theme.metrics.spacing.xs;
+
+        CutlassText {
+            horizontal-stretch: 1;
+            vertical-alignment: center;
+            text: root.current-id == "" ? "None" : root.current-label;
+            style: AppStore.theme.typography.body;
+            foreground: root.current-id == "" ? AppStore.theme.text.muted : AppStore.theme.text.primary;
+            overflow: TextOverflow.elide;
+        }
+
+        CutlassText {
+            width: 12px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+            text: "v";
+            style: AppStore.theme.typography.caption;
+            foreground: AppStore.theme.text.muted;
+        }
+    }
+
+    trigger := TouchArea {
+        clicked => {
+            popup.show();
+        }
+    }
+
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: root.width;
+        height: 260px;
+        close-policy: PopupClosePolicy.close-on-click-outside;
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            background: AppStore.theme.panel.background;
+            border-radius: AppStore.theme.metrics.radius.md;
+            border-width: 1px;
+            border-color: #ffffff1f;
+            drop-shadow-blur: 24px;
+            drop-shadow-color: #00000080;
+            drop-shadow-offset-y: 6px;
+
+            VerticalLayout {
+                padding: AppStore.theme.metrics.spacing.sm;
+                spacing: 0;
+
+                CutlassScrollView {
+                    vertical-stretch: 1;
+                    viewport-width: self.width;
+                    viewport-height: list.preferred-height;
+                    show-horizontal-scrollbar: false;
+
+                    list := VerticalLayout {
+                        spacing: 0;
+                        alignment: LayoutAlignment.start;
+
+                        FilterRow {
+                            label: "None";
+                            id: "";
+                            selected: root.current-id == "";
+                            picked(id, _) => {
+                                root.selected(id);
+                                popup.close();
+                            }
+                        }
+
+                        for entry in InspectorBackend.filter-catalog: FilterRow {
+                            label: entry.label;
+                            id: entry.id;
+                            selected: entry.id == root.current-id;
+                            picked(id, _) => {
+                                root.selected(id);
+                                popup.close();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component LookInspector inherits VerticalLayout {
+    in property <Clip> model;
+
+    spacing: AppStore.theme.metrics.spacing.lg;
+    alignment: LayoutAlignment.start;
+
+    function preview-look(
+        filter-id: string,
+        intensity: float,
+        brightness: float,
+        contrast: float,
+        saturation: float,
+        exposure: float,
+        temperature: float,
+    ) {
+        InspectorBackend.preview-clip-look(
+            root.model.id,
+            filter-id,
+            intensity,
+            brightness,
+            contrast,
+            saturation,
+            exposure,
+            temperature,
+            TimelineStore.playhead-tick);
+    }
+
+    function commit-adjust(
+        brightness: float,
+        contrast: float,
+        saturation: float,
+        exposure: float,
+        temperature: float,
+    ) {
+        InspectorBackend.set-clip-adjust(
+            root.model.id,
+            brightness,
+            contrast,
+            saturation,
+            exposure,
+            temperature);
+    }
+
+    SectionHeader {
+        title: "Filter";
+    }
+
+    HorizontalLayout {
+        spacing: AppStore.theme.metrics.spacing.md;
+        height: 28px;
+        vertical-stretch: 0;
+
+        LabelCell {
+            label: "Preset";
+        }
+
+        FilterDropdown {
+            current-id: root.model.filter-id;
+            current-label: root.model.filter-label;
+            selected(id) => {
+                InspectorBackend.set-clip-filter(root.model.id, id, id == "" ? 0 : 0.8);
+            }
+        }
+    }
+
+    if root.model.filter-id != "": SliderRow {
+        label: "Intensity";
+        suffix: "%";
+        value: root.model.filter-intensity * 100;
+        minimum: 0;
+        maximum: 100;
+        step: 1;
+        decimals: 0;
+        reset-value: 80;
+        preview(v) => {
+            root.preview-look(
+                root.model.filter-id,
+                clamp(v, 0, 100) / 100,
+                root.model.adjust-brightness,
+                root.model.adjust-contrast,
+                root.model.adjust-saturation,
+                root.model.adjust-exposure,
+                root.model.adjust-temperature);
+        }
+        commit(v) => {
+            InspectorBackend.set-clip-filter(
+                root.model.id,
+                root.model.filter-id,
+                clamp(v, 0, 100) / 100);
+        }
+    }
+
+    SectionHeader {
+        title: "Adjust";
+    }
+
+    SliderRow {
+        label: "Brightness";
+        suffix: "%";
+        value: root.model.adjust-brightness * 100;
+        minimum: -100;
+        maximum: 100;
+        step: 1;
+        reset-value: 0;
+        preview(v) => {
+            root.preview-look(
+                root.model.filter-id,
+                root.model.filter-intensity,
+                clamp(v, -100, 100) / 100,
+                root.model.adjust-contrast,
+                root.model.adjust-saturation,
+                root.model.adjust-exposure,
+                root.model.adjust-temperature);
+        }
+        commit(v) => {
+            root.commit-adjust(
+                clamp(v, -100, 100) / 100,
+                root.model.adjust-contrast,
+                root.model.adjust-saturation,
+                root.model.adjust-exposure,
+                root.model.adjust-temperature);
+        }
+    }
+
+    SliderRow {
+        label: "Contrast";
+        suffix: "%";
+        value: root.model.adjust-contrast * 100;
+        minimum: -100;
+        maximum: 100;
+        step: 1;
+        reset-value: 0;
+        preview(v) => {
+            root.preview-look(
+                root.model.filter-id,
+                root.model.filter-intensity,
+                root.model.adjust-brightness,
+                clamp(v, -100, 100) / 100,
+                root.model.adjust-saturation,
+                root.model.adjust-exposure,
+                root.model.adjust-temperature);
+        }
+        commit(v) => {
+            root.commit-adjust(
+                root.model.adjust-brightness,
+                clamp(v, -100, 100) / 100,
+                root.model.adjust-saturation,
+                root.model.adjust-exposure,
+                root.model.adjust-temperature);
+        }
+    }
+
+    SliderRow {
+        label: "Saturation";
+        suffix: "%";
+        value: root.model.adjust-saturation * 100;
+        minimum: -100;
+        maximum: 100;
+        step: 1;
+        reset-value: 0;
+        preview(v) => {
+            root.preview-look(
+                root.model.filter-id,
+                root.model.filter-intensity,
+                root.model.adjust-brightness,
+                root.model.adjust-contrast,
+                clamp(v, -100, 100) / 100,
+                root.model.adjust-exposure,
+                root.model.adjust-temperature);
+        }
+        commit(v) => {
+            root.commit-adjust(
+                root.model.adjust-brightness,
+                root.model.adjust-contrast,
+                clamp(v, -100, 100) / 100,
+                root.model.adjust-exposure,
+                root.model.adjust-temperature);
+        }
+    }
+
+    SliderRow {
+        label: "Exposure";
+        suffix: "%";
+        value: root.model.adjust-exposure * 100;
+        minimum: -100;
+        maximum: 100;
+        step: 1;
+        reset-value: 0;
+        preview(v) => {
+            root.preview-look(
+                root.model.filter-id,
+                root.model.filter-intensity,
+                root.model.adjust-brightness,
+                root.model.adjust-contrast,
+                root.model.adjust-saturation,
+                clamp(v, -100, 100) / 100,
+                root.model.adjust-temperature);
+        }
+        commit(v) => {
+            root.commit-adjust(
+                root.model.adjust-brightness,
+                root.model.adjust-contrast,
+                root.model.adjust-saturation,
+                clamp(v, -100, 100) / 100,
+                root.model.adjust-temperature);
+        }
+    }
+
+    SliderRow {
+        label: "Temperature";
+        suffix: "%";
+        value: root.model.adjust-temperature * 100;
+        minimum: -100;
+        maximum: 100;
+        step: 1;
+        reset-value: 0;
+        preview(v) => {
+            root.preview-look(
+                root.model.filter-id,
+                root.model.filter-intensity,
+                root.model.adjust-brightness,
+                root.model.adjust-contrast,
+                root.model.adjust-saturation,
+                root.model.adjust-exposure,
+                clamp(v, -100, 100) / 100);
+        }
+        commit(v) => {
+            root.commit-adjust(
+                root.model.adjust-brightness,
+                root.model.adjust-contrast,
+                root.model.adjust-saturation,
+                root.model.adjust-exposure,
+                clamp(v, -100, 100) / 100);
+        }
+    }
+}
