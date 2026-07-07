@@ -9,8 +9,8 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, CompositorError, GpuContext, LayerPlacement,
-    RgbaImage, SdfLayer,
+    CompositeLayer, Compositor, CompositorConfig, CompositorError, CompositorLayer, GpuContext,
+    LayerPlacement, PassInstance, RgbaImage, SdfLayer,
 };
 use cutlass_core::{RationalTime, VideoDecoder, VideoFrame};
 use cutlass_decoder::OutputMode;
@@ -20,7 +20,7 @@ use cutlass_text::TextRenderer;
 
 use crate::error::RenderError;
 use crate::resolve::{ResolveOverrides, resolve, resolve_with};
-use crate::scene::{LayerSource, Scene, SizeSpec};
+use crate::scene::{LayerSource, ResolvedPass, Scene, SizeSpec};
 
 /// Renders project frames on a headless (or shared) GPU.
 pub struct Renderer {
@@ -178,6 +178,7 @@ impl Renderer {
         // placement. Held in `realized` so the borrowed `CompositeLayer`s built
         // below stay valid through the composite call.
         let mut realized: Vec<Realized> = Vec::with_capacity(scene.layers.len());
+        let mut effect_store: Vec<EffectChain> = Vec::new();
         for layer in &scene.layers {
             // The layer carries the anchor position; the quad center falls out
             // of the final pixel size (bitmap sizes only exist after raster).
@@ -188,11 +189,27 @@ impl Renderer {
                 opacity: layer.opacity,
             };
             match &layer.source {
+                LayerSource::Transition {
+                    outgoing,
+                    incoming,
+                    transition_id,
+                    progress,
+                } => {
+                    let out = self.realize_subscene_layer(project, scene, outgoing)?;
+                    let inc = self.realize_subscene_layer(project, scene, incoming)?;
+                    realized.push(Realized::Transition {
+                        outgoing: out,
+                        incoming: inc,
+                        transition_id: transition_id.clone(),
+                        progress: *progress,
+                    });
+                }
                 LayerSource::Solid(rgba) => {
                     let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
                     realized.push(Realized::Solid {
                         rgba: *rgba,
                         placement: place(size),
+                        effects: layer.effects.clone(),
                     });
                 }
                 LayerSource::Text { content, style } => {
@@ -209,6 +226,7 @@ impl Renderer {
                         image,
                         placement: place(size),
                         uv: layer.uv,
+                        effects: layer.effects.clone(),
                     });
                 }
                 LayerSource::Media { media, source_time } => {
@@ -218,6 +236,7 @@ impl Renderer {
                         frame,
                         placement: place(size),
                         uv: layer.uv,
+                        effects: layer.effects.clone(),
                     });
                 }
                 LayerSource::Still { media } => {
@@ -227,6 +246,7 @@ impl Renderer {
                         media: *media,
                         placement: place(size),
                         uv: layer.uv,
+                        effects: layer.effects.clone(),
                     });
                 }
                 LayerSource::Shape {
@@ -249,6 +269,7 @@ impl Renderer {
                             stroke: *stroke,
                         },
                         placement: place(size),
+                        effects: layer.effects.clone(),
                     });
                 }
                 LayerSource::PathShape {
@@ -274,39 +295,236 @@ impl Renderer {
                         image,
                         placement: place(size),
                         uv: layer.uv,
+                        effects: layer.effects.clone(),
                     });
                 }
             }
         }
 
-        // Second pass: borrow the owned pixels into the compositor's layer type.
-        let layers: Vec<CompositeLayer> = realized
+        // Pack effect chains and build compositor layers with stable borrows.
+        for r in &realized {
+            if let Some(effects) = r.effects().filter(|e| !e.is_empty()) {
+                effect_store.push(pack_effects(effects));
+            }
+        }
+
+        let mut effect_idx = 0usize;
+        let mut layer_storage: Vec<CompositeLayer<'_>> = Vec::new();
+        // Phase 1: build all composite layers (indices only for transitions).
+        enum LayerJob<'a> {
+            Plain {
+                storage_idx: usize,
+            },
+            Transition {
+                out_idx: usize,
+                in_idx: usize,
+                transition_id: &'a str,
+                progress: f32,
+            },
+        }
+        let mut jobs: Vec<LayerJob<'_>> = Vec::new();
+
+        for r in &realized {
+            match r {
+                Realized::Transition {
+                    outgoing,
+                    incoming,
+                    transition_id,
+                    progress,
+                } => {
+                    let out_effects = outgoing
+                        .effects()
+                        .filter(|e| !e.is_empty())
+                        .map(|_| {
+                            let chain = &effect_store[effect_idx];
+                            effect_idx += 1;
+                            chain.instances.as_slice()
+                        })
+                        .unwrap_or(&[]);
+                    layer_storage.push(composite_from_realized(
+                        outgoing.as_ref(),
+                        &self.stills,
+                        out_effects,
+                    ));
+                    let out_idx = layer_storage.len() - 1;
+                    let in_effects = incoming
+                        .effects()
+                        .filter(|e| !e.is_empty())
+                        .map(|_| {
+                            let chain = &effect_store[effect_idx];
+                            effect_idx += 1;
+                            chain.instances.as_slice()
+                        })
+                        .unwrap_or(&[]);
+                    layer_storage.push(composite_from_realized(
+                        incoming.as_ref(),
+                        &self.stills,
+                        in_effects,
+                    ));
+                    let in_idx = layer_storage.len() - 1;
+                    jobs.push(LayerJob::Transition {
+                        out_idx,
+                        in_idx,
+                        transition_id: transition_id.as_str(),
+                        progress: *progress,
+                    });
+                }
+                other => {
+                    let effects = other
+                        .effects()
+                        .filter(|e| !e.is_empty())
+                        .map(|_| {
+                            let chain = &effect_store[effect_idx];
+                            effect_idx += 1;
+                            chain.instances.as_slice()
+                        })
+                        .unwrap_or(&[]);
+                    layer_storage.push(composite_from_realized(other, &self.stills, effects));
+                    jobs.push(LayerJob::Plain {
+                        storage_idx: layer_storage.len() - 1,
+                    });
+                }
+            }
+        }
+
+        // Phase 2: borrow storage immutably for compositor dispatch.
+        let compositor_layers: Vec<CompositorLayer<'_>> = jobs
             .iter()
-            .map(|r| match r {
-                Realized::Solid { rgba, placement } => CompositeLayer::solid(*rgba, *placement),
-                Realized::Bitmap {
-                    image,
-                    placement,
-                    uv,
-                } => CompositeLayer::rgba(image, *placement).with_uv(*uv),
-                Realized::Frame {
-                    frame,
-                    placement,
-                    uv,
-                } => CompositeLayer::frame(frame, *placement).with_uv(*uv),
-                // `ensure_still` populated the cache in the first pass.
-                Realized::Still {
-                    media,
-                    placement,
-                    uv,
-                } => CompositeLayer::rgba(&self.stills[media], *placement).with_uv(*uv),
-                Realized::Sdf { shape, placement } => CompositeLayer::sdf(*shape, *placement),
+            .map(|job| match job {
+                LayerJob::Plain { storage_idx } => {
+                    CompositorLayer::layer(&layer_storage[*storage_idx])
+                }
+                LayerJob::Transition {
+                    out_idx,
+                    in_idx,
+                    transition_id,
+                    progress,
+                } => CompositorLayer::Transition {
+                    outgoing: &layer_storage[*out_idx],
+                    incoming: &layer_storage[*in_idx],
+                    transition_id,
+                    progress: *progress,
+                },
             })
             .collect();
 
         let config =
             CompositorConfig::new(scene.width, scene.height).with_background(scene.background);
-        Ok(self.compositor.render(&self.gpu, &config, &layers)?)
+        Ok(self
+            .compositor
+            .render_compositor_layers(&self.gpu, &config, &compositor_layers)?)
+    }
+
+    fn realize_subscene_layer(
+        &mut self,
+        project: &Project,
+        scene: &Scene,
+        layer: &crate::scene::SceneLayer,
+    ) -> Result<Box<Realized>, RenderError> {
+        let place = |size: [f32; 2]| LayerPlacement {
+            center: layer.quad_center(size),
+            size,
+            rotation: layer.rotation,
+            opacity: layer.opacity,
+        };
+        let realized = match &layer.source {
+            LayerSource::Solid(rgba) => {
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                Realized::Solid {
+                    rgba: *rgba,
+                    placement: place(size),
+                    effects: layer.effects.clone(),
+                }
+            }
+            LayerSource::Text { content, style } => {
+                let image = self.text.rasterize(content, style);
+                if image.width == 0 || image.height == 0 {
+                    return Err(RenderError::unsupported("empty text layer"));
+                }
+                let scale = match layer.size {
+                    SizeSpec::BitmapScaled(s) => s,
+                    SizeSpec::Fixed(_) => 1.0,
+                };
+                let size = [image.width as f32 * scale, image.height as f32 * scale];
+                Realized::Bitmap {
+                    image,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                }
+            }
+            LayerSource::Media { media, source_time } => {
+                let frame = self.decode(project, *media, *source_time)?;
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                Realized::Frame {
+                    frame,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                }
+            }
+            LayerSource::Still { media } => {
+                self.ensure_still(project, *media)?;
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                Realized::Still {
+                    media: *media,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                }
+            }
+            LayerSource::Shape {
+                params,
+                fill,
+                stroke,
+                pad,
+            } => {
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                let half = [
+                    (size[0] * 0.5 - pad).max(0.0),
+                    (size[1] * 0.5 - pad).max(0.0),
+                ];
+                Realized::Sdf {
+                    shape: SdfLayer {
+                        shape: params.with_half(half),
+                        fill: *fill,
+                        stroke: *stroke,
+                    },
+                    placement: place(size),
+                    effects: layer.effects.clone(),
+                }
+            }
+            LayerSource::PathShape {
+                path,
+                fill,
+                stroke,
+                raster_scale,
+            } => {
+                let style = ShapeStyle {
+                    fill: Some(*fill).filter(|c| c[3] > 0),
+                    stroke: *stroke,
+                };
+                let image = self.paths.rasterize(path, &style, *raster_scale);
+                if image.width == 0 || image.height == 0 {
+                    return Err(RenderError::unsupported("degenerate path layer"));
+                }
+                let scale = match layer.size {
+                    SizeSpec::BitmapScaled(s) => s,
+                    SizeSpec::Fixed(_) => 1.0,
+                };
+                let size = [image.width as f32 * scale, image.height as f32 * scale];
+                Realized::Bitmap {
+                    image,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                }
+            }
+            LayerSource::Transition { .. } => {
+                return Err(RenderError::unsupported("nested transitions"));
+            }
+        };
+        Ok(Box::new(realized))
     }
 
     /// Decode the frame of `media` at `source_time`, opening (and caching) a
@@ -359,6 +577,7 @@ impl Renderer {
             canvas_h as f32,
             1.0,
             tick,
+            Vec::new(),
         )?;
         match layer.size {
             SizeSpec::Fixed(size) => Some((size[0].round() as u32, size[1].round() as u32)),
@@ -399,33 +618,129 @@ impl Renderer {
     }
 }
 
+/// Packed effect instances with stable ids for compositor dispatch.
+struct EffectChain {
+    instances: Vec<PassInstance<'static>>,
+    ids: Vec<String>,
+    params: Vec<Vec<f32>>,
+}
+
+fn pack_effects(resolved: &[ResolvedPass]) -> EffectChain {
+    let mut ids = Vec::new();
+    let mut params = Vec::new();
+    for pass in resolved {
+        ids.push(pass.id.clone());
+        params.push(pass.params.clone());
+    }
+    let instances: Vec<PassInstance<'static>> = ids
+        .iter()
+        .zip(params.iter())
+        .map(|(id, p)| {
+            // Leak stable storage for the compositor borrow lifetime of one render.
+            let id_static: &'static str = Box::leak(id.clone().into_boxed_str());
+            let params_static: &'static [f32] = Box::leak(p.clone().into_boxed_slice());
+            PassInstance {
+                id: id_static,
+                params: params_static,
+            }
+        })
+        .collect();
+    EffectChain {
+        instances,
+        ids,
+        params,
+    }
+}
+
+fn composite_from_realized<'a>(
+    r: &'a Realized,
+    stills: &'a HashMap<MediaId, RgbaImage>,
+    effects: &'a [PassInstance<'a>],
+) -> CompositeLayer<'a> {
+    match r {
+        Realized::Solid { rgba, placement, .. } => {
+            CompositeLayer::solid(*rgba, *placement).with_effects(effects)
+        }
+        Realized::Bitmap {
+            image,
+            placement,
+            uv,
+            ..
+        } => CompositeLayer::rgba(image, *placement)
+            .with_uv(*uv)
+            .with_effects(effects),
+        Realized::Frame {
+            frame,
+            placement,
+            uv,
+            ..
+        } => CompositeLayer::frame(frame, *placement)
+            .with_uv(*uv)
+            .with_effects(effects),
+        Realized::Still {
+            media,
+            placement,
+            uv,
+            ..
+        } => CompositeLayer::rgba(&stills[media], *placement)
+            .with_uv(*uv)
+            .with_effects(effects),
+        Realized::Sdf { shape, placement, .. } => {
+            CompositeLayer::sdf(*shape, *placement).with_effects(effects)
+        }
+        Realized::Transition { .. } => unreachable!("transitions handled separately"),
+    }
+}
+
 /// An owned, decoded/rasterized layer kept alive while the compositor borrows it.
 enum Realized {
+    Transition {
+        outgoing: Box<Realized>,
+        incoming: Box<Realized>,
+        transition_id: String,
+        progress: f32,
+    },
     Frame {
         frame: VideoFrame,
         placement: LayerPlacement,
         uv: [f32; 4],
+        effects: Vec<ResolvedPass>,
     },
-    /// A still image already decoded into the renderer's cache; the composite
-    /// pass borrows the pixels from there instead of cloning them per frame.
     Still {
         media: MediaId,
         placement: LayerPlacement,
         uv: [f32; 4],
+        effects: Vec<ResolvedPass>,
     },
     Bitmap {
         image: RgbaImage,
         placement: LayerPlacement,
         uv: [f32; 4],
+        effects: Vec<ResolvedPass>,
     },
     Solid {
         rgba: [u8; 4],
         placement: LayerPlacement,
+        effects: Vec<ResolvedPass>,
     },
     Sdf {
         shape: SdfLayer,
         placement: LayerPlacement,
+        effects: Vec<ResolvedPass>,
     },
+}
+
+impl Realized {
+    fn effects(&self) -> Option<&[ResolvedPass]> {
+        match self {
+            Realized::Transition { .. } => None,
+            Realized::Frame { effects, .. }
+            | Realized::Still { effects, .. }
+            | Realized::Bitmap { effects, .. }
+            | Realized::Solid { effects, .. }
+            | Realized::Sdf { effects, .. } => Some(effects),
+        }
+    }
 }
 
 /// The on-canvas size for a non-text layer, falling back to the canvas if a
