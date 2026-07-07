@@ -18,11 +18,11 @@ use cutlass_core::{
     CpuImage, FrameData, MatrixCoefficients, PixelFormat, Plane, RgbaImage, VideoFrame,
 };
 
-use crate::error::CompositorError;
 use crate::effect_render::{
     OffscreenPool, PassRegistry, blit_premultiplied_to_canvas, draw_layer_to_offscreen,
     effects_need_offscreen, run_effect_chain, run_transition_pass,
 };
+use crate::error::CompositorError;
 use crate::gpu::GpuContext;
 use crate::layer::{
     CompositeLayer, CompositorConfig, CompositorLayer, LayerContent, LayerPlacement,
@@ -341,8 +341,7 @@ impl Compositor {
         config: &CompositorConfig,
         layers: &[CompositeLayer<'_>],
     ) -> Result<RgbaImage, CompositorError> {
-        let items: Vec<CompositorLayer<'_>> =
-            layers.iter().map(CompositorLayer::layer).collect();
+        let items: Vec<CompositorLayer<'_>> = layers.iter().map(CompositorLayer::layer).collect();
         self.render_compositor_layers(gpu, config, &items)
     }
 

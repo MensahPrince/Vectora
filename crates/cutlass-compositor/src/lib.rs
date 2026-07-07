@@ -30,9 +30,9 @@ mod effect_render;
 mod error;
 mod gpu;
 mod layer;
-mod passes;
 #[cfg(target_vendor = "apple")]
 mod metal_import;
+mod passes;
 
 pub use compositor::Compositor;
 pub use cutlass_core::RgbaImage;

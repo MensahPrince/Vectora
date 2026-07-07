@@ -656,13 +656,17 @@ fn vignette_darkens_corners_vs_center() {
         params: &[0.8],
     };
     let effects = [vignette];
-    let effected = CompositeLayer::solid([255, 255, 255, 255], LayerPlacement::full_canvas(&config))
-        .with_effects(&effects);
+    let effected =
+        CompositeLayer::solid([255, 255, 255, 255], LayerPlacement::full_canvas(&config))
+            .with_effects(&effects);
     let dark = comp.render(&gpu, &config, &[effected]).expect("vignette");
 
     let center = baseline.pixel(32, 32);
     let corner = dark.pixel(2, 2);
-    assert!(corner[0] < center[0] - 20, "corner should darken: {corner:?} vs {center:?}");
+    assert!(
+        corner[0] < center[0] - 20,
+        "corner should darken: {corner:?} vs {center:?}"
+    );
 }
 
 #[test]
@@ -672,7 +676,7 @@ fn pixelate_produces_uniform_blocks() {
     let config = CompositorConfig::new(64, 64);
     // Horizontal gradient bitmap.
     let mut pixels = Vec::with_capacity(64 * 64 * 4);
-    for y in 0..64 {
+    for _y in 0..64 {
         for x in 0..64 {
             let v = (x * 4) as u8;
             pixels.extend_from_slice(&[v, v, v, 255]);
@@ -689,7 +693,9 @@ fn pixelate_produces_uniform_blocks() {
     let effects = [pixelate];
     let blocky_layer =
         CompositeLayer::rgba(&bmp, LayerPlacement::full_canvas(&config)).with_effects(&effects);
-    let blocky = comp.render(&gpu, &config, &[blocky_layer]).expect("pixelate");
+    let blocky = comp
+        .render(&gpu, &config, &[blocky_layer])
+        .expect("pixelate");
 
     // Within an 8px block, colors should match after pixelate.
     let a = blocky.pixel(10, 10);

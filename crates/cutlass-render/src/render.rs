@@ -307,6 +307,8 @@ impl Renderer {
                 effect_store.push(pack_effects(effects));
             }
         }
+        let instance_store: Vec<Vec<PassInstance<'_>>> =
+            effect_store.iter().map(EffectChain::instances).collect();
 
         let mut effect_idx = 0usize;
         let mut layer_storage: Vec<CompositeLayer<'_>> = Vec::new();
@@ -336,9 +338,9 @@ impl Renderer {
                         .effects()
                         .filter(|e| !e.is_empty())
                         .map(|_| {
-                            let chain = &effect_store[effect_idx];
+                            let chain = &instance_store[effect_idx];
                             effect_idx += 1;
-                            chain.instances.as_slice()
+                            chain.as_slice()
                         })
                         .unwrap_or(&[]);
                     layer_storage.push(composite_from_realized(
@@ -351,9 +353,9 @@ impl Renderer {
                         .effects()
                         .filter(|e| !e.is_empty())
                         .map(|_| {
-                            let chain = &effect_store[effect_idx];
+                            let chain = &instance_store[effect_idx];
                             effect_idx += 1;
-                            chain.instances.as_slice()
+                            chain.as_slice()
                         })
                         .unwrap_or(&[]);
                     layer_storage.push(composite_from_realized(
@@ -374,9 +376,9 @@ impl Renderer {
                         .effects()
                         .filter(|e| !e.is_empty())
                         .map(|_| {
-                            let chain = &effect_store[effect_idx];
+                            let chain = &instance_store[effect_idx];
                             effect_idx += 1;
-                            chain.instances.as_slice()
+                            chain.as_slice()
                         })
                         .unwrap_or(&[]);
                     layer_storage.push(composite_from_realized(other, &self.stills, effects));
@@ -618,38 +620,38 @@ impl Renderer {
     }
 }
 
-/// Packed effect instances with stable ids for compositor dispatch.
+/// Packed effect chain: catalog-static ids plus owned parameter values.
+///
+/// [`PassInstance`] wants a `&'static str` id and borrowed params. Ids are
+/// interned against the compositor's static effect catalog (unknown ids are
+/// dropped here — they'd dispatch as no-op passthroughs anyway), and params
+/// stay owned so the instances built by [`EffectChain::instances`] borrow from
+/// this store for the duration of one render instead of leaking.
 struct EffectChain {
-    instances: Vec<PassInstance<'static>>,
-    ids: Vec<String>,
-    params: Vec<Vec<f32>>,
+    passes: Vec<(&'static str, Vec<f32>)>,
+}
+
+impl EffectChain {
+    fn instances(&self) -> Vec<PassInstance<'_>> {
+        self.passes
+            .iter()
+            .map(|(id, params)| PassInstance { id, params })
+            .collect()
+    }
 }
 
 fn pack_effects(resolved: &[ResolvedPass]) -> EffectChain {
-    let mut ids = Vec::new();
-    let mut params = Vec::new();
-    for pass in resolved {
-        ids.push(pass.id.clone());
-        params.push(pass.params.clone());
-    }
-    let instances: Vec<PassInstance<'static>> = ids
+    let passes = resolved
         .iter()
-        .zip(params.iter())
-        .map(|(id, p)| {
-            // Leak stable storage for the compositor borrow lifetime of one render.
-            let id_static: &'static str = Box::leak(id.clone().into_boxed_str());
-            let params_static: &'static [f32] = Box::leak(p.clone().into_boxed_slice());
-            PassInstance {
-                id: id_static,
-                params: params_static,
-            }
+        .filter_map(|pass| {
+            let id = cutlass_compositor::effect_descriptors()
+                .iter()
+                .find(|d| d.id == pass.id)?
+                .id;
+            Some((id, pass.params.clone()))
         })
         .collect();
-    EffectChain {
-        instances,
-        ids,
-        params,
-    }
+    EffectChain { passes }
 }
 
 fn composite_from_realized<'a>(
@@ -658,9 +660,9 @@ fn composite_from_realized<'a>(
     effects: &'a [PassInstance<'a>],
 ) -> CompositeLayer<'a> {
     match r {
-        Realized::Solid { rgba, placement, .. } => {
-            CompositeLayer::solid(*rgba, *placement).with_effects(effects)
-        }
+        Realized::Solid {
+            rgba, placement, ..
+        } => CompositeLayer::solid(*rgba, *placement).with_effects(effects),
         Realized::Bitmap {
             image,
             placement,
@@ -685,9 +687,9 @@ fn composite_from_realized<'a>(
         } => CompositeLayer::rgba(&stills[media], *placement)
             .with_uv(*uv)
             .with_effects(effects),
-        Realized::Sdf { shape, placement, .. } => {
-            CompositeLayer::sdf(*shape, *placement).with_effects(effects)
-        }
+        Realized::Sdf {
+            shape, placement, ..
+        } => CompositeLayer::sdf(*shape, *placement).with_effects(effects),
         Realized::Transition { .. } => unreachable!("transitions handled separately"),
     }
 }

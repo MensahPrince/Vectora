@@ -20,8 +20,8 @@
 
 use cutlass_core::{RationalTime, resample};
 use cutlass_models::{
-    ClipId, ClipSource, ClipTransform, EffectInstance, Generator, MediaKind, Param, Project,
-    Shape, ShapePath, ShapeStroke, TextAlignH, TextStyle as ModelTextStyle,
+    ClipId, ClipSource, ClipTransform, EffectInstance, Generator, MediaKind, Param, Project, Shape,
+    ShapePath, ShapeStroke, TextAlignH, TextStyle as ModelTextStyle,
 };
 use cutlass_shapes::{BezierPath, PathPoint, SDF_AA, SdfParams, Stroke};
 use cutlass_text::{FontFamily, TextAlign, TextStyle};
@@ -96,12 +96,12 @@ fn resolve_track_at(
 ) -> Result<Option<SceneLayer>, cutlass_models::ModelError> {
     // Transition window takes precedence over single-clip resolve.
     for transition in track.transitions() {
-        let left = track.clip(transition.left).ok_or(
-            cutlass_models::ModelError::UnknownClip(transition.left),
-        )?;
-        let right = track.clip(transition.right).ok_or(
-            cutlass_models::ModelError::UnknownClip(transition.right),
-        )?;
+        let left = track
+            .clip(transition.left)
+            .ok_or(cutlass_models::ModelError::UnknownClip(transition.left))?;
+        let right = track
+            .clip(transition.right)
+            .ok_or(cutlass_models::ModelError::UnknownClip(transition.right))?;
         if left.timeline.end_tick() != right.timeline.start.value {
             continue;
         }
@@ -304,9 +304,7 @@ fn pack_effect(fx: &EffectInstance, tick: f64) -> Result<ResolvedPass, cutlass_m
     let spec = fx.spec()?;
     let mut params = Vec::with_capacity(spec.params.len());
     for pspec in spec.params {
-        let value = fx
-            .sample_param(pspec.name, tick)
-            .unwrap_or(pspec.default);
+        let value = fx.sample_param(pspec.name, tick).unwrap_or(pspec.default);
         params.push(value);
     }
     Ok(ResolvedPass {

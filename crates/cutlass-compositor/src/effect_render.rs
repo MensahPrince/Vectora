@@ -4,7 +4,6 @@ use bytemuck::{Pod, Zeroable};
 use wgpu::util::DeviceExt;
 
 use crate::error::CompositorError;
-use crate::layer::{CompositorConfig, LayerPlacement};
 use crate::passes::{PassInstance, effect_is_noop, resolve_transition_pass};
 
 const RT_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8Unorm;
@@ -33,7 +32,7 @@ struct TransitionUniforms {
 pub(crate) struct OffscreenPool {
     pub(crate) width: u32,
     pub(crate) height: u32,
-    textures: [wgpu::Texture; 3],
+    // The views keep the underlying textures alive; no need to store them.
     views: [wgpu::TextureView; 3],
 }
 
@@ -58,13 +57,12 @@ impl OffscreenPool {
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             (texture, view)
         };
-        let (t0, v0) = make("cutlass.offscreen.a");
-        let (t1, v1) = make("cutlass.offscreen.b");
-        let (t2, v2) = make("cutlass.offscreen.c");
+        let (_t0, v0) = make("cutlass.offscreen.a");
+        let (_t1, v1) = make("cutlass.offscreen.b");
+        let (_t2, v2) = make("cutlass.offscreen.c");
         Self {
             width,
             height,
-            textures: [t0, t1, t2],
             views: [v0, v1, v2],
         }
     }
@@ -104,23 +102,18 @@ impl PassRegistry {
 
         let effect_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cutlass.effect.bgl"),
-            entries: &[
-                tex_entry(0),
-                sampler_entry(1),
-                uniform_entry(2),
-            ],
+            entries: &[tex_entry(0), sampler_entry(1), uniform_entry(2)],
         });
 
-        let transition_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("cutlass.transition.bgl"),
-                entries: &[
-                    tex_entry(0),
-                    tex_entry(1),
-                    sampler_entry(2),
-                    uniform_entry(3),
-                ],
-            });
+        let transition_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("cutlass.transition.bgl"),
+            entries: &[
+                tex_entry(0),
+                tex_entry(1),
+                sampler_entry(2),
+                uniform_entry(3),
+            ],
+        });
 
         let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("cutlass.blit.bgl"),
@@ -205,6 +198,7 @@ impl PassRegistry {
 }
 
 /// Run an effect chain on `input` view, ping-ponging through `pool`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_effect_chain<'a>(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
@@ -281,6 +275,7 @@ pub(crate) fn run_effect_chain<'a>(
     current_input
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_transition_pass(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
@@ -390,6 +385,7 @@ pub(crate) fn blit_premultiplied_to_canvas(
     pass.draw(0..6, 0..1);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_effect_pass(
     device: &wgpu::Device,
     encoder: &mut wgpu::CommandEncoder,
@@ -598,25 +594,6 @@ pub(crate) fn draw_layer_to_offscreen(
 /// Returns `true` when the effect chain is empty or all passes are no-ops.
 pub(crate) fn effects_need_offscreen(effects: &[PassInstance<'_>]) -> bool {
     !effects.is_empty() && effects.iter().any(|e| !effect_is_noop(e.id, e.params))
-}
-
-/// Placement for full-canvas offscreen realize (effects/transitions).
-pub(crate) fn offscreen_placement(config: &CompositorConfig) -> LayerPlacement {
-    LayerPlacement::full_canvas(config)
-}
-
-/// Convert straight-alpha RGBA to premultiplied for offscreen compositing.
-pub(crate) fn premultiply_rgba(image: &cutlass_core::RgbaImage) -> Vec<u8> {
-    let n = image.pixels.len();
-    let mut out = vec![0u8; n];
-    for (dst, src) in out.chunks_exact_mut(4).zip(image.pixels.chunks_exact(4)) {
-        let a = u16::from(src[3]);
-        dst[0] = ((u16::from(src[0]) * a + 127) / 255) as u8;
-        dst[1] = ((u16::from(src[1]) * a + 127) / 255) as u8;
-        dst[2] = ((u16::from(src[2]) * a + 127) / 255) as u8;
-        dst[3] = src[3];
-    }
-    out
 }
 
 #[allow(dead_code)]

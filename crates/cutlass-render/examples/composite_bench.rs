@@ -176,7 +176,12 @@ fn bench_compositor_only(
 }
 
 /// Effect-free vs passthrough-chain vs blur at preview resolution.
-fn bench_effect_overhead(gpu: &GpuContext, frame: &cutlass_core::VideoFrame, iters: i64, import: &str) {
+fn bench_effect_overhead(
+    gpu: &GpuContext,
+    frame: &cutlass_core::VideoFrame,
+    iters: i64,
+    import: &str,
+) {
     let (w, h) = (960u32, 540u32);
     println!("effect overhead ({import}) @ {w}x{h}:");
     let config = CompositorConfig::new(w, h);
@@ -219,9 +224,7 @@ fn bench_effect_overhead(gpu: &GpuContext, frame: &cutlass_core::VideoFrame, ite
             baseline_mean = stats.mean;
         }
         let delta = stats.mean - baseline_mean;
-        stats.print(&format!(
-            "  {name:<22} Δ{delta:+.2} ms vs baseline"
-        ));
+        stats.print(&format!("  {name:<22} Δ{delta:+.2} ms vs baseline"));
     }
 }
 

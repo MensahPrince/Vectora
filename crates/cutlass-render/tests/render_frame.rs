@@ -179,6 +179,9 @@ fn crossfade_transition_blends_two_solids_at_midpoint() {
     let image = renderer.render_frame(&project, rt(24)).expect("render");
     let px = image.pixel(960, 540);
     // Mid blend of red + blue → purple-ish, not pure red or blue.
-    assert!(px[0] > 80 && px[2] > 80, "midpoint should blend channels, got {px:?}");
+    assert!(
+        px[0] > 80 && px[2] > 80,
+        "midpoint should blend channels, got {px:?}"
+    );
     assert!(px[0] < 240 && px[2] < 240);
 }
