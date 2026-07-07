@@ -1,4 +1,4 @@
-import { Clip, Sequence, TrackKind, TextClipStyle } from "../models/index.slint";
+import { CatalogEntry, Clip, Sequence, TrackKind, TextClipStyle } from "../models/index.slint";
 
 export struct SelectedClipInfo {
     found: bool,
@@ -56,6 +56,9 @@ export struct AudioSample {
 // Implemented in Rust (`src/inspector.rs`) so nested model traversal
 // stays out of Slint.
 export global InspectorBackend {
+    // Clip-level filter preset catalog, populated once at startup.
+    in-out property <[CatalogEntry]> filter-catalog: [];
+
     pure callback resolve-selection(
         sequence: Sequence,
         track-id: string,
@@ -195,6 +198,36 @@ export global InspectorBackend {
         bottom: float,
         flip-h: bool,
         flip-v: bool,
+    );
+
+    // Set (or clear with an empty id) a visual clip's filter preset. Intensity
+    // is normalized 0..=1; the inspector displays it as 0..=100%.
+    callback set-clip-filter(clip-id: string, filter-id: string, intensity: float);
+
+    // Set all five manual color adjustment sliders in one undoable edit.
+    // Values are normalized -1..=1.
+    callback set-clip-adjust(
+        clip-id: string,
+        brightness: float,
+        contrast: float,
+        saturation: float,
+        exposure: float,
+        temperature: float,
+    );
+
+    // Atomic live preview of the whole look: filter plus all adjustments.
+    // The worker coalesces bursts and clears this session-only override on
+    // the matching commit.
+    callback preview-clip-look(
+        clip-id: string,
+        filter-id: string,
+        intensity: float,
+        brightness: float,
+        contrast: float,
+        saturation: float,
+        exposure: float,
+        temperature: float,
+        tick: int,
     );
 
     // Fit/fill clip helper (M1 canvas settings): re-place the clip centered

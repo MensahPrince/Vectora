@@ -18,9 +18,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
 use cutlass_models::{
-    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, CropRect, Easing, Generator,
-    LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param, ParamValue, Rational,
-    RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
+    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
+    Easing, Filter, Generator, LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param,
+    ParamValue, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
 };
 use cutlass_render::{ExportSettings, RenderError, Renderer};
 use tracing::{debug, error, info, warn};
@@ -222,6 +222,28 @@ enum WorkerMsg {
         crop: CropRect,
         flip_h: bool,
         flip_v: bool,
+    },
+    /// Set (or clear) a visual clip's filter preset. `filter_id == ""`
+    /// clears; intensity is normalized 0..=1. One undoable history entry.
+    SetClipFilter {
+        clip: String,
+        filter_id: String,
+        intensity: f32,
+    },
+    /// Set all five manual color adjustments in one undoable history entry.
+    SetClipAdjust {
+        clip: String,
+        adjust: ColorAdjustments,
+    },
+    /// Live color-grading preview: replace one clip's filter + adjustments
+    /// through the engine's session-only look override. Bursts coalesce to
+    /// the newest like transform/generator overrides.
+    PreviewClipLook {
+        clip: String,
+        filter_id: String,
+        intensity: f32,
+        adjust: ColorAdjustments,
+        tick: i64,
     },
     /// Append a catalog effect to a clip's chain (M4). One undoable entry.
     AddEffect {
@@ -763,6 +785,35 @@ impl WorkerHandle {
         });
     }
 
+    pub fn set_clip_filter(&self, clip: String, filter_id: String, intensity: f32) {
+        let _ = self.tx.send(WorkerMsg::SetClipFilter {
+            clip,
+            filter_id,
+            intensity,
+        });
+    }
+
+    pub fn set_clip_adjust(&self, clip: String, adjust: ColorAdjustments) {
+        let _ = self.tx.send(WorkerMsg::SetClipAdjust { clip, adjust });
+    }
+
+    pub fn preview_clip_look(
+        &self,
+        clip: String,
+        filter_id: String,
+        intensity: f32,
+        adjust: ColorAdjustments,
+        tick: i64,
+    ) {
+        let _ = self.tx.send(WorkerMsg::PreviewClipLook {
+            clip,
+            filter_id,
+            intensity,
+            adjust,
+            tick,
+        });
+    }
+
     pub fn add_effect(&self, clip: String, effect_id: String) {
         let _ = self.tx.send(WorkerMsg::AddEffect { clip, effect_id });
     }
@@ -1203,6 +1254,27 @@ fn worker_loop(
                 flip_h,
                 flip_v,
             } => set_clip_crop_and_publish(engine, &clip, crop, flip_h, flip_v, &ui),
+            WorkerMsg::SetClipFilter {
+                clip,
+                filter_id,
+                intensity,
+            } => set_clip_filter_and_publish(engine, &clip, &filter_id, intensity, &ui),
+            WorkerMsg::SetClipAdjust { clip, adjust } => {
+                set_clip_adjust_and_publish(engine, &clip, adjust, &ui)
+            }
+            // Only reached when a look-preview burst interleaves with another
+            // coalesced gesture's drain. The dedicated loop arm coalesces the
+            // common case.
+            WorkerMsg::PreviewClipLook {
+                clip,
+                filter_id,
+                intensity,
+                adjust,
+                tick,
+            } => {
+                apply_look_override(engine, &clip, &filter_id, intensity, adjust);
+                render_frame(engine, tl_rate, &preview_weak, tick, &fit);
+            }
             WorkerMsg::AddEffect { clip, effect_id } => {
                 add_effect_and_publish(engine, &clip, &effect_id, &ui)
             }
@@ -1586,6 +1658,55 @@ fn worker_loop(
                 }
                 render_frame(engine, tl_rate, &preview_weak, tick, &fit);
             }
+            // Look drags (filter intensity / adjust sliders) carry the whole
+            // grade so preview frames never mix a new adjustment with a stale
+            // filter or vice versa. Coalesce to the newest value like other
+            // inspector preview overrides.
+            WorkerMsg::PreviewClipLook {
+                mut clip,
+                mut filter_id,
+                mut intensity,
+                mut adjust,
+                mut tick,
+            } => {
+                let mut pending = true;
+                while let Ok(next) = req_rx.try_recv() {
+                    match next {
+                        WorkerMsg::Frame(latest) => tick = latest,
+                        WorkerMsg::PreviewClipLook {
+                            clip: c,
+                            filter_id: f,
+                            intensity: i,
+                            adjust: a,
+                            tick: at,
+                        } => {
+                            clip = c;
+                            filter_id = f;
+                            intensity = i;
+                            adjust = a;
+                            tick = at;
+                            pending = true;
+                        }
+                        other => {
+                            if std::mem::take(&mut pending) {
+                                apply_look_override(engine, &clip, &filter_id, intensity, adjust);
+                            }
+                            mutate(
+                                engine,
+                                &mut clipboard,
+                                &mut main_magnet,
+                                &mut linkage,
+                                other,
+                            )
+                        }
+                    }
+                }
+                last_tick = tick;
+                if pending {
+                    apply_look_override(engine, &clip, &filter_id, intensity, adjust);
+                }
+                render_frame(engine, tl_rate, &preview_weak, tick, &fit);
+            }
             // The preview panel resized (or first laid out): renders now fit
             // the new bound. Repaint the current frame only when the bucketed
             // size actually changed — live window resizes report every frame.
@@ -1680,6 +1801,8 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::SetSpeedCurve { .. }
             | WorkerMsg::SetSpeedCurvePoint { .. }
             | WorkerMsg::SetClipCrop { .. }
+            | WorkerMsg::SetClipFilter { .. }
+            | WorkerMsg::SetClipAdjust { .. }
             // Effects and transitions repaint the canvas at the playhead.
             | WorkerMsg::AddEffect { .. }
             | WorkerMsg::RemoveEffect { .. }
@@ -1834,6 +1957,63 @@ fn apply_generator_override(engine: &mut Engine, clip: &str, generator: Generato
     match parse_raw_id(clip).map(ClipId::from_raw) {
         Some(id) => engine.set_generator_override(Some((id, generator))),
         None => error!(clip, "generator override ignored: unparsable clip id"),
+    }
+}
+
+/// Point the engine's look override at `clip` (raw id) for the next renders —
+/// the live preview of an uncommitted filter/adjustment edit. Unparsable ids
+/// are dropped (stale projection race), same as the other overrides.
+fn apply_look_override(
+    engine: &mut Engine,
+    clip: &str,
+    filter_id: &str,
+    intensity: f32,
+    adjust: ColorAdjustments,
+) {
+    match parse_raw_id(clip).map(ClipId::from_raw) {
+        Some(id) => engine.set_look_override(Some((
+            id,
+            filter_from_ui(filter_id, intensity),
+            sanitize_adjustments(adjust),
+        ))),
+        None => error!(clip, "look override ignored: unparsable clip id"),
+    }
+}
+
+fn filter_from_ui(filter_id: &str, intensity: f32) -> Option<Filter> {
+    let id = filter_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(Filter {
+        id: id.to_string(),
+        intensity: clamp_unit(intensity),
+    })
+}
+
+fn sanitize_adjustments(adjust: ColorAdjustments) -> ColorAdjustments {
+    ColorAdjustments {
+        brightness: clamp_signed_unit(adjust.brightness),
+        contrast: clamp_signed_unit(adjust.contrast),
+        saturation: clamp_signed_unit(adjust.saturation),
+        exposure: clamp_signed_unit(adjust.exposure),
+        temperature: clamp_signed_unit(adjust.temperature),
+    }
+}
+
+fn clamp_unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn clamp_signed_unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -2935,6 +3115,58 @@ fn set_clip_crop_and_publish(
         x = crop.x, y = crop.y, w = crop.w, h = crop.h, flip_h, flip_v,
         "set clip crop"
     );
+    publish_projection(engine, ui);
+}
+
+/// Set or clear a visual clip's filter preset. A live look drag may have left
+/// an override in place; clear it first so the commit becomes authoritative.
+fn set_clip_filter_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    filter_id: &str,
+    intensity: f32,
+    ui: &UiSink,
+) {
+    engine.set_look_override(None);
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-filter ignored: unparsable clip id");
+        return;
+    };
+    let filter = filter_from_ui(filter_id, intensity);
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipFilter {
+        clip: clip_id,
+        filter: filter.clone(),
+    })) {
+        error!(%clip_id, filter_id, intensity, "set clip filter failed: {e}");
+        return;
+    }
+    info!(%clip_id, ?filter, "set clip filter");
+    publish_projection(engine, ui);
+}
+
+/// Set all manual color adjustments on a visual clip in one undoable edit.
+/// Release commits clear the live look override first, mirroring generator
+/// and transform preview semantics.
+fn set_clip_adjust_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    adjust: ColorAdjustments,
+    ui: &UiSink,
+) {
+    engine.set_look_override(None);
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-adjust ignored: unparsable clip id");
+        return;
+    };
+    let adjust = sanitize_adjustments(adjust);
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipAdjustments {
+        clip: clip_id,
+        adjust,
+    })) {
+        error!(%clip_id, ?adjust, "set clip adjustments failed: {e}");
+        return;
+    }
+    info!(%clip_id, ?adjust, "set clip adjustments");
     publish_projection(engine, ui);
 }
 

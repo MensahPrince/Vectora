@@ -1628,6 +1628,59 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
+    let set_filter_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_clip_filter(move |clip_id, filter_id, intensity| {
+            set_filter_handle.set_clip_filter(
+                clip_id.to_string(),
+                filter_id.to_string(),
+                intensity,
+            );
+        });
+
+    let set_adjust_handle = preview_worker.handle();
+    app.global::<InspectorBackend>().on_set_clip_adjust(
+        move |clip_id, brightness, contrast, saturation, exposure, temperature| {
+            set_adjust_handle.set_clip_adjust(
+                clip_id.to_string(),
+                cutlass_models::ColorAdjustments {
+                    brightness,
+                    contrast,
+                    saturation,
+                    exposure,
+                    temperature,
+                },
+            );
+        },
+    );
+
+    let preview_look_handle = preview_worker.handle();
+    app.global::<InspectorBackend>().on_preview_clip_look(
+        move |clip_id,
+              filter_id,
+              intensity,
+              brightness,
+              contrast,
+              saturation,
+              exposure,
+              temperature,
+              tick| {
+            preview_look_handle.preview_clip_look(
+                clip_id.to_string(),
+                filter_id.to_string(),
+                intensity,
+                cutlass_models::ColorAdjustments {
+                    brightness,
+                    contrast,
+                    saturation,
+                    exposure,
+                    temperature,
+                },
+                i64::from(tick),
+            );
+        },
+    );
+
     let fit_clip_handle = preview_worker.handle();
     app.global::<InspectorBackend>()
         .on_fit_clip(move |clip_id, fill, tick| {
@@ -1709,8 +1762,19 @@ fn main() -> Result<(), slint::PlatformError> {
             ModelRc::new(VecModel::from(filtered))
         });
 
-    // Effects & transitions: fill the Library catalogs once, then route the
-    // inspector/timeline edits through the engine's undoable commands.
+    // Filter, effect & transition catalogs are filled once from the model
+    // catalogs, then inspector/timeline edits route to undoable commands.
+    {
+        let inspector = app.global::<InspectorBackend>();
+        let filter_rows: Vec<CatalogEntry> = cutlass_models::filter_catalog()
+            .iter()
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector.set_filter_catalog(ModelRc::new(VecModel::from(filter_rows)));
+    }
     {
         let effects = app.global::<EffectsBackend>();
         let effect_rows: Vec<CatalogEntry> = cutlass_models::effect_catalog()
