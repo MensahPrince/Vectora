@@ -1254,6 +1254,22 @@ fn main() -> Result<(), slint::PlatformError> {
         },
     );
 
+    app.global::<PreviewBackend>().on_sprite_placement(
+        |sequence, clip_id, tick, view_w, view_h, zoom, pan_x, pan_y, gesture_active, gesture| {
+            preview_select::sprite_placement_in_viewport(
+                &sequence,
+                clip_id.as_str(),
+                tick,
+                view_w,
+                view_h,
+                zoom,
+                pan_x,
+                pan_y,
+                gesture_active.then_some(&gesture),
+            )
+        },
+    );
+
     app.global::<PreviewBackend>().on_resolve_drag(
         |sequence,
          clip_id,
@@ -1439,6 +1455,16 @@ fn main() -> Result<(), slint::PlatformError> {
             );
         },
     );
+
+    let gesture_start_handle = preview_worker.handle();
+    editor.on_on_preview_gesture_started(move |clip_id, tick| {
+        gesture_start_handle.begin_transform_gesture(clip_id.to_string(), i64::from(tick));
+    });
+
+    let gesture_abandon_handle = preview_worker.handle();
+    editor.on_on_preview_gesture_abandoned(move || {
+        gesture_abandon_handle.end_transform_gesture();
+    });
 
     let override_clear_handle = preview_worker.handle();
     editor.on_on_preview_override_cleared(move |tick| {

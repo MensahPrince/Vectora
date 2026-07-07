@@ -278,6 +278,14 @@ enum WorkerMsg {
         transform: ClipTransform,
         tick: i64,
     },
+    /// Render partitioned below/sprite/above frames once for a zero-drift
+    /// transform gesture. On failure the per-move override path is used.
+    BeginTransformGesture {
+        clip: String,
+        tick: i64,
+    },
+    /// Press ended without a drag: drop prepared sprite frames.
+    EndTransformGesture,
     /// Drop the gesture override (no-op release / cancelled drag) and
     /// re-render `tick` from committed state.
     ClearTransformOverride {
@@ -849,6 +857,14 @@ impl WorkerHandle {
         });
     }
 
+    pub fn begin_transform_gesture(&self, clip: String, tick: i64) {
+        let _ = self.tx.send(WorkerMsg::BeginTransformGesture { clip, tick });
+    }
+
+    pub fn end_transform_gesture(&self) {
+        let _ = self.tx.send(WorkerMsg::EndTransformGesture);
+    }
+
     pub fn clear_transform_override(&self, tick: i64) {
         let _ = self.tx.send(WorkerMsg::ClearTransformOverride { tick });
     }
@@ -1052,6 +1068,9 @@ fn worker_loop(
     // it current; edits re-render here so the composite reflects a delete,
     // generator change, etc. without waiting for the user to move the playhead.
     let mut last_tick: i64 = 0;
+    // Zero-drift transform gesture: partitioned frames are on the UI thread;
+    // per-move worker renders are suppressed until commit/cancel.
+    let sprite_mode = Cell::new(false);
     // One export job at a time. `active` outlives jobs (the export thread
     // clears it when it exits); `cancel` flags the running job to stop.
     let export_state = ExportJobState::default();
@@ -1210,7 +1229,14 @@ fn worker_loop(
             } => set_canvas_and_publish(engine, aspect_index, background, &ui),
             WorkerMsg::ClearTransformOverride { tick } => {
                 engine.set_transform_override(None);
-                render_frame(engine, tl_rate, &preview_weak, tick, &fit);
+                render_frame_exit_sprite(
+                    engine,
+                    tl_rate,
+                    &preview_weak,
+                    tick,
+                    &fit,
+                    &sprite_mode,
+                );
             }
             WorkerMsg::ClearGeneratorOverride { tick } => {
                 engine.set_generator_override(None);
@@ -1242,7 +1268,14 @@ fn worker_loop(
                 // flattened (M2 compose semantics).
                 let at = RationalTime::new(tick, tl_rate);
                 set_transform_and_publish(engine, &clip, transform, at, &ui);
-                render_frame(engine, tl_rate, &preview_weak, tick, &fit);
+                render_frame_exit_sprite(
+                    engine,
+                    tl_rate,
+                    &preview_weak,
+                    tick,
+                    &fit,
+                    &sprite_mode,
+                );
             }
             WorkerMsg::FitClip { clip, fill, tick } => {
                 fit_clip_and_publish(engine, &clip, fill, tick, tl_rate, &ui);
@@ -1341,6 +1374,9 @@ fn worker_loop(
             WorkerMsg::TransformOverride { .. } => {
                 unreachable!("overrides are handled by the drain below")
             }
+            WorkerMsg::BeginTransformGesture { .. } | WorkerMsg::EndTransformGesture => {
+                unreachable!("gesture lifecycle is handled in the main loop")
+            }
         }
     };
 
@@ -1382,6 +1418,24 @@ fn worker_loop(
                 }
                 last_tick = tick;
                 render_frame(engine, tl_rate, &preview_weak, tick, &fit);
+            }
+            WorkerMsg::BeginTransformGesture { clip, tick } => {
+                last_tick = tick;
+                begin_transform_gesture(
+                    engine,
+                    &clip,
+                    tick,
+                    tl_rate,
+                    &preview_weak,
+                    &fit,
+                    &sprite_mode,
+                );
+            }
+            WorkerMsg::EndTransformGesture => {
+                if sprite_mode.get() {
+                    sprite_mode.set(false);
+                    clear_gesture_sprite_ready(&preview_weak);
+                }
             }
             // Drag-gesture overrides arrive at pointer-move rate; render only
             // the newest one (same coalescing as scrub frames) so a fast drag
@@ -1430,7 +1484,11 @@ fn worker_loop(
                 if pending {
                     apply_transform_override(engine, &clip, transform);
                 }
-                render_frame(engine, tl_rate, &preview_weak, tick, &fit);
+                if sprite_mode.get() {
+                    // UI-side sprite compositing owns mid-gesture pixels.
+                } else {
+                    render_frame(engine, tl_rate, &preview_weak, tick, &fit);
+                }
             }
             // Live inspector edits (font-size drag) arrive at pointer-move
             // rate; coalesce to the newest like transform overrides do.
@@ -4862,6 +4920,109 @@ impl FrameFit {
             self.tier.set(tier - 1);
             self.avg_ms.set(0.0);
             debug!(tier = tier - 1, avg_ms = next, "preview quality tier up");
+        }
+    }
+}
+
+fn clear_gesture_sprite_ready(preview_weak: &slint::Weak<PreviewStore<'static>>) {
+    let weak = preview_weak.clone();
+    if let Err(e) = slint::invoke_from_event_loop(move || {
+        if let Some(store) = weak.upgrade() {
+            store.set_gesture_sprite_ready(false);
+        }
+    }) {
+        error!("failed to clear gesture sprite mode on UI: {e}");
+    }
+}
+
+fn begin_transform_gesture(
+    engine: &mut Engine,
+    clip: &str,
+    tick: i64,
+    tl_rate: Rational,
+    preview_weak: &slint::Weak<PreviewStore<'static>>,
+    fit: &FrameFit,
+    sprite_mode: &Cell<bool>,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "begin transform gesture ignored: unparsable clip id");
+        return;
+    };
+    let at = RationalTime::new(tick, tl_rate);
+    let started = Instant::now();
+    let result = match fit.fit_bound() {
+        Some((max_w, max_h)) => engine.get_gesture_frames(at, clip_id, max_w, max_h),
+        None => Ok(None),
+    };
+    match result {
+        Ok(Some(frames)) => {
+            fit.note_render_cost(started.elapsed());
+            sprite_mode.set(true);
+            let weak = preview_weak.clone();
+            if let Err(e) = slint::invoke_from_event_loop(move || {
+                if let Some(store) = weak.upgrade() {
+                    store.set_gesture_frame_below(crate::preview::to_slint_image(frames.below));
+                    store.set_gesture_frame_sprite(crate::preview::to_slint_image(frames.sprite));
+                    if let Some(above) = frames.above {
+                        store.set_gesture_frame_above(crate::preview::to_slint_image(above));
+                        store.set_gesture_has_above(true);
+                    } else {
+                        store.set_gesture_has_above(false);
+                    }
+                    store.set_gesture_sprite_ready(true);
+                }
+            }) {
+                error!("failed to deliver gesture frames to UI: {e}");
+                sprite_mode.set(false);
+            }
+        }
+        Ok(None) => {
+            debug!(%clip_id, tick, "gesture sprite unavailable; using override path");
+            sprite_mode.set(false);
+        }
+        Err(e) => {
+            error!(%clip_id, tick, "gesture frame render failed: {e}");
+            sprite_mode.set(false);
+        }
+    }
+}
+
+fn render_frame_exit_sprite(
+    engine: &mut Engine,
+    tl_rate: Rational,
+    preview_weak: &slint::Weak<PreviewStore<'static>>,
+    tick: i64,
+    fit: &FrameFit,
+    sprite_mode: &Cell<bool>,
+) {
+    let clear_sprite = sprite_mode.get();
+    sprite_mode.set(false);
+    let at = RationalTime::new(tick, tl_rate);
+    let started = Instant::now();
+    let result = match fit.fit_bound() {
+        Some((max_w, max_h)) => engine.get_frame_fit(at, max_w, max_h),
+        None => engine.get_frame(at),
+    };
+    match result {
+        Ok(frame) => {
+            fit.note_render_cost(started.elapsed());
+            let weak = preview_weak.clone();
+            if let Err(e) = slint::invoke_from_event_loop(move || {
+                if let Some(store) = weak.upgrade() {
+                    if clear_sprite {
+                        store.set_gesture_sprite_ready(false);
+                    }
+                    store.set_frame(crate::preview::to_slint_image(frame));
+                }
+            }) {
+                error!("failed to deliver preview frame to UI: {e}");
+            }
+        }
+        Err(e) => {
+            if clear_sprite {
+                clear_gesture_sprite_ready(preview_weak);
+            }
+            error!(tick, "preview frame failed: {e}");
         }
     }
 }

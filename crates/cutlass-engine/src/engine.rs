@@ -250,6 +250,24 @@ impl Engine {
         )?)
     }
 
+    /// Partitioned gesture frames for zero-drift preview transform drags.
+    /// See [`cutlass_render::Renderer::render_gesture_frames`].
+    pub fn get_gesture_frames(
+        &mut self,
+        time: RationalTime,
+        clip_id: ClipId,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Option<cutlass_render::GestureFrames>, EngineError> {
+        Ok(self.renderer.render_gesture_frames(
+            &self.project,
+            time,
+            clip_id,
+            max_width,
+            max_height,
+        )?)
+    }
+
     pub fn undo(&mut self) -> bool {
         debug_assert!(
             !self.history.in_group(),

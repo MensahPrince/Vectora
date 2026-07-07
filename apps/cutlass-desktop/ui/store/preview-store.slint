@@ -28,4 +28,11 @@ export global PreviewStore {
     in-out property <bool> gesture-commit-pending: false;
     in-out property <string> gesture-clip;
     in-out property <PreviewDragResolution> gesture;
+
+    // Zero-drift transform gesture: partitioned frames rendered once at press.
+    in-out property <image> gesture-frame-below;
+    in-out property <image> gesture-frame-sprite;
+    in-out property <image> gesture-frame-above;
+    in-out property <bool> gesture-sprite-ready: false;
+    in-out property <bool> gesture-has-above: false;
 }

@@ -50,6 +50,78 @@ pub struct ResolveOverrides<'a> {
     pub generator: Option<(ClipId, &'a Generator)>,
 }
 
+/// Identity transform used when rasterizing the gesture sprite: the clip's
+/// pixels at scale 1, centered on the canvas, with no rotation.
+pub const GESTURE_IDENTITY_TRANSFORM: ClipTransform = ClipTransform {
+    position: [0.0, 0.0],
+    anchor_point: [0.5, 0.5],
+    scale: 1.0,
+    rotation: 0.0,
+    opacity: 1.0,
+};
+
+/// Three scene partitions for zero-drift preview transform gestures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GestureScenePartition {
+    /// Layers below the dragged clip over the canvas background.
+    pub below: Scene,
+    /// The dragged clip alone at [`GESTURE_IDENTITY_TRANSFORM`].
+    pub sprite: Scene,
+    /// Layers above the dragged clip (may be empty).
+    pub above: Scene,
+}
+
+/// Resolve the scene at `t`, force `clip_id`'s transform to identity, and
+/// split the stack into below / sprite / above partitions. Returns `None` when
+/// the clip isn't composited at `t`, sits inside a transition window, or
+/// otherwise can't be sprite-partitioned (caller falls back to per-move
+/// override rendering).
+pub fn resolve_gesture_partitions(
+    project: &Project,
+    t: RationalTime,
+    clip_id: ClipId,
+) -> Result<Option<GestureScenePartition>, cutlass_models::ModelError> {
+    let overrides = ResolveOverrides {
+        transform: Some((clip_id, GESTURE_IDENTITY_TRANSFORM)),
+        generator: None,
+    };
+    let scene = resolve_with(project, t, overrides)?;
+    let index = scene
+        .layers
+        .iter()
+        .position(|layer| layer.clip == Some(clip_id));
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    if matches!(
+        scene.layers[index].source,
+        LayerSource::Transition { .. }
+    ) {
+        return Ok(None);
+    }
+
+    Ok(Some(GestureScenePartition {
+        below: Scene {
+            width: scene.width,
+            height: scene.height,
+            background: scene.background,
+            layers: scene.layers[..index].to_vec(),
+        },
+        sprite: Scene {
+            width: scene.width,
+            height: scene.height,
+            background: [0, 0, 0, 0],
+            layers: vec![scene.layers[index].clone()],
+        },
+        above: Scene {
+            width: scene.width,
+            height: scene.height,
+            background: [0, 0, 0, 0],
+            layers: scene.layers[index + 1..].to_vec(),
+        },
+    }))
+}
+
 /// Resolve `project` at timeline instant `t` into a [`Scene`].
 ///
 /// `t` is interpreted at the timeline frame rate (it is resampled to it first),
@@ -130,6 +202,7 @@ fn resolve_track_at(
                     )
                 })?;
             return Ok(Some(SceneLayer {
+                clip: None,
                 source: LayerSource::Transition {
                     outgoing,
                     incoming,
@@ -264,6 +337,7 @@ fn resolve_clip(
                 src.height as f32 * fit * xf.scale,
             ]);
             Ok(Some(SceneLayer {
+                clip: Some(clip.id),
                 source,
                 center,
                 anchor_point,
@@ -296,7 +370,11 @@ fn resolve_clip(
                 xf.scale,
                 local_tick,
                 effects,
-            ))
+            )
+            .map(|mut layer| {
+                layer.clip = Some(clip.id);
+                layer
+            }))
         }
     }
 }
@@ -346,6 +424,7 @@ pub(crate) fn resolve_generator(
                 return None;
             }
             Some(SceneLayer {
+                clip: None,
                 source: LayerSource::Text {
                     content: text,
                     style: map_text_style(style, cw, ch),
@@ -363,6 +442,7 @@ pub(crate) fn resolve_generator(
             })
         }
         Generator::SolidColor { rgba } => Some(SceneLayer {
+            clip: None,
             source: LayerSource::Solid(*rgba),
             center,
             anchor_point,
@@ -453,6 +533,7 @@ fn resolve_shape(
             px_scale
         };
         return Some(SceneLayer {
+            clip: None,
             source: LayerSource::PathShape {
                 path: bezier,
                 fill,
@@ -487,6 +568,7 @@ fn resolve_shape(
     // Plain rectangles keep the no-texture solid fast path.
     if matches!(shape, Shape::Rectangle) && radius == 0.0 && stroke_px.is_none() {
         return Some(SceneLayer {
+            clip: None,
             source: LayerSource::Solid(fill),
             center,
             anchor_point,
@@ -523,6 +605,7 @@ fn resolve_shape(
     // shader's ink clips at the quad edge (same margin as the CPU raster).
     let pad = stroke_px.map_or(0.0, |s| s.width * 0.5) + 2.0 * SDF_AA;
     Some(SceneLayer {
+        clip: None,
         source: LayerSource::Shape {
             params,
             fill,
@@ -891,6 +974,7 @@ mod tests {
     #[test]
     fn quad_center_rotates_about_the_anchor() {
         let layer = SceneLayer {
+            clip: None,
             source: LayerSource::Solid([255, 255, 255, 255]),
             center: [960.0, 540.0],
             anchor_point: [0.0, 0.0],
@@ -1461,5 +1545,72 @@ mod tests {
         let scene = resolve(&project, rt(0)).unwrap();
         assert_eq!(scene.layers.len(), 1);
         assert!(matches!(scene.layers[0].source, LayerSource::Solid(_)));
+    }
+
+    #[test]
+    fn gesture_partitions_split_stack_and_apply_identity_to_sprite() {
+        let mut project = Project::new("p", FPS_24);
+        let media_a = project.add_media(video(1920, 1080));
+        let media_b = project.add_media(video(1280, 720));
+        let bottom_track = project.add_track(TrackKind::Video, "V1");
+        let top_track = project.add_track(TrackKind::Video, "V2");
+        let bottom = project
+            .add_clip(bottom_track, media_a, tr(0, 100), rt(0))
+            .unwrap();
+        let top = project
+            .add_clip(top_track, media_b, tr(0, 100), rt(0))
+            .unwrap();
+
+        let parts = resolve_gesture_partitions(&project, rt(5), top)
+            .unwrap()
+            .expect("top clip should partition");
+        assert_eq!(parts.below.layers.len(), 1);
+        assert_eq!(parts.below.layers[0].clip, Some(bottom));
+        assert_eq!(parts.sprite.layers.len(), 1);
+        assert_eq!(parts.sprite.layers[0].clip, Some(top));
+        assert!(parts.above.layers.is_empty());
+        assert_eq!(parts.below.background[3], 255);
+        assert_eq!(parts.sprite.background, [0, 0, 0, 0]);
+        assert_eq!(parts.above.background, [0, 0, 0, 0]);
+        approx2(parts.sprite.layers[0].center, [960.0, 540.0]);
+        match parts.sprite.layers[0].size {
+            SizeSpec::Fixed(size) => {
+                // 1280×720 aspect-fits into 1920×1080, then × identity scale 1.
+                approx(size[0], 1920.0);
+                approx(size[1], 1080.0);
+            }
+            other => panic!("expected fixed size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gesture_partitions_return_none_inside_transition_window() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let left = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 24),
+            )
+            .unwrap();
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
+                tr(24, 24),
+            )
+            .unwrap();
+        project.add_transition(left, "crossfade").unwrap();
+
+        assert!(
+            resolve_gesture_partitions(&project, rt(12), left)
+                .unwrap()
+                .is_none()
+        );
     }
 }

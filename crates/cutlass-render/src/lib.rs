@@ -29,6 +29,9 @@ pub use export::{
     export_observed, export_to_file, export_to_file_observed,
 };
 pub use export_audio::{EXPORT_AUDIO_CHANNELS, EXPORT_AUDIO_RATE, ExportAudioMixer};
-pub use render::Renderer;
-pub use resolve::{ResolveOverrides, canvas_size, resolve, resolve_with};
+pub use render::{GestureFrames, Renderer};
+pub use resolve::{
+    GESTURE_IDENTITY_TRANSFORM, GestureScenePartition, ResolveOverrides, canvas_size, resolve,
+    resolve_gesture_partitions, resolve_with,
+};
 pub use scene::{LayerSource, Scene, SceneLayer, SizeSpec};

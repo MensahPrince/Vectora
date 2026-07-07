@@ -9,7 +9,7 @@
 //! while [`Renderer`](crate::Renderer) does the decode + rasterize + composite.
 
 use cutlass_compositor::ColorGrade;
-use cutlass_models::{ChromaKey, Mask, MediaId};
+use cutlass_models::{ChromaKey, ClipId, Mask, MediaId};
 use cutlass_shapes::{BezierPath, SdfParams, Stroke};
 use cutlass_text::TextStyle;
 
@@ -29,7 +29,8 @@ pub struct Scene {
     pub width: u32,
     /// Canvas height in pixels.
     pub height: u32,
-    /// Opaque background the canvas clears to before layers composite over it.
+    /// Canvas clear color before layers composite. Alpha 0 is supported for
+    /// gesture sprite/foreground passes that stack over an opaque backdrop.
     pub background: [u8; 4],
     /// Layers in bottom-to-top stacking order (index 0 draws first).
     pub layers: Vec<SceneLayer>,
@@ -131,6 +132,9 @@ fn scaled_dim(dim: u32, factor: f32) -> u32 {
 /// One placed layer: a pixel source plus where it lands on the canvas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneLayer {
+    /// Originating timeline clip, when this layer maps 1:1 to one clip.
+    /// `None` for transition composites and other multi-source layers.
+    pub clip: Option<ClipId>,
     /// What to draw.
     pub source: LayerSource,
     /// Canvas position of the content's anchor point (+x right, +y down) —
@@ -256,6 +260,7 @@ mod tests {
 
     fn media_layer(center: [f32; 2], size: [f32; 2]) -> SceneLayer {
         SceneLayer {
+            clip: None,
             source: LayerSource::Media {
                 media: MediaId::from_raw(1),
                 source_time: RationalTime::new(0, Rational::FPS_30),
@@ -275,6 +280,7 @@ mod tests {
 
     fn shape_layer() -> SceneLayer {
         SceneLayer {
+            clip: None,
             source: LayerSource::Shape {
                 params: SdfParams::Ellipse,
                 fill: [255, 0, 0, 255],
@@ -299,6 +305,7 @@ mod tests {
 
     fn text_layer() -> SceneLayer {
         SceneLayer {
+            clip: None,
             source: LayerSource::Text {
                 content: "hi".into(),
                 style: TextStyle::new(48.0),

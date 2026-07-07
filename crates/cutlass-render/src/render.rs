@@ -15,12 +15,12 @@ use cutlass_compositor::{
 };
 use cutlass_core::{RationalTime, VideoDecoder, VideoFrame};
 use cutlass_decoder::OutputMode;
-use cutlass_models::{MaskKind, MediaId, Project};
+use cutlass_models::{ClipId, MaskKind, MediaId, Project};
 use cutlass_shapes::{PathRaster, ShapeStyle};
 use cutlass_text::TextRenderer;
 
 use crate::error::RenderError;
-use crate::resolve::{ResolveOverrides, resolve, resolve_with};
+use crate::resolve::{ResolveOverrides, resolve, resolve_gesture_partitions, resolve_with};
 use crate::scene::{LayerSource, ResolvedPass, Scene, SizeSpec};
 
 /// Renders project frames on a headless (or shared) GPU.
@@ -126,6 +126,49 @@ impl Renderer {
         let mut scene = resolve_with(project, t, overrides)?;
         scene.fit_within(max_width, max_height);
         self.render_scene(project, &scene)
+    }
+
+    /// Partitioned preview frames for a zero-drift transform gesture: layers
+    /// below the clip (opaque background), the clip alone at identity
+    /// transform (transparent background), and layers above (transparent).
+    /// Each pass is fit to `max_width`×`max_height`. Returns `None` when the
+    /// clip can't be partitioned (transitions, etc.).
+    pub fn render_gesture_frames(
+        &mut self,
+        project: &Project,
+        t: RationalTime,
+        clip_id: ClipId,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Option<GestureFrames>, RenderError> {
+        let Some(partitions) = resolve_gesture_partitions(project, t, clip_id)? else {
+            return Ok(None);
+        };
+
+        let mut below = partitions.below;
+        below.fit_within(max_width, max_height);
+        let below = self.render_scene(project, &below)?;
+
+        let mut sprite_scene = partitions.sprite;
+        sprite_scene.fit_within(max_width, max_height);
+        let mut sprite = self.render_scene(project, &sprite_scene)?;
+        straighten_alpha(&mut sprite);
+
+        let above = if partitions.above.layers.is_empty() {
+            None
+        } else {
+            let mut above_scene = partitions.above;
+            above_scene.fit_within(max_width, max_height);
+            let mut image = self.render_scene(project, &above_scene)?;
+            straighten_alpha(&mut image);
+            Some(image)
+        };
+
+        Ok(Some(GestureFrames {
+            below,
+            sprite,
+            above,
+        }))
     }
 
     /// [`render_frame`](Self::render_frame) at an exact output size: content
@@ -844,6 +887,28 @@ fn fixed_size(size: SizeSpec, canvas: [f32; 2]) -> [f32; 2] {
     match size {
         SizeSpec::Fixed(s) => s,
         SizeSpec::BitmapScaled(_) => canvas,
+    }
+}
+
+/// Three fit-sized RGBA images for a zero-drift preview transform gesture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GestureFrames {
+    pub below: RgbaImage,
+    pub sprite: RgbaImage,
+    pub above: Option<RgbaImage>,
+}
+
+/// Convert premultiplied RGBA readbacks into straight alpha for Slint.
+fn straighten_alpha(image: &mut RgbaImage) {
+    for chunk in image.pixels.chunks_exact_mut(4) {
+        let a = chunk[3];
+        if a == 0 || a == 255 {
+            continue;
+        }
+        let af = f32::from(a) / 255.0;
+        for c in &mut chunk[..3] {
+            *c = ((*c as f32 / af).round() as u32).min(255) as u8;
+        }
     }
 }
 
