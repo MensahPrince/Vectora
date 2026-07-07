@@ -26,11 +26,13 @@
 //!   [`CompositorError::UnsupportedFormat`].
 
 mod compositor;
+mod effect_render;
 mod error;
 mod gpu;
 mod layer;
 #[cfg(target_vendor = "apple")]
 mod metal_import;
+mod passes;
 
 pub use compositor::Compositor;
 pub use cutlass_core::RgbaImage;
@@ -38,6 +40,10 @@ pub use cutlass_shapes::{SdfParams, SdfShape, Stroke};
 pub use error::CompositorError;
 pub use gpu::GpuContext;
 pub use layer::{
-    ColorGrade, CompositeLayer, CompositorConfig, FULL_UV, LayerChromaKey, LayerContent,
-    LayerEffects, LayerMask, LayerPlacement, SdfLayer, mask_kind,
+    ColorGrade, CompositeLayer, CompositorConfig, CompositorLayer, FULL_UV, LayerChromaKey,
+    LayerContent, LayerEffects, LayerMask, LayerPlacement, SdfLayer, mask_kind,
+};
+pub use passes::{
+    PassCoverage, PassDescriptor, PassInstance, effect_coverage, effect_descriptors,
+    effect_is_noop, resolve_transition_pass, transition_coverage, transition_ids,
 };

@@ -18,10 +18,15 @@ use cutlass_core::{
     CpuImage, FrameData, MatrixCoefficients, PixelFormat, Plane, RgbaImage, VideoFrame,
 };
 
+use crate::effect_render::{
+    OffscreenPool, PassRegistry, blit_premultiplied_to_canvas, draw_layer_to_offscreen,
+    effects_need_offscreen, run_effect_chain, run_transition_pass,
+};
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
 use crate::layer::{
-    ColorGrade, CompositeLayer, CompositorConfig, LayerContent, LayerEffects, LayerPlacement,
+    ColorGrade, CompositeLayer, CompositorConfig, CompositorLayer, LayerContent, LayerEffects,
+    LayerPlacement,
 };
 
 /// Canvas pixel format. Plain (non-sRGB) `Unorm`: the YUV shader already emits
@@ -177,6 +182,8 @@ pub struct Compositor {
     sdf_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     target: Option<TargetCache>,
+    pass_registry: PassRegistry,
+    offscreen: Option<OffscreenPool>,
     /// Maps Apple `CVPixelBuffer` GPU surfaces into `wgpu` textures with no CPU
     /// copy. `None` when the device isn't a Metal device (e.g. a software
     /// adapter) — GPU frames then fall back to [`CompositorError::UnsupportedFormat`]
@@ -359,6 +366,8 @@ impl Compositor {
             sdf_layout,
             sampler,
             target: None,
+            pass_registry: PassRegistry::new(device),
+            offscreen: None,
             #[cfg(target_vendor = "apple")]
             metal_import: crate::metal_import::MetalSurfaceImporter::new(gpu),
         }
@@ -411,6 +420,17 @@ impl Compositor {
         });
     }
 
+    fn ensure_offscreen(&mut self, device: &wgpu::Device, width: u32, height: u32) {
+        if self
+            .offscreen
+            .as_ref()
+            .is_some_and(|o| o.width == width && o.height == height)
+        {
+            return;
+        }
+        self.offscreen = Some(OffscreenPool::ensure(device, width, height));
+    }
+
     /// Composite `layers` (bottom-to-top) onto a cleared canvas and read it
     /// back. The canvas texture and readback buffer are cached on `self` and
     /// reused while the render size stays the same.
@@ -420,6 +440,17 @@ impl Compositor {
         config: &CompositorConfig,
         layers: &[CompositeLayer<'_>],
     ) -> Result<RgbaImage, CompositorError> {
+        let items: Vec<CompositorLayer<'_>> = layers.iter().map(CompositorLayer::layer).collect();
+        self.render_compositor_layers(gpu, config, &items)
+    }
+
+    /// Composite with effect chains and transitions.
+    pub fn render_compositor_layers(
+        &mut self,
+        gpu: &GpuContext,
+        config: &CompositorConfig,
+        layers: &[CompositorLayer<'_>],
+    ) -> Result<RgbaImage, CompositorError> {
         if config.width == 0 || config.height == 0 {
             return Err(CompositorError::InvalidDimensions {
                 width: config.width,
@@ -428,26 +459,23 @@ impl Compositor {
         }
 
         let device = &gpu.device;
-
-        // Build every layer's GPU resources before the pass so they outlive it.
-        let mut built = Vec::with_capacity(layers.len());
-        for layer in layers {
-            built.push(self.build_layer(gpu, config, layer)?);
-        }
-
         self.ensure_target(device, config.width, config.height);
+        self.ensure_offscreen(device, config.width, config.height);
         let target = self
             .target
             .as_ref()
             .expect("ensure_target populates the cache");
+        let offscreen = self.offscreen.as_ref().expect("offscreen pool");
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("cutlass.encoder"),
         });
+
+        // Clear canvas.
         {
             let bg = config.background;
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("cutlass.pass"),
+            let _clear = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("cutlass.clear"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target.view,
                     depth_slice: None,
@@ -467,24 +495,144 @@ impl Compositor {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+        }
 
-            for layer in &built {
-                let pipeline = match layer.pipeline {
-                    LayerPipeline::Yuv => &self.yuv_pipeline,
-                    LayerPipeline::YuvFx => &self.yuv_fx_pipeline,
-                    LayerPipeline::Rgba => &self.rgba_pipeline,
-                    LayerPipeline::RgbaFx => &self.rgba_fx_pipeline,
-                    LayerPipeline::Solid => &self.solid_pipeline,
-                    LayerPipeline::Sdf => &self.sdf_pipeline,
-                };
-                pass.set_pipeline(pipeline);
-                pass.set_bind_group(0, &layer.bind_group, &[]);
-                pass.draw(0..6, 0..1);
+        for item in layers {
+            match item {
+                CompositorLayer::Layer(layer) if !effects_need_offscreen(layer.effects) => {
+                    let built = self.build_layer(gpu, config, layer)?;
+                    let pipeline = pipeline_for(&built.pipeline, self);
+                    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("cutlass.pass"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &target.view,
+                            depth_slice: None,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: wgpu::StoreOp::Store,
+                            },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    pass.set_pipeline(pipeline);
+                    pass.set_bind_group(0, &built.bind_group, &[]);
+                    pass.draw(0..6, 0..1);
+                }
+                CompositorLayer::Layer(layer) => {
+                    let built = self.build_layer(gpu, config, layer)?;
+                    let pipeline = pipeline_for(&built.pipeline, self);
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("cutlass.offscreen.base"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: offscreen.view(0),
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        draw_layer_to_offscreen(&mut pass, pipeline, &built.bind_group);
+                    }
+                    let result = run_effect_chain(
+                        device,
+                        &mut encoder,
+                        &self.pass_registry,
+                        offscreen,
+                        offscreen.view(0),
+                        layer.effects,
+                        config.width,
+                        config.height,
+                    );
+                    blit_premultiplied_to_canvas(
+                        device,
+                        &mut encoder,
+                        &self.pass_registry,
+                        result,
+                        &target.view,
+                    );
+                }
+                CompositorLayer::Transition {
+                    outgoing,
+                    incoming,
+                    transition_id,
+                    progress,
+                } => {
+                    let out_built = self.build_layer(gpu, config, outgoing)?;
+                    let in_built = self.build_layer(gpu, config, incoming)?;
+                    let out_pipe = pipeline_for(&out_built.pipeline, self);
+                    let in_pipe = pipeline_for(&in_built.pipeline, self);
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("cutlass.transition.out"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: offscreen.view(0),
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        draw_layer_to_offscreen(&mut pass, out_pipe, &out_built.bind_group);
+                    }
+                    {
+                        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("cutlass.transition.in"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: offscreen.view(1),
+                                depth_slice: None,
+                                resolve_target: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        draw_layer_to_offscreen(&mut pass, in_pipe, &in_built.bind_group);
+                    }
+                    run_transition_pass(
+                        device,
+                        &mut encoder,
+                        &self.pass_registry,
+                        offscreen.view(0),
+                        offscreen.view(1),
+                        offscreen.view(2),
+                        transition_id,
+                        *progress,
+                        config.width,
+                        config.height,
+                    );
+                    blit_premultiplied_to_canvas(
+                        device,
+                        &mut encoder,
+                        &self.pass_registry,
+                        offscreen.view(2),
+                        &target.view,
+                    );
+                }
             }
         }
 
-        // Record the readback copy, then submit, *then* map — the copy must
-        // execute on the queue before the buffer holds anything.
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
                 texture: &target.texture,
@@ -516,8 +664,6 @@ impl Compositor {
             config.height,
         );
         if result.is_err() {
-            // A failed map can leave the buffer in an unmappable state; drop
-            // the cache so the next render starts from fresh resources.
             self.target = None;
         }
         result
@@ -748,7 +894,7 @@ impl Compositor {
             })
         };
 
-        if layer.effects.is_identity() {
+        if layer.fx.is_identity() {
             let buffer = gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -766,7 +912,7 @@ impl Compositor {
             });
         }
 
-        let fx_uniforms = pack_fx_uniforms(&layer.effects, &layer.placement);
+        let fx_uniforms = pack_fx_uniforms(&layer.fx, &layer.placement);
         let placement_buffer = gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -957,7 +1103,7 @@ impl Compositor {
             grade1,
         };
 
-        if layer.effects.is_identity() {
+        if layer.fx.is_identity() {
             let buffer = gpu
                 .device
                 .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -994,7 +1140,7 @@ impl Compositor {
             });
         }
 
-        let fx_uniforms = pack_fx_uniforms(&layer.effects, &layer.placement);
+        let fx_uniforms = pack_fx_uniforms(&layer.fx, &layer.placement);
         let placement_buffer = gpu
             .device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1061,6 +1207,17 @@ fn pack_fx_uniforms(effects: &LayerEffects, placement: &LayerPlacement) -> FxEff
 
 /// Map the (already-submitted) readback buffer and copy it into a tight
 /// [`RgbaImage`], stripping the per-row copy padding.
+fn pipeline_for<'a>(kind: &LayerPipeline, comp: &'a Compositor) -> &'a wgpu::RenderPipeline {
+    match kind {
+        LayerPipeline::Yuv => &comp.yuv_pipeline,
+        LayerPipeline::YuvFx => &comp.yuv_fx_pipeline,
+        LayerPipeline::Rgba => &comp.rgba_pipeline,
+        LayerPipeline::RgbaFx => &comp.rgba_fx_pipeline,
+        LayerPipeline::Solid => &comp.solid_pipeline,
+        LayerPipeline::Sdf => &comp.sdf_pipeline,
+    }
+}
+
 fn map_readback(
     gpu: &GpuContext,
     buffer: &wgpu::Buffer,

@@ -13,7 +13,7 @@ use std::time::Instant;
 
 use cutlass_compositor::{
     CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerChromaKey, LayerEffects,
-    LayerMask, LayerPlacement, mask_kind,
+    LayerMask, LayerPlacement, PassInstance, mask_kind,
 };
 use cutlass_core::RationalTime;
 use cutlass_decoder::{OutputMode, open_video_decoder, probe};
@@ -64,6 +64,7 @@ fn main() {
         println!("--- {label} ---");
         if let Some(frame) = prime_frame(&path, mode) {
             bench_compositor_only(&gpu, &frame, &canvas_sizes, frames, label);
+            bench_effect_overhead(&gpu, &frame, frames, label);
         }
         bench_decode_and_composite(
             &gpu,
@@ -171,7 +172,7 @@ fn bench_compositor_only(
             let layer = if tag == "baseline" {
                 CompositeLayer::frame(frame, placement)
             } else {
-                CompositeLayer::frame(frame, placement).with_effects(fx_effects)
+                CompositeLayer::frame(frame, placement).with_fx(fx_effects)
             };
             // Prime pipeline + target cache.
             let _ = comp.render(gpu, &config, &[layer]).expect("prime");
@@ -183,7 +184,7 @@ fn bench_compositor_only(
                 let layer = if tag == "baseline" {
                     CompositeLayer::frame(frame, placement)
                 } else {
-                    CompositeLayer::frame(frame, placement).with_effects(fx_effects)
+                    CompositeLayer::frame(frame, placement).with_fx(fx_effects)
                 };
                 let img = comp.render(gpu, &config, &[layer]).expect("render");
                 samples.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -192,6 +193,59 @@ fn bench_compositor_only(
             let stats = Stats::from_samples(samples, total.elapsed().as_secs_f64());
             stats.print(&format!("  composite {label} {w}x{h} ({tag})"));
         }
+    }
+}
+
+/// Effect-free vs passthrough-chain vs blur at preview resolution.
+fn bench_effect_overhead(
+    gpu: &GpuContext,
+    frame: &cutlass_core::VideoFrame,
+    iters: i64,
+    import: &str,
+) {
+    let (w, h) = (960u32, 540u32);
+    println!("effect overhead ({import}) @ {w}x{h}:");
+    let config = CompositorConfig::new(w, h);
+    let placement = LayerPlacement::full_canvas(&config);
+    let mut comp = Compositor::new(gpu);
+
+    let baseline_layer = CompositeLayer::frame(frame, placement);
+    let _ = comp
+        .render(gpu, &config, &[baseline_layer])
+        .expect("prime baseline");
+
+    let passthrough = [PassInstance {
+        id: "sharpen",
+        params: &[0.5],
+    }];
+    let blur = [PassInstance {
+        id: "gaussian_blur",
+        params: &[8.0],
+    }];
+
+    let cases: [(&str, &[PassInstance]); 3] = [
+        ("effect_free", &[]),
+        ("passthrough_sharpen", &passthrough),
+        ("blur_r8", &blur),
+    ];
+
+    let mut baseline_mean = 0.0f64;
+    for (i, (name, effects)) in cases.iter().enumerate() {
+        let mut samples = Vec::with_capacity(iters as usize);
+        let total = Instant::now();
+        for _ in 0..iters {
+            let layer = CompositeLayer::frame(frame, placement).with_effects(effects);
+            let start = Instant::now();
+            let img = comp.render(gpu, &config, &[layer]).expect("render");
+            samples.push(start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(img.pixel(0, 0));
+        }
+        let stats = Stats::from_samples(samples, total.elapsed().as_secs_f64());
+        if i == 0 {
+            baseline_mean = stats.mean;
+        }
+        let delta = stats.mean - baseline_mean;
+        stats.print(&format!("  {name:<22} Δ{delta:+.2} ms vs baseline"));
     }
 }
 

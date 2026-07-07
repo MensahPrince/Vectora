@@ -15,6 +15,13 @@ use cutlass_text::TextStyle;
 
 pub use cutlass_core::RationalTime;
 
+/// One sampled GPU effect pass attached to a clip at resolve time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPass {
+    pub id: String,
+    pub params: Vec<f32>,
+}
+
 /// A canvas plus the ordered layer stack to composite for one timeline instant.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scene {
@@ -74,7 +81,8 @@ impl Scene {
                 LayerSource::Media { .. }
                 | LayerSource::Still { .. }
                 | LayerSource::Text { .. }
-                | LayerSource::Solid(_) => {}
+                | LayerSource::Solid(_)
+                | LayerSource::Transition { .. } => {}
             }
         }
     }
@@ -144,6 +152,8 @@ pub struct SceneLayer {
     /// Sampled UV rect `[u0, v0, u1, v1]` across the visible picture. A sub-rect
     /// crops; a reversed axis mirrors. Ignored by solid fills.
     pub uv: [f32; 4],
+    /// GPU effect chain sampled at clip-local tick (empty when none).
+    pub effects: Vec<ResolvedPass>,
     /// Shaped alpha mask (media clips only).
     pub mask: Option<Mask>,
     /// Green-screen keying (media clips only).
@@ -229,6 +239,14 @@ pub enum LayerSource {
         /// quad via [`SizeSpec::BitmapScaled`]).
         raster_scale: f32,
     },
+    /// A track transition between two abutting clips, sampled at `progress`.
+    Transition {
+        outgoing: Box<SceneLayer>,
+        incoming: Box<SceneLayer>,
+        transition_id: String,
+        /// `0.0` = fully outgoing, `1.0` = fully incoming.
+        progress: f32,
+    },
 }
 
 #[cfg(test)]
@@ -248,6 +266,7 @@ mod tests {
             rotation: 0.5,
             opacity: 0.8,
             uv: [0.1, 0.2, 0.9, 0.8],
+            effects: Vec::new(),
             mask: None,
             chroma_key: None,
             grade: ColorGrade::IDENTITY,
@@ -271,6 +290,7 @@ mod tests {
             rotation: 0.0,
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            effects: Vec::new(),
             mask: None,
             chroma_key: None,
             grade: ColorGrade::IDENTITY,
@@ -289,6 +309,7 @@ mod tests {
             rotation: 0.0,
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            effects: Vec::new(),
             mask: None,
             chroma_key: None,
             grade: ColorGrade::IDENTITY,

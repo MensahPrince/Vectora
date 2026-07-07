@@ -22,6 +22,8 @@ thiserror.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+# Drift guard: model catalog vs compositor pass descriptors.
+cutlass-compositor = { path = "../cutlass-compositor" }
 # Apple-only: synthesize a real mp4 in tests so native import/probe is exercised
 # without a checked-in fixture.
 cutlass-encoder = { path = "../cutlass-encoder" }
