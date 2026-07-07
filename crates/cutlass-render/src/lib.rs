@@ -17,6 +17,7 @@
 mod error;
 mod export;
 mod export_audio;
+mod grade;
 mod render;
 mod resolve;
 mod scene;

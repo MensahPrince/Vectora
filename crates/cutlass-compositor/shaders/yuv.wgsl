@@ -22,6 +22,10 @@ struct Placement {
     // Kr (x), Kb (y), full-range flag (z: 0=limited, 1=full), plane mode
     // (w: 0=planar I420, 1=biplanar NV12).
     coeffs: vec4<f32>,
+    // Color grade: brightness, contrast, saturation, enabled (0 | 1).
+    grade_adj0: vec4<f32>,
+    // Color grade: exposure, temperature, pad, pad.
+    grade_adj1: vec4<f32>,
 }
 
 @group(0) @binding(0) var y_tex: texture_2d<f32>;
@@ -98,5 +102,6 @@ fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
         crs = textureSample(v_tex, samp, in.uv).r;
     }
     let rgb = yuv_to_rgb(ys, cbs, crs, p.coeffs.x, p.coeffs.y, p.coeffs.z);
-    return vec4(rgb, p.trans_opacity.z);
+    let graded = apply_color_grade(rgb, p.grade_adj0, p.grade_adj1);
+    return vec4(graded, p.trans_opacity.z);
 }

@@ -7,6 +7,10 @@ struct Solid {
     linear: vec4<f32>,
     // Clip-space translation (x, y), layer opacity (z), pad (w).
     trans_opacity: vec4<f32>,
+    // Color grade: brightness, contrast, saturation, enabled (0 | 1).
+    grade_adj0: vec4<f32>,
+    // Color grade: exposure, temperature, pad, pad.
+    grade_adj1: vec4<f32>,
 }
 
 @group(0) @binding(0) var<uniform> s: Solid;
@@ -41,5 +45,6 @@ fn vs(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 @fragment
 fn fs(in: VertexOutput) -> @location(0) vec4<f32> {
     let o = s.trans_opacity.z;
-    return vec4(s.color.rgb, s.color.a * o);
+    let rgb = apply_color_grade(s.color.rgb, s.grade_adj0, s.grade_adj1);
+    return vec4(rgb, s.color.a * o);
 }
