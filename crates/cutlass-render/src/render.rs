@@ -10,18 +10,19 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, CompositorError, FrameSink, GpuContext,
-    ImageSink, LayerPlacement, RgbaImage, SdfLayer,
+    ColorGrade, CompositeLayer, Compositor, CompositorConfig, CompositorError, CompositorLayer,
+    FrameSink, GpuContext, ImageSink, LayerChromaKey, LayerEffects, LayerMask, LayerPlacement,
+    PassInstance, RgbaImage, SdfLayer, mask_kind,
 };
 use cutlass_core::{RationalTime, VideoDecoder, VideoFrame};
 use cutlass_decoder::OutputMode;
-use cutlass_models::{MediaId, Project};
+use cutlass_models::{ClipId, MaskKind, MediaId, Project};
 use cutlass_shapes::{PathRaster, ShapeStyle};
 use cutlass_text::TextRenderer;
 
 use crate::error::RenderError;
-use crate::resolve::{ResolveOverrides, resolve, resolve_with};
-use crate::scene::{LayerSource, Scene, SizeSpec};
+use crate::resolve::{ResolveOverrides, resolve, resolve_gesture_partitions, resolve_with};
+use crate::scene::{LayerSource, ResolvedPass, Scene, SizeSpec};
 
 /// A composited frame slower than this logs its stage breakdown at `info`
 /// (default-visible): interactive preview budgets a few frames of latency,
@@ -269,6 +270,49 @@ impl Renderer {
         self.render_scene(project, &scene)
     }
 
+    /// Partitioned preview frames for a zero-drift transform gesture: layers
+    /// below the clip (opaque background), the clip alone at identity
+    /// transform (transparent background), and layers above (transparent).
+    /// Each pass is fit to `max_width`×`max_height`. Returns `None` when the
+    /// clip can't be partitioned (transitions, etc.).
+    pub fn render_gesture_frames(
+        &mut self,
+        project: &Project,
+        t: RationalTime,
+        clip_id: ClipId,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Option<GestureFrames>, RenderError> {
+        let Some(partitions) = resolve_gesture_partitions(project, t, clip_id)? else {
+            return Ok(None);
+        };
+
+        let mut below = partitions.below;
+        below.fit_within(max_width, max_height);
+        let below = self.render_scene(project, &below)?;
+
+        let mut sprite_scene = partitions.sprite;
+        sprite_scene.fit_within(max_width, max_height);
+        let mut sprite = self.render_scene(project, &sprite_scene)?;
+        straighten_alpha(&mut sprite);
+
+        let above = if partitions.above.layers.is_empty() {
+            None
+        } else {
+            let mut above_scene = partitions.above;
+            above_scene.fit_within(max_width, max_height);
+            let mut image = self.render_scene(project, &above_scene)?;
+            straighten_alpha(&mut image);
+            Some(image)
+        };
+
+        Ok(Some(GestureFrames {
+            below,
+            sprite,
+            above,
+        }))
+    }
+
     /// [`render_frame_with`](Self::render_frame_with) writing the composited
     /// rows directly into `sink`-provided storage (see
     /// [`render_scene_into`](Self::render_scene_into)), decoding under
@@ -391,10 +435,10 @@ impl Renderer {
         // placement. Held in `realized` so the borrowed `CompositeLayer`s built
         // below stay valid through the composite call.
         let mut realized: Vec<Realized> = Vec::with_capacity(scene.layers.len());
-        // Per-scene occurrence index of each media source: the decoder-cache
-        // slot for repeated uses of one file (see `decoders`).
+        let mut effect_store: Vec<EffectChain> = Vec::new();
         let mut occurrence: HashMap<MediaId, u32> = HashMap::new();
         for layer in &scene.layers {
+            let fx = layer_effects(layer);
             let color_grade = layer.color_grade;
             // The layer carries the anchor position; the quad center falls out
             // of the final pixel size (bitmap sizes only exist after raster).
@@ -405,11 +449,34 @@ impl Renderer {
                 opacity: layer.opacity,
             };
             match &layer.source {
+                LayerSource::CanvasPass => {
+                    realized.push(Realized::CanvasPass {
+                        effects: layer.effects.clone(),
+                        grade: color_grade,
+                    });
+                }
+                LayerSource::Transition {
+                    outgoing,
+                    incoming,
+                    transition_id,
+                    progress,
+                } => {
+                    let out = self.realize_subscene_layer(project, scene, outgoing, policy)?;
+                    let inc = self.realize_subscene_layer(project, scene, incoming, policy)?;
+                    realized.push(Realized::Transition {
+                        outgoing: out,
+                        incoming: inc,
+                        transition_id: transition_id.clone(),
+                        progress: *progress,
+                    });
+                }
                 LayerSource::Solid(rgba) => {
                     let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
                     realized.push(Realized::Solid {
                         rgba: *rgba,
                         placement: place(size),
+                        effects: layer.effects.clone(),
+                        fx,
                         color_grade,
                     });
                 }
@@ -427,6 +494,8 @@ impl Renderer {
                         image,
                         placement: place(size),
                         uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
                         color_grade,
                     });
                 }
@@ -441,6 +510,8 @@ impl Renderer {
                         frame,
                         placement: place(size),
                         uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
                         color_grade,
                     });
                 }
@@ -451,6 +522,8 @@ impl Renderer {
                         media: *media,
                         placement: place(size),
                         uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
                         color_grade,
                     });
                 }
@@ -474,6 +547,8 @@ impl Renderer {
                             stroke: *stroke,
                         },
                         placement: place(size),
+                        effects: layer.effects.clone(),
+                        fx,
                         color_grade,
                     });
                 }
@@ -500,51 +575,141 @@ impl Renderer {
                         image,
                         placement: place(size),
                         uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
                         color_grade,
                     });
                 }
             }
         }
 
-        // Second pass: borrow the owned pixels into the compositor's layer type.
-        let layers: Vec<CompositeLayer> = realized
+        // Pack effect chains and build compositor layers with stable borrows.
+        for r in &realized {
+            if let Some(effects) = r.effects().filter(|e| !e.is_empty()) {
+                effect_store.push(pack_effects(effects));
+            }
+        }
+        let instance_store: Vec<Vec<PassInstance<'_>>> =
+            effect_store.iter().map(EffectChain::instances).collect();
+
+        let mut effect_idx = 0usize;
+        let mut layer_storage: Vec<CompositeLayer<'_>> = Vec::new();
+        // Phase 1: build all composite layers (indices only for transitions).
+        enum LayerJob<'a> {
+            Plain {
+                storage_idx: usize,
+            },
+            CanvasPass {
+                effects: &'a [PassInstance<'a>],
+                grade: Option<ColorGrade>,
+            },
+            Transition {
+                out_idx: usize,
+                in_idx: usize,
+                transition_id: &'a str,
+                progress: f32,
+            },
+        }
+        let mut jobs: Vec<LayerJob<'_>> = Vec::new();
+
+        for r in &realized {
+            match r {
+                Realized::CanvasPass { effects, grade } => {
+                    let effects = if effects.is_empty() {
+                        &[]
+                    } else {
+                        let chain = &instance_store[effect_idx];
+                        effect_idx += 1;
+                        chain.as_slice()
+                    };
+                    jobs.push(LayerJob::CanvasPass {
+                        effects,
+                        grade: *grade,
+                    });
+                }
+                Realized::Transition {
+                    outgoing,
+                    incoming,
+                    transition_id,
+                    progress,
+                } => {
+                    let out_effects = outgoing
+                        .effects()
+                        .filter(|e| !e.is_empty())
+                        .map(|_| {
+                            let chain = &instance_store[effect_idx];
+                            effect_idx += 1;
+                            chain.as_slice()
+                        })
+                        .unwrap_or(&[]);
+                    layer_storage.push(composite_from_realized(
+                        outgoing.as_ref(),
+                        &self.stills,
+                        out_effects,
+                    ));
+                    let out_idx = layer_storage.len() - 1;
+                    let in_effects = incoming
+                        .effects()
+                        .filter(|e| !e.is_empty())
+                        .map(|_| {
+                            let chain = &instance_store[effect_idx];
+                            effect_idx += 1;
+                            chain.as_slice()
+                        })
+                        .unwrap_or(&[]);
+                    layer_storage.push(composite_from_realized(
+                        incoming.as_ref(),
+                        &self.stills,
+                        in_effects,
+                    ));
+                    let in_idx = layer_storage.len() - 1;
+                    jobs.push(LayerJob::Transition {
+                        out_idx,
+                        in_idx,
+                        transition_id: transition_id.as_str(),
+                        progress: *progress,
+                    });
+                }
+                other => {
+                    let effects = other
+                        .effects()
+                        .filter(|e| !e.is_empty())
+                        .map(|_| {
+                            let chain = &instance_store[effect_idx];
+                            effect_idx += 1;
+                            chain.as_slice()
+                        })
+                        .unwrap_or(&[]);
+                    layer_storage.push(composite_from_realized(other, &self.stills, effects));
+                    jobs.push(LayerJob::Plain {
+                        storage_idx: layer_storage.len() - 1,
+                    });
+                }
+            }
+        }
+
+        // Phase 2: borrow storage immutably for compositor dispatch.
+        let compositor_layers: Vec<CompositorLayer<'_>> = jobs
             .iter()
-            .map(|r| match r {
-                Realized::Solid {
-                    rgba,
-                    placement,
-                    color_grade,
-                } => CompositeLayer::solid(*rgba, *placement).with_color_grade(*color_grade),
-                Realized::Bitmap {
-                    image,
-                    placement,
-                    uv,
-                    color_grade,
-                } => CompositeLayer::rgba(image, *placement)
-                    .with_uv(*uv)
-                    .with_color_grade(*color_grade),
-                Realized::Frame {
-                    frame,
-                    placement,
-                    uv,
-                    color_grade,
-                } => CompositeLayer::frame(frame, *placement)
-                    .with_uv(*uv)
-                    .with_color_grade(*color_grade),
-                // `ensure_still` populated the cache in the first pass.
-                Realized::Still {
-                    media,
-                    placement,
-                    uv,
-                    color_grade,
-                } => CompositeLayer::rgba(&self.stills[media], *placement)
-                    .with_uv(*uv)
-                    .with_color_grade(*color_grade),
-                Realized::Sdf {
-                    shape,
-                    placement,
-                    color_grade,
-                } => CompositeLayer::sdf(*shape, *placement).with_color_grade(*color_grade),
+            .map(|job| match job {
+                LayerJob::Plain { storage_idx } => {
+                    CompositorLayer::layer(&layer_storage[*storage_idx])
+                }
+                LayerJob::CanvasPass { effects, grade } => CompositorLayer::CanvasPass {
+                    effects,
+                    grade: *grade,
+                },
+                LayerJob::Transition {
+                    out_idx,
+                    in_idx,
+                    transition_id,
+                    progress,
+                } => CompositorLayer::Transition {
+                    outgoing: &layer_storage[*out_idx],
+                    incoming: &layer_storage[*in_idx],
+                    transition_id,
+                    progress: *progress,
+                },
             })
             .collect();
 
@@ -552,8 +717,12 @@ impl Renderer {
             CompositorConfig::new(scene.width, scene.height).with_background(scene.background);
         let realize_ms = realize_started.elapsed().as_secs_f64() * 1000.0;
         let composite_started = Instant::now();
-        self.compositor
-            .render_into(&self.gpu, &config, &layers, sink)?;
+        self.compositor.render_compositor_layers_into(
+            &self.gpu,
+            &config,
+            &compositor_layers,
+            sink,
+        )?;
 
         // Stage breakdown per frame: decode (media layers), raster (text/
         // shape/still realize minus decode), composite (GPU submit + mapped
@@ -572,7 +741,7 @@ impl Renderer {
                 decode_ms = %format_args!("{decode_ms:.1}"),
                 raster_ms = %format_args!("{raster_ms:.1}"),
                 composite_ms = %format_args!("{composite_ms:.1}"),
-                layers = layers.len(),
+                layers = compositor_layers.len(),
                 width = scene.width,
                 height = scene.height,
                 "slow frame render: {total_ms:.0} ms"
@@ -582,11 +751,141 @@ impl Renderer {
                 decode_ms = %format_args!("{decode_ms:.1}"),
                 raster_ms = %format_args!("{raster_ms:.1}"),
                 composite_ms = %format_args!("{composite_ms:.1}"),
-                layers = layers.len(),
+                layers = compositor_layers.len(),
                 "frame render: {total_ms:.1} ms"
             );
         }
         Ok(())
+    }
+
+    fn realize_subscene_layer(
+        &mut self,
+        project: &Project,
+        scene: &Scene,
+        layer: &crate::scene::SceneLayer,
+        policy: SeekPolicy,
+    ) -> Result<Box<Realized>, RenderError> {
+        let place = |size: [f32; 2]| LayerPlacement {
+            center: layer.quad_center(size),
+            size,
+            rotation: layer.rotation,
+            opacity: layer.opacity,
+        };
+        let fx = layer_effects(layer);
+        let color_grade = layer.color_grade;
+        let realized = match &layer.source {
+            LayerSource::Solid(rgba) => {
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                Realized::Solid {
+                    rgba: *rgba,
+                    placement: place(size),
+                    effects: layer.effects.clone(),
+                    fx,
+                    color_grade,
+                }
+            }
+            LayerSource::Text { content, style } => {
+                let image = self.text.rasterize(content, style);
+                if image.width == 0 || image.height == 0 {
+                    return Err(RenderError::unsupported("empty text layer"));
+                }
+                let scale = match layer.size {
+                    SizeSpec::BitmapScaled(s) => s,
+                    SizeSpec::Fixed(_) => 1.0,
+                };
+                let size = [image.width as f32 * scale, image.height as f32 * scale];
+                Realized::Bitmap {
+                    image,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                    fx,
+                    color_grade,
+                }
+            }
+            LayerSource::Media { media, source_time } => {
+                let frame = self.decode(project, *media, 0, *source_time, policy)?;
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                Realized::Frame {
+                    frame,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                    fx,
+                    color_grade,
+                }
+            }
+            LayerSource::Still { media } => {
+                self.ensure_still(project, *media)?;
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                Realized::Still {
+                    media: *media,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                    fx,
+                    color_grade,
+                }
+            }
+            LayerSource::Shape {
+                params,
+                fill,
+                stroke,
+                pad,
+            } => {
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                let half = [
+                    (size[0] * 0.5 - pad).max(0.0),
+                    (size[1] * 0.5 - pad).max(0.0),
+                ];
+                Realized::Sdf {
+                    shape: SdfLayer {
+                        shape: params.with_half(half),
+                        fill: *fill,
+                        stroke: *stroke,
+                    },
+                    placement: place(size),
+                    effects: layer.effects.clone(),
+                    fx,
+                    color_grade,
+                }
+            }
+            LayerSource::PathShape {
+                path,
+                fill,
+                stroke,
+                raster_scale,
+            } => {
+                let style = ShapeStyle {
+                    fill: Some(*fill).filter(|c| c[3] > 0),
+                    stroke: *stroke,
+                };
+                let image = self.paths.rasterize(path, &style, *raster_scale);
+                if image.width == 0 || image.height == 0 {
+                    return Err(RenderError::unsupported("degenerate path layer"));
+                }
+                let scale = match layer.size {
+                    SizeSpec::BitmapScaled(s) => s,
+                    SizeSpec::Fixed(_) => 1.0,
+                };
+                let size = [image.width as f32 * scale, image.height as f32 * scale];
+                Realized::Bitmap {
+                    image,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                    fx,
+                    color_grade,
+                }
+            }
+            LayerSource::Transition { .. } => {
+                return Err(RenderError::unsupported("nested transitions"));
+            }
+            LayerSource::CanvasPass => {
+                return Err(RenderError::unsupported("nested canvas pass"));
+            }
+        };
+        Ok(Box::new(realized))
     }
 
     /// Decode the frame of `media` at `source_time`, opening (and caching) a
@@ -655,10 +954,12 @@ impl Renderer {
             0.0,
             1.0,
             [0.0, 0.0, 1.0, 1.0],
+            None,
             canvas_w as f32,
             canvas_h as f32,
             1.0,
             tick,
+            Vec::new(),
         )?;
         match layer.size {
             SizeSpec::Fixed(size) => Some((size[0].round() as u32, size[1].round() as u32)),
@@ -699,38 +1000,201 @@ impl Renderer {
     }
 }
 
+/// Packed effect chain: catalog-static ids plus owned parameter values.
+///
+/// [`PassInstance`] wants a `&'static str` id and borrowed params. Ids are
+/// interned against the compositor's static effect catalog (unknown ids are
+/// dropped here — they'd dispatch as no-op passthroughs anyway), and params
+/// stay owned so the instances built by [`EffectChain::instances`] borrow from
+/// this store for the duration of one render instead of leaking.
+struct EffectChain {
+    passes: Vec<(&'static str, Vec<f32>)>,
+}
+
+impl EffectChain {
+    fn instances(&self) -> Vec<PassInstance<'_>> {
+        self.passes
+            .iter()
+            .map(|(id, params)| PassInstance { id, params })
+            .collect()
+    }
+}
+
+fn pack_effects(resolved: &[ResolvedPass]) -> EffectChain {
+    let passes = resolved
+        .iter()
+        .filter_map(|pass| {
+            let id = cutlass_compositor::effect_descriptors()
+                .iter()
+                .find(|d| d.id == pass.id)?
+                .id;
+            Some((id, pass.params.clone()))
+        })
+        .collect();
+    EffectChain { passes }
+}
+
+fn composite_from_realized<'a>(
+    r: &'a Realized,
+    stills: &'a HashMap<MediaId, RgbaImage>,
+    effects: &'a [PassInstance<'a>],
+) -> CompositeLayer<'a> {
+    match r {
+        Realized::Solid {
+            rgba,
+            placement,
+            fx,
+            color_grade,
+            ..
+        } => CompositeLayer::solid(*rgba, *placement)
+            .with_fx(*fx)
+            .with_effects(effects)
+            .with_color_grade(*color_grade),
+        Realized::Bitmap {
+            image,
+            placement,
+            uv,
+            fx,
+            color_grade,
+            ..
+        } => CompositeLayer::rgba(image, *placement)
+            .with_uv(*uv)
+            .with_fx(*fx)
+            .with_effects(effects)
+            .with_color_grade(*color_grade),
+        Realized::Frame {
+            frame,
+            placement,
+            uv,
+            fx,
+            color_grade,
+            ..
+        } => CompositeLayer::frame(frame, *placement)
+            .with_uv(*uv)
+            .with_fx(*fx)
+            .with_effects(effects)
+            .with_color_grade(*color_grade),
+        Realized::Still {
+            media,
+            placement,
+            uv,
+            fx,
+            color_grade,
+            ..
+        } => CompositeLayer::rgba(&stills[media], *placement)
+            .with_uv(*uv)
+            .with_fx(*fx)
+            .with_effects(effects)
+            .with_color_grade(*color_grade),
+        Realized::Sdf {
+            shape,
+            placement,
+            fx,
+            color_grade,
+            ..
+        } => CompositeLayer::sdf(*shape, *placement)
+            .with_fx(*fx)
+            .with_effects(effects)
+            .with_color_grade(*color_grade),
+        Realized::Transition { .. } | Realized::CanvasPass { .. } => {
+            unreachable!("non-layer realized items handled separately")
+        }
+    }
+}
+
 /// An owned, decoded/rasterized layer kept alive while the compositor borrows it.
 enum Realized {
+    Transition {
+        outgoing: Box<Realized>,
+        incoming: Box<Realized>,
+        transition_id: String,
+        progress: f32,
+    },
+    CanvasPass {
+        effects: Vec<ResolvedPass>,
+        grade: Option<ColorGrade>,
+    },
     Frame {
         frame: VideoFrame,
         placement: LayerPlacement,
         uv: [f32; 4],
-        color_grade: Option<cutlass_compositor::ColorGrade>,
+        effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
+        color_grade: Option<ColorGrade>,
     },
-    /// A still image already decoded into the renderer's cache; the composite
-    /// pass borrows the pixels from there instead of cloning them per frame.
     Still {
         media: MediaId,
         placement: LayerPlacement,
         uv: [f32; 4],
-        color_grade: Option<cutlass_compositor::ColorGrade>,
+        effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
+        color_grade: Option<ColorGrade>,
     },
     Bitmap {
         image: RgbaImage,
         placement: LayerPlacement,
         uv: [f32; 4],
-        color_grade: Option<cutlass_compositor::ColorGrade>,
+        effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
+        color_grade: Option<ColorGrade>,
     },
     Solid {
         rgba: [u8; 4],
         placement: LayerPlacement,
-        color_grade: Option<cutlass_compositor::ColorGrade>,
+        effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
+        color_grade: Option<ColorGrade>,
     },
     Sdf {
         shape: SdfLayer,
         placement: LayerPlacement,
-        color_grade: Option<cutlass_compositor::ColorGrade>,
+        effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
+        color_grade: Option<ColorGrade>,
     },
+}
+
+impl Realized {
+    fn effects(&self) -> Option<&[ResolvedPass]> {
+        match self {
+            Realized::Transition { .. } => None,
+            Realized::CanvasPass { effects, .. } => Some(effects),
+            Realized::Frame { effects, .. }
+            | Realized::Still { effects, .. }
+            | Realized::Bitmap { effects, .. }
+            | Realized::Solid { effects, .. }
+            | Realized::Sdf { effects, .. } => Some(effects),
+        }
+    }
+}
+
+fn layer_effects(layer: &crate::scene::SceneLayer) -> LayerEffects {
+    let mask = layer.mask.map(|m| LayerMask {
+        kind: mask_kind_id(m.kind),
+        feather: m.feather,
+        invert: u32::from(m.invert),
+    });
+    let chroma_key = layer.chroma_key.map(|c| LayerChromaKey {
+        rgb: [
+            f32::from(c.rgb[0]) / 255.0,
+            f32::from(c.rgb[1]) / 255.0,
+            f32::from(c.rgb[2]) / 255.0,
+        ],
+        strength: c.strength,
+        shadow: c.shadow,
+    });
+    LayerEffects { mask, chroma_key }
+}
+
+fn mask_kind_id(kind: MaskKind) -> u32 {
+    match kind {
+        MaskKind::Linear => mask_kind::LINEAR,
+        MaskKind::Mirror => mask_kind::MIRROR,
+        MaskKind::Circle => mask_kind::CIRCLE,
+        MaskKind::Rectangle => mask_kind::RECTANGLE,
+        MaskKind::Heart => mask_kind::HEART,
+        MaskKind::Star => mask_kind::STAR,
+    }
 }
 
 /// The on-canvas size for a non-text layer, falling back to the canvas if a
@@ -739,6 +1203,28 @@ fn fixed_size(size: SizeSpec, canvas: [f32; 2]) -> [f32; 2] {
     match size {
         SizeSpec::Fixed(s) => s,
         SizeSpec::BitmapScaled(_) => canvas,
+    }
+}
+
+/// Three fit-sized RGBA images for a zero-drift preview transform gesture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GestureFrames {
+    pub below: RgbaImage,
+    pub sprite: RgbaImage,
+    pub above: Option<RgbaImage>,
+}
+
+/// Convert premultiplied RGBA readbacks into straight alpha for Slint.
+fn straighten_alpha(image: &mut RgbaImage) {
+    for chunk in image.pixels.chunks_exact_mut(4) {
+        let a = chunk[3];
+        if a == 0 || a == 255 {
+            continue;
+        }
+        let af = f32::from(a) / 255.0;
+        for c in &mut chunk[..3] {
+            *c = ((*c as f32 / af).round() as u32).min(255) as u8;
+        }
     }
 }
 

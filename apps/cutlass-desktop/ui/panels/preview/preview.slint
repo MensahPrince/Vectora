@@ -5,7 +5,7 @@ import { TimelineLib } from "../../lib/timeline-lib.slint";
 import { TimelineStore, TimelineActions } from "../../store/index.slint";
 import { RationalTime } from "../../models/index.slint";
 import { AppState } from "../../state.slint";
-import { PreviewBackend, PreviewHit, PreviewSelectionBox, PreviewDragResolution, PreviewView } from "../../lib/preview-backend.slint";
+import { PreviewBackend, PreviewHit, PreviewSelectionBox, PreviewSpritePlacement, PreviewDragResolution, PreviewView } from "../../lib/preview-backend.slint";
 import { SelectionBackend } from "../../lib/selection-backend.slint";
 
 export component PreviewPanel inherits PanelBase {
@@ -60,6 +60,7 @@ export component PreviewPanel inherits PanelBase {
                     private property <int> drag-mode: 0;
                     private property <int> drag-zone: 0;
                     private property <bool> dragging: false;
+                    private property <bool> sprite-hold: false;
                     private property <string> drag-clip;
                     private property <float> press-x;
                     private property <float> press-y;
@@ -129,6 +130,12 @@ export component PreviewPanel inherits PanelBase {
                         self.reclamp();
                         PreviewStore.viewport-changed(self.width, self.height);
                     }
+                    private property <bool> sprite-ready: PreviewStore.gesture-sprite-ready;
+                    changed sprite-ready => {
+                        if (!self.sprite-ready) {
+                            self.sprite-hold = false;
+                        }
+                    }
 
                     // Recomputed reactively: follows playhead, edits
                     // (projection republish), selection, panel resizes, and
@@ -149,6 +156,32 @@ export component PreviewPanel inherits PanelBase {
                             && PreviewStore.gesture-clip == TimelineStore.selected-clip-id
                             && PreviewStore.gesture.valid,
                         PreviewStore.gesture);
+
+                    private property <PreviewSpritePlacement> sprite-placement: PreviewBackend.sprite-placement(
+                        EditorStore.project.sequence,
+                        TimelineStore.selected-clip-id,
+                        TimelineStore.playhead-tick,
+                        self.width / 1px,
+                        self.height / 1px,
+                        PreviewStore.viewport-zoom,
+                        PreviewStore.viewport-pan-x / 1px,
+                        PreviewStore.viewport-pan-y / 1px,
+                        PreviewStore.gesture-active
+                            && PreviewStore.gesture-clip == TimelineStore.selected-clip-id
+                            && PreviewStore.gesture.valid,
+                        PreviewStore.gesture);
+
+                    private property <bool> show-sprite-stack:
+                        self.sprite-ready && self.sprite-hold;
+
+                    private property <length> frame-x:
+                        (self.width - self.fitted-width * PreviewStore.viewport-zoom) / 2
+                            + PreviewStore.viewport-pan-x;
+                    private property <length> frame-y:
+                        (self.height - self.fitted-height * PreviewStore.viewport-zoom) / 2
+                            + PreviewStore.viewport-pan-y;
+                    private property <length> frame-w: self.fitted-width * PreviewStore.viewport-zoom;
+                    private property <length> frame-h: self.fitted-height * PreviewStore.viewport-zoom;
 
                     // Which handle sits at (px, py): corners double as scale
                     // grips, (hx, hy) is the rotate affordance. Generous hit
@@ -215,18 +248,54 @@ export component PreviewPanel inherits PanelBase {
                             EditorStore.on-preview-override-cleared(TimelineStore.playhead-tick);
                             PreviewStore.gesture-active = false;
                             PreviewStore.gesture-commit-pending = false;
+                            self.sprite-hold = false;
+                        } else if (self.drag-mode != 0) {
+                            EditorStore.on-preview-gesture-abandoned();
+                            self.sprite-hold = false;
                         }
                         self.drag-mode = 0;
                         self.drag-zone = 0;
                         self.dragging = false;
                     }
 
-                    Image {
-                        x: (viewport.width - self.width) / 2 + PreviewStore.viewport-pan-x;
-                        y: (viewport.height - self.height) / 2 + PreviewStore.viewport-pan-y;
-                        width: viewport.fitted-width * PreviewStore.viewport-zoom;
-                        height: viewport.fitted-height * PreviewStore.viewport-zoom;
+                    if !viewport.show-sprite-stack: Image {
+                        x: viewport.frame-x;
+                        y: viewport.frame-y;
+                        width: viewport.frame-w;
+                        height: viewport.frame-h;
                         source: PreviewStore.frame;
+                        image-fit: ImageFit.contain;
+                    }
+
+                    if viewport.show-sprite-stack: Image {
+                        x: viewport.frame-x;
+                        y: viewport.frame-y;
+                        width: viewport.frame-w;
+                        height: viewport.frame-h;
+                        source: PreviewStore.gesture-frame-below;
+                        image-fit: ImageFit.contain;
+                    }
+
+                    if viewport.show-sprite-stack && viewport.sprite-placement.visible: Image {
+                        x: viewport.sprite-placement.x * 1px;
+                        y: viewport.sprite-placement.y * 1px;
+                        width: viewport.sprite-placement.width * 1px;
+                        height: viewport.sprite-placement.height * 1px;
+                        transform-origin: { x: viewport.sprite-placement.origin-x * 1px, y: viewport.sprite-placement.origin-y * 1px };
+                        transform-scale-x: viewport.sprite-placement.scale * 100%;
+                        transform-scale-y: viewport.sprite-placement.scale * 100%;
+                        transform-rotation: viewport.sprite-placement.rotation-degrees * 1deg;
+                        opacity: viewport.sprite-placement.opacity;
+                        source: PreviewStore.gesture-frame-sprite;
+                        image-fit: ImageFit.contain;
+                    }
+
+                    if viewport.show-sprite-stack && PreviewStore.gesture-has-above: Image {
+                        x: viewport.frame-x;
+                        y: viewport.frame-y;
+                        width: viewport.frame-w;
+                        height: viewport.frame-h;
+                        source: PreviewStore.gesture-frame-above;
                         image-fit: ImageFit.contain;
                     }
 
@@ -260,6 +329,9 @@ export component PreviewPanel inherits PanelBase {
                                     viewport.drag-mode = viewport.drag-zone == 5 ? 3
                                         : viewport.drag-zone == 6 ? 4 : 2;
                                     viewport.drag-clip = TimelineStore.selected-clip-id;
+                                    EditorStore.on-preview-gesture-started(
+                                        viewport.drag-clip,
+                                        TimelineStore.playhead-tick);
                                 } else {
                                     viewport.hit = PreviewBackend.hit-test(
                                         EditorStore.project.sequence,
@@ -292,6 +364,9 @@ export component PreviewPanel inherits PanelBase {
                                                 PreviewStore.viewport-pan-y / 1px)) {
                                             viewport.drag-mode = 1;
                                             viewport.drag-clip = TimelineStore.selected-clip-id;
+                                            EditorStore.on-preview-gesture-started(
+                                                viewport.drag-clip,
+                                                TimelineStore.playhead-tick);
                                         } else {
                                             // Empty canvas or letterbox bar:
                                             // deselect, CapCut-style.
@@ -310,6 +385,9 @@ export component PreviewPanel inherits PanelBase {
                                             TimelineStore.link-enabled));
                                         viewport.drag-mode = 1;
                                         viewport.drag-clip = viewport.hit.clip-id;
+                                        EditorStore.on-preview-gesture-started(
+                                            viewport.drag-clip,
+                                            TimelineStore.playhead-tick);
                                     }
                                 }
                             }
@@ -418,6 +496,7 @@ export component PreviewPanel inherits PanelBase {
                             }
                             if (viewport.drag-res.valid) {
                                 viewport.dragging = true;
+                                viewport.sprite-hold = true;
                                 // Mirror UI-wide: the selection box and the
                                 // inspector's numbers follow mid-gesture.
                                 PreviewStore.gesture-clip = viewport.drag-clip;

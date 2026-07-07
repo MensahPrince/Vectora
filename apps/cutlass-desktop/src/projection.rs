@@ -256,6 +256,7 @@ fn clip_to_slint(
     let transform = clip.transform.sample(0);
     let clip_start = clip.timeline.start.value;
     let (shape_width, shape_height) = clip_shape_size(clip);
+    let (filter_id, filter_label, filter_intensity) = clip_filter(clip);
     let caps = clip_capabilities(clip, track_kind);
 
     Clip {
@@ -310,6 +311,14 @@ fn clip_to_slint(
         crop_h: clip.crop.h,
         flip_h: clip.flip_h,
         flip_v: clip.flip_v,
+        filter_id: filter_id.into(),
+        filter_label: filter_label.into(),
+        filter_intensity,
+        adjust_brightness: clip.adjust.brightness,
+        adjust_contrast: clip.adjust.contrast,
+        adjust_saturation: clip.adjust.saturation,
+        adjust_exposure: clip.adjust.exposure,
+        adjust_temperature: clip.adjust.temperature,
         kf_position: keyframes_to_slint(&clip.transform.position, clip_start, |v| (v[0], v[1])),
         kf_anchor: keyframes_to_slint(&clip.transform.anchor_point, clip_start, |v| (v[0], v[1])),
         kf_scale: keyframes_to_slint(&clip.transform.scale, clip_start, |v| (*v, 0.0)),
@@ -336,6 +345,17 @@ fn clip_to_slint(
         ),
         caps,
     }
+}
+
+fn clip_filter(clip: &EngineClip) -> (String, String, f32) {
+    let Some(filter) = &clip.filter else {
+        return (String::new(), String::new(), 0.0);
+    };
+    let label = cutlass_models::filter_spec(&filter.id)
+        .map(|s| s.label)
+        .unwrap_or(filter.id.as_str())
+        .to_string();
+    (filter.id.clone(), label, filter.intensity)
 }
 
 /// Project a clip's speed ramp keyframes (M2 speed curves) as the inspector's

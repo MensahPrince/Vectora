@@ -24,6 +24,7 @@ import {
 import { TextInspector } from "text-inspector.slint";
 import { TransformInspector } from "transform-inspector.slint";
 import { CropInspector } from "crop-inspector.slint";
+import { LookInspector } from "look-inspector.slint";
 import { EffectsInspector } from "effects-inspector.slint";
 
 struct InspectorField {
@@ -692,6 +693,12 @@ component VisualClipInspector inherits VerticalLayout {
             InspectorDivider { }
 
             CropInspector {
+                model: root.model;
+            }
+
+            InspectorDivider { }
+
+            LookInspector {
                 model: root.model;
             }
 

@@ -18,9 +18,9 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, SeekPolicy};
 use cutlass_models::{
-    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, CropRect, Easing, Generator,
-    LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param, ParamValue, Rational,
-    RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
+    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
+    Easing, Filter, Generator, LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param,
+    ParamValue, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
 };
 use cutlass_render::{ExportSettings, RenderError, Renderer};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -249,6 +249,28 @@ enum WorkerMsg {
         flip_h: bool,
         flip_v: bool,
     },
+    /// Set (or clear) a visual clip's filter preset. `filter_id == ""`
+    /// clears; intensity is normalized 0..=1. One undoable history entry.
+    SetClipFilter {
+        clip: String,
+        filter_id: String,
+        intensity: f32,
+    },
+    /// Set all five manual color adjustments in one undoable history entry.
+    SetClipAdjust {
+        clip: String,
+        adjust: ColorAdjustments,
+    },
+    /// Live color-grading preview: replace one clip's filter + adjustments
+    /// through the engine's session-only look override. Bursts coalesce to
+    /// the newest like transform/generator overrides.
+    PreviewClipLook {
+        clip: String,
+        filter_id: String,
+        intensity: f32,
+        adjust: ColorAdjustments,
+        tick: i64,
+    },
     /// Append a catalog effect to a clip's chain (M4). One undoable entry.
     AddEffect {
         clip: String,
@@ -304,6 +326,14 @@ enum WorkerMsg {
         transform: ClipTransform,
         tick: i64,
     },
+    /// Render partitioned below/sprite/above frames once for a zero-drift
+    /// transform gesture. On failure the per-move override path is used.
+    BeginTransformGesture {
+        clip: String,
+        tick: i64,
+    },
+    /// Press ended without a drag: drop prepared sprite frames.
+    EndTransformGesture,
     /// Drop the gesture override (no-op release / cancelled drag) and
     /// re-render `tick` from committed state.
     ClearTransformOverride {
@@ -799,6 +829,35 @@ impl WorkerHandle {
         });
     }
 
+    pub fn set_clip_filter(&self, clip: String, filter_id: String, intensity: f32) {
+        let _ = self.tx.send(WorkerMsg::SetClipFilter {
+            clip,
+            filter_id,
+            intensity,
+        });
+    }
+
+    pub fn set_clip_adjust(&self, clip: String, adjust: ColorAdjustments) {
+        let _ = self.tx.send(WorkerMsg::SetClipAdjust { clip, adjust });
+    }
+
+    pub fn preview_clip_look(
+        &self,
+        clip: String,
+        filter_id: String,
+        intensity: f32,
+        adjust: ColorAdjustments,
+        tick: i64,
+    ) {
+        let _ = self.tx.send(WorkerMsg::PreviewClipLook {
+            clip,
+            filter_id,
+            intensity,
+            adjust,
+            tick,
+        });
+    }
+
     pub fn add_effect(&self, clip: String, effect_id: String) {
         let _ = self.tx.send(WorkerMsg::AddEffect { clip, effect_id });
     }
@@ -891,6 +950,16 @@ impl WorkerHandle {
             transform,
             tick,
         });
+    }
+
+    pub fn begin_transform_gesture(&self, clip: String, tick: i64) {
+        let _ = self
+            .tx
+            .send(WorkerMsg::BeginTransformGesture { clip, tick });
+    }
+
+    pub fn end_transform_gesture(&self) {
+        let _ = self.tx.send(WorkerMsg::EndTransformGesture);
     }
 
     pub fn clear_transform_override(&self, tick: i64) {
@@ -1105,17 +1174,14 @@ fn worker_loop(
     // it current; edits re-render here so the composite reflects a delete,
     // generator change, etc. without waiting for the user to move the playhead.
     let mut last_tick: i64 = 0;
+    // Zero-drift transform gesture: partitioned frames are on the UI thread;
+    // per-move worker renders are suppressed until commit/cancel.
+    let sprite_mode = Cell::new(false);
     // A post-edit repaint owed but deferred: with more requests already
     // queued, rendering between messages would serialize one slow composite
     // per edit behind a rapid burst (multi-second stalls on weak iGPUs).
-    // Deferred repaints run once, when the queue drains; any arm that
-    // renders the current state on its own settles the debt too.
     let mut pending_redraw = false;
-    // An exact render of `last_tick` owed after a keyframe-snapped scrub
-    // frame (see the `Frame` arm): armed to a short deadline after each
-    // snapped render, re-armed while the drag keeps producing, fired once
-    // the queue stays idle past it. Cleared by any arm that renders
-    // `last_tick` exactly on its own.
+    // An exact render of `last_tick` owed after a keyframe-snapped scrub frame.
     let mut settle_deadline: Option<Instant> = None;
     // One export job at a time. `active` outlives jobs (the export thread
     // clears it when it exits); `cancel` flags the running job to stop.
@@ -1266,6 +1332,35 @@ fn worker_loop(
                 flip_h,
                 flip_v,
             } => set_clip_crop_and_publish(engine, &clip, crop, flip_h, flip_v, &ui),
+            WorkerMsg::SetClipFilter {
+                clip,
+                filter_id,
+                intensity,
+            } => set_clip_filter_and_publish(engine, &clip, &filter_id, intensity, &ui),
+            WorkerMsg::SetClipAdjust { clip, adjust } => {
+                set_clip_adjust_and_publish(engine, &clip, adjust, &ui)
+            }
+            // Only reached when a look-preview burst interleaves with another
+            // coalesced gesture's drain. The dedicated loop arm coalesces the
+            // common case.
+            WorkerMsg::PreviewClipLook {
+                clip,
+                filter_id,
+                intensity,
+                adjust,
+                tick,
+            } => {
+                apply_look_override(engine, &clip, &filter_id, intensity, adjust);
+                render_frame(
+                    engine,
+                    tl_rate,
+                    &preview_weak,
+                    tick,
+                    &fit,
+                    &cache,
+                    SeekPolicy::Exact,
+                );
+            }
             WorkerMsg::AddEffect { clip, effect_id } => {
                 add_effect_and_publish(engine, &clip, &effect_id, &ui)
             }
@@ -1294,15 +1389,7 @@ fn worker_loop(
             } => set_canvas_and_publish(engine, aspect_index, background, &ui),
             WorkerMsg::ClearTransformOverride { tick } => {
                 engine.set_transform_override(None);
-                render_frame(
-                    engine,
-                    tl_rate,
-                    &preview_weak,
-                    tick,
-                    &fit,
-                    &cache,
-                    SeekPolicy::Exact,
-                );
+                render_frame_exit_sprite(engine, tl_rate, &preview_weak, tick, &fit, &sprite_mode);
             }
             WorkerMsg::ClearGeneratorOverride { tick } => {
                 engine.set_generator_override(None);
@@ -1350,15 +1437,7 @@ fn worker_loop(
                 // flattened (M2 compose semantics).
                 let at = RationalTime::new(tick, tl_rate);
                 set_transform_and_publish(engine, &clip, transform, at, &ui);
-                render_frame(
-                    engine,
-                    tl_rate,
-                    &preview_weak,
-                    tick,
-                    &fit,
-                    &cache,
-                    SeekPolicy::Exact,
-                );
+                render_frame_exit_sprite(engine, tl_rate, &preview_weak, tick, &fit, &sprite_mode);
             }
             WorkerMsg::FitClip { clip, fill, tick } => {
                 fit_clip_and_publish(engine, &clip, fill, tick, tl_rate, &ui);
@@ -1464,6 +1543,21 @@ fn worker_loop(
             WorkerMsg::Frame(_) => unreachable!("frames are handled by the drain below"),
             WorkerMsg::TransformOverride { .. } => {
                 unreachable!("overrides are handled by the drain below")
+            }
+            WorkerMsg::BeginTransformGesture { clip, tick } => begin_transform_gesture(
+                engine,
+                &clip,
+                tick,
+                tl_rate,
+                &preview_weak,
+                &fit,
+                &sprite_mode,
+            ),
+            WorkerMsg::EndTransformGesture => {
+                if sprite_mode.get() {
+                    sprite_mode.set(false);
+                    clear_gesture_sprite_ready(&preview_weak);
+                }
             }
         }
     };
@@ -1589,6 +1683,24 @@ fn worker_loop(
                     }
                 }
             }
+            WorkerMsg::BeginTransformGesture { clip, tick } => {
+                last_tick = tick;
+                begin_transform_gesture(
+                    engine,
+                    &clip,
+                    tick,
+                    tl_rate,
+                    &preview_weak,
+                    &fit,
+                    &sprite_mode,
+                );
+            }
+            WorkerMsg::EndTransformGesture => {
+                if sprite_mode.get() {
+                    sprite_mode.set(false);
+                    clear_gesture_sprite_ready(&preview_weak);
+                }
+            }
             // Drag-gesture overrides arrive at pointer-move rate; render only
             // the newest one (same coalescing as scrub frames) so a fast drag
             // can't back the queue up behind stale composites.
@@ -1636,17 +1748,21 @@ fn worker_loop(
                 if pending {
                     apply_transform_override(engine, &clip, transform);
                 }
-                render_frame(
-                    engine,
-                    tl_rate,
-                    &preview_weak,
-                    tick,
-                    &fit,
-                    &cache,
-                    SeekPolicy::Exact,
-                );
-                pending_redraw = false;
-                settle_deadline = None;
+                if sprite_mode.get() {
+                    // UI-side sprite compositing owns mid-gesture pixels.
+                } else {
+                    render_frame(
+                        engine,
+                        tl_rate,
+                        &preview_weak,
+                        tick,
+                        &fit,
+                        &cache,
+                        SeekPolicy::Exact,
+                    );
+                    pending_redraw = false;
+                    settle_deadline = None;
+                }
             }
             // Live inspector edits (font-size drag) arrive at pointer-move
             // rate; coalesce to the newest like transform overrides do.
@@ -1763,6 +1879,63 @@ fn worker_loop(
                 );
                 pending_redraw = false;
                 settle_deadline = None;
+            }
+            // Look drags (filter intensity / adjust sliders) carry the whole
+            // grade so preview frames never mix a new adjustment with a stale
+            // filter or vice versa. Coalesce to the newest value like other
+            // inspector preview overrides.
+            WorkerMsg::PreviewClipLook {
+                mut clip,
+                mut filter_id,
+                mut intensity,
+                mut adjust,
+                mut tick,
+            } => {
+                let mut pending = true;
+                while let Ok(next) = req_rx.try_recv() {
+                    match next {
+                        WorkerMsg::Frame(latest) => tick = latest,
+                        WorkerMsg::PreviewClipLook {
+                            clip: c,
+                            filter_id: f,
+                            intensity: i,
+                            adjust: a,
+                            tick: at,
+                        } => {
+                            clip = c;
+                            filter_id = f;
+                            intensity = i;
+                            adjust = a;
+                            tick = at;
+                            pending = true;
+                        }
+                        other => {
+                            if std::mem::take(&mut pending) {
+                                apply_look_override(engine, &clip, &filter_id, intensity, adjust);
+                            }
+                            mutate(
+                                engine,
+                                &mut clipboard,
+                                &mut main_magnet,
+                                &mut linkage,
+                                other,
+                            )
+                        }
+                    }
+                }
+                last_tick = tick;
+                if pending {
+                    apply_look_override(engine, &clip, &filter_id, intensity, adjust);
+                }
+                render_frame(
+                    engine,
+                    tl_rate,
+                    &preview_weak,
+                    tick,
+                    &fit,
+                    &cache,
+                    SeekPolicy::Exact,
+                );
             }
             // The preview panel resized (or first laid out): renders now fit
             // the new bound. Repaint the current frame only when the bucketed
@@ -1897,6 +2070,8 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::SetSpeedCurve { .. }
             | WorkerMsg::SetSpeedCurvePoint { .. }
             | WorkerMsg::SetClipCrop { .. }
+            | WorkerMsg::SetClipFilter { .. }
+            | WorkerMsg::SetClipAdjust { .. }
             // Effects and transitions repaint the canvas at the playhead.
             | WorkerMsg::AddEffect { .. }
             | WorkerMsg::RemoveEffect { .. }
@@ -2056,6 +2231,63 @@ fn apply_generator_override(engine: &mut Engine, clip: &str, generator: Generato
     match parse_raw_id(clip).map(ClipId::from_raw) {
         Some(id) => engine.set_generator_override(Some((id, generator))),
         None => error!(clip, "generator override ignored: unparsable clip id"),
+    }
+}
+
+/// Point the engine's look override at `clip` (raw id) for the next renders —
+/// the live preview of an uncommitted filter/adjustment edit. Unparsable ids
+/// are dropped (stale projection race), same as the other overrides.
+fn apply_look_override(
+    engine: &mut Engine,
+    clip: &str,
+    filter_id: &str,
+    intensity: f32,
+    adjust: ColorAdjustments,
+) {
+    match parse_raw_id(clip).map(ClipId::from_raw) {
+        Some(id) => engine.set_look_override(Some((
+            id,
+            filter_from_ui(filter_id, intensity),
+            sanitize_adjustments(adjust),
+        ))),
+        None => error!(clip, "look override ignored: unparsable clip id"),
+    }
+}
+
+fn filter_from_ui(filter_id: &str, intensity: f32) -> Option<Filter> {
+    let id = filter_id.trim();
+    if id.is_empty() {
+        return None;
+    }
+    Some(Filter {
+        id: id.to_string(),
+        intensity: clamp_unit(intensity),
+    })
+}
+
+fn sanitize_adjustments(adjust: ColorAdjustments) -> ColorAdjustments {
+    ColorAdjustments {
+        brightness: clamp_signed_unit(adjust.brightness),
+        contrast: clamp_signed_unit(adjust.contrast),
+        saturation: clamp_signed_unit(adjust.saturation),
+        exposure: clamp_signed_unit(adjust.exposure),
+        temperature: clamp_signed_unit(adjust.temperature),
+    }
+}
+
+fn clamp_unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn clamp_signed_unit(value: f32) -> f32 {
+    if value.is_finite() {
+        value.clamp(-1.0, 1.0)
+    } else {
+        0.0
     }
 }
 
@@ -3197,6 +3429,58 @@ fn set_clip_crop_and_publish(
         x = crop.x, y = crop.y, w = crop.w, h = crop.h, flip_h, flip_v,
         "set clip crop"
     );
+    publish_projection(engine, ui);
+}
+
+/// Set or clear a visual clip's filter preset. A live look drag may have left
+/// an override in place; clear it first so the commit becomes authoritative.
+fn set_clip_filter_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    filter_id: &str,
+    intensity: f32,
+    ui: &UiSink,
+) {
+    engine.set_look_override(None);
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-filter ignored: unparsable clip id");
+        return;
+    };
+    let filter = filter_from_ui(filter_id, intensity);
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipFilter {
+        clip: clip_id,
+        filter: filter.clone(),
+    })) {
+        error!(%clip_id, filter_id, intensity, "set clip filter failed: {e}");
+        return;
+    }
+    info!(%clip_id, ?filter, "set clip filter");
+    publish_projection(engine, ui);
+}
+
+/// Set all manual color adjustments on a visual clip in one undoable edit.
+/// Release commits clear the live look override first, mirroring generator
+/// and transform preview semantics.
+fn set_clip_adjust_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    adjust: ColorAdjustments,
+    ui: &UiSink,
+) {
+    engine.set_look_override(None);
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-adjust ignored: unparsable clip id");
+        return;
+    };
+    let adjust = sanitize_adjustments(adjust);
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipAdjustments {
+        clip: clip_id,
+        adjust,
+    })) {
+        error!(%clip_id, ?adjust, "set clip adjustments failed: {e}");
+        return;
+    }
+    info!(%clip_id, ?adjust, "set clip adjustments");
     publish_projection(engine, ui);
 }
 
@@ -5452,6 +5736,115 @@ impl FrameCache {
             }
         }
     }
+}
+
+fn clear_gesture_sprite_ready(preview_weak: &slint::Weak<PreviewStore<'static>>) {
+    let weak = preview_weak.clone();
+    if let Err(e) = slint::invoke_from_event_loop(move || {
+        if let Some(store) = weak.upgrade() {
+            store.set_gesture_sprite_ready(false);
+        }
+    }) {
+        error!("failed to clear gesture sprite mode on UI: {e}");
+    }
+}
+
+fn begin_transform_gesture(
+    engine: &mut Engine,
+    clip: &str,
+    tick: i64,
+    tl_rate: Rational,
+    preview_weak: &slint::Weak<PreviewStore<'static>>,
+    fit: &FrameFit,
+    sprite_mode: &Cell<bool>,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "begin transform gesture ignored: unparsable clip id");
+        return;
+    };
+    let at = RationalTime::new(tick, tl_rate);
+    let started = Instant::now();
+    let result = match fit.fit_bound() {
+        Some((max_w, max_h)) => engine.get_gesture_frames(at, clip_id, max_w, max_h),
+        None => Ok(None),
+    };
+    match result {
+        Ok(Some(frames)) => {
+            fit.note_render_cost(started.elapsed().as_secs_f64() * 1000.0);
+            sprite_mode.set(true);
+            let weak = preview_weak.clone();
+            if let Err(e) = slint::invoke_from_event_loop(move || {
+                if let Some(store) = weak.upgrade() {
+                    store.set_gesture_frame_below(slint_image_from_rgba(frames.below));
+                    store.set_gesture_frame_sprite(slint_image_from_rgba(frames.sprite));
+                    if let Some(above) = frames.above {
+                        store.set_gesture_frame_above(slint_image_from_rgba(above));
+                        store.set_gesture_has_above(true);
+                    } else {
+                        store.set_gesture_has_above(false);
+                    }
+                    store.set_gesture_sprite_ready(true);
+                }
+            }) {
+                error!("failed to deliver gesture frames to UI: {e}");
+                sprite_mode.set(false);
+            }
+        }
+        Ok(None) => {
+            debug!(%clip_id, tick, "gesture sprite unavailable; using override path");
+            sprite_mode.set(false);
+        }
+        Err(e) => {
+            error!(%clip_id, tick, "gesture frame render failed: {e}");
+            sprite_mode.set(false);
+        }
+    }
+}
+
+fn render_frame_exit_sprite(
+    engine: &mut Engine,
+    tl_rate: Rational,
+    preview_weak: &slint::Weak<PreviewStore<'static>>,
+    tick: i64,
+    fit: &FrameFit,
+    sprite_mode: &Cell<bool>,
+) {
+    let clear_sprite = sprite_mode.get();
+    sprite_mode.set(false);
+    let at = RationalTime::new(tick, tl_rate);
+    let started = Instant::now();
+    let result = match fit.fit_bound() {
+        Some((max_w, max_h)) => engine.get_frame_fit(at, max_w, max_h),
+        None => engine.get_frame(at),
+    };
+    match result {
+        Ok(frame) => {
+            fit.note_render_cost(started.elapsed().as_secs_f64() * 1000.0);
+            let weak = preview_weak.clone();
+            if let Err(e) = slint::invoke_from_event_loop(move || {
+                if let Some(store) = weak.upgrade() {
+                    if clear_sprite {
+                        store.set_gesture_sprite_ready(false);
+                    }
+                    store.set_frame(slint_image_from_rgba(frame));
+                }
+            }) {
+                error!("failed to deliver preview frame to UI: {e}");
+            }
+        }
+        Err(e) => {
+            if clear_sprite {
+                clear_gesture_sprite_ready(preview_weak);
+            }
+            error!(tick, "preview frame failed: {e}");
+        }
+    }
+}
+
+fn slint_image_from_rgba(frame: cutlass_render::RgbaImage) -> slint::Image {
+    let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(frame.width, frame.height);
+    buffer.make_mut_bytes().copy_from_slice(&frame.pixels);
+    slint::Image::from_rgba8(buffer)
 }
 
 fn render_frame(

@@ -280,6 +280,17 @@ export struct Clip {
     crop-h: float,
     flip-h: bool,
     flip-v: bool,
+    // Clip-level color grading (filters + manual adjust), projected read-only.
+    // Edits go through `InspectorBackend.set-clip-filter` /
+    // `set-clip-adjust`; slider drags use a session-only look override.
+    filter-id: string,
+    filter-label: string,
+    filter-intensity: float,
+    adjust-brightness: float,
+    adjust-contrast: float,
+    adjust-saturation: float,
+    adjust-exposure: float,
+    adjust-temperature: float,
     // Keyframe curves per animatable property (M2), in tick order with
     // ABSOLUTE sequence ticks. Empty ⇔ the property is a constant (read it
     // from `transform-*` above). Edits go through

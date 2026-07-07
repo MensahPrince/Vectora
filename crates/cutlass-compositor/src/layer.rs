@@ -5,6 +5,7 @@ use cutlass_core::{RgbaImage, VideoFrame};
 use cutlass_shapes::{SdfShape, Stroke};
 
 use crate::grade::ColorGrade;
+use crate::passes::PassInstance;
 
 /// Canvas dimensions and background for one composite pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +63,50 @@ impl LayerPlacement {
     }
 }
 
+/// Mask shape kind ids shared with WGSL (`mask.wgsl`).
+pub mod mask_kind {
+    pub const LINEAR: u32 = 0;
+    pub const MIRROR: u32 = 1;
+    pub const CIRCLE: u32 = 2;
+    pub const RECTANGLE: u32 = 3;
+    pub const HEART: u32 = 4;
+    pub const STAR: u32 = 5;
+}
+
+/// GPU-ready mask parameters (no `cutlass-models` dependency).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerMask {
+    pub kind: u32,
+    pub feather: f32,
+    pub invert: u32,
+}
+
+/// GPU-ready chroma-key parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LayerChromaKey {
+    pub rgb: [f32; 3],
+    pub strength: f32,
+    pub shadow: f32,
+}
+
+/// Per-layer mask and chroma-key state for the fx pipelines.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LayerEffects {
+    pub mask: Option<LayerMask>,
+    pub chroma_key: Option<LayerChromaKey>,
+}
+
+impl LayerEffects {
+    pub const IDENTITY: Self = Self {
+        mask: None,
+        chroma_key: None,
+    };
+
+    pub fn is_identity(&self) -> bool {
+        self.mask.is_none() && self.chroma_key.is_none()
+    }
+}
+
 /// A parametric vector shape drawn as a signed-distance field by the shape
 /// pipeline: no texture, no rasterization — geometry parameters ride in the
 /// layer's uniform block, so animated shapes cost a uniform update per frame
@@ -87,7 +132,7 @@ pub struct SdfLayer {
 /// Frames are borrowed: the engine pulls a [`VideoFrame`] from the decoder for
 /// the current tick and hands it to the compositor without copying the planes.
 pub enum LayerContent<'a> {
-    /// A decoded video frame (CPU planes; GPU-surface import is a follow-up).
+    /// A decoded video frame (CPU planes or imported GPU surfaces).
     Frame(&'a VideoFrame),
     /// A pre-rasterized straight-alpha RGBA bitmap: text, pen-tool shape
     /// paths, stickers, or a decoded still. The compositor premultiplies it
@@ -107,8 +152,36 @@ pub struct CompositeLayer<'a> {
     /// (`(0,0)`=top-left, `(1,1)`=bottom-right of the frame's visible region).
     /// A sub-rect crops; a reversed axis mirrors. Ignored by solid fills.
     pub uv: [f32; 4],
+    /// Optional GPU effect chain applied after the base content is realized.
+    pub effects: &'a [PassInstance<'a>],
+    /// Mask/chroma-key state; identity uses the fast path pipelines.
+    pub fx: LayerEffects,
     /// Resolved color grade for this layer; `None` is the identity fast path.
     pub color_grade: Option<ColorGrade>,
+}
+
+/// A layer, a canvas-wide pass, or a dual-source transition submitted to the compositor.
+pub enum CompositorLayer<'a> {
+    /// A standard layer (optionally with an effect chain).
+    Layer(&'a CompositeLayer<'a>),
+    /// Apply an effect chain and grade to the current composited canvas.
+    CanvasPass {
+        effects: &'a [PassInstance<'a>],
+        grade: Option<ColorGrade>,
+    },
+    /// Blend two independently placed layers by transition progress.
+    Transition {
+        outgoing: &'a CompositeLayer<'a>,
+        incoming: &'a CompositeLayer<'a>,
+        transition_id: &'a str,
+        progress: f32,
+    },
+}
+
+impl<'a> CompositorLayer<'a> {
+    pub fn layer(layer: &'a CompositeLayer<'a>) -> Self {
+        Self::Layer(layer)
+    }
 }
 
 impl<'a> CompositeLayer<'a> {
@@ -118,6 +191,8 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Frame(frame),
             placement,
             uv: FULL_UV,
+            effects: &[],
+            fx: LayerEffects::IDENTITY,
             color_grade: None,
         }
     }
@@ -128,6 +203,8 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Rgba(image),
             placement,
             uv: FULL_UV,
+            effects: &[],
+            fx: LayerEffects::IDENTITY,
             color_grade: None,
         }
     }
@@ -138,6 +215,8 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Solid(rgba),
             placement,
             uv: FULL_UV,
+            effects: &[],
+            fx: LayerEffects::IDENTITY,
             color_grade: None,
         }
     }
@@ -148,8 +227,16 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Sdf(shape),
             placement,
             uv: FULL_UV,
+            effects: &[],
+            fx: LayerEffects::IDENTITY,
             color_grade: None,
         }
+    }
+
+    /// Attach an effect chain (sampled at resolve time).
+    pub fn with_effects(mut self, effects: &'a [PassInstance<'a>]) -> Self {
+        self.effects = effects;
+        self
     }
 
     /// Replace the sampled UV rect (crop / mirror).
@@ -158,9 +245,21 @@ impl<'a> CompositeLayer<'a> {
         self
     }
 
+    /// Attach mask/chroma-key fx (routes to the fx pipelines when non-identity).
+    pub fn with_fx(mut self, fx: LayerEffects) -> Self {
+        self.fx = fx;
+        self
+    }
+
+    /// Replace the per-layer color grade.
+    pub fn with_grade(mut self, grade: ColorGrade) -> Self {
+        self.color_grade = (!grade.is_identity()).then_some(grade);
+        self
+    }
+
     /// Attach a resolved color grade (filter preset + manual adjustments).
     pub fn with_color_grade(mut self, grade: Option<ColorGrade>) -> Self {
-        self.color_grade = grade;
+        self.color_grade = grade.filter(|g| !g.is_identity());
         self
     }
 }

@@ -31,3 +31,6 @@ venv/
 crates/cutlass-py/.venv/
 crates/cutlass-py/examples/trailer.mp4
 trailer.cutlass
+# Agent task scaffolding (local only; do not commit).
+AGENT_TASK.md
+.cursor/plans/

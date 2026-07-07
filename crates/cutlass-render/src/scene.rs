@@ -8,13 +8,19 @@
 //! z-order, transforms, crop) deterministic and unit-testable without a device,
 //! while [`Renderer`](crate::Renderer) does the decode + rasterize + composite.
 
-use cutlass_models::MediaId;
+use cutlass_compositor::ColorGrade;
+use cutlass_models::{ChromaKey, ClipId, Mask, MediaId};
 use cutlass_shapes::{BezierPath, SdfParams, Stroke};
 use cutlass_text::TextStyle;
 
-use cutlass_compositor::ColorGrade;
-
 pub use cutlass_core::RationalTime;
+
+/// One sampled GPU effect pass attached to a clip at resolve time.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResolvedPass {
+    pub id: String,
+    pub params: Vec<f32>,
+}
 
 /// A canvas plus the ordered layer stack to composite for one timeline instant.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,7 +29,8 @@ pub struct Scene {
     pub width: u32,
     /// Canvas height in pixels.
     pub height: u32,
-    /// Opaque background the canvas clears to before layers composite over it.
+    /// Canvas clear color before layers composite. Alpha 0 is supported for
+    /// gesture sprite/foreground passes that stack over an opaque backdrop.
     pub background: [u8; 4],
     /// Layers in bottom-to-top stacking order (index 0 draws first).
     pub layers: Vec<SceneLayer>,
@@ -72,10 +79,12 @@ impl Scene {
                 // Path strokes live in path-local pixels folded into the
                 // raster, so scaling the raster factor scales them too.
                 LayerSource::PathShape { raster_scale, .. } => *raster_scale *= factor,
-                LayerSource::Media { .. }
+                LayerSource::CanvasPass
+                | LayerSource::Media { .. }
                 | LayerSource::Still { .. }
                 | LayerSource::Text { .. }
-                | LayerSource::Solid(_) => {}
+                | LayerSource::Solid(_)
+                | LayerSource::Transition { .. } => {}
             }
         }
     }
@@ -124,6 +133,9 @@ fn scaled_dim(dim: u32, factor: f32) -> u32 {
 /// One placed layer: a pixel source plus where it lands on the canvas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneLayer {
+    /// Originating timeline clip, when this layer maps 1:1 to one clip.
+    /// `None` for transition composites and other multi-source layers.
+    pub clip: Option<ClipId>,
     /// What to draw.
     pub source: LayerSource,
     /// Canvas position of the content's anchor point (+x right, +y down) —
@@ -145,6 +157,12 @@ pub struct SceneLayer {
     /// Sampled UV rect `[u0, v0, u1, v1]` across the visible picture. A sub-rect
     /// crops; a reversed axis mirrors. Ignored by solid fills.
     pub uv: [f32; 4],
+    /// GPU effect chain sampled at clip-local tick (empty when none).
+    pub effects: Vec<ResolvedPass>,
+    /// Shaped alpha mask (media clips only).
+    pub mask: Option<Mask>,
+    /// Green-screen keying (media clips only).
+    pub chroma_key: Option<ChromaKey>,
     /// Resolved color grade (filter preset + manual adjustments); `None` when
     /// the clip's look is identity.
     pub color_grade: Option<ColorGrade>,
@@ -198,6 +216,11 @@ pub enum LayerSource {
     Text { content: String, style: TextStyle },
     /// A solid RGBA fill across the placed quad.
     Solid([u8; 4]),
+    /// Apply this layer's effect chain and color grade to the current canvas.
+    ///
+    /// Lane-level effect/filter/adjustment generator bars use this geometry-free
+    /// marker to process everything already drawn below their track.
+    CanvasPass,
     /// A parametric vector shape, every animatable parameter already sampled
     /// at this instant (canvas pixels). Realized as a GPU SDF layer: the
     /// layer's `size` is the *padded quad* (shape + stroke overhang + AA);
@@ -226,6 +249,14 @@ pub enum LayerSource {
         /// quad via [`SizeSpec::BitmapScaled`]).
         raster_scale: f32,
     },
+    /// A track transition between two abutting clips, sampled at `progress`.
+    Transition {
+        outgoing: Box<SceneLayer>,
+        incoming: Box<SceneLayer>,
+        transition_id: String,
+        /// `0.0` = fully outgoing, `1.0` = fully incoming.
+        progress: f32,
+    },
 }
 
 #[cfg(test)]
@@ -235,6 +266,7 @@ mod tests {
 
     fn media_layer(center: [f32; 2], size: [f32; 2]) -> SceneLayer {
         SceneLayer {
+            clip: None,
             source: LayerSource::Media {
                 media: MediaId::from_raw(1),
                 source_time: RationalTime::new(0, Rational::FPS_30),
@@ -245,12 +277,16 @@ mod tests {
             rotation: 0.5,
             opacity: 0.8,
             uv: [0.1, 0.2, 0.9, 0.8],
+            effects: Vec::new(),
+            mask: None,
+            chroma_key: None,
             color_grade: None,
         }
     }
 
     fn shape_layer() -> SceneLayer {
         SceneLayer {
+            clip: None,
             source: LayerSource::Shape {
                 params: SdfParams::Ellipse,
                 fill: [255, 0, 0, 255],
@@ -266,12 +302,16 @@ mod tests {
             rotation: 0.0,
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            effects: Vec::new(),
+            mask: None,
+            chroma_key: None,
             color_grade: None,
         }
     }
 
     fn text_layer() -> SceneLayer {
         SceneLayer {
+            clip: None,
             source: LayerSource::Text {
                 content: "hi".into(),
                 style: TextStyle::new(48.0),
@@ -282,6 +322,9 @@ mod tests {
             rotation: 0.0,
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            effects: Vec::new(),
+            mask: None,
+            chroma_key: None,
             color_grade: None,
         }
     }

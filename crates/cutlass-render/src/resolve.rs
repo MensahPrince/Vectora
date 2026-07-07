@@ -15,21 +15,23 @@
 //!   shapes resolve to sampled SDF layers (animated geometry/colors are
 //!   sampled per instant here, evaluated on the GPU), pen paths to CPU-raster
 //!   layers.
-//! - **Look**: per-clip color adjustments and filter presets flow into each
-//!   layer's `color_grade` and are applied in the compositor shader.
-//! - **Deferred**: stickers, effects, and adjustment *track* layers are skipped
-//!   (they produce no layer) rather than rendered wrong.
+//! - **Lane passes**: effect, filter, and adjustment generator bars resolve to
+//!   canvas-wide passes over everything below their track.
+//! - **Deferred**: stickers are skipped (they produce no layer) rather than
+//!   rendered wrong.
 
+use cutlass_compositor::ColorGrade;
 use cutlass_core::{RationalTime, resample};
 use cutlass_models::{
-    ClipId, ClipSource, ClipTransform, Generator, MediaKind, Param, Project, Shape, ShapePath,
-    ShapeStroke, TextAlignH, TextStyle as ModelTextStyle,
+    ClipId, ClipSource, ClipTransform, ColorAdjustments, EffectInstance, Filter, Generator,
+    MediaKind, Param, Project, Shape, ShapePath, ShapeStroke, TextAlignH,
+    TextStyle as ModelTextStyle,
 };
 use cutlass_shapes::{BezierPath, PathPoint, SDF_AA, SdfParams, Stroke};
 use cutlass_text::{FontFamily, TextAlign, TextStyle};
 
 use crate::grade::resolve_color_grade;
-use crate::scene::{LayerSource, Scene, SceneLayer, SizeSpec};
+use crate::scene::{LayerSource, ResolvedPass, Scene, SceneLayer, SizeSpec};
 
 /// Vertical reference height that a generator's reference-pixel sizes (text
 /// `size`, shape `width`/`height`) are authored against. Matches the model's
@@ -49,6 +51,86 @@ const DEFAULT_CANVAS: (u32, u32) = (1920, 1080);
 pub struct ResolveOverrides<'a> {
     pub transform: Option<(ClipId, ClipTransform)>,
     pub generator: Option<(ClipId, &'a Generator)>,
+    pub look: Option<(ClipId, Option<&'a Filter>, &'a ColorAdjustments)>,
+}
+
+/// Identity transform used when rasterizing the gesture sprite: the clip's
+/// pixels at scale 1, centered on the canvas, with no rotation.
+pub const GESTURE_IDENTITY_TRANSFORM: ClipTransform = ClipTransform {
+    position: [0.0, 0.0],
+    anchor_point: [0.5, 0.5],
+    scale: 1.0,
+    rotation: 0.0,
+    opacity: 1.0,
+};
+
+/// Three scene partitions for zero-drift preview transform gestures.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GestureScenePartition {
+    /// Layers below the dragged clip over the canvas background.
+    pub below: Scene,
+    /// The dragged clip alone at [`GESTURE_IDENTITY_TRANSFORM`].
+    pub sprite: Scene,
+    /// Layers above the dragged clip (may be empty).
+    pub above: Scene,
+}
+
+/// Resolve the scene at `t`, force `clip_id`'s transform to identity, and
+/// split the stack into below / sprite / above partitions. Returns `None` when
+/// the clip isn't composited at `t`, sits inside a transition window, or
+/// otherwise can't be sprite-partitioned (caller falls back to per-move
+/// override rendering).
+pub fn resolve_gesture_partitions(
+    project: &Project,
+    t: RationalTime,
+    clip_id: ClipId,
+) -> Result<Option<GestureScenePartition>, cutlass_models::ModelError> {
+    let overrides = ResolveOverrides {
+        transform: Some((clip_id, GESTURE_IDENTITY_TRANSFORM)),
+        generator: None,
+        look: None,
+    };
+    let scene = resolve_with(project, t, overrides)?;
+    let index = scene
+        .layers
+        .iter()
+        .position(|layer| layer.clip == Some(clip_id));
+    let Some(index) = index else {
+        return Ok(None);
+    };
+    if matches!(
+        scene.layers[index].source,
+        LayerSource::Transition { .. } | LayerSource::CanvasPass
+    ) {
+        return Ok(None);
+    }
+    if scene.layers[index + 1..]
+        .iter()
+        .any(|layer| matches!(layer.source, LayerSource::CanvasPass))
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(GestureScenePartition {
+        below: Scene {
+            width: scene.width,
+            height: scene.height,
+            background: scene.background,
+            layers: scene.layers[..index].to_vec(),
+        },
+        sprite: Scene {
+            width: scene.width,
+            height: scene.height,
+            background: [0, 0, 0, 0],
+            layers: vec![scene.layers[index].clone()],
+        },
+        above: Scene {
+            width: scene.width,
+            height: scene.height,
+            background: [0, 0, 0, 0],
+            layers: scene.layers[index + 1..].to_vec(),
+        },
+    }))
 }
 
 /// Resolve `project` at timeline instant `t` into a [`Scene`].
@@ -80,15 +162,82 @@ pub fn resolve_with(
         if !track.kind.is_visual() || !track.enabled {
             continue;
         }
-        let Some(clip) = track.clip_at(t)? else {
-            continue;
-        };
-        if let Some(layer) = resolve_clip(project, clip, t, cw, ch, overrides)? {
+        if let Some(layer) = resolve_track_at(project, track, t, cw, ch, overrides)? {
             scene.layers.push(layer);
         }
     }
 
     Ok(scene)
+}
+
+/// Resolve one visual track at timeline instant `t`.
+fn resolve_track_at(
+    project: &Project,
+    track: &cutlass_models::Track,
+    t: RationalTime,
+    cw: f32,
+    ch: f32,
+    overrides: ResolveOverrides<'_>,
+) -> Result<Option<SceneLayer>, cutlass_models::ModelError> {
+    // Transition window takes precedence over single-clip resolve.
+    for transition in track.transitions() {
+        let left = track
+            .clip(transition.left)
+            .ok_or(cutlass_models::ModelError::UnknownClip(transition.left))?;
+        let right = track
+            .clip(transition.right)
+            .ok_or(cutlass_models::ModelError::UnknownClip(transition.right))?;
+        if left.timeline.end_tick() != right.timeline.start.value {
+            continue;
+        }
+        let cut = left.timeline.end_tick();
+        let half = transition.duration / 2;
+        let window_start = cut - half;
+        let window_end = window_start + transition.duration;
+        if t.value >= window_start && t.value < window_end {
+            let progress = (t.value - window_start) as f32 / transition.duration as f32;
+            let outgoing_t = RationalTime::new(left.timeline.end_tick() - 1, t.rate);
+            let incoming_t = RationalTime::new(right.timeline.start.value, t.rate);
+            let outgoing = resolve_clip(project, left, outgoing_t, cw, ch, overrides)?
+                .map(Box::new)
+                .ok_or_else(|| {
+                    cutlass_models::ModelError::InvalidParam(
+                        "transition outgoing clip produced no layer".into(),
+                    )
+                })?;
+            let incoming = resolve_clip(project, right, incoming_t, cw, ch, overrides)?
+                .map(Box::new)
+                .ok_or_else(|| {
+                    cutlass_models::ModelError::InvalidParam(
+                        "transition incoming clip produced no layer".into(),
+                    )
+                })?;
+            return Ok(Some(SceneLayer {
+                clip: None,
+                source: LayerSource::Transition {
+                    outgoing,
+                    incoming,
+                    transition_id: transition.transition_id.clone(),
+                    progress,
+                },
+                center: [cw * 0.5, ch * 0.5],
+                anchor_point: [0.5, 0.5],
+                size: SizeSpec::Fixed([cw, ch]),
+                rotation: 0.0,
+                opacity: 1.0,
+                uv: [0.0, 0.0, 1.0, 1.0],
+                effects: Vec::new(),
+                mask: None,
+                chroma_key: None,
+                color_grade: None,
+            }));
+        }
+    }
+
+    let Some(clip) = track.clip_at(t)? else {
+        return Ok(None);
+    };
+    resolve_clip(project, clip, t, cw, ch, overrides)
 }
 
 /// Canvas pixel size for `project`: fixed presets resolve to a 1080-baseline
@@ -168,8 +317,14 @@ fn resolve_clip(
     let rotation = xf.rotation.to_radians();
     let opacity = xf.opacity.clamp(0.0, 1.0);
     let uv = crop_flip_uv(clip);
+    let effects = resolve_effects(clip, local_tick);
+    let (filter, adjust) = match overrides.look {
+        Some((id, filter, adjust)) if id == clip.id => (filter, adjust),
+        _ => (clip.filter.as_ref(), &clip.adjust),
+    };
+    let color_grade = resolve_color_grade(filter, adjust);
 
-    let layer = match &clip.content {
+    match &clip.content {
         ClipSource::Media { media, .. } => {
             let Some(src) = project.media(*media) else {
                 return Ok(None);
@@ -196,7 +351,8 @@ fn resolve_clip(
                 src.width as f32 * fit * xf.scale,
                 src.height as f32 * fit * xf.scale,
             ]);
-            Some(SceneLayer {
+            Ok(Some(SceneLayer {
+                clip: Some(clip.id),
                 source,
                 center,
                 anchor_point,
@@ -204,8 +360,11 @@ fn resolve_clip(
                 rotation,
                 opacity,
                 uv,
-                color_grade: None,
-            })
+                effects,
+                mask: clip.mask,
+                chroma_key: clip.chroma_key,
+                color_grade,
+            }))
         }
         ClipSource::Generated(generator) => {
             // A live inspector edit replaces the clip's generator content.
@@ -213,25 +372,48 @@ fn resolve_clip(
                 Some((id, live)) if id == clip.id => live,
                 _ => generator,
             };
-            resolve_generator(
+            Ok(resolve_generator(
                 generator,
                 center,
                 anchor_point,
                 rotation,
                 opacity,
                 uv,
+                color_grade,
                 cw,
                 ch,
                 xf.scale,
                 local_tick,
+                effects,
             )
+            .map(|mut layer| {
+                layer.clip = Some(clip.id);
+                layer
+            }))
         }
     }
-    .map(|mut layer| {
-        layer.color_grade = resolve_color_grade(clip.filter.as_ref(), &clip.adjust);
-        layer
-    });
-    Ok(layer)
+}
+
+/// Sample `clip.effects` at clip-local `tick` into compositor-ready passes.
+fn resolve_effects(clip: &cutlass_models::Clip, tick: i64) -> Vec<ResolvedPass> {
+    let tick_f = tick as f64;
+    clip.effects
+        .iter()
+        .filter_map(|fx| pack_effect(fx, tick_f).ok())
+        .collect()
+}
+
+fn pack_effect(fx: &EffectInstance, tick: f64) -> Result<ResolvedPass, cutlass_models::ModelError> {
+    let spec = fx.spec()?;
+    let mut params = Vec::with_capacity(spec.params.len());
+    for pspec in spec.params {
+        let value = fx.sample_param(pspec.name, tick).unwrap_or(pspec.default);
+        params.push(value);
+    }
+    Ok(ResolvedPass {
+        id: fx.effect_id.clone(),
+        params,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -242,10 +424,12 @@ pub(crate) fn resolve_generator(
     rotation: f32,
     opacity: f32,
     uv: [f32; 4],
+    color_grade: Option<ColorGrade>,
     cw: f32,
     ch: f32,
     scale: f32,
     tick: i64,
+    effects: Vec<ResolvedPass>,
 ) -> Option<SceneLayer> {
     let ref_scale = ch / REFERENCE_HEIGHT;
     match generator {
@@ -255,6 +439,7 @@ pub(crate) fn resolve_generator(
                 return None;
             }
             Some(SceneLayer {
+                clip: None,
                 source: LayerSource::Text {
                     content: text,
                     style: map_text_style(style, cw, ch),
@@ -265,10 +450,14 @@ pub(crate) fn resolve_generator(
                 rotation,
                 opacity,
                 uv,
-                color_grade: None,
+                effects,
+                mask: None,
+                chroma_key: None,
+                color_grade,
             })
         }
         Generator::SolidColor { rgba } => Some(SceneLayer {
+            clip: None,
             source: LayerSource::Solid(*rgba),
             center,
             anchor_point,
@@ -276,7 +465,10 @@ pub(crate) fn resolve_generator(
             rotation,
             opacity,
             uv,
-            color_grade: None,
+            effects,
+            mask: None,
+            chroma_key: None,
+            color_grade,
         }),
         Generator::Shape {
             shape,
@@ -299,12 +491,38 @@ pub(crate) fn resolve_generator(
             rotation,
             opacity,
             uv,
+            color_grade,
             scale,
+            effects,
         ),
-        // Stickers/effects/filters/adjustment layers are not composited yet.
+        Generator::Effect => canvas_pass(effects, None, cw, ch),
+        Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), color_grade, cw, ch),
+        // Stickers are not composited yet.
         // Skip rather than draw something wrong.
-        Generator::Sticker | Generator::Effect | Generator::Filter | Generator::Adjustment => None,
+        Generator::Sticker => None,
     }
+}
+
+fn canvas_pass(
+    effects: Vec<ResolvedPass>,
+    color_grade: Option<ColorGrade>,
+    cw: f32,
+    ch: f32,
+) -> Option<SceneLayer> {
+    (!effects.is_empty() || color_grade.is_some()).then_some(SceneLayer {
+        clip: None,
+        source: LayerSource::CanvasPass,
+        center: [cw * 0.5, ch * 0.5],
+        anchor_point: [0.5, 0.5],
+        size: SizeSpec::Fixed([cw, ch]),
+        rotation: 0.0,
+        opacity: 1.0,
+        uv: [0.0, 0.0, 1.0, 1.0],
+        effects,
+        mask: None,
+        chroma_key: None,
+        color_grade,
+    })
 }
 
 /// Resolve one shape generator at `tick` into a placed layer.
@@ -330,7 +548,9 @@ fn resolve_shape(
     rotation: f32,
     opacity: f32,
     uv: [f32; 4],
+    color_grade: Option<ColorGrade>,
     transform_scale: f32,
+    effects: Vec<ResolvedPass>,
 ) -> Option<SceneLayer> {
     let fill = rgba.sample(tick);
     let stroke_px = stroke.map(|s| Stroke {
@@ -352,6 +572,7 @@ fn resolve_shape(
             px_scale
         };
         return Some(SceneLayer {
+            clip: None,
             source: LayerSource::PathShape {
                 path: bezier,
                 fill,
@@ -369,7 +590,10 @@ fn resolve_shape(
             rotation,
             opacity,
             uv,
-            color_grade: None,
+            effects,
+            mask: None,
+            chroma_key: None,
+            color_grade,
         });
     }
 
@@ -383,6 +607,7 @@ fn resolve_shape(
     // Plain rectangles keep the no-texture solid fast path.
     if matches!(shape, Shape::Rectangle) && radius == 0.0 && stroke_px.is_none() {
         return Some(SceneLayer {
+            clip: None,
             source: LayerSource::Solid(fill),
             center,
             anchor_point,
@@ -390,7 +615,10 @@ fn resolve_shape(
             rotation,
             opacity,
             uv,
-            color_grade: None,
+            effects,
+            mask: None,
+            chroma_key: None,
+            color_grade,
         });
     }
 
@@ -416,6 +644,7 @@ fn resolve_shape(
     // shader's ink clips at the quad edge (same margin as the CPU raster).
     let pad = stroke_px.map_or(0.0, |s| s.width * 0.5) + 2.0 * SDF_AA;
     Some(SceneLayer {
+        clip: None,
         source: LayerSource::Shape {
             params,
             fill,
@@ -428,7 +657,10 @@ fn resolve_shape(
         rotation,
         opacity,
         uv,
-        color_grade: None,
+        effects,
+        mask: None,
+        chroma_key: None,
+        color_grade,
     })
 }
 
@@ -501,10 +733,12 @@ fn fit_scale(nw: f32, nh: f32, cw: f32, ch: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::grade::effective_grade;
     use crate::scene::{LayerSource, SizeSpec};
     use cutlass_models::{
-        CanvasAspect, CanvasSettings, ClipTransform, CropRect, Generator, MediaSource, Project,
-        Rational, RationalTime, Shape, TextStyle as ModelTextStyle, TimeRange, TrackKind,
+        CanvasAspect, CanvasSettings, ClipTransform, ColorAdjustments, CropRect, Filter, Generator,
+        MediaSource, Project, Rational, RationalTime, Shape, TextStyle as ModelTextStyle,
+        TimeRange, TrackKind,
     };
 
     const FPS_24: Rational = Rational::FPS_24;
@@ -778,6 +1012,7 @@ mod tests {
     #[test]
     fn quad_center_rotates_about_the_anchor() {
         let layer = SceneLayer {
+            clip: None,
             source: LayerSource::Solid([255, 255, 255, 255]),
             center: [960.0, 540.0],
             anchor_point: [0.0, 0.0],
@@ -785,6 +1020,9 @@ mod tests {
             rotation: std::f32::consts::FRAC_PI_2, // 90° clockwise
             opacity: 1.0,
             uv: [0.0, 0.0, 1.0, 1.0],
+            effects: Vec::new(),
+            mask: None,
+            chroma_key: None,
             color_grade: None,
         };
         // to_center (960, 540) rotated 90° cw (+y down) → (-540, 960).
@@ -820,10 +1058,28 @@ mod tests {
                     rgba: [0, 255, 0, 255],
                 },
             )),
+            look: Some((
+                clip,
+                None,
+                &ColorAdjustments {
+                    brightness: 0.25,
+                    ..ColorAdjustments::default()
+                },
+            )),
         };
         let scene = resolve_with(&project, rt(5), overrides).unwrap();
         let layer = &scene.layers[0];
         assert_eq!(layer.source, LayerSource::Solid([0, 255, 0, 255]));
+        assert_eq!(
+            layer.color_grade,
+            Some(effective_grade(
+                None,
+                &ColorAdjustments {
+                    brightness: 0.25,
+                    ..ColorAdjustments::default()
+                }
+            ))
+        );
         approx2(layer.center, [1920.0 * 0.75, 540.0]);
         match layer.size {
             SizeSpec::Fixed(size) => approx2(size, [960.0, 540.0]),
@@ -833,6 +1089,7 @@ mod tests {
         // Plain resolve still sees only committed state.
         let scene = resolve(&project, rt(5)).unwrap();
         assert_eq!(scene.layers[0].source, LayerSource::Solid([255, 0, 0, 255]));
+        assert_eq!(scene.layers[0].color_grade, None);
         approx2(scene.layers[0].center, [960.0, 540.0]);
     }
 
@@ -1093,8 +1350,157 @@ mod tests {
         assert_eq!(layer.size, SizeSpec::BitmapScaled(1.0));
     }
 
+    #[test]
+    fn untouched_clip_resolves_to_identity_grade() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers[0].color_grade, None);
+    }
+
+    #[test]
+    fn clip_adjust_and_filter_flow_into_scene_layer_grade() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let adjust_clip = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                adjust_clip,
+                ColorAdjustments {
+                    saturation: -1.0,
+                    ..ColorAdjustments::default()
+                },
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        let expected = effective_grade(
+            None,
+            &ColorAdjustments {
+                saturation: -1.0,
+                ..ColorAdjustments::default()
+            },
+        );
+        assert_eq!(scene.layers[0].color_grade, Some(expected));
+        assert_eq!(scene.layers[0].color_grade.unwrap().saturation, -1.0);
+
+        let filter_track = project.add_track(TrackKind::Sticker, "S2");
+        let filter_clip = project
+            .add_generated(
+                filter_track,
+                Generator::SolidColor {
+                    rgba: [0, 255, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let filter = Filter {
+            id: "mono".into(),
+            intensity: 0.8,
+        };
+        project
+            .set_clip_filter(filter_clip, Some(filter.clone()))
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        let filter_layer = scene
+            .layers
+            .iter()
+            .find(|l| matches!(l.source, LayerSource::Solid([0, 255, 0, 255])))
+            .expect("filter clip layer");
+        assert_eq!(
+            filter_layer.color_grade,
+            Some(effective_grade(Some(&filter), &ColorAdjustments::default()))
+        );
+    }
+
     /// The model's validation cap and the evaluator's vertex-buffer bound
     /// must agree, or a valid project could hold a star the renderer clamps.
+    #[test]
+    fn mask_and_chroma_key_reach_media_layer() {
+        use cutlass_models::{ChromaKey, Mask, MaskKind};
+
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_mask(clip, Some(Mask::new(MaskKind::Circle)))
+            .unwrap();
+        project
+            .set_clip_chroma_key(
+                clip,
+                Some(ChromaKey {
+                    rgb: [0, 255, 0],
+                    strength: 0.5,
+                    shadow: 0.0,
+                }),
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        let layer = &scene.layers[0];
+        assert_eq!(layer.mask.unwrap().kind, MaskKind::Circle);
+        assert_eq!(layer.chroma_key.unwrap().rgb, [0, 255, 0]);
+        assert!((layer.chroma_key.unwrap().strength - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn generated_clip_has_no_look_fields() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        assert!(scene.layers[0].mask.is_none());
+        assert!(scene.layers[0].chroma_key.is_none());
+    }
+
+    #[test]
+    fn cleared_mask_is_none_on_layer() {
+        use cutlass_models::{Mask, MaskKind};
+
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_mask(clip, Some(Mask::new(MaskKind::Rectangle)))
+            .unwrap();
+        project.set_clip_mask(clip, None).unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert!(scene.layers[0].mask.is_none());
+    }
+
     #[test]
     fn star_point_cap_matches_the_shapes_crate() {
         assert_eq!(
@@ -1104,42 +1510,349 @@ mod tests {
     }
 
     #[test]
-    fn look_data_reaches_the_resolved_layer() {
-        use cutlass_models::{ColorAdjustments, Filter};
-
+    fn clip_with_gaussian_blur_carries_sampled_radius() {
         let mut project = Project::new("p", FPS_24);
-        let media = project.add_media(video(1920, 1080));
-        let track = project.add_track(TrackKind::Video, "V1");
-        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let clip = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        project.add_effect(clip, "gaussian_blur").unwrap();
         project
-            .set_clip_filter(clip, Some(Filter::new("warm")))
+            .set_effect_param(clip, 0, 0, 12.0)
+            .expect("set radius");
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        assert_eq!(scene.layers[0].effects.len(), 1);
+        assert_eq!(scene.layers[0].effects[0].id, "gaussian_blur");
+        approx(scene.layers[0].effects[0].params[0], 12.0);
+    }
+
+    #[test]
+    fn adjustment_lane_resolves_to_canvas_pass_above_lower_layers() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let adjustment = project.add_track(TrackKind::Adjustment, "A1");
+        let bar = project
+            .add_generated(adjustment, Generator::Adjustment, tr(0, 100))
             .unwrap();
         project
             .set_clip_adjustments(
-                clip,
+                bar,
                 ColorAdjustments {
-                    exposure: 0.25,
+                    saturation: -1.0,
                     ..ColorAdjustments::default()
                 },
             )
             .unwrap();
 
         let scene = resolve(&project, rt(5)).unwrap();
-        let grade = scene.layers[0]
-            .color_grade
-            .expect("filter + adjust should resolve to a grade");
-        assert!(grade.temperature > 0.0);
-        assert_eq!(grade.exposure, 0.25);
+        assert_eq!(scene.layers.len(), 2);
+        assert!(matches!(scene.layers[0].source, LayerSource::Solid(_)));
+        assert_eq!(scene.layers[1].source, LayerSource::CanvasPass);
+        assert_eq!(scene.layers[1].clip, Some(bar));
+        assert_eq!(scene.layers[1].effects, Vec::<ResolvedPass>::new());
+        assert_eq!(
+            scene.layers[1].color_grade,
+            Some(effective_grade(
+                None,
+                &ColorAdjustments {
+                    saturation: -1.0,
+                    ..ColorAdjustments::default()
+                },
+            ))
+        );
     }
 
     #[test]
-    fn neutral_look_stays_none_on_the_layer() {
+    fn filter_lane_resolves_to_canvas_pass_grade() {
         let mut project = Project::new("p", FPS_24);
-        let media = project.add_media(video(1920, 1080));
-        let track = project.add_track(TrackKind::Video, "V1");
-        project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let filter_track = project.add_track(TrackKind::Filter, "F1");
+        let bar = project
+            .add_generated(filter_track, Generator::Filter, tr(0, 100))
+            .unwrap();
+        let filter = Filter {
+            id: "mono".into(),
+            intensity: 1.0,
+        };
+        project.set_clip_filter(bar, Some(filter.clone())).unwrap();
 
         let scene = resolve(&project, rt(5)).unwrap();
-        assert!(scene.layers[0].color_grade.is_none());
+        assert_eq!(scene.layers.len(), 2);
+        assert_eq!(scene.layers[1].source, LayerSource::CanvasPass);
+        assert_eq!(
+            scene.layers[1].color_grade,
+            Some(effective_grade(Some(&filter), &ColorAdjustments::default()))
+        );
+    }
+
+    #[test]
+    fn effect_lane_resolves_to_canvas_pass_effect_chain() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let effect_track = project.add_track(TrackKind::Effect, "E1");
+        let bar = project
+            .add_generated(effect_track, Generator::Effect, tr(0, 100))
+            .unwrap();
+        project.add_effect(bar, "gaussian_blur").unwrap();
+        project.set_effect_param(bar, 0, 0, 8.0).unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 2);
+        assert_eq!(scene.layers[1].source, LayerSource::CanvasPass);
+        assert_eq!(scene.layers[1].color_grade, None);
+        assert_eq!(scene.layers[1].effects.len(), 1);
+        assert_eq!(scene.layers[1].effects[0].id, "gaussian_blur");
+        approx(scene.layers[1].effects[0].params[0], 8.0);
+    }
+
+    #[test]
+    fn identity_or_inactive_lane_passes_are_elided() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let adjustment = project.add_track(TrackKind::Adjustment, "A1");
+        project
+            .add_generated(adjustment, Generator::Adjustment, tr(0, 100))
+            .unwrap();
+
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1, "neutral pass should not render");
+
+        let bar = project
+            .add_generated(adjustment, Generator::Adjustment, tr(120, 10))
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                bar,
+                ColorAdjustments {
+                    exposure: 1.0,
+                    ..ColorAdjustments::default()
+                },
+            )
+            .unwrap();
+        let scene = resolve(&project, rt(5)).unwrap();
+        assert_eq!(scene.layers.len(), 1, "out-of-range pass should not render");
+
+        project
+            .timeline_mut()
+            .track_mut(adjustment)
+            .unwrap()
+            .enabled = false;
+        let scene = resolve(&project, rt(125)).unwrap();
+        assert!(
+            scene.layers.is_empty(),
+            "disabled pass track should not render"
+        );
+    }
+
+    #[test]
+    fn gesture_partitions_fall_back_when_canvas_pass_sits_above_clip() {
+        let mut project = Project::new("p", FPS_24);
+        let base = project.add_track(TrackKind::Sticker, "S1");
+        let clip = project
+            .add_generated(
+                base,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        let adjustment = project.add_track(TrackKind::Adjustment, "A1");
+        let bar = project
+            .add_generated(adjustment, Generator::Adjustment, tr(0, 100))
+            .unwrap();
+        project
+            .set_clip_adjustments(
+                bar,
+                ColorAdjustments {
+                    exposure: 1.0,
+                    ..ColorAdjustments::default()
+                },
+            )
+            .unwrap();
+
+        let partitions = resolve_gesture_partitions(&project, rt(5), clip).unwrap();
+        assert!(partitions.is_none());
+    }
+
+    #[test]
+    fn abutting_clips_crossfade_at_midpoint() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let left = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 24),
+            )
+            .unwrap();
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
+                tr(24, 24),
+            )
+            .unwrap();
+        project.add_transition(left, "crossfade").unwrap();
+        project.set_transition_duration(left, 24).unwrap();
+
+        // Cut at 24; window [12, 36); midpoint tick 24 → progress 0.5.
+        let scene = resolve(&project, rt(24)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        match &scene.layers[0].source {
+            LayerSource::Transition {
+                transition_id,
+                progress,
+                ..
+            } => {
+                assert_eq!(transition_id, "crossfade");
+                approx(*progress, 0.5);
+            }
+            other => panic!("expected transition layer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn outside_transition_window_is_single_clip() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let left = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 24),
+            )
+            .unwrap();
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
+                tr(24, 24),
+            )
+            .unwrap();
+        project.add_transition(left, "crossfade").unwrap();
+
+        let scene = resolve(&project, rt(0)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        assert!(matches!(scene.layers[0].source, LayerSource::Solid(_)));
+    }
+
+    #[test]
+    fn gesture_partitions_split_stack_and_apply_identity_to_sprite() {
+        let mut project = Project::new("p", FPS_24);
+        let media_a = project.add_media(video(1920, 1080));
+        let media_b = project.add_media(video(1280, 720));
+        let bottom_track = project.add_track(TrackKind::Video, "V1");
+        let top_track = project.add_track(TrackKind::Video, "V2");
+        let bottom = project
+            .add_clip(bottom_track, media_a, tr(0, 100), rt(0))
+            .unwrap();
+        let top = project
+            .add_clip(top_track, media_b, tr(0, 100), rt(0))
+            .unwrap();
+
+        let parts = resolve_gesture_partitions(&project, rt(5), top)
+            .unwrap()
+            .expect("top clip should partition");
+        assert_eq!(parts.below.layers.len(), 1);
+        assert_eq!(parts.below.layers[0].clip, Some(bottom));
+        assert_eq!(parts.sprite.layers.len(), 1);
+        assert_eq!(parts.sprite.layers[0].clip, Some(top));
+        assert!(parts.above.layers.is_empty());
+        assert_eq!(parts.below.background[3], 255);
+        assert_eq!(parts.sprite.background, [0, 0, 0, 0]);
+        assert_eq!(parts.above.background, [0, 0, 0, 0]);
+        approx2(parts.sprite.layers[0].center, [960.0, 540.0]);
+        match parts.sprite.layers[0].size {
+            SizeSpec::Fixed(size) => {
+                // 1280×720 aspect-fits into 1920×1080, then × identity scale 1.
+                approx(size[0], 1920.0);
+                approx(size[1], 1080.0);
+            }
+            other => panic!("expected fixed size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn gesture_partitions_return_none_inside_transition_window() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let left = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 24),
+            )
+            .unwrap();
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
+                tr(24, 24),
+            )
+            .unwrap();
+        project.add_transition(left, "crossfade").unwrap();
+
+        assert!(
+            resolve_gesture_partitions(&project, rt(12), left)
+                .unwrap()
+                .is_none()
+        );
     }
 }

@@ -7,7 +7,10 @@
 use std::path::PathBuf;
 
 use cutlass_commands::{Command, ProjectCommand};
-use cutlass_models::{ClipId, ClipTransform, Generator, MediaId, Project, Rational, RationalTime};
+use cutlass_models::{
+    ClipId, ClipTransform, ColorAdjustments, Filter, Generator, MediaId, Project, Rational,
+    RationalTime,
+};
 use cutlass_render::{
     FrameSink, Renderer, ResolveOverrides, RgbaImage, SeekPolicy, export_to_file,
 };
@@ -49,6 +52,9 @@ pub struct Engine {
     /// Live generator content for one clip (inspector slider preview), same
     /// session-only semantics as `transform_override`.
     generator_override: Option<(ClipId, Generator)>,
+    /// Live filter/adjustment look for one clip (inspector slider preview),
+    /// same session-only semantics as `transform_override`.
+    look_override: Option<(ClipId, Option<Filter>, ColorAdjustments)>,
 }
 
 impl Engine {
@@ -71,6 +77,7 @@ impl Engine {
             saved_revision: 0,
             transform_override: None,
             generator_override: None,
+            look_override: None,
         })
     }
 
@@ -152,6 +159,7 @@ impl Engine {
         self.project_path = None;
         self.transform_override = None;
         self.generator_override = None;
+        self.look_override = None;
         // Media ids persist in project files: an id in the proxy registry
         // can name a different file in the incoming project.
         self.renderer.clear_proxies();
@@ -230,26 +238,27 @@ impl Engine {
         self.generator_override = value;
     }
 
-    /// True while a live gesture override (transform or generator) is set:
-    /// frames rendered now show session-only state that no project revision
-    /// describes, so revision-keyed frame caches must skip them.
-    pub fn has_live_overrides(&self) -> bool {
-        self.transform_override.is_some() || self.generator_override.is_some()
+    /// Set (or clear with `None`) the live look for one clip — the
+    /// color-grading analogue of
+    /// [`set_transform_override`](Self::set_transform_override).
+    pub fn set_look_override(&mut self, value: Option<(ClipId, Option<Filter>, ColorAdjustments)>) {
+        self.look_override = value;
     }
 
-    /// Stage timings of the most recent successful preview/export render:
-    /// how the frame's cost split between decode, raster, and composite.
-    /// The preview quality ladder keys off the resolution-dependent share.
+    /// True while a live preview override is set: frames rendered now show
+    /// session-only state that no project revision describes.
+    pub fn has_live_overrides(&self) -> bool {
+        self.transform_override.is_some()
+            || self.generator_override.is_some()
+            || self.look_override.is_some()
+    }
+
+    /// Stage timings of the most recent successful preview/export render.
     pub fn last_frame_stats(&self) -> cutlass_render::FrameStats {
         self.renderer.last_frame_stats()
     }
 
-    /// Decode `media` from `path` (a preview proxy: same content, smaller /
-    /// short-GOP) instead of the pool file, starting with the next frame.
-    /// Session-only state — the project, history, and saves are untouched,
-    /// and the engine's own export command always renders the originals.
-    /// The registry clears on session swaps and per-media on relink; the
-    /// caller owns re-requesting generation then.
+    /// Decode `media` from `path` (a preview proxy) instead of the pool file.
     pub fn set_media_proxy(&mut self, media: MediaId, path: PathBuf) {
         self.renderer.set_proxy(media, path);
     }
@@ -285,6 +294,10 @@ impl Engine {
         let overrides = ResolveOverrides {
             transform: self.transform_override,
             generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+            look: self
+                .look_override
+                .as_ref()
+                .map(|(id, filter, adjust)| (*id, filter.as_ref(), adjust)),
         };
         Ok(self
             .renderer
@@ -304,6 +317,10 @@ impl Engine {
         let overrides = ResolveOverrides {
             transform: self.transform_override,
             generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+            look: self
+                .look_override
+                .as_ref()
+                .map(|(id, filter, adjust)| (*id, filter.as_ref(), adjust)),
         };
         Ok(self.renderer.render_frame_fit_with(
             &self.project,
@@ -314,11 +331,25 @@ impl Engine {
         )?)
     }
 
-    /// [`get_frame`](Self::get_frame) writing the composited rows directly
-    /// into `sink`-provided storage: the preview worker hands its UI pixel
-    /// buffer in, so the mapped GPU readback is the only CPU copy. `policy`
-    /// selects exact or keyframe-snapped decode (see [`SeekPolicy`]); every
-    /// non-interactive caller wants [`SeekPolicy::Exact`].
+    /// Partitioned gesture frames for zero-drift preview transform drags.
+    /// See [`cutlass_render::Renderer::render_gesture_frames`].
+    pub fn get_gesture_frames(
+        &mut self,
+        time: RationalTime,
+        clip_id: ClipId,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<Option<cutlass_render::GestureFrames>, EngineError> {
+        Ok(self.renderer.render_gesture_frames(
+            &self.project,
+            time,
+            clip_id,
+            max_width,
+            max_height,
+        )?)
+    }
+
+    /// [`get_frame`](Self::get_frame) writing composited rows directly into `sink`.
     pub fn get_frame_into(
         &mut self,
         time: RationalTime,
@@ -328,15 +359,17 @@ impl Engine {
         let overrides = ResolveOverrides {
             transform: self.transform_override,
             generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+            look: self
+                .look_override
+                .as_ref()
+                .map(|(id, filter, adjust)| (*id, filter.as_ref(), adjust)),
         };
         Ok(self
             .renderer
             .render_frame_into_with(&self.project, time, overrides, policy, sink)?)
     }
 
-    /// [`get_frame_fit`](Self::get_frame_fit) writing the composited rows
-    /// directly into `sink`-provided storage (see
-    /// [`get_frame_into`](Self::get_frame_into)).
+    /// [`get_frame_fit`](Self::get_frame_fit) writing composited rows directly into `sink`.
     pub fn get_frame_fit_into(
         &mut self,
         time: RationalTime,
@@ -348,6 +381,10 @@ impl Engine {
         let overrides = ResolveOverrides {
             transform: self.transform_override,
             generator: self.generator_override.as_ref().map(|(id, g)| (*id, g)),
+            look: self
+                .look_override
+                .as_ref()
+                .map(|(id, filter, adjust)| (*id, filter.as_ref(), adjust)),
         };
         Ok(self.renderer.render_frame_fit_into_with(
             &self.project,

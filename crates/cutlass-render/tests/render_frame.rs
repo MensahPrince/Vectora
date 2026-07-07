@@ -1,9 +1,12 @@
 //! End-to-end smoke test: resolve a generator-only project and composite it on
 //! a headless GPU. Skips cleanly when no GPU adapter is available (CI).
 
+use std::path::Path;
+
+use cutlass_compositor::{ColorGrade, GpuContext};
 use cutlass_models::{
-    Generator, Project, Rational, RationalTime, Shape, ShapePath, ShapePathPoint, TimeRange,
-    TrackKind,
+    ChromaKey, ColorAdjustments, Filter, Generator, Mask, MaskKind, MediaSource, Project, Rational,
+    RationalTime, Shape, ShapePath, ShapePathPoint, TimeRange, TrackKind,
 };
 use cutlass_render::Renderer;
 
@@ -11,6 +14,175 @@ const FPS_24: Rational = Rational::FPS_24;
 
 fn rt(value: i64) -> RationalTime {
     RationalTime::new(value, FPS_24)
+}
+
+fn write_solid_png(path: &Path, width: u32, height: u32, rgba: [u8; 4]) {
+    let file = std::fs::File::create(path).expect("create png");
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().expect("png header");
+    let flat: Vec<u8> = rgba
+        .iter()
+        .copied()
+        .cycle()
+        .take((width * height * 4) as usize)
+        .collect();
+    writer.write_image_data(&flat).expect("png data");
+}
+
+fn assert_near(actual: [u8; 4], expected: [u8; 4], tolerance: u8, what: &str) {
+    for (a, e) in actual.iter().zip(expected.iter()) {
+        assert!(
+            a.abs_diff(*e) <= tolerance,
+            "{what}: got {actual:?}, expected ~{expected:?} (±{tolerance})"
+        );
+    }
+}
+
+/// CPU mirror of `grade.wgsl`'s `apply_grade`, for tolerance comparisons.
+fn grade_ref_u8(rgba: [u8; 4], grade: ColorGrade) -> [u8; 4] {
+    let mut c = [
+        f32::from(rgba[0]) / 255.0,
+        f32::from(rgba[1]) / 255.0,
+        f32::from(rgba[2]) / 255.0,
+    ];
+    c[0] *= 2f32.powf(2.0 * grade.exposure);
+    c[1] *= 2f32.powf(2.0 * grade.exposure);
+    c[2] *= 2f32.powf(2.0 * grade.exposure);
+    c[0] += 0.25 * grade.temperature;
+    c[2] -= 0.25 * grade.temperature;
+    c[1] += 0.25 * grade.tint;
+    for ch in &mut c {
+        *ch += 0.25 * grade.brightness;
+    }
+    for ch in &mut c {
+        *ch = (*ch - 0.5) * (1.0 + grade.contrast) + 0.5;
+    }
+    let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let sat = 1.0 + grade.saturation;
+    c[0] = luma + (c[0] - luma) * sat;
+    c[1] = luma + (c[1] - luma) * sat;
+    c[2] = luma + (c[2] - luma) * sat;
+    let quant = |x: f32| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+    [quant(c[0]), quant(c[1]), quant(c[2]), rgba[3]]
+}
+
+fn pixel_tol(gpu: &GpuContext) -> i32 {
+    if gpu.is_software() { 8 } else { 3 }
+}
+
+fn assert_px_close(got: [u8; 4], expect: [u8; 4], tol: i32, label: &str) {
+    for ch in 0..4 {
+        let d = i32::from(got[ch]) - i32::from(expect[ch]);
+        assert!(
+            d.abs() <= tol,
+            "{label}: got {got:?}, expected ~{expect:?} (channel {ch} off by {d}, tol {tol})"
+        );
+    }
+}
+
+#[test]
+fn renders_still_with_circle_mask_and_chroma_key() {
+    let dir = tempfile::tempdir().unwrap();
+    let png_path = dir.path().join("green.png");
+    write_solid_png(&png_path, 320, 180, [0, 255, 0, 255]);
+
+    let mut project = Project::new("p", FPS_24);
+    let media = project.add_media(MediaSource::image(&png_path, 320, 180));
+    let window = project.media(media).unwrap().full_range();
+    let track = project.add_track(TrackKind::Video, "V1");
+    let clip = project.add_clip(track, media, window, rt(0)).unwrap();
+    project
+        .set_clip_mask(clip, Some(Mask::new(MaskKind::Circle)))
+        .unwrap();
+    project
+        .set_clip_chroma_key(
+            clip,
+            Some(ChromaKey {
+                rgb: [0, 255, 0],
+                strength: 0.5,
+                shadow: 0.0,
+            }),
+        )
+        .unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let frame = renderer
+        .render_frame_fit(&project, rt(0), 640, 640)
+        .expect("render masked still");
+
+    // Center is inside the circle but green is keyed out → black background.
+    assert_near(frame.pixel(320, 180), [0, 0, 0, 255], 8, "center");
+    // Corner is outside the circle → background.
+    assert_near(frame.pixel(10, 10), [0, 0, 0, 255], 8, "corner");
+}
+
+#[test]
+fn renders_adjustment_lane_over_still_media() {
+    let dir = tempfile::tempdir().unwrap();
+    let png_path = dir.path().join("red.png");
+    write_solid_png(&png_path, 320, 180, [255, 0, 0, 255]);
+
+    let mut project = Project::new("p", FPS_24);
+    let media = project.add_media(MediaSource::image(&png_path, 320, 180));
+    let window = project.media(media).unwrap().full_range();
+    let video = project.add_track(TrackKind::Video, "V1");
+    project.add_clip(video, media, window, rt(0)).unwrap();
+    let adjustment = project.add_track(TrackKind::Adjustment, "A1");
+    let bar = project
+        .add_generated(
+            adjustment,
+            Generator::Adjustment,
+            TimeRange::at_rate(0, 100, FPS_24),
+        )
+        .unwrap();
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+    project
+        .set_clip_adjustments(
+            bar,
+            ColorAdjustments {
+                saturation: -1.0,
+                ..ColorAdjustments::default()
+            },
+        )
+        .unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let frame = renderer
+        .render_frame_fit(&project, rt(0), 320, 180)
+        .expect("render adjustment lane");
+
+    assert_px_close(
+        frame.pixel(160, 90),
+        grade_ref_u8([255, 0, 0, 255], grade),
+        8,
+        "adjusted center",
+    );
+}
+
+fn red_solid_project() -> (Project, cutlass_models::ClipId) {
+    let mut project = Project::new("p", FPS_24);
+    let track = project.add_track(TrackKind::Sticker, "S1");
+    let clip = project
+        .add_generated(
+            track,
+            Generator::SolidColor {
+                rgba: [255, 0, 0, 255],
+            },
+            TimeRange::at_rate(0, 100, FPS_24),
+        )
+        .unwrap();
+    (project, clip)
 }
 
 #[test]
@@ -122,20 +294,79 @@ fn renders_a_pen_path_through_the_bitmap_pipeline() {
 }
 
 #[test]
-fn color_adjustments_change_a_solid_generator_render() {
-    use cutlass_models::ColorAdjustments;
-
+fn pixelate_effect_blockifies_a_solid_fill() {
     let mut project = Project::new("p", FPS_24);
     let track = project.add_track(TrackKind::Sticker, "S1");
     let clip = project
         .add_generated(
             track,
             Generator::SolidColor {
-                rgba: [200, 40, 40, 255],
+                rgba: [200, 100, 50, 255],
             },
             TimeRange::at_rate(0, 100, FPS_24),
         )
         .unwrap();
+    project.add_effect(clip, "pixelate").unwrap();
+    project.set_effect_param(clip, 0, 0, 24.0).unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let image = renderer.render_frame(&project, rt(0)).expect("render");
+    // Blocky pixelate on a uniform fill still renders; center stays the fill color.
+    let center = image.pixel(960, 540);
+    assert!(center[0] > 180 && center[1] > 80);
+}
+
+#[test]
+fn crossfade_transition_blends_two_solids_at_midpoint() {
+    let mut project = Project::new("p", FPS_24);
+    let track = project.add_track(TrackKind::Sticker, "S1");
+    let left = project
+        .add_generated(
+            track,
+            Generator::SolidColor {
+                rgba: [255, 0, 0, 255],
+            },
+            TimeRange::at_rate(0, 24, FPS_24),
+        )
+        .unwrap();
+    project
+        .add_generated(
+            track,
+            Generator::SolidColor {
+                rgba: [0, 0, 255, 255],
+            },
+            TimeRange::at_rate(24, 24, FPS_24),
+        )
+        .unwrap();
+    project.add_transition(left, "crossfade").unwrap();
+    project.set_transition_duration(left, 24).unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let image = renderer.render_frame(&project, rt(24)).expect("render");
+    let px = image.pixel(960, 540);
+    // Mid blend of red + blue → purple-ish, not pure red or blue.
+    assert!(
+        px[0] > 80 && px[2] > 80,
+        "midpoint should blend channels, got {px:?}"
+    );
+    assert!(px[0] < 240 && px[2] < 240);
+}
+
+#[test]
+fn saturation_minus_one_desaturates_red_solid() {
+    let Ok(gpu) = GpuContext::new_headless_blocking() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let tol = pixel_tol(&gpu);
+
+    let (mut project, clip) = red_solid_project();
     project
         .set_clip_adjustments(
             clip,
@@ -150,11 +381,47 @@ fn color_adjustments_change_a_solid_generator_render() {
         eprintln!("skipping: no headless GPU available");
         return;
     };
+
     let image = renderer.render_frame(&project, rt(0)).expect("render");
-    let px = image.pixel(960, 540);
-    let spread = px[0].abs_diff(px[1]) + px[1].abs_diff(px[2]);
-    assert!(
-        spread <= 2,
-        "full desaturation should gray out the red, got {px:?}"
-    );
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+    let expect = grade_ref_u8([255, 0, 0, 255], grade);
+    let top_left = image.pixel(0, 0);
+    assert_px_close(top_left, expect, tol, "desaturated red solid");
+}
+
+#[test]
+fn mono_filter_at_zero_intensity_matches_no_filter() {
+    let Ok(gpu) = GpuContext::new_headless_blocking() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    let tol = pixel_tol(&gpu);
+
+    let (mut project, clip) = red_solid_project();
+    project
+        .set_clip_filter(
+            clip,
+            Some(Filter {
+                id: "mono".into(),
+                intensity: 0.0,
+            }),
+        )
+        .unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+
+    let graded = renderer.render_frame(&project, rt(0)).expect("render");
+
+    let (project, _) = red_solid_project();
+    let baseline = renderer.render_frame(&project, rt(0)).expect("render");
+
+    let top_left = graded.pixel(0, 0);
+    let baseline_px = baseline.pixel(0, 0);
+    assert_px_close(top_left, baseline_px, tol, "mono filter intensity 0");
 }

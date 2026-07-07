@@ -7,7 +7,8 @@
 //! If no GPU adapter is available the test skips rather than fails.
 
 use cutlass_compositor::{
-    ColorGrade, CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement, RgbaImage,
+    ColorGrade, CompositeLayer, Compositor, CompositorConfig, CompositorLayer, GpuContext,
+    LayerChromaKey, LayerEffects, LayerMask, LayerPlacement, PassInstance, RgbaImage, mask_kind,
 };
 use cutlass_core::{
     ColorRange, ColorSpace, CpuImage, FrameData, MatrixCoefficients, PixelFormat, Plane, Rational,
@@ -98,6 +99,45 @@ fn yuv_ref(y: u8, cb: u8, cr: u8, color: ColorSpace) -> [u8; 3] {
 
 fn quant(x: f32) -> u8 {
     (x.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// CPU mirror of `grade.wgsl`'s `apply_grade`, for tolerance comparisons.
+fn grade_ref(rgb: [f32; 3], grade: ColorGrade) -> [f32; 3] {
+    let mut c = rgb;
+    c[0] *= 2f32.powf(2.0 * grade.exposure);
+    c[1] *= 2f32.powf(2.0 * grade.exposure);
+    c[2] *= 2f32.powf(2.0 * grade.exposure);
+    c[0] += 0.25 * grade.temperature;
+    c[2] -= 0.25 * grade.temperature;
+    c[1] += 0.25 * grade.tint;
+    for ch in &mut c {
+        *ch += 0.25 * grade.brightness;
+    }
+    for ch in &mut c {
+        *ch = (*ch - 0.5) * (1.0 + grade.contrast) + 0.5;
+    }
+    let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let sat = 1.0 + grade.saturation;
+    c[0] = luma + (c[0] - luma) * sat;
+    c[1] = luma + (c[1] - luma) * sat;
+    c[2] = luma + (c[2] - luma) * sat;
+    [
+        c[0].clamp(0.0, 1.0),
+        c[1].clamp(0.0, 1.0),
+        c[2].clamp(0.0, 1.0),
+    ]
+}
+
+fn grade_ref_u8(rgba: [u8; 4], grade: ColorGrade) -> [u8; 4] {
+    let rgb = grade_ref(
+        [
+            f32::from(rgba[0]) / 255.0,
+            f32::from(rgba[1]) / 255.0,
+            f32::from(rgba[2]) / 255.0,
+        ],
+        grade,
+    );
+    [quant(rgb[0]), quant(rgb[1]), quant(rgb[2]), rgba[3]]
 }
 
 #[track_caller]
@@ -424,6 +464,85 @@ fn rgba_placement_lands_in_the_right_quadrant() {
 }
 
 #[test]
+fn chroma_key_keys_green_nv12_to_transparent() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(64, 64).with_background([0, 0, 255, 255]);
+    // Full-range BT.709 green (#00FF00).
+    let full = ColorSpace {
+        range: ColorRange::Full,
+        ..ColorSpace::BT709
+    };
+    let f = nv12_uniform(64, 64, 182, 30, 12, full);
+    let placement = LayerPlacement::full_canvas(&config);
+    let effects = LayerEffects {
+        mask: None,
+        chroma_key: Some(LayerChromaKey {
+            rgb: [0.0, 1.0, 0.0],
+            strength: 0.5,
+            shadow: 0.0,
+        }),
+    };
+    let layer = CompositeLayer::frame(&f, placement).with_fx(effects);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+    // Keyed-out green reveals the blue background.
+    assert_px(&img, 32, 32, [0, 0, 255, 255], 8);
+}
+
+#[test]
+fn combined_mask_and_chroma_on_rgba_layer() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(64, 64).with_background([0, 0, 255, 255]);
+    let bmp = rgba_uniform(64, 64, [0, 255, 0, 255]);
+    let placement = LayerPlacement::full_canvas(&config);
+    let effects = LayerEffects {
+        mask: Some(LayerMask {
+            kind: mask_kind::CIRCLE,
+            feather: 0.0,
+            invert: 0,
+        }),
+        chroma_key: Some(LayerChromaKey {
+            rgb: [0.0, 1.0, 0.0],
+            strength: 0.5,
+            shadow: 0.0,
+        }),
+    };
+    let layer = CompositeLayer::rgba(&bmp, placement).with_fx(effects);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+
+    // Center: inside circle but green keyed out → background.
+    assert_px(&img, 32, 32, [0, 0, 255, 255], 8);
+    // Corner: outside circle → background regardless.
+    assert_px(&img, 2, 2, [0, 0, 255, 255], 2);
+}
+
+#[test]
+fn circle_mask_cuts_rgba_corners() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(64, 64).with_background([0, 0, 255, 255]);
+    let bmp = rgba_uniform(64, 64, [255, 0, 0, 255]);
+    let placement = LayerPlacement::full_canvas(&config);
+    let effects = LayerEffects {
+        mask: Some(LayerMask {
+            kind: mask_kind::CIRCLE,
+            feather: 0.0,
+            invert: 0,
+        }),
+        chroma_key: None,
+    };
+    let layer = CompositeLayer::rgba(&bmp, placement).with_fx(effects);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+
+    // Center is inside the circle mask.
+    assert_px(&img, 32, 32, [255, 0, 0, 255], 2);
+    // Corners are outside the circle — background shows through.
+    assert_px(&img, 2, 2, [0, 0, 255, 255], 2);
+    assert_px(&img, 61, 61, [0, 0, 255, 255], 2);
+}
+
+#[test]
 fn rgba_undersized_bitmap_is_rejected() {
     let gpu = gpu_or_skip!();
     let mut comp = Compositor::new(&gpu);
@@ -639,31 +758,281 @@ fn sdf_quad_padding_keeps_stroke_unclipped() {
     assert_px(&g, 0, 0, [40, 60, 80, 255], 1);
 }
 
+// --- effects (M4) -------------------------------------------------------
+
 #[test]
-fn color_grade_desaturates_a_solid_layer() {
+fn vignette_darkens_corners_vs_center() {
     let gpu = gpu_or_skip!();
     let mut comp = Compositor::new(&gpu);
-    let config = CompositorConfig::new(16, 16).with_background([0, 0, 0, 255]);
-    let placement = LayerPlacement::full_canvas(&config);
-    let neutral = CompositeLayer::solid([200, 40, 40, 255], placement);
-    let graded =
-        CompositeLayer::solid([200, 40, 40, 255], placement).with_color_grade(Some(ColorGrade {
-            saturation: -1.0,
-            ..ColorGrade::default()
-        }));
+    let config = CompositorConfig::new(64, 64).with_background([0, 0, 0, 255]);
+    let white = CompositeLayer::solid([255, 255, 255, 255], LayerPlacement::full_canvas(&config));
+    let baseline = comp.render(&gpu, &config, &[white]).expect("baseline");
 
-    let plain = comp.render(&gpu, &config, &[neutral]).expect("plain");
-    let mono = comp.render(&gpu, &config, &[graded]).expect("graded");
-    let plain_px = plain.pixel(8, 8);
-    let mono_px = mono.pixel(8, 8);
-    // Full desaturation: R/G/B channels converge; red channel drops vs the source.
+    let vignette = PassInstance {
+        id: "vignette",
+        params: &[0.8],
+    };
+    let effects = [vignette];
+    let effected =
+        CompositeLayer::solid([255, 255, 255, 255], LayerPlacement::full_canvas(&config))
+            .with_effects(&effects);
+    let dark = comp.render(&gpu, &config, &[effected]).expect("vignette");
+
+    let center = baseline.pixel(32, 32);
+    let corner = dark.pixel(2, 2);
     assert!(
-        mono_px[0] < plain_px[0],
-        "red should fall: {mono_px:?} vs {plain_px:?}"
+        corner[0] < center[0] - 20,
+        "corner should darken: {corner:?} vs {center:?}"
     );
-    let spread = mono_px[0].abs_diff(mono_px[1]) + mono_px[1].abs_diff(mono_px[2]);
-    assert!(
-        spread <= 2,
-        "channels should match in mono, got {mono_px:?}"
+}
+
+#[test]
+fn pixelate_produces_uniform_blocks() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(64, 64);
+    // Horizontal gradient bitmap.
+    let mut pixels = Vec::with_capacity(64 * 64 * 4);
+    for _y in 0..64 {
+        for x in 0..64 {
+            let v = (x * 4) as u8;
+            pixels.extend_from_slice(&[v, v, v, 255]);
+        }
+    }
+    let bmp = RgbaImage::new(64, 64, pixels);
+    let smooth = CompositeLayer::rgba(&bmp, LayerPlacement::full_canvas(&config));
+    let smooth_img = comp.render(&gpu, &config, &[smooth]).expect("smooth");
+
+    let pixelate = PassInstance {
+        id: "pixelate",
+        params: &[8.0],
+    };
+    let effects = [pixelate];
+    let blocky_layer =
+        CompositeLayer::rgba(&bmp, LayerPlacement::full_canvas(&config)).with_effects(&effects);
+    let blocky = comp
+        .render(&gpu, &config, &[blocky_layer])
+        .expect("pixelate");
+
+    // Within an 8px block, colors should match after pixelate.
+    let a = blocky.pixel(10, 10);
+    let b = blocky.pixel(11, 10);
+    assert_eq!(a, b, "pixelate should flatten local variation");
+    // And differ from the smooth original at the same coords.
+    assert_ne!(smooth_img.pixel(10, 10), a);
+}
+
+#[test]
+fn canvas_pass_pixelates_the_composited_stack() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(64, 64);
+    let mut pixels = Vec::with_capacity(64 * 64 * 4);
+    for _y in 0..64 {
+        for x in 0..64 {
+            let v = (x * 4) as u8;
+            pixels.extend_from_slice(&[v, 255u8.saturating_sub(v), 32, 255]);
+        }
+    }
+    let bmp = RgbaImage::new(64, 64, pixels);
+    let gradient = CompositeLayer::rgba(&bmp, LayerPlacement::full_canvas(&config));
+    let mut overlay_place = LayerPlacement::full_canvas(&config);
+    overlay_place.opacity = 0.5;
+    let overlay = CompositeLayer::solid([0, 0, 255, 255], overlay_place);
+
+    let baseline = comp
+        .render_compositor_layers(
+            &gpu,
+            &config,
+            &[
+                CompositorLayer::layer(&gradient),
+                CompositorLayer::layer(&overlay),
+            ],
+        )
+        .expect("baseline");
+
+    let pixelate = PassInstance {
+        id: "pixelate",
+        params: &[8.0],
+    };
+    let effects = [pixelate];
+    let blocky = comp
+        .render_compositor_layers(
+            &gpu,
+            &config,
+            &[
+                CompositorLayer::layer(&gradient),
+                CompositorLayer::layer(&overlay),
+                CompositorLayer::CanvasPass {
+                    effects: &effects,
+                    grade: None,
+                },
+            ],
+        )
+        .expect("canvas pass pixelate");
+
+    assert_eq!(
+        blocky.pixel(10, 10),
+        blocky.pixel(11, 10),
+        "canvas pass should flatten local variation"
+    );
+    assert_ne!(baseline.pixel(10, 10), blocky.pixel(10, 10));
+}
+
+// --- Color grade ---------------------------------------------------------
+
+#[test]
+fn identity_grade_matches_ungraded_solid() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16);
+    let placement = LayerPlacement::full_canvas(&config);
+    let rgba = [200, 80, 40, 255];
+
+    let baseline = comp
+        .render(&gpu, &config, &[CompositeLayer::solid(rgba, placement)])
+        .expect("baseline");
+
+    let explicit = comp
+        .render(
+            &gpu,
+            &config,
+            &[CompositeLayer::solid(rgba, placement).with_grade(ColorGrade::IDENTITY)],
+        )
+        .expect("identity");
+
+    for y in 0..baseline.height {
+        for x in 0..baseline.width {
+            assert_eq!(baseline.pixel(x, y), explicit.pixel(x, y));
+        }
+    }
+}
+
+#[test]
+fn solid_saturation_minus_one_desaturates_red() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16);
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+    let rgba = [255, 0, 0, 255];
+    let layer = CompositeLayer::solid(rgba, LayerPlacement::full_canvas(&config)).with_grade(grade);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+    let expect = grade_ref_u8(rgba, grade);
+    assert_px(&img, 8, 8, expect, 3);
+}
+
+#[test]
+fn solid_exposure_plus_one_brightens_mid_gray() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16);
+    let grade = ColorGrade {
+        exposure: 1.0,
+        ..ColorGrade::IDENTITY
+    };
+    let rgba = [128, 128, 128, 255];
+    let layer = CompositeLayer::solid(rgba, LayerPlacement::full_canvas(&config)).with_grade(grade);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+    let expect = grade_ref_u8(rgba, grade);
+    assert_px(&img, 8, 8, expect, 2);
+}
+
+#[test]
+fn canvas_pass_grade_replaces_translucent_canvas() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16).with_background([0, 0, 0, 0]);
+    let translucent = CompositeLayer::solid([255, 0, 0, 128], LayerPlacement::full_canvas(&config));
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+
+    let img = comp
+        .render_compositor_layers(
+            &gpu,
+            &config,
+            &[
+                CompositorLayer::layer(&translucent),
+                CompositorLayer::CanvasPass {
+                    effects: &[],
+                    grade: Some(grade),
+                },
+            ],
+        )
+        .expect("canvas pass grade");
+
+    let expect = grade_ref_u8([128, 0, 0, 128], grade);
+    assert_px(&img, 8, 8, expect, 3);
+}
+
+/// Left half opaque red, right half fully transparent tinted red.
+fn rgba_opaque_and_transparent(w: u32, h: u32) -> RgbaImage {
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            if x < w / 2 {
+                pixels[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+            } else {
+                pixels[i..i + 4].copy_from_slice(&[255, 0, 0, 0]);
+            }
+        }
+    }
+    RgbaImage::new(w, h, pixels)
+}
+
+#[test]
+fn rgba_grade_skips_transparent_and_grades_opaque() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16).with_background([7, 8, 9, 255]);
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+    let bmp = rgba_opaque_and_transparent(16, 16);
+    let layer = CompositeLayer::rgba(&bmp, LayerPlacement::full_canvas(&config)).with_grade(grade);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+
+    let opaque_expect = grade_ref_u8([255, 0, 0, 255], grade);
+    assert_px(&img, 4, 8, opaque_expect, 3);
+    assert_px(&img, 12, 8, [7, 8, 9, 255], 1);
+}
+
+#[test]
+fn yuv_grade_saturation_minus_one_matches_cpu_reference() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let (y, u, v) = (150u8, 60u8, 200u8);
+    let color = ColorSpace::BT709;
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+
+    let config = CompositorConfig::new(16, 16);
+    let f = nv12_uniform(16, 16, y, u, v, color);
+    let layer = CompositeLayer::frame(&f, LayerPlacement::full_canvas(&config)).with_grade(grade);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+
+    let [r, g, b] = yuv_ref(y, u, v, color);
+    let graded = grade_ref(
+        [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        ],
+        grade,
+    );
+    assert_px(
+        &img,
+        8,
+        8,
+        [quant(graded[0]), quant(graded[1]), quant(graded[2]), 255],
+        3,
     );
 }

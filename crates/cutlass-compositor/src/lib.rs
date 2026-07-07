@@ -28,12 +28,14 @@
 mod compositor;
 #[cfg(target_os = "windows")]
 mod dx12_import;
+mod effect_render;
 mod error;
 mod gpu;
 mod grade;
 mod layer;
 #[cfg(target_vendor = "apple")]
 mod metal_import;
+mod passes;
 
 pub use compositor::{Compositor, FrameSink, ImageSink};
 pub use cutlass_core::RgbaImage;
@@ -42,5 +44,10 @@ pub use error::CompositorError;
 pub use gpu::GpuContext;
 pub use grade::ColorGrade;
 pub use layer::{
-    CompositeLayer, CompositorConfig, FULL_UV, LayerContent, LayerPlacement, SdfLayer,
+    CompositeLayer, CompositorConfig, CompositorLayer, FULL_UV, LayerChromaKey, LayerContent,
+    LayerEffects, LayerMask, LayerPlacement, SdfLayer, mask_kind,
+};
+pub use passes::{
+    PassCoverage, PassDescriptor, PassInstance, effect_coverage, effect_descriptors,
+    effect_is_noop, resolve_transition_pass, transition_coverage, transition_ids,
 };

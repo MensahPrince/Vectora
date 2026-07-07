@@ -14,7 +14,10 @@ use cutlass_models::{ClipTransform, CropRect};
 use slint::Model;
 
 use crate::placement::{anchor_canvas_position, generator_layer_placement, media_layer_placement};
-use crate::{Clip, PreviewDragResolution, PreviewHit, PreviewSelectionBox, Sequence, TrackKind};
+use crate::{
+    Clip, PreviewDragResolution, PreviewHit, PreviewSelectionBox, PreviewSpritePlacement, Sequence,
+    TrackKind,
+};
 
 /// Aspect-fit (`ImageFit.contain`) mapping of the canvas into the viewport:
 /// `(scale, offset_x, offset_y)` such that `view = canvas · scale + offset`.
@@ -404,6 +407,144 @@ pub fn selection_box_in_viewport(
         }
     }
     PreviewSelectionBox::default()
+}
+
+fn apply_identity_transform(clip: &mut Clip) {
+    clip.transform_position_x = 0.0;
+    clip.transform_position_y = 0.0;
+    clip.transform_anchor_x = 0.5;
+    clip.transform_anchor_y = 0.5;
+    clip.transform_scale = 1.0;
+    clip.transform_rotation = 0.0;
+}
+
+fn apply_gesture_transform(clip: &mut Clip, gesture: &PreviewDragResolution) {
+    clip.transform_position_x = gesture.position_x;
+    clip.transform_position_y = gesture.position_y;
+    clip.transform_anchor_x = gesture.anchor_x;
+    clip.transform_anchor_y = gesture.anchor_y;
+    clip.transform_scale = gesture.scale;
+    clip.transform_rotation = gesture.rotation;
+}
+
+fn fitted_frame_rect(
+    canvas_w: f32,
+    canvas_h: f32,
+    view_w: f32,
+    view_h: f32,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+) -> (f32, f32, f32, f32) {
+    let aspect = if canvas_h > 0.0 {
+        canvas_w / canvas_h
+    } else {
+        1.0
+    };
+    let fitted_w = view_w.min(view_h * aspect);
+    let fitted_h = if aspect > 0.0 {
+        fitted_w / aspect
+    } else {
+        fitted_w
+    };
+    let zoom = if zoom.is_finite() {
+        zoom.max(0.01)
+    } else {
+        1.0
+    };
+    let frame_w = fitted_w * zoom;
+    let frame_h = fitted_h * zoom;
+    let frame_x = (view_w - frame_w) * 0.5 + pan_x;
+    let frame_y = (view_h - frame_h) * 0.5 + pan_y;
+    (frame_x, frame_y, frame_w, frame_h)
+}
+
+/// Sprite image placement during a zero-drift transform gesture.
+#[allow(clippy::too_many_arguments)]
+pub fn sprite_placement_in_viewport(
+    sequence: &Sequence,
+    clip_id: &str,
+    tick: i32,
+    view_w: f32,
+    view_h: f32,
+    zoom: f32,
+    pan_x: f32,
+    pan_y: f32,
+    gesture: Option<&PreviewDragResolution>,
+) -> PreviewSpritePlacement {
+    let gesture = gesture.filter(|res| res.valid);
+    if clip_id.is_empty() {
+        return PreviewSpritePlacement::default();
+    }
+
+    let canvas = canvas_config(sequence);
+    let (cw, ch) = (canvas.width as f32, canvas.height as f32);
+    let (scale, ox, oy) = viewport_mapping(cw, ch, view_w, view_h, zoom, pan_x, pan_y);
+    if scale <= 0.0 {
+        return PreviewSpritePlacement::default();
+    }
+    let (frame_x, frame_y, frame_w, frame_h) =
+        fitted_frame_rect(cw, ch, view_w, view_h, zoom, pan_x, pan_y);
+
+    for row in 0..sequence.tracks.row_count() {
+        let Some(track) = sequence.tracks.row_data(row) else {
+            continue;
+        };
+        if track.kind == TrackKind::Audio || !track.enabled {
+            continue;
+        }
+        for idx in 0..track.clips.row_count() {
+            let Some(mut clip) = track.clips.row_data(idx) else {
+                continue;
+            };
+            if clip.id != clip_id {
+                continue;
+            }
+            if !covers_tick(&clip, tick) || !is_composited(&clip) {
+                return PreviewSpritePlacement::default();
+            }
+
+            crate::params::apply_sampled_transform(&mut clip, tick);
+            let mut identity_clip = clip.clone();
+            apply_identity_transform(&mut identity_clip);
+            let p_id = clip_placement(&identity_clip, &canvas);
+
+            let opacity = if let Some(gesture) = gesture {
+                apply_gesture_transform(&mut clip, gesture);
+                gesture.opacity
+            } else {
+                clip.transform_opacity
+            };
+            let p_g = clip_placement(&clip, &canvas);
+
+            let id_center = [ox + p_id.center[0] * scale, oy + p_id.center[1] * scale];
+            let ges_center = [ox + p_g.center[0] * scale, oy + p_g.center[1] * scale];
+            let size_scale = if p_id.size[0] > f32::EPSILON {
+                p_g.size[0] / p_id.size[0]
+            } else {
+                1.0
+            };
+            let origin_x = id_center[0] - frame_x;
+            let origin_y = id_center[1] - frame_y;
+            let x = frame_x + (ges_center[0] - id_center[0]);
+            let y = frame_y + (ges_center[1] - id_center[1]);
+            let rotation = (p_g.rotation - p_id.rotation).to_degrees();
+
+            return PreviewSpritePlacement {
+                visible: true,
+                x,
+                y,
+                width: frame_w,
+                height: frame_h,
+                origin_x,
+                origin_y,
+                rotation_degrees: rotation,
+                scale: size_scale,
+                opacity,
+            };
+        }
+    }
+    PreviewSpritePlacement::default()
 }
 
 #[cfg(test)]
@@ -924,5 +1065,100 @@ mod tests {
             "hidden lane"
         );
         assert!(!selection_box(&seq, "404", 60, VW, VH, None).visible);
+    }
+
+    #[test]
+    fn sprite_placement_is_frame_aligned_at_identity_gesture() {
+        let seq = sequence(vec![track(
+            "1",
+            TrackKind::Video,
+            vec![media_clip("A", 0, 100, 1920, 1080)],
+        )]);
+        let gesture = PreviewDragResolution {
+            valid: true,
+            moved: false,
+            position_x: 0.0,
+            position_y: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+            scale: 1.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            ..PreviewDragResolution::default()
+        };
+        let sprite =
+            sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
+        assert!(sprite.visible);
+        assert!((sprite.x - 0.0).abs() < 1e-3);
+        assert!((sprite.y - 0.0).abs() < 1e-3);
+        assert!((sprite.width - VW).abs() < 1e-3);
+        assert!((sprite.height - VH).abs() < 1e-3);
+        assert!((sprite.scale - 1.0).abs() < 1e-3);
+        assert!((sprite.rotation_degrees - 0.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn sprite_placement_scales_with_gesture() {
+        let seq = sequence(vec![track(
+            "1",
+            TrackKind::Video,
+            vec![media_clip("A", 0, 100, 1920, 1080)],
+        )]);
+        let gesture = PreviewDragResolution {
+            valid: true,
+            moved: true,
+            position_x: 0.0,
+            position_y: 0.0,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+            scale: 0.5,
+            rotation: 0.0,
+            opacity: 1.0,
+            ..PreviewDragResolution::default()
+        };
+        let sprite =
+            sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
+        assert!(sprite.visible);
+        assert!((sprite.scale - 0.5).abs() < 1e-3);
+        let sel_box =
+            selection_box_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
+        assert!(sel_box.visible);
+        // Scaled content sits in the centered quarter of the viewport.
+        assert!((sel_box.x0 - 240.0).abs() < 1e-3);
+        assert!((sel_box.x2 - 720.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn sprite_placement_falls_back_to_committed_transform() {
+        let mut clip = media_clip("A", 0, 100, 1920, 1080);
+        clip.transform_position_x = 0.1;
+        clip.transform_position_y = -0.2;
+        clip.transform_scale = 0.6;
+        clip.transform_rotation = 30.0;
+        clip.transform_opacity = 0.7;
+        let seq = sequence(vec![track("1", TrackKind::Video, vec![clip])]);
+        let gesture = PreviewDragResolution {
+            valid: true,
+            moved: true,
+            position_x: 0.1,
+            position_y: -0.2,
+            anchor_x: 0.5,
+            anchor_y: 0.5,
+            scale: 0.6,
+            rotation: 30.0,
+            opacity: 0.7,
+            ..PreviewDragResolution::default()
+        };
+
+        let committed = sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, None);
+        let live =
+            sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
+
+        assert!(committed.visible);
+        assert!((committed.x - live.x).abs() < 1e-3);
+        assert!((committed.y - live.y).abs() < 1e-3);
+        assert!((committed.scale - live.scale).abs() < 1e-3);
+        assert!((committed.rotation_degrees - live.rotation_degrees).abs() < 1e-3);
+        assert!((committed.opacity - live.opacity).abs() < 1e-3);
     }
 }

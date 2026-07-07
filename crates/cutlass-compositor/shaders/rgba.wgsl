@@ -17,7 +17,7 @@ struct Placement {
     uv_rect: vec4<f32>,
     // Color grade: brightness, contrast, saturation, enabled (0 | 1).
     grade_adj0: vec4<f32>,
-    // Color grade: exposure, temperature, pad, pad.
+    // Color grade: exposure, temperature, tint, pad.
     grade_adj1: vec4<f32>,
 }
 
