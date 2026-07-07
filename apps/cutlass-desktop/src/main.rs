@@ -701,6 +701,17 @@ fn main() -> Result<(), slint::PlatformError> {
         delete_handle.remove_clips(clips);
     });
 
+    let ripple_delete_handle = preview_worker.handle();
+    editor.on_on_clips_ripple_deleted(move |clip_ids| {
+        let clips: Vec<String> = clip_ids.iter().map(|id| id.to_string()).collect();
+        ripple_delete_handle.ripple_delete_clips(clips);
+    });
+
+    let reverse_handle = preview_worker.handle();
+    editor.on_on_clip_reversed(move |clip_id| {
+        reverse_handle.reverse_clip(clip_id.to_string());
+    });
+
     let split_handle = preview_worker.handle();
     editor.on_on_clip_split(move |clip_id, at_tick| {
         split_handle.split_clip(clip_id.to_string(), i64::from(at_tick));

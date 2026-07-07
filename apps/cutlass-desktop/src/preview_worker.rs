@@ -134,6 +134,17 @@ enum WorkerMsg {
     RemoveClips {
         clips: Vec<String>,
     },
+    /// Delete every clip in `clips` and close each lane's gap (`RippleDelete`),
+    /// regardless of the main-track magnet — the explicit "ripple delete"
+    /// gesture. One history group.
+    RippleDeleteClips {
+        clips: Vec<String>,
+    },
+    /// Toggle reverse playback on a media clip: reads the clip's current
+    /// speed and flips `reversed`. One undoable history entry.
+    ReverseClip {
+        clip: String,
+    },
     /// Replace a generated clip's content (raw id) — e.g. an inspector title
     /// edit. One undoable history entry per committed edit.
     SetGenerator {
@@ -662,6 +673,14 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::RemoveClips { clips });
     }
 
+    pub fn ripple_delete_clips(&self, clips: Vec<String>) {
+        let _ = self.tx.send(WorkerMsg::RippleDeleteClips { clips });
+    }
+
+    pub fn reverse_clip(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::ReverseClip { clip });
+    }
+
     pub fn split_clip(&self, clip: String, at_tick: i64) {
         let _ = self.tx.send(WorkerMsg::SplitClip { clip, at_tick });
     }
@@ -1173,6 +1192,12 @@ fn worker_loop(
             ),
             WorkerMsg::RemoveClips { clips } => {
                 remove_clips_and_publish(engine, &clips, *main_magnet, &ui)
+            }
+            WorkerMsg::RippleDeleteClips { clips } => {
+                ripple_delete_clips_and_publish(engine, &clips, &ui)
+            }
+            WorkerMsg::ReverseClip { clip } => {
+                reverse_clip_and_publish(engine, &clip, *linkage, &ui)
             }
             WorkerMsg::SetGenerator { clip, generator } => {
                 set_generator_and_publish(engine, &clip, generator, &ui)
@@ -1886,6 +1911,8 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::RetimeKeyframes { .. }
             | WorkerMsg::RemoveKeyframesAt { .. }
             | WorkerMsg::SplitClip { .. }
+            | WorkerMsg::RippleDeleteClips { .. }
+            | WorkerMsg::ReverseClip { .. }
             | WorkerMsg::PasteAt { .. }
             | WorkerMsg::DuplicateClips { .. }
             | WorkerMsg::Undo
@@ -4180,6 +4207,82 @@ fn remove_clips_and_publish(engine: &mut Engine, clips: &[String], main_magnet: 
     engine.commit_group();
     info!(count = targets.len(), "removed clips");
     publish_projection(engine, ui);
+}
+
+/// Delete every clip in `clips` and close each lane's gap, always via
+/// `RippleDelete` — the explicit ripple-delete gesture, independent of the
+/// main-track magnet. One history group.
+fn ripple_delete_clips_and_publish(engine: &mut Engine, clips: &[String], ui: &UiSink) {
+    let mut targets = Vec::with_capacity(clips.len());
+    for clip in clips {
+        let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+            error!(clip, "ripple delete ignored: unparsable clip id");
+            return;
+        };
+        let Some(track) = engine.project().timeline().track_of(clip_id) else {
+            error!(%clip_id, "ripple delete ignored: clip not on the timeline");
+            return;
+        };
+        targets.push((clip_id, track));
+    }
+    if targets.is_empty() {
+        return;
+    }
+    targets.sort_by_key(|(clip_id, _)| {
+        std::cmp::Reverse(
+            engine
+                .project()
+                .clip(*clip_id)
+                .map(|c| c.timeline.start.value)
+                .unwrap_or(0),
+        )
+    });
+
+    engine.begin_group();
+    for &(clip_id, _) in &targets {
+        if let Err(e) = apply_edit(engine, EditCommand::RippleDelete { clip: clip_id }) {
+            error!(%clip_id, "ripple delete failed: {e}");
+            engine.rollback_group();
+            publish_projection(engine, ui);
+            return;
+        }
+    }
+    let mut lanes: Vec<TrackId> = targets.iter().map(|&(_, track)| track).collect();
+    lanes.sort();
+    lanes.dedup();
+    for lane in lanes {
+        remove_track_if_empty(engine, lane);
+    }
+    engine.commit_group();
+    info!(count = targets.len(), "ripple-deleted clips");
+    publish_projection(engine, ui);
+}
+
+/// Toggle reverse playback on a media clip: keep the current speed and flip
+/// `reversed`. With linkage on the whole link group follows in one history
+/// entry.
+fn reverse_clip_and_publish(engine: &mut Engine, clip: &str, linkage: bool, ui: &UiSink) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "reverse ignored: unparsable clip id");
+        return;
+    };
+    let Some(model) = engine.project().clip(clip_id).cloned() else {
+        error!(%clip_id, "reverse ignored: clip not on the timeline");
+        return;
+    };
+    if model.source_range().is_none() {
+        error!(%clip_id, "reverse ignored: generated clip");
+        return;
+    }
+    set_clip_speed_and_publish(
+        engine,
+        clip,
+        model.speed.num,
+        model.speed.den,
+        !model.reversed,
+        linkage,
+        ui,
+    );
 }
 
 /// Split a clip into two abutting clips at `at_tick`. The UI only offers the
