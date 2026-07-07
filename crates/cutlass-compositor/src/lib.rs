@@ -26,10 +26,10 @@
 //!   [`CompositorError::UnsupportedFormat`].
 
 mod compositor;
+mod effect_render;
 mod error;
 mod gpu;
 mod layer;
-mod passes;
 mod passes;
 #[cfg(target_vendor = "apple")]
 mod metal_import;
@@ -40,9 +40,10 @@ pub use cutlass_shapes::{SdfParams, SdfShape, Stroke};
 pub use error::CompositorError;
 pub use gpu::GpuContext;
 pub use layer::{
-    CompositeLayer, CompositorConfig, FULL_UV, LayerContent, LayerPlacement, SdfLayer,
+    CompositeLayer, CompositorConfig, CompositorLayer, FULL_UV, LayerContent, LayerPlacement,
+    SdfLayer,
 };
 pub use passes::{
     PassCoverage, PassDescriptor, PassInstance, effect_coverage, effect_descriptors,
-    transition_coverage, transition_ids,
+    effect_is_noop, resolve_transition_pass, transition_coverage, transition_ids,
 };
