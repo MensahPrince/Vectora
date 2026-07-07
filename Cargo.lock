@@ -1278,6 +1278,7 @@ name = "cutlass-engine"
 version = "0.5.3-alpha.0"
 dependencies = [
  "cutlass-commands",
+ "cutlass-compositor",
  "cutlass-core",
  "cutlass-decoder",
  "cutlass-encoder",
