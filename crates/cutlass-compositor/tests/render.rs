@@ -7,7 +7,7 @@
 //! If no GPU adapter is available the test skips rather than fails.
 
 use cutlass_compositor::{
-    CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement, RgbaImage,
+    ColorGrade, CompositeLayer, Compositor, CompositorConfig, GpuContext, LayerPlacement, RgbaImage,
 };
 use cutlass_core::{
     ColorRange, ColorSpace, CpuImage, FrameData, MatrixCoefficients, PixelFormat, Plane, Rational,
@@ -98,6 +98,45 @@ fn yuv_ref(y: u8, cb: u8, cr: u8, color: ColorSpace) -> [u8; 3] {
 
 fn quant(x: f32) -> u8 {
     (x.clamp(0.0, 1.0) * 255.0).round() as u8
+}
+
+/// CPU mirror of `grade.wgsl`'s `apply_grade`, for tolerance comparisons.
+fn grade_ref(rgb: [f32; 3], grade: ColorGrade) -> [f32; 3] {
+    let mut c = rgb;
+    c[0] *= 2f32.powf(2.0 * grade.exposure);
+    c[1] *= 2f32.powf(2.0 * grade.exposure);
+    c[2] *= 2f32.powf(2.0 * grade.exposure);
+    c[0] += 0.25 * grade.temperature;
+    c[2] -= 0.25 * grade.temperature;
+    c[1] += 0.25 * grade.tint;
+    for ch in &mut c {
+        *ch += 0.25 * grade.brightness;
+    }
+    for ch in &mut c {
+        *ch = (*ch - 0.5) * (1.0 + grade.contrast) + 0.5;
+    }
+    let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+    let sat = 1.0 + grade.saturation;
+    c[0] = luma + (c[0] - luma) * sat;
+    c[1] = luma + (c[1] - luma) * sat;
+    c[2] = luma + (c[2] - luma) * sat;
+    [
+        c[0].clamp(0.0, 1.0),
+        c[1].clamp(0.0, 1.0),
+        c[2].clamp(0.0, 1.0),
+    ]
+}
+
+fn grade_ref_u8(rgba: [u8; 4], grade: ColorGrade) -> [u8; 4] {
+    let rgb = grade_ref(
+        [
+            f32::from(rgba[0]) / 255.0,
+            f32::from(rgba[1]) / 255.0,
+            f32::from(rgba[2]) / 255.0,
+        ],
+        grade,
+    );
+    [quant(rgb[0]), quant(rgb[1]), quant(rgb[2]), rgba[3]]
 }
 
 #[track_caller]
@@ -637,4 +676,133 @@ fn sdf_quad_padding_keeps_stroke_unclipped() {
     assert_px(&g, cx + 23, cy, [0, 255, 0, 255], 3);
     // At the canvas corner: untouched background.
     assert_px(&g, 0, 0, [40, 60, 80, 255], 1);
+}
+
+// --- Color grade ---------------------------------------------------------
+
+#[test]
+fn identity_grade_matches_ungraded_solid() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16);
+    let placement = LayerPlacement::full_canvas(&config);
+    let rgba = [200, 80, 40, 255];
+
+    let baseline = comp
+        .render(&gpu, &config, &[CompositeLayer::solid(rgba, placement)])
+        .expect("baseline");
+
+    let explicit = comp
+        .render(
+            &gpu,
+            &config,
+            &[CompositeLayer::solid(rgba, placement).with_grade(ColorGrade::IDENTITY)],
+        )
+        .expect("identity");
+
+    for y in 0..baseline.height {
+        for x in 0..baseline.width {
+            assert_eq!(baseline.pixel(x, y), explicit.pixel(x, y));
+        }
+    }
+}
+
+#[test]
+fn solid_saturation_minus_one_desaturates_red() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16);
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+    let rgba = [255, 0, 0, 255];
+    let layer = CompositeLayer::solid(rgba, LayerPlacement::full_canvas(&config)).with_grade(grade);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+    let expect = grade_ref_u8(rgba, grade);
+    assert_px(&img, 8, 8, expect, 3);
+}
+
+#[test]
+fn solid_exposure_plus_one_brightens_mid_gray() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16);
+    let grade = ColorGrade {
+        exposure: 1.0,
+        ..ColorGrade::IDENTITY
+    };
+    let rgba = [128, 128, 128, 255];
+    let layer = CompositeLayer::solid(rgba, LayerPlacement::full_canvas(&config)).with_grade(grade);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+    let expect = grade_ref_u8(rgba, grade);
+    assert_px(&img, 8, 8, expect, 2);
+}
+
+/// Left half opaque red, right half fully transparent tinted red.
+fn rgba_opaque_and_transparent(w: u32, h: u32) -> RgbaImage {
+    let mut pixels = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..w {
+            let i = ((y * w + x) * 4) as usize;
+            if x < w / 2 {
+                pixels[i..i + 4].copy_from_slice(&[255, 0, 0, 255]);
+            } else {
+                pixels[i..i + 4].copy_from_slice(&[255, 0, 0, 0]);
+            }
+        }
+    }
+    RgbaImage::new(w, h, pixels)
+}
+
+#[test]
+fn rgba_grade_skips_transparent_and_grades_opaque() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let config = CompositorConfig::new(16, 16).with_background([7, 8, 9, 255]);
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+    let bmp = rgba_opaque_and_transparent(16, 16);
+    let layer = CompositeLayer::rgba(&bmp, LayerPlacement::full_canvas(&config)).with_grade(grade);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+
+    let opaque_expect = grade_ref_u8([255, 0, 0, 255], grade);
+    assert_px(&img, 4, 8, opaque_expect, 3);
+    assert_px(&img, 12, 8, [7, 8, 9, 255], 1);
+}
+
+#[test]
+fn yuv_grade_saturation_minus_one_matches_cpu_reference() {
+    let gpu = gpu_or_skip!();
+    let mut comp = Compositor::new(&gpu);
+    let (y, u, v) = (150u8, 60u8, 200u8);
+    let color = ColorSpace::BT709;
+    let grade = ColorGrade {
+        saturation: -1.0,
+        ..ColorGrade::IDENTITY
+    };
+
+    let config = CompositorConfig::new(16, 16);
+    let f = nv12_uniform(16, 16, y, u, v, color);
+    let layer = CompositeLayer::frame(&f, LayerPlacement::full_canvas(&config)).with_grade(grade);
+    let img = comp.render(&gpu, &config, &[layer]).expect("render");
+
+    let [r, g, b] = yuv_ref(y, u, v, color);
+    let graded = grade_ref(
+        [
+            f32::from(r) / 255.0,
+            f32::from(g) / 255.0,
+            f32::from(b) / 255.0,
+        ],
+        grade,
+    );
+    assert_px(
+        &img,
+        8,
+        8,
+        [quant(graded[0]), quant(graded[1]), quant(graded[2]), 255],
+        3,
+    );
 }

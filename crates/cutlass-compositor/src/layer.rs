@@ -60,6 +60,50 @@ impl LayerPlacement {
     }
 }
 
+/// Per-layer color grade applied in the fragment shader on gamma-encoded RGB
+/// before opacity and compositing.
+///
+/// All fields are nominally in `[-1.0, 1.0]` with `0.0` neutral (identity).
+/// Values outside that range are not clamped on the CPU; the shader clamps the
+/// final RGB to `[0, 1]`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ColorGrade {
+    /// Photographic exposure: `±1.0` nominally maps to `±2` stops via `exp2(2·x)`.
+    pub exposure: f32,
+    /// Additive brightness offset (shader adds `0.25·x` to each channel).
+    pub brightness: f32,
+    /// Contrast pivoting at mid-gray `0.5`: `(rgb − 0.5)·(1 + x) + 0.5`.
+    pub contrast: f32,
+    /// Saturation: `-1` desaturates to luma, `+1` doubles color vs luma.
+    pub saturation: f32,
+    /// White-balance temperature: positive warms (R up, B down).
+    pub temperature: f32,
+    /// White-balance tint on the green/magenta axis.
+    pub tint: f32,
+}
+
+impl ColorGrade {
+    /// Identity grade: all zeros; leaves gamma-encoded RGB unchanged.
+    pub const IDENTITY: Self = Self {
+        exposure: 0.0,
+        brightness: 0.0,
+        contrast: 0.0,
+        saturation: 0.0,
+        temperature: 0.0,
+        tint: 0.0,
+    };
+
+    /// Whether every control is at its neutral value.
+    pub const fn is_identity(&self) -> bool {
+        self.exposure == 0.0
+            && self.brightness == 0.0
+            && self.contrast == 0.0
+            && self.saturation == 0.0
+            && self.temperature == 0.0
+            && self.tint == 0.0
+    }
+}
+
 /// A parametric vector shape drawn as a signed-distance field by the shape
 /// pipeline: no texture, no rasterization — geometry parameters ride in the
 /// layer's uniform block, so animated shapes cost a uniform update per frame
@@ -105,6 +149,8 @@ pub struct CompositeLayer<'a> {
     /// (`(0,0)`=top-left, `(1,1)`=bottom-right of the frame's visible region).
     /// A sub-rect crops; a reversed axis mirrors. Ignored by solid fills.
     pub uv: [f32; 4],
+    /// Color grade applied to the layer's RGB before opacity and compositing.
+    pub grade: ColorGrade,
 }
 
 impl<'a> CompositeLayer<'a> {
@@ -114,6 +160,7 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Frame(frame),
             placement,
             uv: FULL_UV,
+            grade: ColorGrade::IDENTITY,
         }
     }
 
@@ -123,6 +170,7 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Rgba(image),
             placement,
             uv: FULL_UV,
+            grade: ColorGrade::IDENTITY,
         }
     }
 
@@ -132,6 +180,7 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Solid(rgba),
             placement,
             uv: FULL_UV,
+            grade: ColorGrade::IDENTITY,
         }
     }
 
@@ -141,12 +190,19 @@ impl<'a> CompositeLayer<'a> {
             content: LayerContent::Sdf(shape),
             placement,
             uv: FULL_UV,
+            grade: ColorGrade::IDENTITY,
         }
     }
 
     /// Replace the sampled UV rect (crop / mirror).
     pub fn with_uv(mut self, uv: [f32; 4]) -> Self {
         self.uv = uv;
+        self
+    }
+
+    /// Replace the per-layer color grade.
+    pub fn with_grade(mut self, grade: ColorGrade) -> Self {
+        self.grade = grade;
         self
     }
 }
