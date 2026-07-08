@@ -239,7 +239,7 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
         }
         WireCommand::AddTransition(args) => {
             let clip = clip_ref(project, args.clip)?;
-            reject_audio_lane(project, clip, "transitions need a visual frame", args.clip)?;
+            reject_non_transition_lane(project, clip, args.clip)?;
             if cutlass_models::transition_spec(&args.transition).is_none() {
                 return Err(Rejection::new(format!(
                     "unknown transition '{}'; available transitions: {}",
@@ -1038,6 +1038,28 @@ fn reject_audio_lane(
     Ok(())
 }
 
+/// Reject transitions on lanes whose clips don't composite as frames: audio
+/// has no frame, and effect/filter/adjustment segments resolve to canvas-wide
+/// passes the renderer can't nest inside a transition (mirrors the model's
+/// `TrackKind::supports_transitions`).
+fn reject_non_transition_lane(
+    project: &Project,
+    clip: &Clip,
+    raw_clip: u64,
+) -> Result<(), Rejection> {
+    let timeline = project.timeline();
+    let kind = timeline
+        .track_of(clip.id)
+        .and_then(|id| timeline.track(id))
+        .map(|t| t.kind);
+    match kind {
+        Some(kind) if !kind.supports_transitions() => Err(Rejection::new(format!(
+            "clip {raw_clip} is on a {kind:?} lane; transitions need a lane that composites frames (video, sticker, or text)"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 fn track_ref(project: &Project, raw: u64) -> Result<&cutlass_models::Track, Rejection> {
     project
         .timeline()
@@ -1464,6 +1486,37 @@ mod tests {
         validate(&cmd, project)
             .expect_err("command should be rejected")
             .message
+    }
+
+    #[test]
+    fn add_transition_rejects_canvas_pass_lanes() {
+        // Effect/filter/adjustment segments resolve to canvas-wide passes the
+        // renderer can't nest inside a transition; the agent gets a rejection
+        // instead of a downstream engine error.
+        let (mut project, ..) = fixture();
+        let lane = project.add_track(TrackKind::Adjustment, "FX");
+        let left = project
+            .add_generated(
+                lane,
+                Generator::Adjustment,
+                TimeRange::at_rate(0, 24, R24),
+            )
+            .unwrap();
+        project
+            .add_generated(lane, Generator::Adjustment, TimeRange::at_rate(24, 24, R24))
+            .unwrap();
+
+        let msg = reject(
+            &project,
+            WireCommand::AddTransition(wire::AddTransition {
+                clip: left.raw(),
+                transition: "crossfade".into(),
+            }),
+        );
+        assert!(
+            msg.contains("Adjustment lane"),
+            "message should name the lane kind: {msg}"
+        );
     }
 
     #[test]
