@@ -419,6 +419,33 @@ enum WorkerMsg {
     RemoveMarker {
         marker: String,
     },
+    /// Move / rename / recolor a ruler marker. One undoable history entry.
+    SetMarker {
+        marker: String,
+        at_tick: i64,
+        name: String,
+        color: String,
+    },
+    /// Add a track from the timeline UI (`pinned` survives empty auto-removal).
+    AddTrackManual {
+        kind: TrackKind,
+        index: usize,
+        pinned: bool,
+    },
+    /// Remove a track explicitly (context menu), even when non-empty.
+    RemoveTrackManual {
+        track: String,
+    },
+    /// Reorder a track in the stack (0 = bottom layer).
+    MoveTrackManual {
+        track: String,
+        index: usize,
+    },
+    /// Rename a track lane.
+    SetTrackName {
+        track: String,
+        name: String,
+    },
     /// Step the engine history one entry back / forward.
     Undo,
     Redo,
@@ -759,6 +786,35 @@ impl WorkerHandle {
 
     pub fn remove_marker(&self, marker: String) {
         let _ = self.tx.send(WorkerMsg::RemoveMarker { marker });
+    }
+
+    pub fn set_marker(&self, marker: String, at_tick: i64, name: String, color: String) {
+        let _ = self.tx.send(WorkerMsg::SetMarker {
+            marker,
+            at_tick,
+            name,
+            color,
+        });
+    }
+
+    pub fn add_track_manual(&self, kind: TrackKind, index: usize, pinned: bool) {
+        let _ = self.tx.send(WorkerMsg::AddTrackManual {
+            kind,
+            index,
+            pinned,
+        });
+    }
+
+    pub fn remove_track_manual(&self, track: String) {
+        let _ = self.tx.send(WorkerMsg::RemoveTrackManual { track });
+    }
+
+    pub fn move_track_manual(&self, track: String, index: usize) {
+        let _ = self.tx.send(WorkerMsg::MoveTrackManual { track, index });
+    }
+
+    pub fn set_track_name(&self, track: String, name: String) {
+        let _ = self.tx.send(WorkerMsg::SetTrackName { track, name });
     }
 
     pub fn set_generator(&self, clip: String, generator: Generator) {
@@ -1539,6 +1595,26 @@ fn worker_loop(
                 color,
             } => add_marker_and_publish(engine, at_tick, &name, &color, tl_rate, &ui),
             WorkerMsg::RemoveMarker { marker } => remove_marker_and_publish(engine, &marker, &ui),
+            WorkerMsg::SetMarker {
+                marker,
+                at_tick,
+                name,
+                color,
+            } => set_marker_and_publish(engine, &marker, at_tick, &name, &color, tl_rate, &ui),
+            WorkerMsg::AddTrackManual {
+                kind,
+                index,
+                pinned,
+            } => add_track_manual_and_publish(engine, kind, index, pinned, &ui),
+            WorkerMsg::RemoveTrackManual { track } => {
+                remove_track_manual_and_publish(engine, &track, &ui)
+            }
+            WorkerMsg::MoveTrackManual { track, index } => {
+                move_track_manual_and_publish(engine, &track, index, &ui)
+            }
+            WorkerMsg::SetTrackName { track, name } => {
+                set_track_name_and_publish(engine, &track, &name, &ui)
+            }
             WorkerMsg::Undo => history_step_and_publish(engine, false, &ui),
             WorkerMsg::Redo => history_step_and_publish(engine, true, &ui),
             WorkerMsg::CopyClips { clips } => {
@@ -3748,6 +3824,124 @@ fn remove_marker_and_publish(engine: &mut Engine, marker: &str, ui: &UiSink) {
     }
 }
 
+/// Move / rename / recolor a ruler marker (M1). One undoable history entry.
+fn set_marker_and_publish(
+    engine: &mut Engine,
+    marker: &str,
+    at_tick: i64,
+    name: &str,
+    color: &str,
+    tl_rate: Rational,
+    ui: &UiSink,
+) {
+    let Some(marker_id) = parse_raw_id(marker).map(MarkerId::from_raw) else {
+        error!(marker, "set-marker ignored: unparsable marker id");
+        return;
+    };
+    let at = RationalTime::new(at_tick.max(0), tl_rate);
+    let color = parse_marker_color(color)
+        .or_else(|| {
+            engine
+                .project()
+                .timeline()
+                .marker(marker_id)
+                .map(|m| m.color)
+        })
+        .unwrap_or(MarkerColor::Teal);
+    match engine.apply(Command::Edit(EditCommand::SetMarker {
+        marker: marker_id,
+        at,
+        name: name.to_string(),
+        color,
+    })) {
+        Ok(_) => {
+            info!(%marker_id, at_tick, "updated timeline marker");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!(%marker_id, "set marker failed: {e}"),
+    }
+}
+
+fn add_track_manual_and_publish(
+    engine: &mut Engine,
+    kind: TrackKind,
+    index: usize,
+    pinned: bool,
+    ui: &UiSink,
+) {
+    let count = engine
+        .project()
+        .timeline()
+        .tracks_ordered()
+        .filter(|t| t.kind == kind)
+        .count();
+    match engine.apply(Command::Edit(EditCommand::AddTrack {
+        kind,
+        name: format!("{}{}", kind_prefix(kind), count + 1),
+        index: Some(index),
+        pinned,
+    })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(id))) => {
+            info!(%id, ?kind, index, pinned, "added manual track");
+            publish_projection(engine, ui);
+        }
+        Ok(other) => error!(?kind, index, "unexpected add-track outcome: {other:?}"),
+        Err(e) => error!(?kind, index, "add track failed: {e}"),
+    }
+}
+
+fn remove_track_manual_and_publish(engine: &mut Engine, track: &str, ui: &UiSink) {
+    let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
+        error!(track, "remove-track ignored: unparsable track id");
+        return;
+    };
+    match engine.apply(Command::Edit(EditCommand::RemoveTrack { track: track_id })) {
+        Ok(_) => {
+            info!(%track_id, "removed track");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!(%track_id, "remove track failed: {e}"),
+    }
+}
+
+fn move_track_manual_and_publish(engine: &mut Engine, track: &str, index: usize, ui: &UiSink) {
+    let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
+        error!(track, "move-track ignored: unparsable track id");
+        return;
+    };
+    match engine.apply(Command::Edit(EditCommand::MoveTrack {
+        track: track_id,
+        index,
+    })) {
+        Ok(_) => {
+            info!(%track_id, index, "moved track");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!(%track_id, index, "move track failed: {e}"),
+    }
+}
+
+fn set_track_name_and_publish(engine: &mut Engine, track: &str, name: &str, ui: &UiSink) {
+    let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
+        error!(track, "set-track-name ignored: unparsable track id");
+        return;
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match engine.apply(Command::Edit(EditCommand::SetTrackName {
+        track: track_id,
+        name: trimmed.to_string(),
+    })) {
+        Ok(_) => {
+            info!(%track_id, name = trimmed, "renamed track");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!(%track_id, "rename track failed: {e}"),
+    }
+}
+
 fn parse_marker_color(name: &str) -> Option<MarkerColor> {
     match name {
         "teal" => Some(MarkerColor::Teal),
@@ -5432,7 +5626,7 @@ fn remove_track_if_empty(engine: &mut Engine, track: TrackId) {
         .project()
         .timeline()
         .track(track)
-        .is_some_and(|t| t.is_empty());
+        .is_some_and(|t| t.is_empty() && !t.pinned);
     if !emptied {
         return;
     }
@@ -5457,6 +5651,7 @@ fn create_track(engine: &mut Engine, kind: TrackKind, drop_row: i64) -> Result<T
         kind,
         name: format!("{}{}", kind_prefix(kind), count + 1),
         index: Some(order_index),
+        pinned: false,
     })) {
         Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(id))) => Ok(id),
         Ok(other) => Err(format!("unexpected add-track outcome: {other:?}")),
@@ -6326,6 +6521,7 @@ mod tests {
                 kind: TrackKind::Video,
                 name: name.into(),
                 index: None,
+                pinned: false,
             }))
             .expect("add track")
         {
@@ -6621,6 +6817,7 @@ mod tests {
                 kind: TrackKind::Audio,
                 name: "A1".into(),
                 index: None,
+                pinned: false,
             }))
             .expect("add audio track")
         {

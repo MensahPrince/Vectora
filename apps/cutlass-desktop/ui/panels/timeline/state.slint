@@ -68,4 +68,17 @@ export global TimelineViewState {
     in-out property <color> trimming-color: transparent;
 
     in-out property <bool> trim-released: false;
+
+    // Horizontal scrollbar fade: bumped on scroll/zoom activity so the overlay
+    // stays visible while the user is navigating.
+    in-out property <int> scrollbar-activity-nonce: 0;
+
+    // Preview axis hover tick (-1 when inactive).
+    in-out property <int> hover-preview-tick: -1;
+
+    // Track head vertical reorder gesture.
+    in-out property <string> track-drag-id: "";
+    in-out property <int> track-drag-source-row: 0;
+    in-out property <length> track-drag-dy-px: 0px;
+    in-out property <bool> track-drag-released: false;
 }

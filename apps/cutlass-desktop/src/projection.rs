@@ -207,6 +207,7 @@ fn track_to_slint(
         muted: track.muted,
         locked: track.locked,
         duck_source: track.duck_source,
+        pinned: track.pinned,
         transitions: project_transitions(track),
     }
 }
@@ -889,6 +890,21 @@ fn marker_to_slint(marker: &EngineMarker) -> TimelineMarker {
         tick: clamp_i32(marker.tick.value),
         name: marker.name.clone().into(),
         color: Color::from_argb_u8(a, r, g, b),
+        color_name: marker_color_name(marker.color).into(),
+    }
+}
+
+fn marker_color_name(color: cutlass_models::MarkerColor) -> &'static str {
+    use cutlass_models::MarkerColor;
+    match color {
+        MarkerColor::Teal => "teal",
+        MarkerColor::Blue => "blue",
+        MarkerColor::Purple => "purple",
+        MarkerColor::Pink => "pink",
+        MarkerColor::Red => "red",
+        MarkerColor::Orange => "orange",
+        MarkerColor::Yellow => "yellow",
+        MarkerColor::Green => "green",
     }
 }
 

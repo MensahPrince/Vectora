@@ -15,7 +15,8 @@ import { TransitionPill } from "transition-pill.slint";
 import { TimelineViewState } from "state.slint";
 import { Sequence } from "../../models/index.slint";
 import { TimelineLib } from "../../lib/timeline-lib.slint";
-import { DragBackend, SnapResult, ClipDragResolution, ClipTrimResolution, LibraryDropResolution, GroupDragResolution } from "../../lib/drag-backend.slint";
+import { DragBackend, SnapResult, ClipDragResolution, ClipTrimResolution, LibraryDropResolution, GroupDragResolution, TransitionJunctionResolution } from "../../lib/drag-backend.slint";
+import { EffectsBackend } from "../../lib/effects-backend.slint";
 import { SelectionBackend } from "../../lib/selection-backend.slint";
 import { AppState } from "../../state.slint";
 
@@ -23,7 +24,7 @@ import { AppState } from "../../state.slint";
 
 component ForceHeadSpace inherits Rectangle {
 
-    height: AppStore.theme.track-lane.height;
+    height: TimelineActions.track-lane-height();
 
     background: transparent;
 }
@@ -64,6 +65,59 @@ export component TimelinePanel inherits PanelBase {
     // Mirror into AppState so the ghost can react.
     changed library-drag-over => {
         AppState.library-drag-over-timeline = self.library-drag-over;
+    }
+
+    private property <bool> transition-cursor-inside:
+        AppState.transition-drag-cursor-x >= self.absolute-position.x
+        && AppState.transition-drag-cursor-x < self.absolute-position.x + self.width
+        && AppState.transition-drag-cursor-y >= self.absolute-position.y
+        && AppState.transition-drag-cursor-y < self.absolute-position.y + self.height;
+
+    private property <bool> transition-drag-over:
+        AppState.transition-drag-active && self.transition-cursor-inside;
+
+    changed transition-drag-over => {
+        AppState.transition-drag-over-timeline = self.transition-drag-over;
+    }
+
+    private property <int> transition-drop-cursor-tick: max(0, round(
+        (AppState.transition-drag-cursor-x - lanes.absolute-position.x - TimelineViewState.scroll-x)
+        / TimelineStore.zoom / 1px));
+
+    private property <int> transition-drop-row: floor(
+        (AppState.transition-drag-cursor-y - lanes.absolute-position.y - TimelineViewState.scroll-y)
+        / (root.track-height + root.track-spacing)) - 1;
+
+    private property <TransitionJunctionResolution> transition-drop-res:
+        DragBackend.resolve-transition-junction(
+            root.sequence,
+            root.transition-drop-cursor-tick,
+            root.transition-drop-row,
+            root.snap-threshold-ticks);
+
+    private property <bool> transition-drag-live: AppState.transition-drag-active;
+    changed transition-drag-live => {
+        if (!self.transition-drag-live && self.transition-cursor-inside
+                && transition-drop-res.valid) {
+            EffectsBackend.add-transition(
+                transition-drop-res.left-clip-id,
+                AppState.transition-drag-id);
+        }
+    }
+
+    private property <bool> preview-axis-gesture-free:
+        !clip-dragging && !clip-trimming && !TimelineViewState.marquee-active
+        && !library-drag-over && !transition-drag-over;
+
+    private property <int> hover-preview-watch: TimelineViewState.hover-preview-tick;
+
+    changed hover-preview-watch => {
+        if (TimelineViewState.hover-preview-tick >= 0
+                && TimelineStore.preview-axis-enabled
+                && !TimelineStore.playing
+                && preview-axis-gesture-free) {
+            EditorStore.on-hover-preview(TimelineViewState.hover-preview-tick);
+        }
     }
 
     // --- library drop targeting --------------------------------------------
@@ -121,7 +175,7 @@ export component TimelinePanel inherits PanelBase {
     }
 
     private property <length> track-spacing: AppStore.theme.metrics.spacing.sm;
-    private property <length> track-height: AppStore.theme.track-lane.height;
+    private property <length> track-height: TimelineActions.track-lane-height();
     // Lane rows repeat every `row-pitch`; row 0 is the ForceHeadSpace spacer,
     // lane r starts at (r + 1) * row-pitch.
     private property <length> row-pitch: track-height + track-spacing;
@@ -371,6 +425,39 @@ export component TimelinePanel inherits PanelBase {
         TimelineViewState.viewport-w = self.lanes-width;
     }
 
+    // Pinch-zoom base scale captured at gesture start.
+    private property <float> timeline-pinch-base-zoom: TimelineStore.zoom;
+
+    // Horizontal scrollbar: visible when content is wider than the viewport.
+    private property <bool> h-scroll-needed: content-width > lanes-width + 1px;
+    private property <float> h-scroll-fraction:
+        h-scroll-needed && min-scroll-x < 0px
+            ? TimelineViewState.scroll-x / min-scroll-x
+            : 0;
+    private property <length> h-thumb-width:
+        h-scroll-needed
+            ? max(32px, lanes-width * lanes-width / content-width)
+            : 0px;
+    private property <length> h-thumb-travel: max(0px, lanes-width - h-thumb-width);
+    private property <length> h-thumb-x: h-thumb-travel * h-scroll-fraction;
+
+    // Fade the scrollbar in while scrolling, out after idle.
+    private property <int> scrollbar-activity: TimelineViewState.scrollbar-activity-nonce;
+    private property <float> h-scrollbar-opacity: 0.0;
+
+    changed scrollbar-activity => {
+        h-scrollbar-opacity = 0.85;
+        scrollbar-fade.restart();
+    }
+
+    scrollbar-fade := Timer {
+        interval: 1500ms;
+        running: false;
+        triggered => {
+            h-scrollbar-opacity = 0.25;
+        }
+    }
+
     init => {
         TimelineViewState.viewport-w = lanes.width;
     }
@@ -426,8 +513,10 @@ export component TimelinePanel inherits PanelBase {
 
                         ForceHeadSpace { }
 
-                        for t in sequence.tracks: TrackHead {
+                        for t[lane-idx] in sequence.tracks: TrackHead {
                             track: t;
+                            track-row: lane-idx;
+                            lane-height: root.track-height;
                         }
                     }
                 }
@@ -444,8 +533,22 @@ export component TimelinePanel inherits PanelBase {
             // this ancestor. Plain wheel scrolls the lanes; Ctrl/Cmd+wheel
             // zooms anchored on the cursor tick. Pointer grabs still go to the
             // innermost clip/lane TouchArea, so dragging is unaffected.
-            wheel-area := TouchArea {
+            lane-host := Rectangle {
                 horizontal-stretch: 1;
+                clip: true;
+
+    private property <bool> wheel-hover: wheel-area.has-hover;
+
+    changed wheel-hover => {
+        if (!wheel-hover) {
+            TimelineViewState.hover-preview-tick = -1;
+            EditorStore.on-hover-preview-ended();
+        }
+    }
+
+            wheel-area := TouchArea {
+                width: 100%;
+                height: 100%;
 
                 changed pressed => {
                     if (self.pressed) {
@@ -462,10 +565,18 @@ export component TimelinePanel inherits PanelBase {
                         }
                         root.marquee-armed = false;
                         TimelineViewState.marquee-active = false;
+                        TimelineViewState.hover-preview-tick = -1;
+                        EditorStore.on-hover-preview-ended();
                     }
                 }
 
                 moved => {
+                    if (TimelineStore.preview-axis-enabled && !TimelineStore.playing
+                            && root.preview-axis-gesture-free) {
+                        TimelineViewState.hover-preview-tick = max(0, round(
+                            (self.mouse-x - TimelineViewState.scroll-x)
+                            / TimelineStore.zoom / 1px));
+                    }
                     if (!root.marquee-armed) {
                         return;
                     }
@@ -502,6 +613,7 @@ export component TimelinePanel inherits PanelBase {
                                     + e.delta-y / 1px * 0.15,
                                 0, 100)),
                             (self.mouse-x - TimelineViewState.scroll-x) / 1px / TimelineStore.zoom);
+                        TimelineViewState.scrollbar-activity-nonce += 1;
                         return accept;
                     }
                     // Shift (or a horizontal trackpad swipe) scrolls the
@@ -516,6 +628,7 @@ export component TimelinePanel inherits PanelBase {
                         TimelineViewState.scroll-y = clamp(
                             TimelineViewState.scroll-y + e.delta-y, root.min-scroll-y, 0px);
                     }
+                    TimelineViewState.scrollbar-activity-nonce += 1;
                     return accept;
                 }
 
@@ -891,7 +1004,109 @@ export component TimelinePanel inherits PanelBase {
                     height: max(parent.height, content-height);
                     background: #ffffff;
                 }
+
+                // Preview axis hover line (CapCut yellow/accent — does not move playhead).
+                if TimelineStore.preview-axis-enabled
+                        && TimelineViewState.hover-preview-tick >= 0
+                        && root.preview-axis-gesture-free
+                        && !TimelineStore.playing: Rectangle {
+                    x: TimelineViewState.hover-preview-tick * TimelineStore.zoom * 1px;
+                    y: 0;
+                    width: 2px;
+                    height: max(parent.height, content-height);
+                    background: AppStore.theme.accent.primary.with-alpha(0.85);
                 }
+
+                // Transition junction highlight while dragging from the library.
+                if transition-drag-over && transition-drop-res.valid: Rectangle {
+                    x: transition-drop-res.cut-tick * TimelineStore.zoom * 1px - 6px;
+                    y: (transition-drop-res.row + 1) * row-pitch;
+                    width: 12px;
+                    height: track-height - 5px;
+                    border-width: 2px;
+                    border-color: #C84A8F;
+                    background: #C84A8F22;
+                    border-radius: 2px;
+                }
+                }
+            }
+
+            // Trackpad pinch-to-zoom on the timeline (CapCut desktop). `scale`
+            // is cumulative since the pinch started, anchored on the pinch
+            // center; non-gesture events fall through to the TouchArea below.
+            ScaleRotateGestureHandler {
+                width: 100%;
+                height: 100%;
+                started => {
+                    root.timeline-pinch-base-zoom = TimelineStore.zoom;
+                }
+                updated => {
+                    TimelineActions.set-zoom-anchored(
+                        clamp(
+                            root.timeline-pinch-base-zoom * self.scale,
+                            TimelineActions.min-zoom,
+                            TimelineActions.max-zoom),
+                        (self.center.x - TimelineViewState.scroll-x) / 1px / TimelineStore.zoom);
+                    TimelineViewState.scrollbar-activity-nonce += 1;
+                }
+            }
+
+            // Slim horizontal scrollbar overlay (auto-fades when idle).
+            if root.h-scroll-needed: Rectangle {
+                y: parent.height - 10px;
+                width: parent.width;
+                height: 8px;
+                opacity: root.h-scrollbar-opacity;
+
+                Rectangle {
+                    x: root.h-thumb-x;
+                    y: 0;
+                    width: root.h-thumb-width;
+                    height: parent.height;
+                    background: #ffffff66;
+                    border-radius: 4px;
+
+                    TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        moved => {
+                            if (!self.pressed) {
+                                return;
+                            }
+                            TimelineViewState.scroll-x = clamp(
+                                root.min-scroll-x
+                                    * (self.mouse-x - self.width / 2)
+                                    / max(1px, root.h-thumb-travel),
+                                root.min-scroll-x,
+                                0px);
+                            TimelineViewState.scrollbar-activity-nonce += 1;
+                        }
+                        scroll-event(e) => {
+                            TimelineViewState.scroll-x = clamp(
+                                TimelineViewState.scroll-x + e.delta-x,
+                                root.min-scroll-x,
+                                0px);
+                            TimelineViewState.scrollbar-activity-nonce += 1;
+                            return accept;
+                        }
+                    }
+                }
+
+                // Click the track to jump scroll position.
+                TouchArea {
+                    width: 100%;
+                    height: 100%;
+                    clicked => {
+                        TimelineViewState.scroll-x = clamp(
+                            root.min-scroll-x
+                                * (self.mouse-x - root.h-thumb-width / 2)
+                                / max(1px, root.h-thumb-travel),
+                            root.min-scroll-x,
+                            0px);
+                        TimelineViewState.scrollbar-activity-nonce += 1;
+                    }
+                }
+            }
             }
         }
     }

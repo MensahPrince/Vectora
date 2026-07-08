@@ -97,4 +97,15 @@ export global AppState {
     // Written by TimelinePanel (it knows its own window-space bounds); read by
     // the library's drop handler and the ghost.
     in-out property <bool> library-drag-over-timeline: false;
+
+    // Transition tile drag from the library (drop on a clip junction).
+    in-out property <bool> transition-drag-active: false;
+    in-out property <string> transition-drag-id: "";
+    in-out property <length> transition-drag-w: 0px;
+    in-out property <length> transition-drag-h: 0px;
+    in-out property <length> transition-drag-tile-anchor-x: 0px;
+    in-out property <length> transition-drag-tile-anchor-y: 0px;
+    in-out property <length> transition-drag-cursor-x: 0px;
+    in-out property <length> transition-drag-cursor-y: 0px;
+    in-out property <bool> transition-drag-over-timeline: false;
 }

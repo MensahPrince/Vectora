@@ -376,7 +376,21 @@ export component AppWindow inherits Window {
                     TimelineActions.toggle-loop();
                     return accept;
                 }
+                // Timeline zoom in/out (CapCut: Ctrl/Cmd + / -).
+                if (event.text == "+" || event.text == "=") {
+                    TimelineActions.zoom-in();
+                    return accept;
+                }
+                if (event.text == "-" || event.text == "_") {
+                    TimelineActions.zoom-out();
+                    return accept;
+                }
                 return reject;
+            }
+            // Zoom to fit timeline (CapCut: Shift+Z).
+            if (event.modifiers.shift && (event.text == "z" || event.text == "Z")) {
+                TimelineActions.zoom-to-fit();
+                return accept;
             }
             // Clear the in/out range (Alt+X, Premiere-style).
             if (event.modifiers.alt && (event.text == "x" || event.text == "X")) {
@@ -554,6 +568,15 @@ export component AppWindow inherits Window {
         x: AppState.library-drag-cursor-x - AppState.library-drag-tile-anchor-x;
         y: AppState.library-drag-cursor-y - AppState.library-drag-tile-anchor-y;
         background: #C83A3A;
+        border-radius: AppStore.theme.track-lane.clip.radius;
+    }
+
+    if AppState.transition-drag-active && !AppState.transition-drag-over-timeline: Rectangle {
+        width: AppState.transition-drag-w;
+        height: AppState.transition-drag-h;
+        x: AppState.transition-drag-cursor-x - AppState.transition-drag-tile-anchor-x;
+        y: AppState.transition-drag-cursor-y - AppState.transition-drag-tile-anchor-y;
+        background: #C84A8F;
         border-radius: AppStore.theme.track-lane.clip.radius;
     }
 

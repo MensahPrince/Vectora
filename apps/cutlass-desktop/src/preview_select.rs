@@ -595,6 +595,7 @@ mod tests {
             muted: false,
             locked: false,
             duck_source: false,
+            pinned: false,
             transitions: ModelRc::default(),
         }
     }

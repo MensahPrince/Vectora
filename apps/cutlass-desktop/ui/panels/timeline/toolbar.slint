@@ -164,6 +164,24 @@ export component Toolbar inherits Rectangle {
             }
         }
 
+        // CapCut preview axis: hover-scrub preview without moving playhead.
+        ToolButton {
+            label: "Preview";
+            active: TimelineStore.preview-axis-enabled;
+            clicked => {
+                TimelineActions.toggle-preview-axis();
+            }
+        }
+
+        // Lane height preset (S / M / L).
+        ToolButton {
+            label: TimelineStore.track-height-preset == 0 ? "H-S"
+                : TimelineStore.track-height-preset == 2 ? "H-L" : "H-M";
+            clicked => {
+                TimelineActions.cycle-track-height();
+            }
+        }
+
         // CapCut's linkage toggle: linked video+audio pairs select, move,
         // and trim together while on; drops of media with audio create
         // linked pairs. Routed through TimelineActions so the worker

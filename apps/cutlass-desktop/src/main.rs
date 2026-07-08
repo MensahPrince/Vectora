@@ -614,6 +614,20 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
+    // Preview axis: hover-scrub frames without moving the playhead (no audio).
+    let hover_frame_handle = preview_worker.handle();
+    let hover_playhead_weak = app.as_weak();
+    editor.on_on_hover_preview(move |tick| {
+        hover_frame_handle.request_frame(i64::from(tick));
+    });
+    let hover_restore_handle = preview_worker.handle();
+    editor.on_on_hover_preview_ended(move || {
+        if let Some(app) = hover_playhead_weak.upgrade() {
+            let tick = app.global::<TimelineStore>().get_playhead_tick();
+            hover_restore_handle.request_frame(i64::from(tick));
+        }
+    });
+
     // Preview surface size (docked panel or fullscreen) → render fit bound.
     // Slint reports logical px; the worker wants physical so a Retina preview
     // doesn't render at half resolution.
@@ -797,6 +811,15 @@ fn main() -> Result<(), slint::PlatformError> {
     timeline_store.on_on_marker_removed(move |marker_id| {
         marker_remove_handle.remove_marker(marker_id.to_string());
     });
+    let marker_set_handle = preview_worker.handle();
+    timeline_store.on_on_marker_set(move |marker_id, at_tick, name, color| {
+        marker_set_handle.set_marker(
+            marker_id.to_string(),
+            i64::from(at_tick),
+            name.to_string(),
+            color.to_string(),
+        );
+    });
 
     // Clipboard ops (Cmd/Ctrl+C / V / D, context menu): the worker owns the
     // clipboard as project-independent snapshots.
@@ -837,6 +860,33 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         };
         track_flag_handle.set_track_flag(track_id.to_string(), flag, value);
+    });
+
+    let add_track_handle = preview_worker.handle();
+    editor.on_on_track_added(move |kind, index, pinned| {
+        let kind = match kind.as_str() {
+            "video" => cutlass_models::TrackKind::Video,
+            "audio" => cutlass_models::TrackKind::Audio,
+            "text" => cutlass_models::TrackKind::Text,
+            "sticker" => cutlass_models::TrackKind::Sticker,
+            other => {
+                tracing::error!(kind = other, "ignoring unknown track kind");
+                return;
+            }
+        };
+        add_track_handle.add_track_manual(kind, index as usize, pinned);
+    });
+    let remove_track_handle = preview_worker.handle();
+    editor.on_on_track_removed(move |track_id| {
+        remove_track_handle.remove_track_manual(track_id.to_string());
+    });
+    let move_track_handle = preview_worker.handle();
+    editor.on_on_track_moved(move |track_id, index| {
+        move_track_handle.move_track_manual(track_id.to_string(), index as usize);
+    });
+    let rename_track_handle = preview_worker.handle();
+    editor.on_on_track_renamed(move |track_id, name| {
+        rename_track_handle.set_track_name(track_id.to_string(), name.to_string());
     });
 
     // Canvas settings (title bar → dialog → engine thread).
@@ -1280,6 +1330,17 @@ fn main() -> Result<(), slint::PlatformError> {
                 playhead_tick,
                 snap_threshold_ticks,
                 main_magnet,
+            )
+        },
+    );
+
+    app.global::<DragBackend>().on_resolve_transition_junction(
+        |sequence, cursor_tick, hover_row, snap_threshold_ticks| {
+            snap::resolve_transition_junction(
+                &sequence,
+                cursor_tick,
+                hover_row,
+                snap_threshold_ticks,
             )
         },
     );

@@ -15,7 +15,7 @@ import {
 import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
 import { Media, TrackKind, CatalogEntry } from "../../models/index.slint";
 import { EffectsBackend } from "../../lib/index.slint";
-import { MediaTile, GeneratedTile, CatalogTile } from "tiles.slint";
+import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile } from "tiles.slint";
 import { SectionPlaceholder } from "placeholder.slint";
 import { CutlassScrollView } from "../../components/scroll-view.slint";
 
@@ -552,8 +552,8 @@ export component LibraryPanel inherits PanelBase {
                 }
 
                 // ---- Transitions --------------------------------------------
-                // Click applies at the selected clip's right junction; the
-                // engine rejects when there's no abutting neighbor.
+                // Drag onto a clip junction, or click to apply at the selected
+                // clip's right edge.
                 if LibraryState.active-tab == "transitions": VerticalLayout {
                     spacing: AppStore.theme.metrics.spacing.none;
 
@@ -565,9 +565,7 @@ export component LibraryPanel inherits PanelBase {
                             width: parent.width - 2 * AppStore.theme.metrics.spacing.md;
                             height: parent.height;
                             vertical-alignment: center;
-                            text: TimelineStore.selected-clip-id == ""
-                                ? "Select a clip to add a transition after it"
-                                : "Click to add a transition at the selected clip's end";
+                            text: "Drag onto a cut, or click with a clip selected";
                             style: AppStore.theme.typography.caption;
                             foreground: AppStore.theme.text.secondary;
                             overflow: elide;
@@ -588,17 +586,13 @@ export component LibraryPanel inherits PanelBase {
                         inset: AppStore.theme.metrics.spacing.md;
                         item-count: EffectsBackend.transition-catalog.length;
 
-                        for tr[i] in EffectsBackend.transition-catalog: CatalogTile {
+                        for tr[i] in EffectsBackend.transition-catalog: TransitionCatalogTile {
                             x: transitions-grid.cell-x(i);
                             y: transitions-grid.cell-y(i);
                             width: transitions-grid.cell-width;
                             height: transitions-grid.cell-height;
+                            transition-id: tr.id;
                             label: tr.label;
-                            swatch: #C84A8F;
-                            enabled: TimelineStore.selected-clip-id != "";
-                            apply => {
-                                EffectsBackend.add-transition(TimelineStore.selected-clip-id, tr.id);
-                            }
                         }
                     }
                 }

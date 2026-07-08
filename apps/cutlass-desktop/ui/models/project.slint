@@ -393,6 +393,8 @@ export struct Track {
     muted: bool,
     locked: bool,
     duck-source: bool,
+    // Manual lanes survive empty auto-removal until explicitly deleted.
+    pinned: bool,
     // Transitions at this track's clip junctions (M4), keyed by the left
     // (outgoing) clip. Empty ⇔ none.
     transitions: [TransitionView],
@@ -405,6 +407,8 @@ export struct TimelineMarker {
     tick: int,
     name: string,
     color: color,
+    // Palette name for round-tripping edits ("teal", "blue", …).
+    color-name: string,
 }
 
 @rust-attr(derive(serde::Serialize, serde::Deserialize))

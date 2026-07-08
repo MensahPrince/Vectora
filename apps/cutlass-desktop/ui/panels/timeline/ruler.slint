@@ -38,6 +38,27 @@ import { TimelineViewState } from "state.slint";
 import { RulerBackend, RulerTick } from "../../lib/ruler-backend.slint";
 import { DragBackend } from "../../lib/drag-backend.slint";
 import { AppState } from "../../state.slint";
+import { LineTextInput } from "../inspector/inspector-widgets.slint";
+
+component MarkerColorSwatch inherits Rectangle {
+    in property <string> color-name;
+    in property <color> swatch-color;
+    in property <bool> selected;
+    callback picked();
+
+    width: 18px;
+    height: 18px;
+    border-radius: 3px;
+    background: swatch-color;
+    border-width: selected ? 2px : 0px;
+    border-color: #ffffff;
+
+    ta := TouchArea {
+        clicked => {
+            root.picked();
+        }
+    }
+}
 
 export component Ruler inherits Rectangle {
     private property <length> scroll-x: TimelineViewState.scroll-x;
@@ -55,29 +76,32 @@ export component Ruler inherits Rectangle {
     private property <int> snap-threshold-ticks:
         TimelineStore.snap-enabled ? max(1, round(10 / zoom)) : 0;
 
-    // Move the playhead to the frame under viewport-local `mx`,
-    // magneting to clip edges / tick 0 when the snap toggle is on.
-    // Passing a zero-width span makes the resolver treat the playhead
-    // itself as the dragged edge; playhead-tick is passed as 0 so the
-    // old playhead position is not a magnet candidate (0 already is).
-    // The result is clamped to the sequence so a drag into the padded
-    // scroll region past the last clip can't push the playhead past the
-    // end (and an empty timeline stays parked at 0).
-    function scrub-to(mx: length) {
-        TimelineStore.playhead-tick = TimelineActions.clamp-playhead(DragBackend.snap-clip-start(
+    // Marker drag / editor state.
+    private property <string> marker-drag-id: "";
+    private property <int> marker-drag-tick: -1;
+    private property <bool> marker-drag-active: false;
+    private property <string> marker-edit-id: "";
+    private property <int> marker-edit-tick: 0;
+    private property <string> marker-edit-name: "";
+    private property <string> marker-edit-color: "teal";
+
+    function snap-tick(raw-tick: int) -> int {
+        return DragBackend.snap-clip-start(
             EditorStore.project.sequence,
             "",
             "",
-            max(0, round((mx - scroll-x) / 1px / zoom)),
+            raw-tick,
             0,
             snap-threshold-ticks,
-            0).snapped-start-value);
+            0).snapped-start-value;
     }
 
-    // --- in/out playback range (playback roadmap Phase 4) -------------
-    // Drawn under the marks: a translucent band between the in/out marks
-    // (I / O keys at the playhead, Alt+X clears) plus an edge pin per set
-    // mark, in the same accent the toolbar toggles latch with.
+    // Move the playhead to the frame under viewport-local `mx`,
+    // magneting to clip edges / tick 0 when the snap toggle is on.
+    function scrub-to(mx: length) {
+        TimelineStore.playhead-tick = TimelineActions.clamp-playhead(
+            self.snap-tick(max(0, round((mx - scroll-x) / 1px / zoom))));
+    }
 
     private property <length> range-in-x:
         TimelineStore.range-in-tick * zoom * 1px + scroll-x;
@@ -109,16 +133,12 @@ export component Ruler inherits Rectangle {
         background: AppStore.theme.accent.primary;
     }
 
-    // One zero-width anchor per mark; the dot or label hangs off it,
-    // centered on the position (children are not clipped to parents).
     for tick in tick-model: Rectangle {
         x: tick.x;
         y: 0;
         width: 0;
         height: parent.height;
 
-        // Dot subdivisions: tiny rounded squares — the `· · ·` rhythm
-        // CapCut puts between labels.
         if !tick.is-major: Rectangle {
             x: -1px;
             y: parent.height / 2 - 1px;
@@ -128,8 +148,6 @@ export component Ruler inherits Rectangle {
             background: AppStore.theme.text.muted;
         }
 
-        // Labels, centered (Text defaults to its content size outside
-        // layouts, so `self.width` is the glyph width).
         if tick.is-major: CutlassText {
             x: -self.width / 2;
             y: parent.height / 2 - self.height / 2;
@@ -146,8 +164,6 @@ export component Ruler inherits Rectangle {
 
         pointer-event(event) => {
             if event.kind == PointerEventKind.down {
-                // Scrubbing reclaims the keyboard (frame-step arrows
-                // should act on the playhead right after).
                 AppState.refocus-shortcuts();
                 root.scrub-to(self.mouse-x);
             }
@@ -160,17 +176,31 @@ export component Ruler inherits Rectangle {
         }
     }
 
-    // M1 ruler markers: colored flags in tick order. Declared after the
-    // scrub TouchArea so the flags sit on top and win the pointer — left-
-    // click seeks the playhead to the marker, right-click removes it.
-    // (Under the scrub area they'd be shadowed and every click would just
-    // scrub.)
+    // Ghost flag while dragging a marker.
+    if marker-drag-active: Rectangle {
+        x: marker-drag-tick * zoom * 1px + scroll-x;
+        y: 0;
+        width: 0;
+        height: parent.height;
+
+        Rectangle {
+            x: -3px;
+            y: 2px;
+            width: 6px;
+            height: 10px;
+            border-radius: 1px;
+            background: AppStore.theme.accent.primary;
+            opacity: 0.75;
+        }
+    }
+
     for marker in EditorStore.project.sequence.markers: Rectangle {
         property <length> marker-x: marker.tick * zoom * 1px + scroll-x;
         x: marker-x;
         y: 0;
         width: 0;
         height: parent.height;
+        visible: marker-drag-active ? marker.id != marker-drag-id : true;
 
         Rectangle {
             x: -3px;
@@ -196,24 +226,164 @@ export component Ruler inherits Rectangle {
             height: parent.height;
             mouse-cursor: MouseCursor.pointer;
 
+            property <length> press-x: 0px;
+            property <bool> moved-since-press: false;
+
             pointer-event(e) => {
                 if (e.kind == PointerEventKind.down) {
                     AppState.refocus-shortcuts();
+                    self.press-x = self.mouse-x;
+                    self.moved-since-press = false;
                     if (e.button == PointerEventButton.right) {
                         TimelineActions.remove-marker(marker.id);
                     } else if (e.button == PointerEventButton.left) {
+                        root.marker-drag-id = marker.id;
+                        root.marker-drag-tick = marker.tick;
+                        root.marker-drag-active = false;
+                    }
+                }
+                if (e.kind == PointerEventKind.up && e.button == PointerEventButton.left) {
+                    if (root.marker-drag-active) {
+                        TimelineActions.set-marker(
+                            marker.id,
+                            root.marker-drag-tick,
+                            marker.name,
+                            marker.color-name);
+                        root.marker-drag-id = "";
+                        root.marker-drag-active = false;
+                    } else if (!self.moved-since-press) {
                         TimelineStore.playhead-tick =
                             TimelineActions.clamp-playhead(marker.tick);
                     }
                 }
             }
+
+            moved => {
+                if (!self.pressed || root.marker-drag-id != marker.id) {
+                    return;
+                }
+                if (abs((self.mouse-x - self.press-x) / 1px) > 3) {
+                    self.moved-since-press = true;
+                    root.marker-drag-active = true;
+                }
+                if (root.marker-drag-active) {
+                    root.marker-drag-tick = root.snap-tick(max(0, round(
+                        (self.mouse-x - scroll-x) / 1px / zoom)));
+                }
+            }
+
+            double-clicked => {
+                root.marker-edit-id = marker.id;
+                root.marker-edit-tick = marker.tick;
+                root.marker-edit-name = marker.name;
+                root.marker-edit-color = marker.color-name;
+                marker-editor.show();
+            }
         }
     }
 
-    // --- playhead pin (over the scrub TouchArea: it is part of it) ---
+    marker-editor := PopupWindow {
+        x: playhead-x;
+        y: parent.height + 4px;
+        close-policy: PopupClosePolicy.close-on-click-outside;
 
-    // Hairline through the ruler strip; the lanes draw their own
-    // content-space line below.
+        Rectangle {
+            width: 220px;
+            background: AppStore.theme.panel.background;
+            border-radius: 4px;
+
+            VerticalLayout {
+            padding: 8px;
+            spacing: 6px;
+
+            CutlassText {
+                text: "Marker";
+                style: AppStore.theme.typography.label;
+            }
+
+            LineTextInput {
+                text <=> marker-edit-name;
+            }
+
+            HorizontalLayout {
+                spacing: 4px;
+                MarkerColorSwatch {
+                    color-name: "teal";
+                    swatch-color: #3DB8A8;
+                    selected: marker-edit-color == "teal";
+                    picked => { marker-edit-color = "teal"; }
+                }
+                MarkerColorSwatch {
+                    color-name: "blue";
+                    swatch-color: #4A7FD4;
+                    selected: marker-edit-color == "blue";
+                    picked => { marker-edit-color = "blue"; }
+                }
+                MarkerColorSwatch {
+                    color-name: "purple";
+                    swatch-color: #8B5FD4;
+                    selected: marker-edit-color == "purple";
+                    picked => { marker-edit-color = "purple"; }
+                }
+                MarkerColorSwatch {
+                    color-name: "pink";
+                    swatch-color: #D45FA0;
+                    selected: marker-edit-color == "pink";
+                    picked => { marker-edit-color = "pink"; }
+                }
+                MarkerColorSwatch {
+                    color-name: "red";
+                    swatch-color: #D44A4A;
+                    selected: marker-edit-color == "red";
+                    picked => { marker-edit-color = "red"; }
+                }
+                MarkerColorSwatch {
+                    color-name: "orange";
+                    swatch-color: #D48A3A;
+                    selected: marker-edit-color == "orange";
+                    picked => { marker-edit-color = "orange"; }
+                }
+                MarkerColorSwatch {
+                    color-name: "yellow";
+                    swatch-color: #D4B83A;
+                    selected: marker-edit-color == "yellow";
+                    picked => { marker-edit-color = "yellow"; }
+                }
+                MarkerColorSwatch {
+                    color-name: "green";
+                    swatch-color: #4AB85A;
+                    selected: marker-edit-color == "green";
+                    picked => { marker-edit-color = "green"; }
+                }
+            }
+
+            Rectangle {
+                height: 28px;
+                background: AppStore.theme.accent.primary;
+                border-radius: 4px;
+                Text {
+                    text: "Apply";
+                    color: #ffffff;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+                TouchArea {
+                    clicked => {
+                        if (marker-edit-id != "") {
+                            TimelineActions.set-marker(
+                                marker-edit-id,
+                                marker-edit-tick,
+                                marker-edit-name,
+                                marker-edit-color);
+                        }
+                        marker-editor.close();
+                    }
+                }
+            }
+        }
+        }
+    }
+
     Rectangle {
         x: playhead-x;
         y: 0;
@@ -222,7 +392,6 @@ export component Ruler inherits Rectangle {
         background: AppStore.theme.text.primary;
     }
 
-    // Rounded head…
     Rectangle {
         x: playhead-x - 4.5px;
         y: 3px;
@@ -232,7 +401,6 @@ export component Ruler inherits Rectangle {
         background: AppStore.theme.text.primary;
     }
 
-    // …with a pointer toward the timeline (CapCut's pin silhouette).
     Path {
         x: playhead-x - 4.5px;
         y: 12px;
