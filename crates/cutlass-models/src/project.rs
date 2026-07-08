@@ -666,6 +666,16 @@ impl Project {
             .timeline
             .track_of(left)
             .ok_or(ModelError::UnknownClip(left))?;
+        let kind = self
+            .timeline
+            .track(track_id)
+            .ok_or(ModelError::UnknownClip(left))?
+            .kind;
+        if !kind.supports_transitions() {
+            return Err(ModelError::InvalidParam(format!(
+                "transitions aren't supported on {kind:?} lanes"
+            )));
+        }
         let right = self.right_neighbor(track_id, left).ok_or_else(|| {
             ModelError::InvalidParam("clip has no abutting clip to its right".into())
         })?;
@@ -1818,16 +1828,28 @@ mod tests {
 
     // --- transitions (M4) -------------------------------------------------
 
-    /// Two abutting adjustment clips on one track; returns `(project, left,
-    /// right, track)`.
+    /// Two abutting solid clips on one sticker track (a lane kind that
+    /// supports transitions); returns `(project, left, right, track)`.
     fn project_with_abutting_pair() -> (Project, ClipId, ClipId, TrackId) {
         let mut project = Project::new("test", R24);
-        let track = project.add_track(TrackKind::Adjustment, "FX");
+        let track = project.add_track(TrackKind::Sticker, "S1");
         let left = project
-            .add_generated(track, Generator::Adjustment, tr(0, 24))
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 24),
+            )
             .unwrap();
         let right = project
-            .add_generated(track, Generator::Adjustment, tr(24, 24))
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
+                tr(24, 24),
+            )
             .unwrap();
         (project, left, right, track)
     }
@@ -1855,14 +1877,40 @@ mod tests {
             Err(ModelError::InvalidParam(_))
         ));
         // A lone clip with no right neighbor cannot take a transition.
-        let track = project.add_track(TrackKind::Adjustment, "FX2");
+        let track = project.add_track(TrackKind::Sticker, "S2");
         let lone = project
-            .add_generated(track, Generator::Adjustment, tr(0, 24))
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 255, 0, 255],
+                },
+                tr(0, 24),
+            )
             .unwrap();
         assert!(matches!(
             project.add_transition(lone, "crossfade"),
             Err(ModelError::InvalidParam(_))
         ));
+    }
+
+    #[test]
+    fn add_transition_rejects_canvas_pass_lanes() {
+        // Effect/filter/adjustment segments resolve to canvas-wide passes,
+        // which the renderer can't nest inside a transition — the model
+        // refuses the junction outright.
+        let mut project = Project::new("test", R24);
+        let track = project.add_track(TrackKind::Adjustment, "FX");
+        let left = project
+            .add_generated(track, Generator::Adjustment, tr(0, 24))
+            .unwrap();
+        project
+            .add_generated(track, Generator::Adjustment, tr(24, 24))
+            .unwrap();
+        assert!(matches!(
+            project.add_transition(left, "crossfade"),
+            Err(ModelError::InvalidParam(_))
+        ));
+        assert!(!project.has_transitions());
     }
 
     #[test]

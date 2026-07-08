@@ -33,6 +33,14 @@ impl TrackKind {
         !matches!(self, Self::Audio)
     }
 
+    /// Lanes whose clips composite as frames and can therefore take a
+    /// transition at their junctions. Audio has no frame; effect/filter/
+    /// adjustment segments resolve to canvas-wide passes, which the renderer
+    /// can't nest inside a transition.
+    pub const fn supports_transitions(self) -> bool {
+        matches!(self, Self::Video | Self::Sticker | Self::Text)
+    }
+
     /// Whether `content` may be placed on a track of this kind.
     pub fn accepts_content(self, content: &ClipSource) -> bool {
         matches!(
