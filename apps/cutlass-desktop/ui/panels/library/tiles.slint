@@ -8,6 +8,7 @@ import { CutlassText } from "../../components/index.slint";
 import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
 import { EffectsBackend } from "../../lib/effects-backend.slint";
 import { CloudBackend, StockTile } from "../../lib/cloud-backend.slint";
+import { TextPresetTile } from "../../lib/text-presets-backend.slint";
 import { AppState } from "../../state.slint";
 import { Media, TrackKind } from "../../models/index.slint";
 
@@ -619,6 +620,111 @@ export component StockMediaTile inherits Rectangle {
             if tile.state != "downloading" && tile.state != "imported" {
                 CloudBackend.stock-import(root.index);
             }
+        }
+    }
+}
+
+// One animated-text preset (Library > Text > Presets): the sample text in
+// the preset's fill color over a dark stage, a corner badge when look
+// animations are attached, and the preset name strip. Drags exactly like
+// GeneratedTile with the key "text-preset:<id>" — the drop resolver looks
+// the preset up in the registry src/text_presets.rs filled and places a
+// styled text clip.
+export component TextPresetLibraryTile inherits Rectangle {
+    in property <TextPresetTile> tile;
+
+    property <int> fps-num: EditorStore.project.sequence.fps.num;
+    property <int> fps-den: EditorStore.project.sequence.fps.den;
+
+    background: AppStore.theme.surface.content-background;
+    border-radius: 4px;
+    clip: true;
+
+    // Sample text on a dark stage.
+    CutlassText {
+        width: parent.width - 12px;
+        height: parent.height - 22px;
+        x: 6px;
+        text: tile.sample;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        style: { size: 16px, weight: 700, italic: false };
+        foreground: tile.fill;
+        wrap: word-wrap;
+        overflow: elide;
+    }
+
+    // Animation badge.
+    if tile.animated: Rectangle {
+        x: 4px;
+        y: 4px;
+        width: anim-chip.preferred-width + 8px;
+        height: 16px;
+        border-radius: 3px;
+        background: #000000a0;
+
+        anim-chip := CutlassText {
+            width: parent.width;
+            text: "anim";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            style: { size: 10px, weight: 500, italic: false };
+            foreground: #ffffffcc;
+        }
+    }
+
+    VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 22px;
+            background: #000000a0;
+            CutlassText {
+                text: tile.name;
+                style: AppStore.theme.typography.label;
+                overflow: elide;
+                x: 4px;
+                width: parent.width - 8px;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        width: parent.width;
+        height: parent.height;
+
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                AppState.library-drag-media-id = "";
+                AppState.library-drag-generator = "text-preset:" + tile.key;
+                AppState.library-drag-lane-kind = TrackKind.text;
+                AppState.library-drag-duration-ticks =
+                    max(1, round(3 * root.fps-num / root.fps-den));
+                AppState.library-drag-w = root.width;
+                AppState.library-drag-h = root.height;
+                AppState.library-drag-tile-anchor-x = self.mouse-x;
+                AppState.library-drag-tile-anchor-y = self.mouse-y;
+                AppState.library-drag-cursor-x = self.absolute-position.x + self.mouse-x;
+                AppState.library-drag-cursor-y = self.absolute-position.y + self.mouse-y;
+                AppState.library-drag-active = true;
+            }
+            if event.kind == PointerEventKind.up {
+                AppState.library-drag-active = false;
+            }
+            if event.kind == PointerEventKind.cancel {
+                AppState.library-drag-cursor-x = -10000px;
+                AppState.library-drag-cursor-y = -10000px;
+                AppState.library-drag-active = false;
+            }
+        }
+
+        moved => {
+            if !self.pressed || !AppState.library-drag-active {
+                return;
+            }
+            AppState.library-drag-cursor-x = self.absolute-position.x + self.mouse-x;
+            AppState.library-drag-cursor-y = self.absolute-position.y + self.mouse-y;
         }
     }
 }

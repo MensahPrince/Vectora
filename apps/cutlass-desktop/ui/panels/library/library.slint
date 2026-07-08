@@ -14,8 +14,8 @@ import {
 } from "../../components/index.slint";
 import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
 import { Media, TrackKind, CatalogEntry } from "../../models/index.slint";
-import { EffectsBackend, CloudBackend } from "../../lib/index.slint";
-import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile, StockMediaTile } from "tiles.slint";
+import { EffectsBackend, CloudBackend, TextPresetsBackend } from "../../lib/index.slint";
+import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile, StockMediaTile, TextPresetLibraryTile } from "tiles.slint";
 import { SectionPlaceholder } from "placeholder.slint";
 import { CutlassScrollView } from "../../components/scroll-view.slint";
 
@@ -26,6 +26,7 @@ global LibraryState {
     in-out property <string> active-tab: "media";
     in-out property <string> media-section: "local";
     in-out property <string> audio-section: "local";
+    in-out property <string> text-section: "titles";
 }
 
 // Shared accent for active tab / section labels (same accent as AccentButton).
@@ -328,8 +329,17 @@ export component LibraryPanel inherits PanelBase {
 
                 if LibraryState.active-tab == "text": SectionList {
                     width: parent.width;
-                    sections: [{ id: "titles", label: "Add text" }];
-                    active: "titles";
+                    sections: [
+                        { id: "titles", label: "Add text" },
+                        { id: "presets", label: "Presets" },
+                    ];
+                    active: LibraryState.text-section;
+                    select(id) => {
+                        LibraryState.text-section = id;
+                        if id == "presets" && TextPresetsBackend.status == "idle" {
+                            TextPresetsBackend.refresh();
+                        }
+                    }
                 }
 
                 if LibraryState.active-tab == "stickers": SectionList {
@@ -607,8 +617,8 @@ export component LibraryPanel inherits PanelBase {
                     message: "Generate music and voice-overs from a prompt. Coming soon.";
                 }
 
-                // ---- Text ---------------------------------------------------
-                if LibraryState.active-tab == "text": text-grid := CutlassGridView {
+                // ---- Text > Add text ----------------------------------------
+                if LibraryState.active-tab == "text" && LibraryState.text-section == "titles": text-grid := CutlassGridView {
                     width: parent.width;
                     height: parent.height;
                     show-horizontal-scrollbar: false;
@@ -633,6 +643,88 @@ export component LibraryPanel inherits PanelBase {
                         lane-kind: TrackKind.text;
                         seconds: 3;
                         swatch: #3A6FC8;
+                    }
+                }
+
+                // ---- Text > Presets -----------------------------------------
+                // Served recipes (TextStyle + look-animation combos) rendered
+                // by the existing text pipeline; tiles drag onto the timeline
+                // like the default text tile (src/text_presets.rs).
+                if LibraryState.active-tab == "text" && LibraryState.text-section == "presets": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    if TextPresetsBackend.status == "idle" || TextPresetsBackend.status == "loading": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+
+                        CutlassText {
+                            text: "Loading presets…";
+                            horizontal-alignment: center;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+                    }
+
+                    if TextPresetsBackend.status == "empty": SectionPlaceholder {
+                        vertical-stretch: 1;
+                        icon: @image-url("../../../../../assets/icon/library/text.svg");
+                        title: "Text presets";
+                        message: "Styled, animated title recipes land here as the catalog grows.";
+                    }
+
+                    if TextPresetsBackend.status == "error": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        padding: AppStore.theme.metrics.spacing.xl;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        CutlassText {
+                            text: "Couldn't load presets";
+                            style: AppStore.theme.typography.heading-sm;
+                            horizontal-alignment: center;
+                        }
+
+                        CutlassText {
+                            text: TextPresetsBackend.error;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            SubtleButton {
+                                label: "Retry";
+                                clicked => {
+                                    TextPresetsBackend.refresh();
+                                }
+                            }
+                        }
+                    }
+
+                    if TextPresetsBackend.status == "results": preset-grid := CutlassGridView {
+                        show-horizontal-scrollbar: false;
+                        show-vertical-scrollbar: false;
+                        interactive: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
+                            / (100px + AppStore.theme.metrics.spacing.md)));
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: TextPresetsBackend.items.length;
+
+                        for tile[i] in TextPresetsBackend.items: TextPresetLibraryTile {
+                            x: preset-grid.cell-x(i);
+                            y: preset-grid.cell-y(i);
+                            width: preset-grid.cell-width;
+                            height: preset-grid.cell-height;
+                            tile: tile;
+                        }
                     }
                 }
 

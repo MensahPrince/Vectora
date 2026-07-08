@@ -110,7 +110,9 @@ enum WorkerMsg {
     /// Generated lanes are never the main track, so there's no ripple-insert
     /// path. `effect` seeds the new clip's effect chain — a standalone
     /// effect-lane segment dropped from the Effects catalog (CapCut's
-    /// effect-as-track-clip).
+    /// effect-as-track-clip). `animations` are `(slot, catalog id)` pairs a
+    /// text-preset drop attaches to the fresh clip (unknown ids are skipped,
+    /// never errors — a served preset must not brick the drop).
     AddGenerated {
         generator: Generator,
         track: String,
@@ -118,6 +120,7 @@ enum WorkerMsg {
         duration_ticks: i64,
         drop_row: i64,
         effect: Option<String>,
+        animations: Vec<(String, String)>,
     },
     /// Move `clip` (raw id) to `track` at `start_tick`, or — when `track` is
     /// empty — to a new lane of the clip's kind inserted at `insert_row`.
@@ -745,6 +748,7 @@ impl WorkerHandle {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_generated(
         &self,
         generator: Generator,
@@ -753,6 +757,7 @@ impl WorkerHandle {
         duration_ticks: i64,
         drop_row: i64,
         effect: Option<String>,
+        animations: Vec<(String, String)>,
     ) {
         let _ = self.tx.send(WorkerMsg::AddGenerated {
             generator,
@@ -761,6 +766,7 @@ impl WorkerHandle {
             duration_ticks,
             drop_row,
             effect,
+            animations,
         });
     }
 
@@ -1344,6 +1350,7 @@ fn worker_loop(
                 duration_ticks,
                 drop_row,
                 effect,
+                animations,
             } => add_generated_and_publish(
                 engine,
                 generator,
@@ -1352,6 +1359,7 @@ fn worker_loop(
                 duration_ticks,
                 drop_row,
                 effect.as_deref(),
+                &animations,
                 &ui,
             ),
             WorkerMsg::MoveClip {
@@ -3396,7 +3404,10 @@ fn add_clip_and_publish(
 /// Place a generated clip (text/solid/shape/effect) from a library-tile
 /// drop. One history entry, even when it creates the landing lane; rolled
 /// back on a rejected placement so a lane made for the drop doesn't linger.
-/// `effect` seeds the new clip's chain (standalone effect-lane segments).
+/// `effect` seeds the new clip's chain (standalone effect-lane segments);
+/// `animations` attaches a text preset's look animations (unknown slots or
+/// catalog ids are skipped with a warning — a served preset must not brick
+/// the drop).
 #[allow(clippy::too_many_arguments)]
 fn add_generated_and_publish(
     engine: &mut Engine,
@@ -3406,6 +3417,7 @@ fn add_generated_and_publish(
     duration_ticks: i64,
     drop_row: i64,
     effect: Option<&str>,
+    animations: &[(String, String)],
     ui: &UiSink,
 ) {
     let Some(lane_kind) = TrackKind::for_generator(&generator) else {
@@ -3458,6 +3470,26 @@ fn add_generated_and_publish(
                 engine.rollback_group();
                 publish_projection(engine, ui);
                 return;
+            }
+            // Text-preset animations ride the same history group. Skips
+            // (unknown slot/id) and failures degrade to an unanimated title
+            // rather than rejecting the drop.
+            for (slot, animation_id) in animations {
+                let Some(animation_slot) = parse_animation_slot(slot) else {
+                    warn!(slot, "preset animation skipped: unknown slot");
+                    continue;
+                };
+                if cutlass_models::animation_spec(animation_id).is_none() {
+                    warn!(animation_id, "preset animation skipped: unknown catalog id");
+                    continue;
+                }
+                if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipAnimation {
+                    clip,
+                    slot: animation_slot,
+                    animation: Some(cutlass_models::AnimationRef::new(animation_id)),
+                })) {
+                    warn!(%clip, animation_id, "preset animation skipped: {e}");
+                }
             }
             engine.commit_group();
             info!(%clip, %track_id, start_tick = start_value, "added generated clip from drop");

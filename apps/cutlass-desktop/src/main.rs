@@ -19,6 +19,7 @@ mod selection;
 mod snap;
 mod strips;
 mod templates;
+mod text_presets;
 mod thumbnails;
 mod timecode;
 mod timeline;
@@ -669,6 +670,20 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    // Animated text presets (Library > Text > Presets): catalog fetches on
+    // their own thread (src/text_presets.rs); the registry feeds the
+    // generated-drop resolver below.
+    let text_preset_registry: text_presets::PresetRegistry =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let text_presets_worker =
+        text_presets::TextPresetsWorker::spawn(app.as_weak(), text_preset_registry.clone())
+            .map_err(slint::PlatformError::Other)?;
+    {
+        let refresh_handle = text_presets_worker.handle();
+        app.global::<TextPresetsBackend>()
+            .on_refresh(move || refresh_handle.refresh());
+    }
+
     let agent_worker = agent::AgentWorker::spawn(preview_worker.handle(), agent_store.as_weak())
         .map_err(slint::PlatformError::from)?;
 
@@ -781,6 +796,7 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let generated_drop_handle = preview_worker.handle();
+    let drop_preset_registry = text_preset_registry.clone();
     editor.on_on_generated_dropped(
         move |generator, track_id, start_tick, duration_ticks, drop_row| {
             // "effect:<id>" drops a standalone effect-lane segment: a bare
@@ -788,10 +804,28 @@ fn main() -> Result<(), slint::PlatformError> {
             let effect = generator
                 .strip_prefix("effect:")
                 .map(std::string::ToString::to_string);
-            let Some(generator) = generator_from_key(generator.as_str()) else {
-                tracing::warn!(%generator, "ignoring drop of unknown generator key");
-                return;
-            };
+            // "text-preset:<id>" drops a styled, animated title from the
+            // served preset catalog (src/text_presets.rs fills the registry).
+            let (generator, animations) =
+                if let Some(preset_id) = generator.as_str().strip_prefix("text-preset:") {
+                    let registry = drop_preset_registry
+                        .lock()
+                        .expect("preset registry poisoned");
+                    let Some(preset) = registry.get(preset_id) else {
+                        tracing::warn!(preset_id, "ignoring drop of unknown text preset");
+                        return;
+                    };
+                    (
+                        text_presets::generator_for(preset),
+                        text_presets::animations_for(preset),
+                    )
+                } else {
+                    let Some(generator) = generator_from_key(generator.as_str()) else {
+                        tracing::warn!(%generator, "ignoring drop of unknown generator key");
+                        return;
+                    };
+                    (generator, Vec::new())
+                };
             generated_drop_handle.add_generated(
                 generator,
                 track_id.to_string(),
@@ -799,6 +833,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 i64::from(duration_ticks),
                 i64::from(drop_row),
                 effect,
+                animations,
             );
         },
     );

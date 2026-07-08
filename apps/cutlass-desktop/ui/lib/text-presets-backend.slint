@@ -1,0 +1,31 @@
+// Animated text presets for Library > Text > Presets, implemented in Rust
+// (src/text_presets.rs owns a worker thread; catalog fetches never touch
+// the UI thread).
+//
+// A preset is a served recipe — a TextStyle subset plus look-animation
+// catalog ids — rendered by the existing text pipeline; nothing here is
+// new render tech. Tiles drag onto the timeline with the generator key
+// "text-preset:<id>"; the drop resolver looks the id up in the registry
+// the worker filled and places a styled text clip with its animations.
+
+// One preset tile.
+export struct TextPresetTile {
+    // Preset catalog id ("tp-neon-pop"); becomes "text-preset:<id>" on drag.
+    key: string,
+    name: string,
+    // Sample text drawn on the tile in the preset's fill color.
+    sample: string,
+    fill: color,
+    // Whether any look animation is attached (corner badge).
+    animated: bool,
+}
+
+export global TextPresetsBackend {
+    in-out property <[TextPresetTile]> items: [];
+    // "idle" (never fetched) | "loading" | "results" | "empty" | "error".
+    in-out property <string> status: "idle";
+    in-out property <string> error: "";
+
+    // (Re)fetch the preset catalog.
+    callback refresh();
+}
