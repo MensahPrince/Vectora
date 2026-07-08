@@ -18,18 +18,29 @@
 //!   client downloads **directly from provider CDNs** into a quota-managed
 //!   cache (LRU eviction, clear-cache action) with atomic tmp-then-rename
 //!   writes, progress callbacks, and cancellation.
+//! - [`auth`] / [`token_store`]: the account half — OAuth sign-in (PKCE +
+//!   loopback redirect through the system browser), refresh, balance,
+//!   ledger, Polar checkout; the session token lives in the OS keychain,
+//!   never in a file.
+//!
+//! **The routing rule** (BYOK-first): a user-configured provider key routes
+//! the call direct to the provider; else a signed-in session takes the
+//! managed path through the backend; else only the anonymous surface
+//! (stock, catalogs) is available.
 //!
 //! Invariants carried from the rest of the app: network stays off the UI
 //! thread (callers run this on workers); the editor never blocks on the
 //! backend (catalog fetches are background work, failures degrade to the
 //! Library placeholders); BYOK keys never transit our servers.
 
+pub mod auth;
 pub mod cache;
 pub mod client;
 pub mod download;
 pub mod dto;
 pub mod error;
 pub mod stock;
+pub mod token_store;
 
 pub use client::CloudClient;
 pub use error::CloudError;

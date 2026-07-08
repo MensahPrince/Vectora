@@ -28,8 +28,23 @@
 //!
 //! [appearance]
 //! theme = "dark-blue"              # "default" | "ember" | "dark-blue"
+//!
+//! # BYOK provider keys (stock, generation, TTS) — same literal-or-env
+//! # pattern as [ai]. A configured key routes calls direct to the provider,
+//! # bypassing the Cutlass backend entirely.
+//! [providers.pexels]
+//! api_key_env = "PEXELS_API_KEY"
+//!
+//! [providers.elevenlabs]
+//! api_key = "sk-..."
+//!
+//! # Cutlass account plumbing. The session token itself is NEVER here —
+//! # it lives in the OS keychain (see cutlass-cloud's token store).
+//! [account]
+//! base_url = "https://api.cutlass.app"   # override; empty = default
 //! ```
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use toml_edit::{DocumentMut, Item, Table, value};
@@ -129,6 +144,53 @@ pub struct AppearanceSettings {
     pub theme: ThemeChoice,
 }
 
+/// One `[providers.<name>]` entry: a BYOK key for a third-party service
+/// (stock search, image/video generation, TTS). Same literal-or-env shape
+/// as [`AiSettings`]; key *resolution* stays with the caller (the env
+/// indirection is a use-site concern). A configured provider routes calls
+/// direct — the Cutlass backend never sees the key.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderSettings {
+    /// Literal API key.
+    pub api_key: Option<String>,
+    /// Name of an environment variable holding the key (preferred).
+    pub api_key_env: Option<String>,
+}
+
+impl ProviderSettings {
+    /// Whether either key form is present (the BYOK routing predicate).
+    pub fn is_configured(&self) -> bool {
+        self.api_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty())
+            || self
+                .api_key_env
+                .as_deref()
+                .is_some_and(|k| !k.trim().is_empty())
+    }
+
+    /// Resolve the key: literal wins, else the named environment variable.
+    pub fn resolve_key(&self) -> Option<String> {
+        if let Some(key) = self.api_key.as_deref().filter(|k| !k.trim().is_empty()) {
+            return Some(key.to_string());
+        }
+        self.api_key_env
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .and_then(|name| std::env::var(name).ok())
+            .filter(|v| !v.is_empty())
+    }
+}
+
+/// The `[account]` table. Deliberately tiny: the base-URL override is the
+/// only account state that belongs in a plain file — the session token
+/// lives in the OS keychain, never here.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountSettings {
+    /// Backend base URL override; empty = the shipped default.
+    pub base_url: String,
+}
+
 /// The whole user config, one struct per table. [`Settings::default`] is the
 /// state of a fresh install (no file on disk).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -137,6 +199,18 @@ pub struct Settings {
     pub appearance: AppearanceSettings,
     /// `[ai]`.
     pub ai: AiSettings,
+    /// `[providers.<name>]` — BYOK keys by provider name ("pexels",
+    /// "pixabay", "elevenlabs", …). Sorted map so saves are deterministic.
+    pub providers: BTreeMap<String, ProviderSettings>,
+    /// `[account]`.
+    pub account: AccountSettings,
+}
+
+impl Settings {
+    /// The named provider's settings, defaulting to unconfigured.
+    pub fn provider(&self, name: &str) -> ProviderSettings {
+        self.providers.get(name).cloned().unwrap_or_default()
+    }
 }
 
 /// `~/.cutlass/config.toml` — the user's home dir on every platform
@@ -217,6 +291,26 @@ impl Settings {
             }
         }
 
+        if let Some(t) = section(doc, "providers") {
+            for (name, item) in t.iter() {
+                if let Some(entry) = item.as_table() {
+                    s.providers.insert(
+                        name.to_string(),
+                        ProviderSettings {
+                            api_key: string_at(entry, "api_key"),
+                            api_key_env: string_at(entry, "api_key_env"),
+                        },
+                    );
+                }
+            }
+        }
+
+        if let Some(t) = section(doc, "account") {
+            if let Some(v) = string_at(t, "base_url") {
+                s.account.base_url = v;
+            }
+        }
+
         s
     }
 
@@ -231,6 +325,54 @@ impl Settings {
         {
             let t = ensure_table(doc, "appearance");
             set_str(t, "theme", self.appearance.theme.key());
+        }
+        {
+            // Only write providers we hold; hand-added entries under
+            // `[providers.*]` that we loaded are re-written unchanged, and
+            // ones we never parsed (non-table junk) are left alone.
+            for (name, provider) in &self.providers {
+                let t = ensure_table(doc, "providers");
+                if t.get(name).and_then(Item::as_table).is_none() {
+                    t.insert(name, Item::Table(Table::new()));
+                }
+                let entry = t
+                    .get_mut(name)
+                    .and_then(Item::as_table_mut)
+                    .expect("provider table ensured above");
+                set_optional(entry, "api_key", provider.api_key.as_deref());
+                set_optional(entry, "api_key_env", provider.api_key_env.as_deref());
+            }
+            // Dropping a provider from the map removes its table.
+            if let Some(t) = doc.get_mut("providers").and_then(Item::as_table_mut) {
+                let stale: Vec<String> = t
+                    .iter()
+                    .filter(|(name, item)| {
+                        item.as_table().is_some() && !self.providers.contains_key(*name)
+                    })
+                    .map(|(name, _)| name.to_string())
+                    .collect();
+                for name in stale {
+                    t.remove(&name);
+                }
+                if t.is_empty() {
+                    doc.remove("providers");
+                }
+            }
+        }
+        {
+            // An empty override removes the key (and a now-empty table), so
+            // a fresh config stays minimal.
+            if self.account.base_url.is_empty() {
+                if let Some(t) = doc.get_mut("account").and_then(Item::as_table_mut) {
+                    t.remove("base_url");
+                    if t.is_empty() {
+                        doc.remove("account");
+                    }
+                }
+            } else {
+                let t = ensure_table(doc, "account");
+                set_str(t, "base_url", &self.account.base_url);
+            }
         }
     }
 }
@@ -399,6 +541,69 @@ theme = "ember"
         save(&path, &Settings::default()).unwrap();
         assert!(path.exists());
         assert_eq!(load(&path).unwrap(), Settings::default());
+    }
+
+    #[test]
+    fn providers_and_account_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut s = Settings::default();
+        s.providers.insert(
+            "pexels".into(),
+            ProviderSettings {
+                api_key: None,
+                api_key_env: Some("PEXELS_API_KEY".into()),
+            },
+        );
+        s.providers.insert(
+            "elevenlabs".into(),
+            ProviderSettings {
+                api_key: Some("sk-11".into()),
+                api_key_env: None,
+            },
+        );
+        s.account.base_url = "https://staging.api.cutlass.app".into();
+        save(&path, &s).unwrap();
+
+        let loaded = load(&path).unwrap();
+        assert_eq!(
+            loaded.provider("pexels").api_key_env.as_deref(),
+            Some("PEXELS_API_KEY")
+        );
+        assert!(loaded.provider("pexels").is_configured());
+        assert_eq!(
+            loaded.provider("elevenlabs").api_key.as_deref(),
+            Some("sk-11")
+        );
+        assert!(!loaded.provider("nonexistent").is_configured());
+        assert_eq!(loaded.account.base_url, "https://staging.api.cutlass.app");
+
+        // Dropping a provider removes its table; clearing the account
+        // override removes the key.
+        let mut s = loaded;
+        s.providers.remove("elevenlabs");
+        s.account.base_url.clear();
+        save(&path, &s).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("elevenlabs"), "{raw}");
+        assert!(!raw.contains("base_url = \"https://staging"), "{raw}");
+        assert!(raw.contains("[providers.pexels]"), "{raw}");
+    }
+
+    #[test]
+    fn provider_key_resolution_prefers_literal() {
+        let p = ProviderSettings {
+            api_key: Some("literal".into()),
+            api_key_env: Some("SOME_ENV_THAT_IS_UNSET_12345".into()),
+        };
+        assert_eq!(p.resolve_key().as_deref(), Some("literal"));
+        let p = ProviderSettings {
+            api_key: None,
+            api_key_env: Some("SOME_ENV_THAT_IS_UNSET_12345".into()),
+        };
+        assert_eq!(p.resolve_key(), None);
+        assert!(p.is_configured(), "env-named key counts as configured");
     }
 
     #[test]

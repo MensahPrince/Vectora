@@ -305,6 +305,20 @@ pub struct RefreshRequest {
     pub refresh_token: String,
 }
 
+/// `GET /v1/me` response — the signed-in identity shown in the account UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Me {
+    /// Stable user id (opaque).
+    pub id: String,
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub display_name: String,
+    /// OAuth provider the account was created with (`github`, `google`).
+    #[serde(default)]
+    pub provider: String,
+}
+
 /// `GET /v1/credits/balance` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Balance {
