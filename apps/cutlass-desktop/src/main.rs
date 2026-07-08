@@ -1715,6 +1715,16 @@ fn main() -> Result<(), slint::PlatformError> {
             );
         });
 
+    let set_animation_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_clip_animation(move |clip_id, slot, animation_id| {
+            set_animation_handle.set_clip_animation(
+                clip_id.to_string(),
+                slot.to_string(),
+                animation_id.to_string(),
+            );
+        });
+
     let set_adjust_handle = preview_worker.handle();
     app.global::<InspectorBackend>().on_set_clip_adjust(
         move |clip_id, brightness, contrast, saturation, exposure, temperature| {
@@ -1851,6 +1861,47 @@ fn main() -> Result<(), slint::PlatformError> {
             })
             .collect();
         inspector.set_filter_catalog(ModelRc::new(VecModel::from(filter_rows)));
+
+        let animation_in: Vec<CatalogEntry> = cutlass_models::animation_catalog()
+            .iter()
+            .filter(|s| s.slot == cutlass_models::AnimationSlot::In)
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector.set_animation_in_catalog(ModelRc::new(VecModel::from(animation_in)));
+
+        let animation_out: Vec<CatalogEntry> = cutlass_models::animation_catalog()
+            .iter()
+            .filter(|s| s.slot == cutlass_models::AnimationSlot::Out)
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector.set_animation_out_catalog(ModelRc::new(VecModel::from(animation_out)));
+
+        let animation_combo: Vec<CatalogEntry> = cutlass_models::animation_catalog()
+            .iter()
+            .filter(|s| s.slot == cutlass_models::AnimationSlot::Combo && !s.text_only)
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector.set_animation_combo_catalog(ModelRc::new(VecModel::from(animation_combo)));
+
+        let animation_text_combo: Vec<CatalogEntry> = cutlass_models::animation_catalog()
+            .iter()
+            .filter(|s| s.slot == cutlass_models::AnimationSlot::Combo)
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector
+            .set_animation_text_combo_catalog(ModelRc::new(VecModel::from(animation_text_combo)));
     }
     {
         let effects = app.global::<EffectsBackend>();

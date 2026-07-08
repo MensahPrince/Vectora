@@ -24,13 +24,15 @@ export component InspectorDivider inherits Rectangle {
 component CategoryTab inherits Rectangle {
     in property <string> label;
     in-out property <bool> selected: false;
-    in property <bool> enabled: false;
+    in property <bool> enabled: true;
+
+    callback activated();
 
     width: label-text.preferred-width + 28px;
     height: 50px;
     border-radius: AppStore.theme.metrics.radius.sm;
     background: transparent;
-    opacity: enabled || selected ? 1.0 : 0.78;
+    opacity: enabled ? 1.0 : 0.78;
 
     label-text := CutlassText {
         width: 100%;
@@ -45,6 +47,9 @@ component CategoryTab inherits Rectangle {
     ta := TouchArea {
         enabled: root.enabled;
         clicked => {
+            if (root.enabled) {
+                root.activated();
+            }
             AppState.refocus-shortcuts();
         }
     }
@@ -57,7 +62,10 @@ component CategoryTab inherits Rectangle {
 // view because its Flickable swallows presses that no child handles.
 export component InspectorTabHeader inherits PanelHeader {
     in property <[string]> tabs;
-    in property <int> selected: 0;
+    in property <[bool]> tab-enabled: [];
+    in-out property <int> selected: 0;
+
+    callback tab-selected(idx: int);
 
     tab-scroll := CutlassScrollView {
         width: 100%;
@@ -86,7 +94,10 @@ export component InspectorTabHeader inherits PanelHeader {
             for tab[i] in root.tabs: CategoryTab {
                 label: tab;
                 selected: i == root.selected;
-                enabled: i == root.selected;
+                enabled: root.tab-enabled.length == 0 || i >= root.tab-enabled.length || root.tab-enabled[i];
+                activated => {
+                    root.tab-selected(i);
+                }
             }
         }
     }

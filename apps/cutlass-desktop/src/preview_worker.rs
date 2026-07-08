@@ -261,6 +261,12 @@ enum WorkerMsg {
         clip: String,
         adjust: ColorAdjustments,
     },
+    /// Set (or clear) one look-animation slot on a visual clip.
+    SetClipAnimation {
+        clip: String,
+        slot: String,
+        animation_id: String,
+    },
     /// Live color-grading preview: replace one clip's filter + adjustments
     /// through the engine's session-only look override. Bursts coalesce to
     /// the newest like transform/generator overrides.
@@ -841,6 +847,14 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::SetClipAdjust { clip, adjust });
     }
 
+    pub fn set_clip_animation(&self, clip: String, slot: String, animation_id: String) {
+        let _ = self.tx.send(WorkerMsg::SetClipAnimation {
+            clip,
+            slot,
+            animation_id,
+        });
+    }
+
     pub fn preview_clip_look(
         &self,
         clip: String,
@@ -1340,6 +1354,11 @@ fn worker_loop(
             WorkerMsg::SetClipAdjust { clip, adjust } => {
                 set_clip_adjust_and_publish(engine, &clip, adjust, &ui)
             }
+            WorkerMsg::SetClipAnimation {
+                clip,
+                slot,
+                animation_id,
+            } => set_clip_animation_and_publish(engine, &clip, &slot, &animation_id, &ui),
             // Only reached when a look-preview burst interleaves with another
             // coalesced gesture's drain. The dedicated loop arm coalesces the
             // common case.
@@ -3482,6 +3501,47 @@ fn set_clip_adjust_and_publish(
     }
     info!(%clip_id, ?adjust, "set clip adjustments");
     publish_projection(engine, ui);
+}
+
+fn set_clip_animation_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    slot: &str,
+    animation_id: &str,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-animation ignored: unparsable clip id");
+        return;
+    };
+    let Some(animation_slot) = parse_animation_slot(slot) else {
+        error!(slot, "set-clip-animation ignored: unknown slot");
+        return;
+    };
+    let animation = if animation_id.is_empty() {
+        None
+    } else {
+        Some(cutlass_models::AnimationRef::new(animation_id))
+    };
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipAnimation {
+        clip: clip_id,
+        slot: animation_slot,
+        animation,
+    })) {
+        error!(%clip_id, slot, animation_id, "set clip animation failed: {e}");
+        return;
+    }
+    info!(%clip_id, slot, animation_id, "set clip animation");
+    publish_projection(engine, ui);
+}
+
+fn parse_animation_slot(slot: &str) -> Option<cutlass_models::AnimationSlot> {
+    match slot {
+        "in" => Some(cutlass_models::AnimationSlot::In),
+        "out" => Some(cutlass_models::AnimationSlot::Out),
+        "combo" => Some(cutlass_models::AnimationSlot::Combo),
+        _ => None,
+    }
 }
 
 /// Append a catalog effect to a clip's chain (M4). One undoable entry; the

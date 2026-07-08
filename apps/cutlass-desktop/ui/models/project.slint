@@ -300,6 +300,14 @@ export struct Clip {
     adjust-saturation: float,
     adjust-exposure: float,
     adjust-temperature: float,
+    // Look animation presets (CapCut In / Out / Combo tabs). Projected
+    // read-only — edits go through `InspectorBackend.set-clip-animation`.
+    animation-in-id: string,
+    animation-in-label: string,
+    animation-out-id: string,
+    animation-out-label: string,
+    animation-combo-id: string,
+    animation-combo-label: string,
     // Keyframe curves per animatable property (M2), in tick order with
     // ABSOLUTE sequence ticks. Empty ⇔ the property is a constant (read it
     // from `transform-*` above). Edits go through

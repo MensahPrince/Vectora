@@ -25,6 +25,7 @@ import { TextInspector } from "text-inspector.slint";
 import { TransformInspector } from "transform-inspector.slint";
 import { CropInspector } from "crop-inspector.slint";
 import { LookInspector } from "look-inspector.slint";
+import { AnimationInspector } from "animation-inspector.slint";
 import { EffectsInspector } from "effects-inspector.slint";
 
 struct InspectorField {
@@ -595,10 +596,15 @@ component VisualClipInspector inherits VerticalLayout {
     spacing: AppStore.theme.metrics.spacing.none;
 
     private property <bool> is-shape: model.generator-kind == "rect" || model.generator-kind == "ellipse";
+    private property <int> selected-tab: 0;
 
     InspectorTabHeader {
         tabs: ["Video", "Animation", "Tracking", "Adjustment"];
-        selected: 0;
+        tab-enabled: [true, true, false, false];
+        selected: root.selected-tab;
+        tab-selected(idx) => {
+            root.selected-tab = idx;
+        }
     }
 
     body-scroll := CutlassScrollView {
@@ -625,6 +631,14 @@ component VisualClipInspector inherits VerticalLayout {
             spacing: AppStore.theme.metrics.spacing.lg;
             alignment: LayoutAlignment.start;
             padding: AppStore.theme.metrics.spacing.lg;
+
+            if root.selected-tab == 1: AnimationInspector {
+                model: root.model;
+            }
+
+            if root.selected-tab == 0: VerticalLayout {
+                spacing: AppStore.theme.metrics.spacing.lg;
+                alignment: LayoutAlignment.start;
 
             if root.is-shape: SectionHeader {
                 title: "Shape";
@@ -715,6 +729,7 @@ component VisualClipInspector inherits VerticalLayout {
             // Effect chain (M4): every visual clip can carry effects.
             EffectsInspector {
                 model: root.model;
+            }
             }
         }
     }

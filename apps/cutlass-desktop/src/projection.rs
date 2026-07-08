@@ -257,6 +257,9 @@ fn clip_to_slint(
     let clip_start = clip.timeline.start.value;
     let (shape_width, shape_height) = clip_shape_size(clip);
     let (filter_id, filter_label, filter_intensity) = clip_filter(clip);
+    let (animation_in_id, animation_in_label) = clip_animation(clip.animation_in.as_ref());
+    let (animation_out_id, animation_out_label) = clip_animation(clip.animation_out.as_ref());
+    let (animation_combo_id, animation_combo_label) = clip_animation(clip.animation_combo.as_ref());
     let caps = clip_capabilities(clip, track_kind);
 
     Clip {
@@ -319,6 +322,12 @@ fn clip_to_slint(
         adjust_saturation: clip.adjust.saturation,
         adjust_exposure: clip.adjust.exposure,
         adjust_temperature: clip.adjust.temperature,
+        animation_in_id: animation_in_id.into(),
+        animation_in_label: animation_in_label.into(),
+        animation_out_id: animation_out_id.into(),
+        animation_out_label: animation_out_label.into(),
+        animation_combo_id: animation_combo_id.into(),
+        animation_combo_label: animation_combo_label.into(),
         kf_position: keyframes_to_slint(&clip.transform.position, clip_start, |v| (v[0], v[1])),
         kf_anchor: keyframes_to_slint(&clip.transform.anchor_point, clip_start, |v| (v[0], v[1])),
         kf_scale: keyframes_to_slint(&clip.transform.scale, clip_start, |v| (*v, 0.0)),
@@ -356,6 +365,17 @@ fn clip_filter(clip: &EngineClip) -> (String, String, f32) {
         .unwrap_or(filter.id.as_str())
         .to_string();
     (filter.id.clone(), label, filter.intensity)
+}
+
+fn clip_animation(animation: Option<&cutlass_models::AnimationRef>) -> (String, String) {
+    let Some(animation) = animation else {
+        return (String::new(), String::new());
+    };
+    let label = cutlass_models::animation_spec(&animation.id)
+        .map(|s| s.label)
+        .unwrap_or(animation.id.as_str())
+        .to_string();
+    (animation.id.clone(), label)
 }
 
 /// Project a clip's speed ramp keyframes (M2 speed curves) as the inspector's
