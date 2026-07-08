@@ -704,6 +704,13 @@ fn clip_generator_visual(clip: &EngineClip) -> (&'static str, Color) {
             };
             (tag, rgba_color(rgba.sample(0)))
         }
+        // Only catalog-backed stickers tag as composited (drives preview
+        // hit-testing); a legacy empty asset draws nothing, so no tag.
+        ClipSource::Generated(Generator::Sticker { asset })
+            if cutlass_models::sticker_spec(asset).is_some() =>
+        {
+            ("sticker", transparent)
+        }
         _ => ("", transparent),
     }
 }
@@ -917,6 +924,17 @@ mod tests {
 
     fn t(value: i64, num: i32, den: i32) -> EngineTime {
         EngineTime::new(value, EngineRational { num, den })
+    }
+
+    #[test]
+    fn sticker_card_gets_catalog_label_and_composited_tag() {
+        use cutlass_models::{Clip as MClip, Generator, Rational, TimeRange};
+        let span = TimeRange::at_rate(0, 100, Rational::FPS_24);
+        let heart = MClip::generated(Generator::sticker("heart"), span);
+        assert_eq!(clip_generator_visual(&heart).0, "sticker");
+        // Legacy payload-less stickers draw nothing: no composited tag.
+        let legacy = MClip::generated(Generator::sticker(""), span);
+        assert_eq!(clip_generator_visual(&legacy).0, "");
     }
 
     #[test]

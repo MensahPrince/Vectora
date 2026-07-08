@@ -434,7 +434,7 @@ export component LibraryPanel inherits PanelBase {
                     }
                 }
 
-                // ---- Stickers (shapes) --------------------------------------
+                // ---- Stickers (bundled pack + shapes) -----------------------
                 if LibraryState.active-tab == "stickers": shape-grid := CutlassGridView {
                     width: parent.width;
                     height: parent.height;
@@ -447,11 +447,23 @@ export component LibraryPanel inherits PanelBase {
                     cell-height: 100px;
                     spacing: AppStore.theme.metrics.spacing.md;
                     inset: AppStore.theme.metrics.spacing.md;
-                    item-count: 3;
+                    item-count: EffectsBackend.sticker-catalog.length + 3;
+
+                    for sticker[i] in EffectsBackend.sticker-catalog: GeneratedTile {
+                        x: shape-grid.cell-x(i);
+                        y: shape-grid.cell-y(i);
+                        width: shape-grid.cell-width;
+                        height: shape-grid.cell-height;
+                        generator: "sticker:" + sticker.id;
+                        label: sticker.label;
+                        icon: sticker.icon;
+                        lane-kind: TrackKind.sticker;
+                        seconds: 5;
+                    }
 
                     GeneratedTile {
-                        x: shape-grid.cell-x(0);
-                        y: shape-grid.cell-y(0);
+                        x: shape-grid.cell-x(EffectsBackend.sticker-catalog.length + 0);
+                        y: shape-grid.cell-y(EffectsBackend.sticker-catalog.length + 0);
                         width: shape-grid.cell-width;
                         height: shape-grid.cell-height;
                         generator: "solid";
@@ -462,8 +474,8 @@ export component LibraryPanel inherits PanelBase {
                     }
 
                     GeneratedTile {
-                        x: shape-grid.cell-x(1);
-                        y: shape-grid.cell-y(1);
+                        x: shape-grid.cell-x(EffectsBackend.sticker-catalog.length + 1);
+                        y: shape-grid.cell-y(EffectsBackend.sticker-catalog.length + 1);
                         width: shape-grid.cell-width;
                         height: shape-grid.cell-height;
                         generator: "rect";
@@ -474,8 +486,8 @@ export component LibraryPanel inherits PanelBase {
                     }
 
                     GeneratedTile {
-                        x: shape-grid.cell-x(2);
-                        y: shape-grid.cell-y(2);
+                        x: shape-grid.cell-x(EffectsBackend.sticker-catalog.length + 2);
+                        y: shape-grid.cell-y(EffectsBackend.sticker-catalog.length + 2);
                         width: shape-grid.cell-width;
                         height: shape-grid.cell-height;
                         generator: "ellipse";

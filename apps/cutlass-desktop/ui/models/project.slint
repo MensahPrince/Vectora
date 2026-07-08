@@ -122,6 +122,15 @@ export struct CatalogEntry {
     label: string,
 }
 
+// A bundled sticker for the Library's Stickers tab: catalog id, display
+// label, and the decoded first-frame thumbnail. UI-only (the image isn't
+// serializable), unlike `CatalogEntry`.
+export struct StickerTile {
+    id: string,
+    label: string,
+    icon: image,
+}
+
 // Derived per-clip capabilities (inspector sections + context-menu gates).
 // Computed in src/projection.rs from engine content + lane kind — not
 // persisted.

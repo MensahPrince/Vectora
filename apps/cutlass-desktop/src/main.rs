@@ -47,6 +47,11 @@ slint::include_modules!();
 /// (via the inspector); `None` for unknown keys.
 fn generator_from_key(key: &str) -> Option<cutlass_models::Generator> {
     use cutlass_models::{Generator, Shape};
+    if let Some(asset) = key.strip_prefix("sticker:") {
+        // Only catalog ids drop; a stale key would place an invisible clip.
+        cutlass_models::sticker_spec(asset)?;
+        return Some(Generator::sticker(asset));
+    }
     Some(match key {
         "text" => Generator::text("Title"),
         "solid" => Generator::SolidColor {
@@ -56,6 +61,21 @@ fn generator_from_key(key: &str) -> Option<cutlass_models::Generator> {
         "ellipse" => Generator::shape(Shape::Ellipse, [255, 255, 255, 255]),
         _ => return None,
     })
+}
+
+/// A bundled sticker's first frame as a Slint image — the Library tile
+/// thumbnail. Blank when decode fails (the tile shows its label only).
+fn sticker_thumbnail(spec: &cutlass_models::StickerSpec) -> slint::Image {
+    let Ok(frames) = cutlass_decoder::decode_animation(spec.bytes) else {
+        return slint::Image::default();
+    };
+    let first = &frames[0].image;
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &first.pixels,
+        first.width,
+        first.height,
+    );
+    slint::Image::from_rgba8(buffer)
 }
 
 /// Map an inspector param key to the engine's `ClipParam` plus the matching
@@ -1850,6 +1870,15 @@ fn main() -> Result<(), slint::PlatformError> {
             })
             .collect();
         effects.set_transition_catalog(ModelRc::new(VecModel::from(transition_rows)));
+        let sticker_rows: Vec<StickerTile> = cutlass_models::sticker_catalog()
+            .iter()
+            .map(|s| StickerTile {
+                id: s.id.into(),
+                label: s.label.into(),
+                icon: sticker_thumbnail(s),
+            })
+            .collect();
+        effects.set_sticker_catalog(ModelRc::new(VecModel::from(sticker_rows)));
     }
     let add_effect_handle = preview_worker.handle();
     app.global::<EffectsBackend>()

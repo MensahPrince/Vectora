@@ -72,13 +72,14 @@ pub(crate) fn canvas_config(sequence: &Sequence) -> CompositorConfig {
 }
 
 /// Whether the composite path draws this clip at all: media, or a generator
-/// the raster step supports. Sticker/effect/filter/adjustment clips aren't
-/// composited yet, so they can't be picked (mirrors `resolve_layers`).
+/// the raster step supports. Effect/filter/adjustment clips (and stickers
+/// with no valid asset) aren't composited, so they can't be picked (mirrors
+/// `resolve_layers`).
 pub(crate) fn is_composited(clip: &Clip) -> bool {
     !clip.media_id.is_empty()
         || matches!(
             clip.generator_kind.as_str(),
-            "text" | "solid" | "rect" | "ellipse"
+            "text" | "solid" | "rect" | "ellipse" | "sticker"
         )
 }
 
