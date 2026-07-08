@@ -355,6 +355,21 @@ pub fn resolve_transition_junction(
             row: hover_row,
         };
     }
+    // Transitions need lanes whose clips composite as frames: audio has no
+    // frame, and effect/filter/adjustment segments resolve to canvas-wide
+    // passes the renderer can't nest (mirrors TrackKind::supports_transitions
+    // in cutlass-models).
+    if !matches!(
+        track.kind,
+        TrackKind::Video | TrackKind::Sticker | TrackKind::Text
+    ) {
+        return TransitionJunctionResolution {
+            valid: false,
+            left_clip_id: Default::default(),
+            cut_tick: 0,
+            row: hover_row,
+        };
+    }
 
     let mut spans: Vec<(SharedString, i32, i32)> = Vec::new();
     for idx in 0..track.clips.row_count() {
@@ -899,6 +914,26 @@ mod tests {
             track("1", TrackKind::Video, vec![clip("1", 10, 100)]),
             track("9", TrackKind::Audio, vec![]),
         ])
+    }
+
+    // --- resolve_transition_junction -----------------------------------------
+
+    #[test]
+    fn transition_junction_rejects_canvas_pass_and_audio_lanes() {
+        // Abutting pairs on every lane; only frame-compositing lanes
+        // (video/sticker/text) may take a transition at the junction.
+        let pair = |a: &str, b: &str| vec![clip(a, 0, 40), clip(b, 40, 40)];
+        let seq = sequence(vec![
+            track("e", TrackKind::Effect, pair("e1", "e2")),
+            track("s", TrackKind::Sticker, pair("s1", "s2")),
+            track("v", TrackKind::Video, pair("v1", "v2")),
+            track("a", TrackKind::Audio, pair("a1", "a2")),
+        ]);
+
+        assert!(!resolve_transition_junction(&seq, 40, 0, 5).valid);
+        assert!(resolve_transition_junction(&seq, 40, 1, 5).valid);
+        assert!(resolve_transition_junction(&seq, 40, 2, 5).valid);
+        assert!(!resolve_transition_junction(&seq, 40, 3, 5).valid);
     }
 
     // --- compute_drag_snap --------------------------------------------------
