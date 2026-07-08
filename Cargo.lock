@@ -1311,6 +1311,7 @@ dependencies = [
  "cpal",
  "crossbeam-channel",
  "cutlass-ai",
+ "cutlass-cloud",
  "cutlass-commands",
  "cutlass-compositor",
  "cutlass-decoder",

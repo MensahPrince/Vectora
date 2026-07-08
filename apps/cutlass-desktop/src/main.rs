@@ -1,5 +1,6 @@
 mod agent;
 mod audio;
+mod cloud;
 mod drafts;
 mod inspector;
 mod interaction;
@@ -618,6 +619,36 @@ fn main() -> Result<(), slint::PlatformError> {
         duration_ticks = session.duration_ticks,
         "engine session ready"
     );
+
+    // Library stock browsing: search + direct-CDN downloads on their own
+    // thread (src/cloud.rs); imports route through the preview worker like
+    // any local file.
+    let cloud_worker = cloud::CloudWorker::spawn(app.as_weak(), preview_worker.handle())
+        .map_err(slint::PlatformError::Other)?;
+    {
+        let cloud_backend = app.global::<CloudBackend>();
+        let search_handle = cloud_worker.handle();
+        let search_app = app.as_weak();
+        cloud_backend.on_stock_search(move || {
+            let Some(app) = search_app.upgrade() else {
+                return;
+            };
+            let backend = app.global::<CloudBackend>();
+            let query = backend.get_stock_query().trim().to_string();
+            if query.is_empty() {
+                return;
+            }
+            search_handle.search(query, backend.get_stock_kind().as_str());
+        });
+        let more_handle = cloud_worker.handle();
+        cloud_backend.on_stock_load_more(move || more_handle.load_more());
+        let import_handle = cloud_worker.handle();
+        cloud_backend.on_stock_import(move |index| {
+            if index >= 0 {
+                import_handle.import(index as usize);
+            }
+        });
+    }
 
     let agent_worker = agent::AgentWorker::spawn(preview_worker.handle(), agent_store.as_weak())
         .map_err(slint::PlatformError::from)?;
