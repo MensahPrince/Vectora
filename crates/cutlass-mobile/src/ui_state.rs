@@ -177,14 +177,10 @@ pub struct UiTransition {
     pub duration_seconds: f64,
 }
 
-/// The sequential "main" lane: the lowest video track in the compositing
-/// stack (CapCut's magnetic track). `None` until a video track exists.
+/// The sequential "main" lane (CapCut's magnetic track). Delegates to the
+/// model's designated main track. `None` until a video track exists.
 pub fn main_track(project: &Project) -> Option<TrackId> {
-    project
-        .timeline()
-        .tracks_ordered()
-        .find(|t| t.kind == TrackKind::Video)
-        .map(|t| t.id)
+    project.timeline().main_track()
 }
 
 /// Lane rows in UI order (top row first):
@@ -532,11 +528,12 @@ mod tests {
             .iter()
             .map(|id| lane_kind(timeline.track(*id).unwrap().kind))
             .collect();
-        // Overlay video on top, then main, then text+effect (reverse z:
-        // effect was added after text, so it sits above), then audio floor.
+        // Overlay video on top, then main, then text+effect (text lanes
+        // always occupy the top of the compositing stack, so reversed they
+        // lead the overlay block), then audio floor.
         assert_eq!(
             kinds,
-            vec!["video", "video", "effect", "text", "audio", "audio"]
+            vec!["video", "video", "text", "effect", "audio", "audio"]
         );
 
         let main = main_track(&project).unwrap();

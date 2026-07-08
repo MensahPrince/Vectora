@@ -97,6 +97,14 @@ pub struct Track {
     /// only an explicit user delete removes it (manual "Add track").
     #[serde(default)]
     pub pinned: bool,
+    /// CapCut's main track: the single privileged video lane every other
+    /// visual lane stacks above. It persists when emptied (the only lane
+    /// allowed to exist without clips) and sits directly above the audio
+    /// floor. At most one track carries the flag and it must be a
+    /// [`TrackKind::Video`] lane — [`Timeline`](crate::Timeline) maintains
+    /// both invariants on every structural edit.
+    #[serde(default)]
+    pub main: bool,
     /// Audio: whether this lane is a sidechain "voice" source — its clips
     /// drive audio ducking (M8 Phase 4), so a "duck under voice" gesture dips
     /// music under the talkers on every lane flagged here. Additive: old
@@ -123,6 +131,7 @@ impl Track {
             muted: false,
             locked: false,
             pinned: false,
+            main: false,
             duck_source: false,
             clips: Map::default(),
             transitions: Vec::new(),
