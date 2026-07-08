@@ -1,3 +1,4 @@
+mod agent;
 mod audio;
 mod drafts;
 mod inspector;
@@ -450,13 +451,15 @@ fn main() -> Result<(), slint::PlatformError> {
     // immediately, the AI fields seed the Settings dialog for later phases.
     let app_settings =
         cutlass_settings::load(&cutlass_settings::default_config_path()).unwrap_or_default();
+    let config_path = cutlass_settings::default_config_path();
 
-    // AI assistant: not ported yet (the `cutlass-ai` crate arrives after the
-    // engine phases). The panel stays in its "connect a provider" state and
-    // its callbacks are inert.
+    // AI assistant: a dedicated worker rehearses each prompt on a sandbox
+    // engine, then replays the validated plan through the preview worker as
+    // one undoable group.
     let agent_store = app.global::<AgentStore>();
     agent_store.set_transcript(ModelRc::new(VecModel::<AgentEntry>::default()));
-    agent_store.set_configured(false);
+    agent_store.set_configured(app_settings.ai.is_configured());
+    agent_store.set_config_path(config_path.display().to_string().into());
 
     let editor = app.global::<EditorStore>();
 
@@ -541,6 +544,55 @@ fn main() -> Result<(), slint::PlatformError> {
         duration_ticks = session.duration_ticks,
         "engine session ready"
     );
+
+    let agent_worker = agent::AgentWorker::spawn(preview_worker.handle(), agent_store.as_weak())
+        .map_err(slint::PlatformError::from)?;
+
+    let agent_send = agent_worker.handle();
+    let agent_app = app.as_weak();
+    agent_store.on_send(move |prompt| {
+        let Some(app) = agent_app.upgrade() else {
+            return;
+        };
+        let timeline = app.global::<TimelineStore>();
+        let fps = app.global::<EditorStore>().get_project().sequence.fps;
+        let spf = if fps.num > 0 {
+            f64::from(fps.den) / f64::from(fps.num)
+        } else {
+            0.0
+        };
+        let to_seconds = |tick: i32| f64::from(tick) * spf;
+        let context = cutlass_ai::EditorContext {
+            selected_clips: timeline
+                .get_selected_ids()
+                .iter()
+                .filter_map(|id| id.parse().ok())
+                .collect(),
+            playhead_seconds: to_seconds(timeline.get_playhead_tick()),
+            in_point_seconds: (timeline.get_range_in_tick() >= 0)
+                .then(|| to_seconds(timeline.get_range_in_tick())),
+            out_point_seconds: (timeline.get_range_out_tick() >= 0)
+                .then(|| to_seconds(timeline.get_range_out_tick())),
+        };
+        let dry_run = app.global::<AgentStore>().get_dry_run();
+        agent_send.prompt(prompt.to_string(), context, dry_run);
+    });
+
+    let agent_cancel = agent_worker.handle();
+    agent_store.on_cancel(move || agent_cancel.cancel());
+
+    let agent_apply = agent_worker.handle();
+    agent_store.on_apply_plan(move || agent_apply.apply_plan());
+
+    let agent_discard = agent_worker.handle();
+    agent_store.on_discard_plan(move || agent_discard.discard_plan());
+
+    let agent_session = agent_worker.handle();
+    agent_store.on_session_changed(move || {
+        agent_session.cancel();
+        agent_session.discard_plan();
+        agent_session.reset_history();
+    });
 
     // Playhead moves (ruler scrub, frame-step keys, Home/End) become preview
     // frame requests; the worker coalesces a burst to the newest tick.
@@ -919,7 +971,6 @@ fn main() -> Result<(), slint::PlatformError> {
     // --- app settings (gear / Cutlass menu → dialog → config.toml) -------
 
     let settings_backend = app.global::<SettingsBackend>();
-    let config_path = cutlass_settings::default_config_path();
 
     // Seed the dialog from the loaded config. The theme rides AppStore so it
     // drives the live theme binding the whole shell reads.
@@ -959,23 +1010,54 @@ fn main() -> Result<(), slint::PlatformError> {
 
             if let Err(e) = cutlass_settings::save(&config_path, &s) {
                 tracing::error!("failed to save settings: {e}");
+                return;
             }
-            // The agent isn't ported yet, so `AgentStore.configured` stays
-            // false regardless of the provider fields (Phase 1+ flips this).
+            app.global::<AgentStore>()
+                .set_configured(s.ai.is_configured());
         });
     }
 
-    // Endpoint test requires the AI crate; report that instead of hanging
-    // the button.
     {
         let app_weak = app.as_weak();
         settings_backend.on_test_connection(move || {
-            if let Some(app) = app_weak.upgrade() {
-                let sb = app.global::<SettingsBackend>();
-                sb.set_ai_testing(false);
-                sb.set_ai_test_ok(false);
-                sb.set_ai_test_status("The AI assistant isn't wired up in this build yet.".into());
-            }
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let sb = app.global::<SettingsBackend>();
+            let base_url = sb.get_ai_base_url().trim().to_string();
+            let model = sb.get_ai_model().trim().to_string();
+            let api_key = non_empty(&sb.get_ai_api_key());
+            let api_key_env = non_empty(&sb.get_ai_api_key_env());
+            sb.set_ai_testing(true);
+            sb.set_ai_test_ok(false);
+            sb.set_ai_test_status(SharedString::new());
+
+            let app_weak = app.as_weak();
+            std::thread::spawn(move || {
+                let result =
+                    cutlass_ai::config::resolve_api_key(api_key.as_deref(), api_key_env.as_deref())
+                        .and_then(|key| {
+                            cutlass_ai::providers::OpenAiCompatProvider::new(&base_url, &model, key)
+                                .test_connection()
+                                .map_err(|e| e.to_string())
+                        });
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = app_weak.upgrade() {
+                        let sb = app.global::<SettingsBackend>();
+                        sb.set_ai_testing(false);
+                        match result {
+                            Ok(msg) => {
+                                sb.set_ai_test_ok(true);
+                                sb.set_ai_test_status(msg.into());
+                            }
+                            Err(e) => {
+                                sb.set_ai_test_ok(false);
+                                sb.set_ai_test_status(e.into());
+                            }
+                        }
+                    }
+                });
+            });
         });
     }
 

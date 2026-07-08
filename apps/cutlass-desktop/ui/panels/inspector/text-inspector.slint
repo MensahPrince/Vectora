@@ -559,8 +559,8 @@ export component TextInspector inherits VerticalLayout {
     }
 
     InspectorTabHeader {
-        tabs: ["Text", "Animation", "Tracking", "Text to speech", "AI avatars"];
-        tab-enabled: [true, true, false, false, false];
+        tabs: ["Text", "Animation", "Text to speech"];
+        tab-enabled: [true, true, false];
         selected: root.selected-tab;
         tab-selected(idx) => {
             root.selected-tab = idx;

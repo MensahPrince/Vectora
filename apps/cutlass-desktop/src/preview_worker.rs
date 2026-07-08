@@ -20,12 +20,13 @@ use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, SeekPolicy};
 use cutlass_models::{
     AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
     Easing, Filter, Generator, LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param,
-    ParamValue, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
+    ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
 };
 use cutlass_render::{ExportSettings, RenderError, Renderer};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 use tracing::{debug, error, info, warn};
 
+use crate::agent::{AgentCreated, AgentPlanStep};
 use crate::proxy::ProxyHandle;
 use crate::strips::StripHandle;
 use crate::thumbnails::{ThumbKind, ThumbnailHandle};
@@ -516,9 +517,19 @@ enum WorkerMsg {
     RenameProject {
         name: String,
     },
-    // PORT (later): main's `SnapshotProject` / `AgentApplyPlan` round-trips
-    // return with the cutlass-ai port (the agent rehearses on a sandbox
-    // clone, then replays the plan here as one history group).
+    /// Clone the live project for the AI agent's sandbox rehearsal
+    /// (`src/agent.rs`). Ordered with mutations, so the snapshot always
+    /// reflects every edit sent before it.
+    SnapshotProject {
+        reply: Sender<Project>,
+    },
+    /// Replay a rehearsed agent plan as one history group, re-validating
+    /// every step against the live project and remapping ids the sandbox
+    /// allocated. All-or-nothing: any failure rolls the group back.
+    AgentApplyPlan {
+        steps: Vec<AgentPlanStep>,
+        reply: Sender<Result<(), String>>,
+    },
 }
 
 /// Dialog settings for one export job (see `ui/lib/export-backend.slint`).
@@ -620,6 +631,24 @@ impl WorkerHandle {
 
     pub fn rename_project(&self, name: String) {
         let _ = self.tx.send(WorkerMsg::RenameProject { name });
+    }
+
+    /// Synchronous round-trip: clone of the live project as of every edit
+    /// sent before this call. `None` only if the worker thread is gone.
+    pub fn snapshot_project(&self) -> Option<Project> {
+        let (reply, rx) = bounded(1);
+        self.tx.send(WorkerMsg::SnapshotProject { reply }).ok()?;
+        rx.recv().ok()
+    }
+
+    /// Synchronous round-trip: replay a rehearsed agent plan as one undo
+    /// entry. `None` only if the worker thread is gone.
+    pub fn agent_apply_plan(&self, steps: Vec<AgentPlanStep>) -> Option<Result<(), String>> {
+        let (reply, rx) = bounded(1);
+        self.tx
+            .send(WorkerMsg::AgentApplyPlan { steps, reply })
+            .ok()?;
+        rx.recv().ok()
     }
 
     pub fn relink_media(&self, media: String, path: PathBuf) {
@@ -1559,6 +1588,12 @@ fn worker_loop(
             }
             WorkerMsg::NewProject => new_project_and_publish(engine, &ui),
             WorkerMsg::RenameProject { name } => rename_project_and_publish(engine, name, &ui),
+            WorkerMsg::SnapshotProject { reply } => {
+                let _ = reply.send(engine.project().clone());
+            }
+            WorkerMsg::AgentApplyPlan { steps, reply } => {
+                let _ = reply.send(agent_apply_and_publish(engine, steps, &ui));
+            }
             WorkerMsg::Frame(_) => unreachable!("frames are handled by the drain below"),
             WorkerMsg::TransformOverride { .. } => {
                 unreachable!("overrides are handled by the drain below")
@@ -5281,9 +5316,73 @@ fn nearest_boundary(track: &Track, tick: i64) -> i64 {
     best
 }
 
-// PORT (later): main's `agent_replay` lived here — the AI agent's rehearsed
-// plan replayed on the live engine as one history group, with sandbox ids
-// remapped. It returns with the cutlass-ai port.
+/// one history group, re-validated step by step, with sandbox-allocated
+/// ids remapped onto the ids the live engine hands out. `after_step` runs
+/// after every applied step (the worker publishes there, so the user
+/// watches the plan land) and after the rollback/commit. Any failure rolls
+/// the whole group back — the project changed mid-prompt is the only way
+/// a rehearsed step can fail here.
+pub(crate) fn agent_replay(
+    engine: &mut Engine,
+    steps: Vec<AgentPlanStep>,
+    mut after_step: impl FnMut(&mut Engine),
+) -> Result<(), String> {
+    use std::collections::HashMap as Map;
+    let mut clip_map: Map<u64, u64> = Map::new();
+    let mut track_map: Map<u64, u64> = Map::new();
+    let mut marker_map: Map<u64, u64> = Map::new();
+
+    let total = steps.len();
+    engine.begin_group();
+    for (index, mut step) in steps.into_iter().enumerate() {
+        step.command.remap_ids(&clip_map, &track_map, &marker_map);
+        let outcome = cutlass_ai::validate(&step.command, engine.project())
+            .map_err(|r| r.message)
+            .and_then(|lowered| engine.apply(lowered).map_err(|e| e.to_string()));
+        match outcome {
+            Ok(ApplyOutcome::Edited(edited)) => {
+                match (step.created, &edited) {
+                    (Some(AgentCreated::Clip(sandbox)), EditOutcome::Created(live)) => {
+                        clip_map.insert(sandbox, live.raw());
+                    }
+                    (Some(AgentCreated::Track(sandbox)), EditOutcome::CreatedTrack(live)) => {
+                        track_map.insert(sandbox, live.raw());
+                    }
+                    (Some(AgentCreated::Marker(sandbox)), EditOutcome::CreatedMarker(live)) => {
+                        marker_map.insert(sandbox, live.raw());
+                    }
+                    _ => {}
+                }
+                after_step(engine);
+            }
+            Ok(other) => {
+                engine.rollback_group();
+                after_step(engine);
+                return Err(format!(
+                    "step {}/{total}: unexpected engine outcome {other:?}",
+                    index + 1
+                ));
+            }
+            Err(reason) => {
+                engine.rollback_group();
+                after_step(engine);
+                return Err(format!("step {}/{total}: {reason}", index + 1));
+            }
+        }
+    }
+    engine.commit_group();
+    info!(steps = total, "agent plan applied");
+    after_step(engine);
+    Ok(())
+}
+
+fn agent_apply_and_publish(
+    engine: &mut Engine,
+    steps: Vec<AgentPlanStep>,
+    ui: &UiSink,
+) -> Result<(), String> {
+    agent_replay(engine, steps, |engine| publish_projection(engine, ui))
+}
 
 /// Apply a single edit command, flattening the outcome — for compositions
 /// where only success/failure matters (the group publishes once at the end).

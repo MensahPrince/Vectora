@@ -510,7 +510,7 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
             let animation = match &args.animation {
                 None => None,
                 Some(id) => {
-                    let spec = animation_spec(&id).ok_or_else(|| {
+                    let spec = animation_spec(id).ok_or_else(|| {
                         Rejection::new(format!(
                             "unknown animation '{id}'; available animations include fade_in, \
                              fade_out, pulse, slide_up, zoom_in, and others from the catalog"
