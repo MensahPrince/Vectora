@@ -831,13 +831,14 @@ fn aspect_to_index(aspect: cutlass_models::CanvasAspect) -> i32 {
         .map_or(0, |i| i as i32)
 }
 
-/// Lane kinds the UI surfaces today. Effect / filter lanes are still phantom
-/// until their engines land (v1 roadmap M0 "hide phantom kinds", M5): the
-/// model keeps them — they round-trip through save/load untouched and
-/// composite nothing — but the projection skips them so users never see lanes
-/// that do nothing. Adjustment lanes became real in M4 and are now shown.
+/// Lane kinds the UI surfaces today. Filter lanes are still phantom until
+/// their engine lands (v1 roadmap M0 "hide phantom kinds", M5): the model
+/// keeps them — they round-trip through save/load untouched and composite
+/// nothing — but the projection skips them so users never see lanes that do
+/// nothing. Adjustment lanes became real in M4; effect lanes surfaced with
+/// standalone effect segments (CapCut effects-as-track-clips).
 fn kind_visible(kind: EngineKind) -> bool {
-    !matches!(kind, EngineKind::Effect | EngineKind::Filter)
+    kind != EngineKind::Filter
 }
 
 fn track_kind(kind: EngineKind) -> TrackKind {
@@ -1037,13 +1038,15 @@ mod tests {
 
         let projected = project_to_slint(&project, &HashMap::new(), &HashSet::new());
         let tracks = &projected.sequence.tracks;
-        // Top-first: sticker, then the now-real adjustment lane (M4), then
-        // video; the effect / filter lanes stay model-only (M0 "hide phantom
-        // kinds", their engines land in M5).
-        assert_eq!(tracks.row_count(), 3);
+        // Top-first: sticker, adjustment (M4), effect (standalone effect
+        // segments), then the main video lane; only the filter lane stays
+        // model-only (M0 "hide phantom kinds", its engine lands in M5).
+        assert_eq!(tracks.row_count(), 4);
         assert_eq!(tracks.row_data(0).unwrap().kind, TrackKind::Sticker);
         assert_eq!(tracks.row_data(1).unwrap().kind, TrackKind::Adjustment);
-        assert_eq!(tracks.row_data(2).unwrap().kind, TrackKind::Video);
+        assert_eq!(tracks.row_data(2).unwrap().kind, TrackKind::Effect);
+        assert_eq!(tracks.row_data(3).unwrap().kind, TrackKind::Video);
+        assert!(tracks.row_data(3).unwrap().is_main, "main flag projected");
     }
 
     #[test]

@@ -500,8 +500,9 @@ export component LibraryPanel inherits PanelBase {
                 }
 
                 // ---- Effects ------------------------------------------------
-                // Click applies to the selected clip (no lane drop — effects
-                // ride a clip's chain). Disabled tiles when nothing's selected.
+                // Click applies to the selected clip's chain; drag drops a
+                // standalone effect segment onto an effect lane (CapCut's
+                // effect-as-track-clip, affecting everything beneath it).
                 if LibraryState.active-tab == "effects": VerticalLayout {
                     spacing: AppStore.theme.metrics.spacing.none;
 
@@ -514,8 +515,8 @@ export component LibraryPanel inherits PanelBase {
                             height: parent.height;
                             vertical-alignment: center;
                             text: TimelineStore.selected-clip-id == ""
-                                ? "Select a clip to add an effect"
-                                : "Click an effect to add it to the selected clip";
+                                ? "Drag an effect to the timeline, or select a clip and click"
+                                : "Click to add to the selected clip, or drag to the timeline";
                             style: AppStore.theme.typography.caption;
                             foreground: AppStore.theme.text.secondary;
                             overflow: elide;
@@ -544,6 +545,9 @@ export component LibraryPanel inherits PanelBase {
                             label: fx.label;
                             swatch: #6C4AC8;
                             enabled: TimelineStore.selected-clip-id != "";
+                            generator: "effect:" + fx.id;
+                            lane-kind: TrackKind.effect;
+                            seconds: 3;
                             apply => {
                                 EffectsBackend.add-effect(TimelineStore.selected-clip-id, fx.id);
                             }

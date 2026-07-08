@@ -92,16 +92,20 @@ enum WorkerMsg {
         drop_row: i64,
         insert: bool,
     },
-    /// Place a generated clip (text title, solid, shape) at `start_tick` on
-    /// `track` (raw id of a matching-kind lane), or create a lane of the
-    /// generator's kind at `drop_row` when `track` is empty. Generated lanes
-    /// are never the main track, so there's no ripple-insert path.
+    /// Place a generated clip (text title, solid, shape, effect) at
+    /// `start_tick` on `track` (raw id of a matching-kind lane), or create a
+    /// lane of the generator's kind at `drop_row` when `track` is empty.
+    /// Generated lanes are never the main track, so there's no ripple-insert
+    /// path. `effect` seeds the new clip's effect chain — a standalone
+    /// effect-lane segment dropped from the Effects catalog (CapCut's
+    /// effect-as-track-clip).
     AddGenerated {
         generator: Generator,
         track: String,
         start_tick: i64,
         duration_ticks: i64,
         drop_row: i64,
+        effect: Option<String>,
     },
     /// Move `clip` (raw id) to `track` at `start_tick`, or — when `track` is
     /// empty — to a new lane of the clip's kind inserted at `insert_row`.
@@ -715,6 +719,7 @@ impl WorkerHandle {
         start_tick: i64,
         duration_ticks: i64,
         drop_row: i64,
+        effect: Option<String>,
     ) {
         let _ = self.tx.send(WorkerMsg::AddGenerated {
             generator,
@@ -722,6 +727,7 @@ impl WorkerHandle {
             start_tick,
             duration_ticks,
             drop_row,
+            effect,
         });
     }
 
@@ -1301,6 +1307,7 @@ fn worker_loop(
                 start_tick,
                 duration_ticks,
                 drop_row,
+                effect,
             } => add_generated_and_publish(
                 engine,
                 generator,
@@ -1308,6 +1315,7 @@ fn worker_loop(
                 start_tick,
                 duration_ticks,
                 drop_row,
+                effect.as_deref(),
                 &ui,
             ),
             WorkerMsg::MoveClip {
@@ -3085,9 +3093,11 @@ fn add_clip_and_publish(
     }
 }
 
-/// Place a generated clip (text/solid/shape) from a library-tile drop. One
-/// history entry, even when it creates the landing lane; rolled back on a
-/// rejected placement so a lane made for the drop doesn't linger.
+/// Place a generated clip (text/solid/shape/effect) from a library-tile
+/// drop. One history entry, even when it creates the landing lane; rolled
+/// back on a rejected placement so a lane made for the drop doesn't linger.
+/// `effect` seeds the new clip's chain (standalone effect-lane segments).
+#[allow(clippy::too_many_arguments)]
 fn add_generated_and_publish(
     engine: &mut Engine,
     generator: Generator,
@@ -3095,6 +3105,7 @@ fn add_generated_and_publish(
     start_tick: i64,
     duration_ticks: i64,
     drop_row: i64,
+    effect: Option<&str>,
     ui: &UiSink,
 ) {
     let Some(lane_kind) = TrackKind::for_generator(&generator) else {
@@ -3135,6 +3146,19 @@ fn add_generated_and_publish(
     let content = ClipSource::Generated(generator);
     match add_clip_content(engine, track_id, &content, duration, start_value) {
         Ok(clip) => {
+            // Effect drops carry the catalog effect onto the fresh segment's
+            // chain, still inside the drop's history group.
+            if let Some(effect_id) = effect
+                && let Err(e) = engine.apply(Command::Edit(EditCommand::AddEffect {
+                    clip,
+                    effect_id: effect_id.to_string(),
+                }))
+            {
+                error!(%clip, effect_id, "effect drop failed adding effect: {e}");
+                engine.rollback_group();
+                publish_projection(engine, ui);
+                return;
+            }
             engine.commit_group();
             info!(%clip, %track_id, start_tick = start_value, "added generated clip from drop");
             publish_projection(engine, ui);

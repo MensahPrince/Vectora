@@ -53,6 +53,11 @@ fn generator_from_key(key: &str) -> Option<cutlass_models::Generator> {
         cutlass_models::sticker_spec(asset)?;
         return Some(Generator::sticker(asset));
     }
+    // A standalone effect-lane segment; the id after the prefix seeds the
+    // clip's effect chain (validated by the engine's AddEffect).
+    if key.strip_prefix("effect:").is_some() {
+        return Some(Generator::Effect);
+    }
     Some(match key {
         "text" => Generator::text("Title"),
         "solid" => Generator::SolidColor {
@@ -658,6 +663,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let generated_drop_handle = preview_worker.handle();
     editor.on_on_generated_dropped(
         move |generator, track_id, start_tick, duration_ticks, drop_row| {
+            // "effect:<id>" drops a standalone effect-lane segment: a bare
+            // Effect generator whose chain is seeded with the catalog effect.
+            let effect = generator
+                .strip_prefix("effect:")
+                .map(std::string::ToString::to_string);
             let Some(generator) = generator_from_key(generator.as_str()) else {
                 tracing::warn!(%generator, "ignoring drop of unknown generator key");
                 return;
@@ -668,6 +678,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 i64::from(start_tick),
                 i64::from(duration_ticks),
                 i64::from(drop_row),
+                effect,
             );
         },
     );

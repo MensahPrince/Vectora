@@ -10,21 +10,33 @@ import { EffectsBackend } from "../../lib/effects-backend.slint";
 import { AppState } from "../../state.slint";
 import { Media, TrackKind } from "../../models/index.slint";
 
-// One effect/transition catalog tile (M4). Unlike media/generator tiles these
-// don't drop onto a lane — they apply to the current timeline selection
-// (effects → the selected clip; transitions → that clip's right junction), so
-// a click commits and `enabled` reflects whether a target exists. A gradient
-// swatch keeps the grid lively without per-effect art.
+// One effect/transition catalog tile (M4). A click applies to the current
+// timeline selection (effects → the selected clip's chain), so `enabled`
+// reflects whether a click target exists. Tiles with a `generator` drag key
+// also feed the library-drag state machine: dropping on the timeline lands a
+// standalone effect segment on an effect lane (CapCut's effect-as-track-clip),
+// no selection needed. A gradient swatch keeps the grid lively without
+// per-effect art.
 export component CatalogTile inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
     in property <color> swatch: #3A6FC8;
+    // Library-drag payload ("effect:<id>"); empty disables dragging.
+    in property <string> generator;
+    // Lane kind a dragged tile lands on.
+    in property <TrackKind> lane-kind: TrackKind.effect;
+    // Default placement length in seconds for dragged segments.
+    in property <int> seconds: 3;
     callback apply();
+
+    property <int> fps-num: EditorStore.project.sequence.fps.num;
+    property <int> fps-den: EditorStore.project.sequence.fps.den;
 
     background: AppStore.theme.surface.content-background;
     border-radius: 4px;
     clip: true;
-    opacity: root.enabled ? 1.0 : 0.45;
+    // Draggable tiles stay fully lit even without a click target.
+    opacity: root.enabled || root.generator != "" ? 1.0 : 0.45;
 
     Rectangle {
         width: parent.width - 16px;
@@ -58,9 +70,40 @@ export component CatalogTile inherits Rectangle {
         }
     }
 
-    if root.enabled: TouchArea {
+    if root.enabled || root.generator != "": TouchArea {
+        pointer-event(event) => {
+            if root.generator != "" && event.kind == PointerEventKind.down
+                && event.button == PointerEventButton.left {
+                AppState.library-drag-media-id = "";
+                AppState.library-drag-generator = root.generator;
+                AppState.library-drag-lane-kind = root.lane-kind;
+                AppState.library-drag-duration-ticks =
+                    max(1, round(root.seconds * root.fps-num / root.fps-den));
+                AppState.library-drag-w = root.width;
+                AppState.library-drag-h = root.height;
+                AppState.library-drag-tile-anchor-x = self.mouse-x;
+                AppState.library-drag-tile-anchor-y = self.mouse-y;
+                AppState.library-drag-cursor-x = self.absolute-position.x + self.mouse-x;
+                AppState.library-drag-cursor-y = self.absolute-position.y + self.mouse-y;
+                AppState.library-drag-active = true;
+            }
+            if event.kind == PointerEventKind.up {
+                AppState.library-drag-active = false;
+            }
+        }
+
+        moved => {
+            if !self.pressed || !AppState.library-drag-active {
+                return;
+            }
+            AppState.library-drag-cursor-x = self.absolute-position.x + self.mouse-x;
+            AppState.library-drag-cursor-y = self.absolute-position.y + self.mouse-y;
+        }
+
         clicked => {
-            root.apply();
+            if root.enabled {
+                root.apply();
+            }
         }
     }
 }
