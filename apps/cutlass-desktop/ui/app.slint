@@ -356,7 +356,11 @@ export component AppWindow inherits Window {
                     TimelineActions.redo();
                     return accept;
                 }
-                if (event.text == "z") {
+                // "Z" too: with caps lock on, Cmd+Z delivers "Z" with no
+                // shift modifier — without this branch the keypress silently
+                // matched nothing and undo was dropped. Real Cmd+Shift+Z is
+                // already caught by the shift-gated redo branch above.
+                if (event.text == "z" || event.text == "Z") {
                     TimelineActions.undo();
                     return accept;
                 }
