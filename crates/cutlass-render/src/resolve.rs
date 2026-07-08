@@ -499,7 +499,7 @@ pub(crate) fn resolve_generator(
         Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), color_grade, cw, ch),
         // Stickers are not composited yet.
         // Skip rather than draw something wrong.
-        Generator::Sticker => None,
+        Generator::Sticker { .. } => None,
     }
 }
 

@@ -664,7 +664,11 @@ fn clip_labels(project: &EngineProject, clip: &EngineClip) -> (String, String) {
             Generator::Text { content, .. } => ("Text".to_owned(), content.clone()),
             Generator::SolidColor { .. } => ("Solid".to_owned(), String::new()),
             Generator::Shape { .. } => ("Shape".to_owned(), String::new()),
-            Generator::Sticker => ("Sticker".to_owned(), String::new()),
+            Generator::Sticker { asset } => (
+                cutlass_models::sticker_spec(asset)
+                    .map_or_else(|| "Sticker".to_owned(), |s| s.label.to_owned()),
+                String::new(),
+            ),
             Generator::Effect => ("Effect".to_owned(), String::new()),
             Generator::Filter => ("Filter".to_owned(), String::new()),
             Generator::Adjustment => ("Adjustment".to_owned(), String::new()),

@@ -34,6 +34,7 @@ mod persist;
 mod project;
 mod schema;
 mod serde_map;
+mod sticker;
 mod template;
 mod time;
 mod timeline;
@@ -70,6 +71,7 @@ pub use param::{Easing, Keyframe, Lerp, Param};
 pub use persist::{PROJECT_FILE_EXTENSION, PROJECT_FILE_VERSION};
 pub use project::Project;
 pub use schema::{PROJECT_SCHEMA_KIND, PROJECT_SCHEMA_VERSION, ProjectSchema};
+pub use sticker::{StickerSpec, sticker_catalog, sticker_spec};
 pub use template::{
     Pick, TEMPLATE_FILE_EXTENSION, TEMPLATE_SCHEMA_KIND, Template, TemplateCategory, TemplateMeta,
 };

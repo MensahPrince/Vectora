@@ -258,7 +258,9 @@ pub fn run(engine: &mut Engine, intent: Intent) -> Result<serde_json::Value, Eng
             add_generated(
                 e,
                 TrackKind::Sticker,
-                Generator::Sticker,
+                Generator::Sticker {
+                    asset: String::new(),
+                },
                 at_seconds,
                 duration_seconds,
             )

@@ -42,7 +42,9 @@ impl TrackKind {
                 | (
                     Self::Sticker,
                     ClipSource::Generated(
-                        Generator::Sticker | Generator::SolidColor { .. } | Generator::Shape { .. },
+                        Generator::Sticker { .. }
+                            | Generator::SolidColor { .. }
+                            | Generator::Shape { .. },
                     ),
                 )
                 | (Self::Effect, ClipSource::Generated(Generator::Effect))
@@ -63,7 +65,7 @@ impl TrackKind {
     pub const fn for_generator(generator: &Generator) -> Option<Self> {
         match generator {
             Generator::Text { .. } => Some(Self::Text),
-            Generator::SolidColor { .. } | Generator::Shape { .. } | Generator::Sticker => {
+            Generator::SolidColor { .. } | Generator::Shape { .. } | Generator::Sticker { .. } => {
                 Some(Self::Sticker)
             }
             Generator::Effect => Some(Self::Effect),

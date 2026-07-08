@@ -407,7 +407,11 @@ fn describe_content(
             Generator::Shape { rgba, .. } => {
                 ("shape", "Shape".into(), None, None, Some(rgba.sample(0)))
             }
-            Generator::Sticker => ("sticker", "Sticker".into(), None, None, None),
+            Generator::Sticker { asset } => {
+                let label = cutlass_models::sticker_spec(asset)
+                    .map_or_else(|| "Sticker".into(), |s| s.label.to_owned());
+                ("sticker", label, None, None, None)
+            }
             Generator::Effect => ("effect", "Effect".into(), None, None, None),
             Generator::Filter => ("filter", "Filter".into(), None, None, None),
             Generator::Adjustment => ("adjustment", "Adjustment".into(), None, None, None),
