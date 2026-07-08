@@ -140,7 +140,31 @@ export component Ruler inherits Rectangle {
         }
     }
 
-    // M1 ruler markers: colored flags in tick order; right-click removes.
+    scrub := TouchArea {
+        width: parent.width;
+        height: parent.height;
+
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                // Scrubbing reclaims the keyboard (frame-step arrows
+                // should act on the playhead right after).
+                AppState.refocus-shortcuts();
+                root.scrub-to(self.mouse-x);
+            }
+        }
+
+        moved => {
+            if self.pressed {
+                root.scrub-to(self.mouse-x);
+            }
+        }
+    }
+
+    // M1 ruler markers: colored flags in tick order. Declared after the
+    // scrub TouchArea so the flags sit on top and win the pointer — left-
+    // click seeks the playhead to the marker, right-click removes it.
+    // (Under the scrub area they'd be shadowed and every click would just
+    // scrub.)
     for marker in EditorStore.project.sequence.markers: Rectangle {
         property <length> marker-x: marker.tick * zoom * 1px + scroll-x;
         x: marker-x;
@@ -173,31 +197,15 @@ export component Ruler inherits Rectangle {
             mouse-cursor: MouseCursor.pointer;
 
             pointer-event(e) => {
-                if (e.kind == PointerEventKind.down
-                        && e.button == PointerEventButton.right) {
+                if (e.kind == PointerEventKind.down) {
                     AppState.refocus-shortcuts();
-                    TimelineActions.remove-marker(marker.id);
+                    if (e.button == PointerEventButton.right) {
+                        TimelineActions.remove-marker(marker.id);
+                    } else if (e.button == PointerEventButton.left) {
+                        TimelineStore.playhead-tick =
+                            TimelineActions.clamp-playhead(marker.tick);
+                    }
                 }
-            }
-        }
-    }
-
-    scrub := TouchArea {
-        width: parent.width;
-        height: parent.height;
-
-        pointer-event(event) => {
-            if event.kind == PointerEventKind.down {
-                // Scrubbing reclaims the keyboard (frame-step arrows
-                // should act on the playhead right after).
-                AppState.refocus-shortcuts();
-                root.scrub-to(self.mouse-x);
-            }
-        }
-
-        moved => {
-            if self.pressed {
-                root.scrub-to(self.mouse-x);
             }
         }
     }
