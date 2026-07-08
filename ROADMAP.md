@@ -83,10 +83,18 @@ Stickers are first-class generated content end to end.
 - The starter pack is placeholder art; swapping in real artwork only touches
   `assets/stickers/` and the catalog table (a drift test pins them together).
 
-## 6. Look animations (entrance / exit / combo)
+## 6. Look animations (entrance / exit / combo) — DONE
 
 Drive the persisted animation catalogs from `look.rs` through the param system
 at resolve time (transform/opacity over the clip's local timeline).
+
+- `cutlass-render/src/animation.rs` maps every catalog id to transform/opacity
+  deltas; sampled in `resolve_clip` after the clip's keyframed transform.
+- Combo presets loop over a fixed period; in/out windows default to ~0.5 s
+  (clamped to half the clip length). A catalog drift test pins coverage.
+- Desktop inspector Animation tab wires In/Out/Combo pickers to
+  `SetClipAnimation`; cutlass-py exposes `animations()` and
+  `clip.set_animation(slot, id)`.
 
 ## 7. Export audio: retimed and denoised clips
 

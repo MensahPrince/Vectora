@@ -225,6 +225,22 @@ class TestPlacement:
         animated = {s["id"] for s in stickers if s["animated"]}
         assert "star_spin" in animated
 
+    def test_animation_catalog_lists_presets(self) -> None:
+        animations = cutlass.animations()
+        ids = {a["id"] for a in animations}
+        assert {"fade_in", "fade_out", "pulse", "typewriter"} <= ids
+        assert all(a["slot"] in {"in", "out", "combo"} for a in animations)
+
+    def test_set_animation_on_clip(self, p: Project) -> None:
+        c = p.add_track("sticker").add(Solid("red"), start=0.0, duration=1.0)
+        c.set_animation("in", "fade_in")
+        assert c.animation_in == "fade_in"
+        c.set_animation("combo", "pulse")
+        assert c.animation_combo == "pulse"
+        assert c.animation_in is None
+        c.set_animation("combo")
+        assert c.animation_combo is None
+
 
 # --- clip structure ----------------------------------------------------------
 
