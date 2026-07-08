@@ -642,9 +642,16 @@ export component TimelinePanel inherits PanelBase {
                     viewport-y <=> TimelineViewState.scroll-y;
                     viewport-x <=> TimelineViewState.scroll-x;
 
+                    // Explicit width, not the implicit viewport fill: zooming
+                    // (pinch / Ctrl+wheel) grows `content-width` without a
+                    // scroll event, and the Flickable doesn't re-lay-out its
+                    // content for a viewport-width change alone — the lane
+                    // backdrops kept their stale width until the next scroll.
+                    // A direct binding re-evaluates the moment zoom changes
+                    // (same idiom as the overlay bands below).
                     VerticalLayout {
+                    width: max(content-width, parent.width);
                     vertical-stretch: 1;
-                    horizontal-stretch: 1;
                     spacing: track-spacing;
 
                     ForceHeadSpace { }
