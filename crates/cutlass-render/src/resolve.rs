@@ -1149,7 +1149,7 @@ mod tests {
             .unwrap();
 
         let tail = resolve(&project, rt(99)).unwrap();
-        assert!(tail.layers[0].opacity < 0.2);
+        assert!(tail.layers[0].opacity < 0.05);
         let mid = resolve(&project, rt(40)).unwrap();
         approx(mid.layers[0].opacity, 1.0);
     }

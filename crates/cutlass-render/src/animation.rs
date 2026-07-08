@@ -57,7 +57,8 @@ pub(crate) fn apply_look_animations(
         if let Some(anim) = &clip.animation_out {
             let out_start = duration - window;
             if local_tick >= out_start {
-                let raw = ((local_tick_f - out_start as f64) / window as f64).clamp(0.0, 1.0);
+                let raw = ((local_tick_f - out_start as f64) / (window - 1).max(1) as f64)
+                    .clamp(0.0, 1.0);
                 let eased = f64::from(Easing::EaseIn.apply(raw as f32));
                 deltas.push(sample_exit(&anim.id, eased));
             }
@@ -306,7 +307,7 @@ mod tests {
         let mut clip = solid_clip(48);
         clip.animation_out = Some(AnimationRef::new("fade_out"));
         let tail = apply_look_animations(&clip, ClipTransform::IDENTITY, 47, 47.0, R24);
-        assert!(tail.opacity < 0.2);
+        assert!(tail.opacity < 0.05);
         let mid = apply_look_animations(&clip, ClipTransform::IDENTITY, 20, 20.0, R24);
         approx(mid.opacity, 1.0);
     }

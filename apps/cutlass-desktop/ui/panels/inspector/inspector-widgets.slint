@@ -94,7 +94,7 @@ export component InspectorTabHeader inherits PanelHeader {
             for tab[i] in root.tabs: CategoryTab {
                 label: tab;
                 selected: i == root.selected;
-                enabled: root.tab-enabled.length == 0 || i >= root.tab-enabled.length || root.tab-enabled[i];
+                enabled: root.tab-enabled.length > i ? root.tab-enabled[i] : i == root.selected;
                 activated => {
                     root.tab-selected(i);
                 }
