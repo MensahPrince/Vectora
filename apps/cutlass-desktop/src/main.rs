@@ -723,11 +723,9 @@ fn main() -> Result<(), slint::PlatformError> {
     let drop_app_weak = app.as_weak();
     app.window().on_winit_window_event(move |_window, event| {
         match event {
-            WindowEvent::HoveredFile(path) => {
-                if media_extension_supported(path) {
-                    if let Some(app) = drop_app_weak.upgrade() {
-                        app.global::<AppState>().set_os_drop_hover(true);
-                    }
+            WindowEvent::HoveredFile(path) if media_extension_supported(path) => {
+                if let Some(app) = drop_app_weak.upgrade() {
+                    app.global::<AppState>().set_os_drop_hover(true);
                 }
             }
             WindowEvent::DroppedFile(path) => {
