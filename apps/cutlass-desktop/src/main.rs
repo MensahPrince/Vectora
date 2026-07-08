@@ -120,7 +120,7 @@ fn defer_main_thread(f: impl FnOnce() + Send + 'static) {
 // during which Slint's display-link tick re-enters timer processing and
 // aborts with "Recursion in timer code".
 
-async fn pick_import_path() -> Option<std::path::PathBuf> {
+async fn pick_import_paths() -> Vec<std::path::PathBuf> {
     rfd::AsyncFileDialog::new()
         .add_filter(
             "Media",
@@ -132,9 +132,10 @@ async fn pick_import_path() -> Option<std::path::PathBuf> {
         .add_filter("Video", &["mp4", "mov", "mkv", "webm", "m4v"])
         .add_filter("Audio", &["mp3", "wav", "m4a", "aac", "flac", "ogg"])
         .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
-        .pick_file()
+        .pick_files()
         .await
-        .map(|file| file.path().to_path_buf())
+        .map(|files| files.into_iter().map(|f| f.path().to_path_buf()).collect())
+        .unwrap_or_default()
 }
 
 /// File picker for Open file… — choose an external `.cutlass` to import into
@@ -692,7 +693,7 @@ fn main() -> Result<(), slint::PlatformError> {
     editor.on_on_import_clicked(move || {
         let import_handle = import_handle.clone();
         let task = slint::spawn_local(async move {
-            if let Some(path) = pick_import_path().await {
+            for path in pick_import_paths().await {
                 import_handle.import(path);
             }
         });
