@@ -11,6 +11,9 @@ working GPU + encoder (they run on macOS dev machines).
 
 from __future__ import annotations
 
+import struct
+import zlib
+
 import pytest
 
 import cutlass
@@ -38,6 +41,27 @@ from cutlass import (
 # --- fixtures ----------------------------------------------------------------
 
 
+def write_solid_png(
+    path: str, width: int, height: int, rgba: tuple[int, int, int, int]
+) -> None:
+    """Write a minimal RGBA PNG with a single solid color (stdlib only)."""
+    r, g, b, a = rgba
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        crc = zlib.crc32(tag + data) & 0xFFFFFFFF
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
+
+    row = bytes([r, g, b, a] * width)
+    raw = b"".join(b"\x00" + row for _ in range(height))
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk(b"IHDR", ihdr)
+    png += chunk(b"IDAT", zlib.compress(raw, 9))
+    png += chunk(b"IEND", b"")
+    with open(path, "wb") as f:
+        f.write(png)
+
+
 @pytest.fixture
 def p() -> Project:
     return Project("test", fps=30, canvas="16:9", background=(10, 20, 30))
@@ -51,6 +75,14 @@ def media_path(tmp_path_factory: pytest.TempPathFactory) -> str:
     src.add_track("sticker").add(Solid("#3060c0"), start=0.0, duration=2.0)
     frames = src.export(str(out))
     assert frames == 60
+    return str(out)
+
+
+@pytest.fixture(scope="session")
+def image_path(tmp_path_factory: pytest.TempPathFactory) -> str:
+    """Write a small solid-color PNG for still-image import tests."""
+    out = tmp_path_factory.mktemp("media") / "frame.png"
+    write_solid_png(str(out), 64, 48, (0x30, 0x60, 0xC0, 255))
     return str(out)
 
 
@@ -611,14 +643,39 @@ class TestMedia:
         p.import_media(media_path)
         assert len(p.media) == 1
 
-    def test_import_rejects_missing_and_stills(self, tmp_path) -> None:
+    def test_import_rejects_missing_and_corrupt(self, tmp_path) -> None:
         p = Project("m", fps=30)
         with pytest.raises(MediaError):
             p.import_media(str(tmp_path / "missing.mp4"))
-        still = tmp_path / "frame.png"
-        still.write_bytes(b"\x89PNG\r\n")
+        corrupt = tmp_path / "frame.png"
+        corrupt.write_bytes(b"\x89PNG\r\n")
         with pytest.raises(MediaError):
-            p.import_media(str(still))
+            p.import_media(str(corrupt))
+
+    def test_import_still_image(self, image_path: str) -> None:
+        p = Project("m", fps=30)
+        m = p.import_media(image_path)
+        assert m.kind == "image"
+        assert m.duration == pytest.approx(5.0, abs=0.05)
+        assert m.size == (64, 48)
+        assert m.has_audio is False
+        assert "image" in repr(m)
+        assert len(p.media) == 1
+
+    def test_still_placement_allows_long_duration(self, image_path: str) -> None:
+        p = Project("m", fps=30)
+        m = p.import_media(image_path)
+        clip = p.add_track("video").add(m, start=0.0, duration=8.0)
+        assert clip.duration == pytest.approx(8.0)
+
+    def test_still_renders(self, image_path: str) -> None:
+        p = Project("m", fps=30, canvas="16:9", background=(0, 0, 0))
+        m = p.import_media(image_path)
+        p.add_track("video").add(m, start=0.0, duration=2.0)
+        frame = p.get_frame(1.0)
+        h, w = frame.shape[:2]
+        r, g, b, a = frame[h // 2, w // 2]
+        assert (r, g, b, a) == (0x30, 0x60, 0xC0, 255)
 
     def test_place_full_and_shorthand_duration(self, media_path: str) -> None:
         p = Project("m", fps=30)
