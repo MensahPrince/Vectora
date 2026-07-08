@@ -8,6 +8,7 @@ members = [
     "crates/cutlass-models",
     "crates/cutlass-commands",
     "crates/cutlass-ai",
+    "crates/cutlass-cloud",
     "crates/cutlass-render",
     "crates/cutlass-encoder",
     "crates/cutlass-engine",
