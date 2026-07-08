@@ -463,6 +463,61 @@ impl Engine {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An inverse that always fails, simulating a corrupted/mismatched history
+    /// entry.
+    struct FailAction;
+
+    impl EditAction for FailAction {
+        fn apply(
+            self: Box<Self>,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            Err(cutlass_models::ModelError::InvalidRange.into())
+        }
+    }
+
+    struct NoopAction;
+
+    impl EditAction for NoopAction {
+        fn apply(
+            self: Box<Self>,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            Ok(Box::new(NoopAction))
+        }
+    }
+
+    #[test]
+    fn failed_undo_clears_both_stacks() {
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        // A redo entry that WOULD apply, plus a failing undo entry on top.
+        engine.history.push_redo(Box::new(NoopAction));
+        engine.history.push_undo(Box::new(FailAction));
+        assert!(engine.can_undo() && engine.can_redo());
+
+        assert!(!engine.undo(), "a failing inverse reports no step");
+        assert!(
+            !engine.can_undo() && !engine.can_redo(),
+            "a diverged history is dropped wholesale rather than trusted"
+        );
+    }
+
+    #[test]
+    fn failed_redo_clears_both_stacks() {
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        engine.history.push_undo(Box::new(NoopAction));
+        engine.history.push_redo(Box::new(FailAction));
+        assert!(engine.can_undo() && engine.can_redo());
+
+        assert!(!engine.redo());
+        assert!(!engine.can_undo() && !engine.can_redo());
+    }
+}
+
 // The mobile FFI hands a session across threads (calls serialized by the shell,
 // e.g. a Swift actor whose executor hops threads), which is only sound if the
 // engine is `Send`. Assert it at compile time so a non-Send component (a decoder

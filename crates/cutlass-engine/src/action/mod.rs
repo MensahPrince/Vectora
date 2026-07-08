@@ -929,6 +929,75 @@ mod tests {
         }
     }
 
+    /// Adds a throwaway track; its inverse removes it. Lets a compound test
+    /// observe a real, reversible mutation.
+    struct AddTrackTest;
+
+    impl EditAction for AddTrackTest {
+        fn apply(
+            self: Box<Self>,
+            ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            let id = ctx.project.add_track(TrackKind::Video, "tmp");
+            Ok(Box::new(RemoveTrackTest { id }))
+        }
+    }
+
+    struct RemoveTrackTest {
+        id: cutlass_models::TrackId,
+    }
+
+    impl EditAction for RemoveTrackTest {
+        fn apply(
+            self: Box<Self>,
+            ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            ctx.project
+                .timeline_mut()
+                .remove_track(self.id)
+                .ok_or(cutlass_models::ModelError::UnknownTrack(self.id))?;
+            Ok(Box::new(AddTrackTest))
+        }
+    }
+
+    /// Always fails without touching the project.
+    struct FailAction;
+
+    impl EditAction for FailAction {
+        fn apply(
+            self: Box<Self>,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            Err(cutlass_models::ModelError::InvalidRange.into())
+        }
+    }
+
+    #[test]
+    fn compound_rolls_back_when_an_inner_action_fails() {
+        let mut project = setup();
+        let mut project_path = None;
+        let mut history = History::new(8);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
+
+        // Inverses run in reverse of the vec: AddTrackTest applies first (adds
+        // a track), then FailAction fails. The already-applied AddTrackTest
+        // must be rolled back, leaving the project untouched.
+        let compound: Box<dyn EditAction> = Box::new(CompoundAction {
+            actions: vec![Box::new(FailAction), Box::new(AddTrackTest)],
+        });
+
+        let before = ctx.project.timeline().track_count();
+        assert!(
+            compound.apply(&mut ctx).is_err(),
+            "a failing inner action fails the compound"
+        );
+        assert_eq!(
+            ctx.project.timeline().track_count(),
+            before,
+            "the partial mutation was rolled back"
+        );
+    }
+
     #[test]
     fn group_commits_as_single_entry() {
         let mut history = History::new(8);
