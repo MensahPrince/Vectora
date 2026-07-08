@@ -353,8 +353,15 @@ impl Timeline {
 
     // --- clips ------------------------------------------------------------
 
-    /// Place `clip` on `track_id`, rejecting unknown tracks and overlaps.
+    /// Place `clip` on `track_id`, rejecting unknown tracks, duplicate ids,
+    /// and overlaps.
     pub fn add_clip(&mut self, track_id: TrackId, clip: Clip) -> Result<ClipId, ModelError> {
+        // Defense in depth against id collisions: a plain map insert would
+        // silently overwrite an existing clip (and its index entry), which is
+        // how a cross-session id clash used to destroy a clip. Reject instead.
+        if self.clip_index.contains_key(&clip.id) {
+            return Err(ModelError::DuplicateClip(clip.id));
+        }
         let track = self
             .tracks
             .get(&track_id)
@@ -723,6 +730,31 @@ mod tests {
             timeline.add_clip(track, generated_clip(25, 50)),
             Err(ModelError::Overlap(track))
         );
+    }
+
+    #[test]
+    fn add_clip_rejects_duplicate_id_without_mutating() {
+        // Defense in depth for the id-collision bug: a clip whose id already
+        // lives on the timeline must be rejected, never silently overwrite the
+        // existing clip (which would drop it from its track/index).
+        let mut timeline = Timeline::new(R24);
+        let v1 = timeline.add_track(Track::new(TrackKind::Adjustment, "FX1"));
+        let v2 = timeline.add_track(Track::new(TrackKind::Adjustment, "FX2"));
+        let clip = generated_clip(0, 50);
+        let id = clip.id;
+        let mut dup = generated_clip(200, 10);
+        dup.id = id;
+
+        timeline.add_clip(v1, clip).unwrap();
+        assert_eq!(
+            timeline.add_clip(v2, dup),
+            Err(ModelError::DuplicateClip(id))
+        );
+        // The original is untouched: still on v1, still 50 ticks at start 0.
+        assert_eq!(timeline.clip_count(), 1);
+        assert_eq!(timeline.track_of(id), Some(v1));
+        assert_eq!(timeline.clip(id).unwrap().timeline, tr(0, 50));
+        assert!(timeline.track(v2).unwrap().is_empty());
     }
 
     #[test]

@@ -29,6 +29,9 @@ pub enum ModelError {
     #[error("unknown clip: {0}")]
     UnknownClip(ClipId),
 
+    #[error("clip id {0} already exists on the timeline")]
+    DuplicateClip(ClipId),
+
     #[error("unknown marker: {0}")]
     UnknownMarker(MarkerId),
 

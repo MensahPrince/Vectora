@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 macro_rules! define_id {
     ($(#[$meta:meta])* $name:ident) => {
         $(#[$meta])*
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
         #[serde(transparent)]
         pub struct $name(u64);
 
@@ -27,16 +27,45 @@ macro_rules! define_id {
                 self.0
             }
 
+            /// The process-unique allocator backing [`next`](Self::next).
+            fn counter() -> &'static AtomicU64 {
+                static COUNTER: AtomicU64 = AtomicU64::new(1);
+                &COUNTER
+            }
+
+            /// Advance the allocator past `value`, so a subsequent
+            /// [`next`](Self::next) never re-hands an id already in use.
+            /// Loading a persisted project routes every id through here (see
+            /// the [`Deserialize`] impl) so cross-session ids never collide.
+            fn observe(value: u64) {
+                Self::counter().fetch_max(value.saturating_add(1), Ordering::Relaxed);
+            }
+
             /// Allocate the next process-unique ID for this type.
             pub fn next() -> Self {
-                static COUNTER: AtomicU64 = AtomicU64::new(1);
-                Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+                Self(Self::counter().fetch_add(1, Ordering::Relaxed))
             }
         }
 
         impl std::fmt::Display for $name {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
                 write!(f, "{}#{}", stringify!($name), self.0)
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $name {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: serde::Deserializer<'de>,
+            {
+                let value = u64::deserialize(deserializer)?;
+                // A loaded id is now live in this process: bump the allocator
+                // so freshly created entities can't reuse (and silently
+                // overwrite) it. Without this, per-process counters reset to 1
+                // on relaunch and the first new clip collides with a persisted
+                // one — the cross-session undo data-loss bug.
+                Self::observe(value);
+                Ok(Self(value))
             }
         }
     };
@@ -148,6 +177,32 @@ mod tests {
         assert_eq!(fixed.raw(), 999);
         // `next()` does not consult previously `from_raw` values.
         assert_ne!(allocated, fixed);
+    }
+
+    #[test]
+    fn deserialize_reseeds_the_allocator() {
+        // Simulates loading a persisted id: a huge raw value (well above
+        // anything `next()` reaches during the test run, so it's immune to
+        // parallel allocation) must push the allocator past itself, so no
+        // freshly created id can collide with (and overwrite) the loaded one.
+        // This is the fix for the cross-session undo data-loss bug.
+        let loaded: ClipId = serde_json::from_str("281474976710656").unwrap(); // 1 << 48
+        assert_eq!(loaded.raw(), 1 << 48);
+        assert!(
+            ClipId::next().raw() > loaded.raw(),
+            "next() must not re-hand a deserialized id"
+        );
+    }
+
+    #[test]
+    fn deserialize_never_lowers_the_allocator() {
+        // A small loaded id must not drag the allocator backwards.
+        let before = MediaId::next().raw();
+        let _: MediaId = serde_json::from_str("1").unwrap();
+        assert!(
+            MediaId::next().raw() > before,
+            "a low deserialized id leaves the allocator monotonic"
+        );
     }
 
     // --- Display ----------------------------------------------------------

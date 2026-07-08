@@ -2178,6 +2178,30 @@ mod tests {
     }
 
     #[test]
+    fn split_after_reload_allocates_a_fresh_tail_id() {
+        // Regression for the cross-session id-collision bug: a clip persisted
+        // in one session must not have its id re-handed to a clip created in
+        // the next. Round-tripping through JSON (as loading a project does)
+        // reseeds the id allocator, so the split's tail id is distinct from
+        // every id already in the project.
+        let (mut project, media_id, track) = project_with_media(500);
+        let persisted = project
+            .add_clip(track, media_id, tr(0, 100), rt(0))
+            .unwrap();
+
+        let json = serde_json::to_string(&project).unwrap();
+        let mut reloaded: Project = serde_json::from_str(&json).unwrap();
+
+        let tail = reloaded.split_clip(persisted, rt(40)).unwrap();
+        assert_ne!(tail, persisted, "tail must not reuse the persisted clip id");
+        assert_eq!(reloaded.timeline().clip_count(), 2);
+        // Both halves are addressable and distinct — the overwrite that used
+        // to drop the left half can no longer happen.
+        assert_eq!(reloaded.clip(persisted).unwrap().timeline, tr(0, 40));
+        assert_eq!(reloaded.clip(tail).unwrap().timeline, tr(40, 60));
+    }
+
+    #[test]
     fn split_clip_rejects_at_boundaries() {
         let (mut project, media_id, track) = project_with_media(500);
         let clip = project
