@@ -1089,8 +1089,20 @@ export component TimelinePanel inherits PanelBase {
                     border-color: #ffffff;
                     border-radius: AppStore.theme.track-lane.clip.radius;
 
-                    Text {
+                    // Same constraints as the in-place clip label: without an
+                    // explicit width Slint gives the Text its natural size and
+                    // centers it, painting the full name far outside a narrow
+                    // floater. No `clip: true` here — combined with the
+                    // border-radius it would allocate a floater-sized GPU
+                    // layer (the 16384px wgpu trap from clip.slint).
+                    if TimelineViewState.dragging-duration-ticks * TimelineStore.zoom * 1px > 40px: Text {
+                        x: 4px;
+                        width: min(self.preferred-width, parent.width - 8px);
+                        height: parent.height;
+                        vertical-alignment: center;
                         text: TimelineViewState.dragging-name;
+                        font-size: 9px;
+                        overflow: elide;
                     }
                 }
 
