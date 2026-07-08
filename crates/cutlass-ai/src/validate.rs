@@ -10,14 +10,16 @@
 
 use cutlass_commands::{Command, EditCommand};
 use cutlass_models::{
-    CanvasAspect, Clip, ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, Marker,
-    MarkerColor, MarkerId, MediaId, Param, ParamValue, Project, Rational, RationalTime, TimeRange,
-    TrackId, TrackKind,
+    AnimationRef, AnimationSlot, AudioRole, CanvasAspect, ChromaKey, Clip, ClipId, ClipParam,
+    ClipTransform, CropRect, Easing, Filter, Generator, Marker, MarkerColor, MarkerId, Mask,
+    MaskKind, MediaId, Param, ParamValue, Project, Rational, RationalTime, StabilizeLevel,
+    TimeRange, TrackId, TrackKind, animation_spec, filter_catalog, filter_spec,
 };
 
 use crate::wire::{
-    WireCanvasAspect, WireClipParam, WireCommand, WireEasing, WireGenerator, WireMarkerColor,
-    WireShape, WireTrackKind,
+    WireAnimationSlot, WireAudioRole, WireCanvasAspect, WireChromaKey, WireClipParam, WireCommand,
+    WireEasing, WireGenerator, WireMarkerColor, WireMask, WireMaskKind, WireShape,
+    WireStabilizeLevel, WireTrackKind,
 };
 
 /// A wire command the project as it stands cannot accept. The message is
@@ -395,6 +397,172 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 denoise: args.denoise,
             }
         }
+        WireCommand::SetClipMask(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            reject_audio_lane(project, clip, "masks need a visual frame", args.clip)?;
+            if clip.is_generated() {
+                return Err(Rejection::new(format!(
+                    "clip {} is a generated clip; set_clip_mask only works on media \
+                     clips (footage with a source file)",
+                    args.clip
+                )));
+            }
+            let mask = match &args.mask {
+                None => None,
+                Some(wire) => Some(lower_mask(wire)?),
+            };
+            EditCommand::SetClipMask {
+                clip: clip.id,
+                mask,
+            }
+        }
+        WireCommand::SetClipChroma(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            reject_audio_lane(project, clip, "chroma key needs a visual frame", args.clip)?;
+            if clip.is_generated() {
+                return Err(Rejection::new(format!(
+                    "clip {} is a generated clip; set_clip_chroma only works on media \
+                     clips (footage with a source file)",
+                    args.clip
+                )));
+            }
+            let chroma = match &args.chroma {
+                None => None,
+                Some(wire) => Some(lower_chroma(wire)?),
+            };
+            EditCommand::SetClipChroma {
+                clip: clip.id,
+                chroma,
+            }
+        }
+        WireCommand::SetClipStabilize(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            reject_audio_lane(
+                project,
+                clip,
+                "stabilization needs a visual frame",
+                args.clip,
+            )?;
+            if clip.is_generated() {
+                return Err(Rejection::new(format!(
+                    "clip {} is a generated clip; set_clip_stabilize only works on media \
+                     clips (footage with a source file)",
+                    args.clip
+                )));
+            }
+            if let cutlass_models::ClipSource::Media { media, .. } = &clip.content
+                && project.media(*media).is_some_and(|m| m.is_image)
+            {
+                return Err(Rejection::new(format!(
+                    "clip {} is a still image; stabilization requires video",
+                    args.clip
+                )));
+            }
+            let stabilize = args.level.map(lower_stabilize);
+            EditCommand::SetClipStabilize {
+                clip: clip.id,
+                stabilize,
+            }
+        }
+        WireCommand::SetClipFilter(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            reject_audio_lane(project, clip, "filters need a visual frame", args.clip)?;
+            let filter = match &args.filter {
+                None => None,
+                Some(wire) => Some(lower_filter(wire)?),
+            };
+            EditCommand::SetClipFilter {
+                clip: clip.id,
+                filter,
+            }
+        }
+        WireCommand::SetClipAdjustments(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            reject_audio_lane(project, clip, "adjustments need a visual frame", args.clip)?;
+            let mut adjust = clip.adjust;
+            if let Some(v) = args.brightness {
+                adjust.brightness = unit_slider(v, "brightness")?;
+            }
+            if let Some(v) = args.contrast {
+                adjust.contrast = unit_slider(v, "contrast")?;
+            }
+            if let Some(v) = args.saturation {
+                adjust.saturation = unit_slider(v, "saturation")?;
+            }
+            if let Some(v) = args.exposure {
+                adjust.exposure = unit_slider(v, "exposure")?;
+            }
+            if let Some(v) = args.temperature {
+                adjust.temperature = unit_slider(v, "temperature")?;
+            }
+            adjust
+                .validate()
+                .map_err(|e| Rejection::new(e.to_string()))?;
+            EditCommand::SetClipAdjustments {
+                clip: clip.id,
+                adjust,
+            }
+        }
+        WireCommand::SetClipAnimation(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            reject_audio_lane(project, clip, "animations need a visual frame", args.clip)?;
+            let slot = lower_animation_slot(args.slot);
+            let animation = match &args.animation {
+                None => None,
+                Some(id) => {
+                    let spec = animation_spec(&id).ok_or_else(|| {
+                        Rejection::new(format!(
+                            "unknown animation '{id}'; available animations include fade_in, \
+                             fade_out, pulse, slide_up, zoom_in, and others from the catalog"
+                        ))
+                    })?;
+                    if spec.slot != slot {
+                        return Err(Rejection::new(format!(
+                            "animation '{id}' does not fit the {} slot",
+                            match args.slot {
+                                WireAnimationSlot::In => "in",
+                                WireAnimationSlot::Out => "out",
+                                WireAnimationSlot::Combo => "combo",
+                            }
+                        )));
+                    }
+                    if spec.text_only
+                        && !matches!(
+                            clip.content,
+                            cutlass_models::ClipSource::Generated(Generator::Text { .. })
+                        )
+                    {
+                        return Err(Rejection::new(format!(
+                            "animation '{id}' is a text-only preset"
+                        )));
+                    }
+                    Some(AnimationRef::new(id.clone()))
+                }
+            };
+            EditCommand::SetClipAnimation {
+                clip: clip.id,
+                slot,
+                animation,
+            }
+        }
+        WireCommand::SetAudioRole(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            let timeline = project.timeline();
+            let on_audio = timeline
+                .track_of(clip.id)
+                .and_then(|id| timeline.track(id))
+                .is_some_and(|t| t.kind == TrackKind::Audio);
+            if !on_audio {
+                return Err(Rejection::new(format!(
+                    "clip {} is not on an audio lane; set_audio_role only works on audio clips",
+                    args.clip
+                )));
+            }
+            EditCommand::SetAudioRole {
+                clip: clip.id,
+                role: args.role.map(lower_audio_role),
+            }
+        }
         WireCommand::SetClipAudio(args) => {
             let clip = clip_ref(project, args.clip)?;
             if clip.is_generated() {
@@ -595,60 +763,6 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
             }
             EditCommand::LinkClips { clips }
         }
-        WireCommand::Duck(args) => {
-            if args.voice.is_empty() {
-                return Err(Rejection::new(
-                    "duck needs at least one voice clip id".to_string(),
-                ));
-            }
-            if args.music.is_empty() {
-                return Err(Rejection::new(
-                    "duck needs at least one music clip id".to_string(),
-                ));
-            }
-            let mut voice = Vec::with_capacity(args.voice.len());
-            for &raw in &args.voice {
-                voice.push(clip_ref(project, raw)?.id);
-            }
-            let mut music = Vec::with_capacity(args.music.len());
-            for &raw in &args.music {
-                music.push(clip_ref(project, raw)?.id);
-            }
-            // Defaults mirror the decoder's broadcast-typical ducker; the
-            // linear speech-band threshold stays an internal detail.
-            let amount = args.amount.unwrap_or(0.66);
-            if !(0.0..=1.0).contains(&amount) {
-                return Err(Rejection::new(
-                    "duck amount must be between 0 (no change) and 1 (silence)".to_string(),
-                ));
-            }
-            let attack = args.attack.unwrap_or(0.08);
-            let release = args.release.unwrap_or(0.32);
-            if !attack.is_finite() || attack < 0.0 || !release.is_finite() || release < 0.0 {
-                return Err(Rejection::new(
-                    "duck attack/release must be non-negative seconds".to_string(),
-                ));
-            }
-            EditCommand::DuckLanes {
-                voice,
-                music,
-                threshold: 0.025,
-                amount: amount as f32,
-                attack: attack as f32,
-                release: release as f32,
-            }
-        }
-        WireCommand::DetectBeats(args) => {
-            let clip = clip_ref(project, args.clip)?;
-            if clip.is_generated() {
-                return Err(Rejection::new(format!(
-                    "clip {} is a generated clip; detect_beats only works on media \
-                     clips (footage with a source file)",
-                    args.clip
-                )));
-            }
-            EditCommand::DetectBeats { clip: clip.id }
-        }
         WireCommand::AddMarker(args) => {
             require_non_negative(args.at, "at")?;
             let at = timeline_time(project, args.at, "at")?;
@@ -708,6 +822,117 @@ fn list_ids(mut ids: Vec<u64>) -> String {
         out.push_str(&format!(" (and {extra} more)"));
     }
     out
+}
+
+fn unit_slider(value: f64, name: &str) -> Result<f32, Rejection> {
+    if !value.is_finite() || !(-1.0..=1.0).contains(&value) {
+        return Err(Rejection::new(format!(
+            "{name} must be between -1 and 1 (got {value})"
+        )));
+    }
+    Ok(value as f32)
+}
+
+fn lower_mask_kind(kind: WireMaskKind) -> MaskKind {
+    match kind {
+        WireMaskKind::Linear => MaskKind::Linear,
+        WireMaskKind::Mirror => MaskKind::Mirror,
+        WireMaskKind::Circle => MaskKind::Circle,
+        WireMaskKind::Rectangle => MaskKind::Rectangle,
+        WireMaskKind::Heart => MaskKind::Heart,
+        WireMaskKind::Star => MaskKind::Star,
+    }
+}
+
+fn lower_mask(wire: &WireMask) -> Result<Mask, Rejection> {
+    let feather = wire.feather.unwrap_or(0.0);
+    if !feather.is_finite() || !(0.0..=1.0).contains(&feather) {
+        return Err(Rejection::new(format!(
+            "mask feather must be between 0 and 1 (got {feather})"
+        )));
+    }
+    let mask = Mask {
+        kind: lower_mask_kind(wire.kind),
+        feather: feather as f32,
+        invert: wire.invert.unwrap_or(false),
+    };
+    mask.validate().map_err(|e| Rejection::new(e.to_string()))?;
+    Ok(mask)
+}
+
+fn lower_chroma(wire: &WireChromaKey) -> Result<ChromaKey, Rejection> {
+    let strength = wire.strength.unwrap_or(0.0);
+    let shadow = wire.shadow.unwrap_or(0.0);
+    for (name, value) in [("strength", strength), ("shadow", shadow)] {
+        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+            return Err(Rejection::new(format!(
+                "chroma {name} must be between 0 and 1 (got {value})"
+            )));
+        }
+    }
+    let chroma = ChromaKey {
+        rgb: wire.rgb,
+        strength: strength as f32,
+        shadow: shadow as f32,
+    };
+    chroma
+        .validate()
+        .map_err(|e| Rejection::new(e.to_string()))?;
+    Ok(chroma)
+}
+
+fn lower_stabilize(level: WireStabilizeLevel) -> StabilizeLevel {
+    match level {
+        WireStabilizeLevel::Recommended => StabilizeLevel::Recommended,
+        WireStabilizeLevel::Smooth => StabilizeLevel::Smooth,
+        WireStabilizeLevel::MaxSmooth => StabilizeLevel::MaxSmooth,
+    }
+}
+
+fn lower_filter(wire: &crate::wire::WireFilter) -> Result<Filter, Rejection> {
+    let intensity = wire.intensity.unwrap_or(0.8);
+    if !intensity.is_finite() || !(0.0..=1.0).contains(&intensity) {
+        return Err(Rejection::new(format!(
+            "filter intensity must be between 0 and 1 (got {intensity})"
+        )));
+    }
+    let filter = Filter {
+        id: wire.id.clone(),
+        intensity: intensity as f32,
+    };
+    filter.validate().map_err(|e| {
+        let ids = filter_catalog()
+            .iter()
+            .map(|s| s.id)
+            .collect::<Vec<_>>()
+            .join(", ");
+        if filter_spec(&wire.id).is_none() {
+            Rejection::new(format!(
+                "unknown filter '{}'; available filters: {ids}",
+                wire.id
+            ))
+        } else {
+            Rejection::new(e.to_string())
+        }
+    })?;
+    Ok(filter)
+}
+
+fn lower_animation_slot(slot: WireAnimationSlot) -> AnimationSlot {
+    match slot {
+        WireAnimationSlot::In => AnimationSlot::In,
+        WireAnimationSlot::Out => AnimationSlot::Out,
+        WireAnimationSlot::Combo => AnimationSlot::Combo,
+    }
+}
+
+fn lower_audio_role(role: WireAudioRole) -> AudioRole {
+    match role {
+        WireAudioRole::Music => AudioRole::Music,
+        WireAudioRole::Sfx => AudioRole::Sfx,
+        WireAudioRole::Voiceover => AudioRole::Voiceover,
+        WireAudioRole::Extracted => AudioRole::Extracted,
+    }
 }
 
 fn clip_ref(project: &Project, raw: u64) -> Result<&Clip, Rejection> {
@@ -1741,97 +1966,65 @@ mod tests {
     }
 
     #[test]
-    fn duck_lowers_voice_and_music_with_defaults_and_overrides() {
-        let (mut project, media, _, _, _, _) = fixture();
-        // Two audio-lane clips: one voice, one music.
-        let v_lane = project.add_track(TrackKind::Audio, "A1");
-        let voice = project
-            .add_clip(
-                v_lane,
-                cutlass_models::MediaId::from_raw(media),
-                TimeRange::at_rate(0, 24, R24),
-                RationalTime::new(0, R24),
-            )
-            .unwrap();
-        let m_lane = project.add_track(TrackKind::Audio, "A2");
-        let music = project
-            .add_clip(
-                m_lane,
-                cutlass_models::MediaId::from_raw(media),
-                TimeRange::at_rate(0, 24, R24),
-                RationalTime::new(0, R24),
-            )
-            .unwrap();
-
-        // Defaults fill amount/attack/release; threshold is internal.
-        let edit = lower(
-            &project,
-            WireCommand::Duck(wire::Duck {
-                voice: vec![voice.raw()],
-                music: vec![music.raw()],
-                amount: None,
-                attack: None,
-                release: None,
-            }),
-        );
-        match edit {
-            EditCommand::DuckLanes {
-                voice: v,
-                music: m,
-                amount,
-                ..
-            } => {
-                assert_eq!(v, vec![voice]);
-                assert_eq!(m, vec![music]);
-                assert!((amount - 0.66).abs() < 1e-6, "default amount");
-            }
-            other => panic!("expected DuckLanes, got {other:?}"),
-        }
-
-        // Empty lists and out-of-range amounts are rejected with names.
-        let msg = reject(
-            &project,
-            WireCommand::Duck(wire::Duck {
-                voice: vec![],
-                music: vec![music.raw()],
-                amount: None,
-                attack: None,
-                release: None,
-            }),
-        );
-        assert!(msg.contains("voice clip"), "{msg}");
-        let msg = reject(
-            &project,
-            WireCommand::Duck(wire::Duck {
-                voice: vec![voice.raw()],
-                music: vec![music.raw()],
-                amount: Some(1.5),
-                attack: None,
-                release: None,
-            }),
-        );
-        assert!(msg.contains("between 0"), "{msg}");
-    }
-
-    #[test]
-    fn detect_beats_lowers_and_rejects_generated() {
+    fn look_commands_lower_and_guard() {
         let (project, _, _, _, clip, title) = fixture();
 
         let edit = lower(
             &project,
-            WireCommand::DetectBeats(wire::DetectBeats { clip }),
+            WireCommand::SetClipFilter(wire::SetClipFilter {
+                clip,
+                filter: Some(wire::WireFilter {
+                    id: "vivid".to_string(),
+                    intensity: Some(0.9),
+                }),
+            }),
+        );
+        match edit {
+            EditCommand::SetClipFilter { filter, .. } => {
+                let filter = filter.expect("filter set");
+                assert_eq!(filter.id, "vivid");
+                assert!((filter.intensity - 0.9).abs() < 1e-6);
+            }
+            other => panic!("expected SetClipFilter, got {other:?}"),
+        }
+
+        let edit = lower(
+            &project,
+            WireCommand::SetClipAnimation(wire::SetClipAnimation {
+                clip,
+                slot: wire::WireAnimationSlot::In,
+                animation: Some("fade_in".to_string()),
+            }),
         );
         assert_eq!(
             edit,
-            EditCommand::DetectBeats {
+            EditCommand::SetClipAnimation {
                 clip: ClipId::from_raw(clip),
+                slot: AnimationSlot::In,
+                animation: Some(AnimationRef::new("fade_in")),
             }
         );
 
-        // A generated clip has no footage to analyze.
         let msg = reject(
             &project,
-            WireCommand::DetectBeats(wire::DetectBeats { clip: title }),
+            WireCommand::SetClipAnimation(wire::SetClipAnimation {
+                clip,
+                slot: wire::WireAnimationSlot::Out,
+                animation: Some("fade_in".to_string()),
+            }),
+        );
+        assert!(msg.contains("does not fit"), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::SetClipMask(wire::SetClipMask {
+                clip: title,
+                mask: Some(wire::WireMask {
+                    kind: wire::WireMaskKind::Circle,
+                    feather: None,
+                    invert: None,
+                }),
+            }),
         );
         assert!(msg.contains("generated clip"), "{msg}");
     }

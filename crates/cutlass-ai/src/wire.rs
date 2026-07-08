@@ -39,7 +39,9 @@ use serde::{Deserialize, Serialize};
 /// 18: M8 noise reduction (`set_denoise`).
 /// 19: video clips carry their own audio (CapCut embedded audio) — the audio
 ///     tool descriptions drop the "linked audio companion" steering.
-pub const TOOL_SCHEMA_VERSION: u32 = 19;
+/// 20: look tools (mask/chroma/stabilize/filter/adjust/animation/audio_role);
+///     removed unsupported `duck` and `detect_beats`.
+pub const TOOL_SCHEMA_VERSION: u32 = 20;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -443,42 +445,146 @@ pub struct SetDenoise {
     pub denoise: bool,
 }
 
-/// Duck the music clips under the voice clips (CapCut sidechain ducking). The
-/// editor measures how loud the voice clips are in the speech band and writes
-/// volume keyframes that dip the music while the voice talks, recovering in
-/// the gaps. The result is ordinary, editable volume automation on each music
-/// clip. Target the clips that carry the sound by id — a video clip with
-/// audio, or an audio clip.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct Duck {
-    /// Ids of the voice / narration clips that drive the ducking (at least
-    /// one).
-    pub voice: Vec<u64>,
-    /// Ids of the music / background clips to duck (at least one).
-    pub music: Vec<u64>,
-    /// How far to dip the music while the voice plays: 0.0 leaves it alone,
-    /// 1.0 ducks to silence. Defaults to 0.66 (about a third of the level
-    /// stays).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub amount: Option<f64>,
-    /// Seconds for the music to dip once the voice starts (the "grab").
-    /// Defaults to 0.08.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub attack: Option<f64>,
-    /// Seconds for the music to recover once the voice stops. Defaults to
-    /// 0.32.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub release: Option<f64>,
+/// Mask shape kinds (CapCut mask presets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireMaskKind {
+    Linear,
+    Mirror,
+    Circle,
+    Rectangle,
+    Heart,
+    Star,
 }
 
-/// Detect beat positions on a media clip's audio (CapCut "Beat" markers). The
-/// editor runs onset/tempo analysis and drops a beat grid the timeline magnet
-/// snaps clip edges to — the substrate for beat-synced cutting. Target a
-/// media-backed clip with sound — a video clip with audio, or an audio clip.
+/// A shaped alpha mask on a media-backed visual clip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
-pub struct DetectBeats {
-    /// Id of the media clip to analyze.
+pub struct WireMask {
+    pub kind: WireMaskKind,
+    /// Edge softness, 0 (hard) … 1 (fully feathered). Defaults to 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feather: Option<f64>,
+    /// Keep the outside instead of the inside.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invert: Option<bool>,
+}
+
+/// Set (or clear) a per-clip mask on a media-backed visual clip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetClipMask {
     pub clip: u64,
+    /// Mask to apply. `null` clears the mask.
+    pub mask: Option<WireMask>,
+}
+
+/// Chroma key settings for green-screen style removal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WireChromaKey {
+    /// Key color as `[red, green, blue]`, each 0-255.
+    pub rgb: [u8; 3],
+    /// Keying strength (tolerance), 0 … 1. Defaults to 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f64>,
+    /// Shadow retention, 0 … 1. Defaults to 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shadow: Option<f64>,
+}
+
+/// Set (or clear) chroma keying on a media-backed visual clip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetClipChroma {
+    pub clip: u64,
+    /// Chroma settings. `null` clears chroma key.
+    pub chroma: Option<WireChromaKey>,
+}
+
+/// Stabilization strength presets (CapCut stabilize).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireStabilizeLevel {
+    Recommended,
+    Smooth,
+    MaxSmooth,
+}
+
+/// Set (or clear) video stabilization on a media-backed video clip (not stills).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetClipStabilize {
+    pub clip: u64,
+    /// Stabilization preset. `null` clears stabilization.
+    pub level: Option<WireStabilizeLevel>,
+}
+
+/// A color-grade filter preset and blend intensity.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct WireFilter {
+    /// Catalog id (e.g. "vivid", "warm", "noir").
+    pub id: String,
+    /// Blend of the graded result over the original, 0 … 1. Defaults to 0.8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<f64>,
+}
+
+/// Set (or clear) a color-grade filter preset on any visual clip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetClipFilter {
+    pub clip: u64,
+    /// Filter preset. `null` clears the filter.
+    pub filter: Option<WireFilter>,
+}
+
+/// Set manual color adjustments (CapCut adjust) on any visual clip. Omitted
+/// sliders keep their current value; all-neutral clears the grade.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetClipAdjustments {
+    pub clip: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contrast: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saturation: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exposure: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+}
+
+/// Animation slot (CapCut In / Out / Combo tabs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireAnimationSlot {
+    In,
+    Out,
+    Combo,
+}
+
+/// Set (or clear) a look animation preset on any visual clip.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetClipAnimation {
+    pub clip: u64,
+    /// Which animation slot to set.
+    pub slot: WireAnimationSlot,
+    /// Catalog animation id (e.g. "fade_in", "pulse"). `null` clears the slot.
+    pub animation: Option<String>,
+}
+
+/// Audio role tags for clips on audio tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WireAudioRole {
+    Music,
+    Sfx,
+    Voiceover,
+    Extracted,
+}
+
+/// Tag (or untag) what an audio-lane clip is (music / sfx / voiceover / extracted).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct SetAudioRole {
+    pub clip: u64,
+    /// Role to apply. `null` clears the tag.
+    pub role: Option<WireAudioRole>,
 }
 
 /// Split a clip at a timeline position into two abutting clips.
@@ -717,8 +823,13 @@ pub enum WireCommand {
     SetClipPitch(SetClipPitch),
     SetClipAudio(SetClipAudio),
     SetDenoise(SetDenoise),
-    Duck(Duck),
-    DetectBeats(DetectBeats),
+    SetClipMask(SetClipMask),
+    SetClipChroma(SetClipChroma),
+    SetClipStabilize(SetClipStabilize),
+    SetClipFilter(SetClipFilter),
+    SetClipAdjustments(SetClipAdjustments),
+    SetClipAnimation(SetClipAnimation),
+    SetAudioRole(SetAudioRole),
     SplitClip(SplitClip),
     TrimClip(TrimClip),
     MoveClip(MoveClip),
@@ -788,11 +899,13 @@ impl WireCommand {
             WireCommand::SetClipPitch(a) => clip(&mut a.clip),
             WireCommand::SetClipAudio(a) => clip(&mut a.clip),
             WireCommand::SetDenoise(a) => clip(&mut a.clip),
-            WireCommand::Duck(a) => {
-                a.voice.iter_mut().for_each(&clip);
-                a.music.iter_mut().for_each(clip);
-            }
-            WireCommand::DetectBeats(a) => clip(&mut a.clip),
+            WireCommand::SetClipMask(a) => clip(&mut a.clip),
+            WireCommand::SetClipChroma(a) => clip(&mut a.clip),
+            WireCommand::SetClipStabilize(a) => clip(&mut a.clip),
+            WireCommand::SetClipFilter(a) => clip(&mut a.clip),
+            WireCommand::SetClipAdjustments(a) => clip(&mut a.clip),
+            WireCommand::SetClipAnimation(a) => clip(&mut a.clip),
+            WireCommand::SetAudioRole(a) => clip(&mut a.clip),
             WireCommand::SplitClip(a) => clip(&mut a.clip),
             WireCommand::TrimClip(a) => clip(&mut a.clip),
             WireCommand::MoveClip(a) => {
@@ -955,10 +1068,20 @@ tools! {
         "Set a clip's volume (0.0 mutes, 1.0 unchanged, 2.0 doubles) and/or fade-in/fade-out durations in seconds. Omitted fields keep their current value. A video clip keeps its own sound, so target it directly.";
     "set_denoise" => SetDenoise(SetDenoise),
         "Turn noise reduction on or off for a media clip: runs its audio through a speech-preserving denoiser that suppresses steady background noise (hum, hiss, air-conditioning, room tone) while keeping voice. Use on clips with a constant background drone. A video clip keeps its own sound, so target it directly. Not valid for generated clips.";
-    "duck" => Duck(Duck),
-        "Duck music clips under voice/narration clips (sidechain): measures speech-band loudness on the voice clips and writes volume keyframes that dip the music while the voice talks, recovering in the gaps. amount 0..1 sets how far it dips (default ~0.66). Pass the clip ids that carry the sound for both lists (a video clip with audio, or an audio clip). The result is ordinary, editable volume automation.";
-    "detect_beats" => DetectBeats(DetectBeats),
-        "Detect beat positions on a media clip's audio (onset/tempo analysis) and store them as beat markers the timeline magnet snaps clip edges to — use this to set up beat-synced cuts. Target a media-backed clip with sound — a video clip with audio, or an audio clip. Not valid for generated clips.";
+    "set_clip_mask" => SetClipMask(SetClipMask),
+        "Set or clear a shaped alpha mask on a media-backed visual clip. Mask kinds: linear, mirror, circle, rectangle, heart, star. Pass null for mask to clear.";
+    "set_clip_chroma" => SetClipChroma(SetClipChroma),
+        "Set or clear chroma keying (green screen) on a media-backed visual clip. Pass null for chroma to clear.";
+    "set_clip_stabilize" => SetClipStabilize(SetClipStabilize),
+        "Set or clear video stabilization on a media-backed video clip (not still images). Levels: recommended, smooth, max_smooth. Pass null for level to clear.";
+    "set_clip_filter" => SetClipFilter(SetClipFilter),
+        "Set or clear a color-grade filter preset on any visual clip. Filter ids include vivid, warm, cool, noir, sunset, and others from the catalog. Pass null for filter to clear.";
+    "set_clip_adjustments" => SetClipAdjustments(SetClipAdjustments),
+        "Set manual color adjustments (brightness, contrast, saturation, exposure, temperature) on any visual clip. Each slider is -1..1; omitted sliders keep their current value.";
+    "set_clip_animation" => SetClipAnimation(SetClipAnimation),
+        "Set or clear a look animation preset on any visual clip. Slots: in (entrance), out (exit), combo (looping). Animation ids include fade_in, slide_up, pulse, etc. Pass null for animation to clear the slot.";
+    "set_audio_role" => SetAudioRole(SetAudioRole),
+        "Tag or untag what an audio-lane clip is: music, sfx, voiceover, or extracted. Pass null for role to clear the tag. Audio-track clips only.";
     "split_clip" => SplitClip(SplitClip),
         "Split a clip at a timeline position (seconds) into two abutting clips.";
     "trim_clip" => TrimClip(TrimClip),
@@ -1144,7 +1267,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 38);
+        assert_eq!(specs.len(), 43);
         for spec in &specs {
             assert!(
                 !spec.description.is_empty(),

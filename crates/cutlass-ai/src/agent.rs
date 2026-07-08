@@ -551,12 +551,78 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             if a.denoise { "on" } else { "off" },
             a.clip
         ),
-        WireCommand::Duck(a) => format!(
-            "ducked {} music clip(s) under {} voice clip(s)",
-            a.music.len(),
-            a.voice.len()
-        ),
-        WireCommand::DetectBeats(a) => format!("detected beats on clip {}", a.clip),
+        WireCommand::SetClipMask(a) => match &a.mask {
+            Some(mask) => format!(
+                "set {} mask on clip {}",
+                match mask.kind {
+                    crate::wire::WireMaskKind::Linear => "linear",
+                    crate::wire::WireMaskKind::Mirror => "mirror",
+                    crate::wire::WireMaskKind::Circle => "circle",
+                    crate::wire::WireMaskKind::Rectangle => "rectangle",
+                    crate::wire::WireMaskKind::Heart => "heart",
+                    crate::wire::WireMaskKind::Star => "star",
+                },
+                a.clip
+            ),
+            None => format!("cleared mask on clip {}", a.clip),
+        },
+        WireCommand::SetClipChroma(a) => match &a.chroma {
+            Some(_) => format!("set chroma key on clip {}", a.clip),
+            None => format!("cleared chroma key on clip {}", a.clip),
+        },
+        WireCommand::SetClipStabilize(a) => match a.level {
+            Some(level) => {
+                format!("set {:?} stabilization on clip {}", level, a.clip).to_lowercase()
+            }
+            None => format!("cleared stabilization on clip {}", a.clip),
+        },
+        WireCommand::SetClipFilter(a) => match &a.filter {
+            Some(filter) => format!("set {} filter on clip {}", filter.id, a.clip),
+            None => format!("cleared filter on clip {}", a.clip),
+        },
+        WireCommand::SetClipAdjustments(a) => {
+            let mut parts = Vec::new();
+            if let Some(v) = a.brightness {
+                parts.push(format!("brightness {v:.2}"));
+            }
+            if let Some(v) = a.contrast {
+                parts.push(format!("contrast {v:.2}"));
+            }
+            if let Some(v) = a.saturation {
+                parts.push(format!("saturation {v:.2}"));
+            }
+            if let Some(v) = a.exposure {
+                parts.push(format!("exposure {v:.2}"));
+            }
+            if let Some(v) = a.temperature {
+                parts.push(format!("temperature {v:.2}"));
+            }
+            if parts.is_empty() {
+                parts.push("adjustments unchanged".into());
+            }
+            format!("set clip {} {}", a.clip, parts.join(", "))
+        }
+        WireCommand::SetClipAnimation(a) => match &a.animation {
+            Some(id) => format!(
+                "set {} animation on clip {} ({:?} slot)",
+                id, a.clip, a.slot
+            )
+            .to_lowercase(),
+            None => format!("cleared {:?} animation on clip {}", a.slot, a.clip).to_lowercase(),
+        },
+        WireCommand::SetAudioRole(a) => match a.role {
+            Some(role) => format!(
+                "tagged clip {} as {}",
+                a.clip,
+                match role {
+                    crate::wire::WireAudioRole::Music => "music",
+                    crate::wire::WireAudioRole::Sfx => "sfx",
+                    crate::wire::WireAudioRole::Voiceover => "voiceover",
+                    crate::wire::WireAudioRole::Extracted => "extracted",
+                }
+            ),
+            None => format!("cleared audio role on clip {}", a.clip),
+        },
         WireCommand::SetClipAudio(a) => {
             let mut parts = Vec::new();
             if let Some(v) = a.volume {

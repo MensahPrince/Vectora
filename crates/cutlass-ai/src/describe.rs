@@ -139,6 +139,24 @@ pub struct ClipSummary {
     /// catalog id of the blend into the next clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transition: Option<String>,
+    /// Mask kind (set_clip_mask); absent when no mask.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mask: Option<String>,
+    /// Filter preset id (set_clip_filter); absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    /// Entrance animation id (set_clip_animation in slot); absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation_in: Option<String>,
+    /// Exit animation id; absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation_out: Option<String>,
+    /// Combo animation id; absent when none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub animation_combo: Option<String>,
+    /// Audio role tag (set_audio_role); absent when untagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub audio_role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -337,6 +355,19 @@ pub fn summarize(project: &Project) -> ProjectSummary {
                     transition: track
                         .transition_at(clip.id)
                         .map(|t| t.transition_id.clone()),
+                    mask: clip.mask.as_ref().map(|m| match m.kind {
+                        cutlass_models::MaskKind::Linear => "linear".to_string(),
+                        cutlass_models::MaskKind::Mirror => "mirror".to_string(),
+                        cutlass_models::MaskKind::Circle => "circle".to_string(),
+                        cutlass_models::MaskKind::Rectangle => "rectangle".to_string(),
+                        cutlass_models::MaskKind::Heart => "heart".to_string(),
+                        cutlass_models::MaskKind::Star => "star".to_string(),
+                    }),
+                    filter: clip.filter.as_ref().map(|f| f.id.clone()),
+                    animation_in: clip.animation_in.as_ref().map(|a| a.id.clone()),
+                    animation_out: clip.animation_out.as_ref().map(|a| a.id.clone()),
+                    animation_combo: clip.animation_combo.as_ref().map(|a| a.id.clone()),
+                    audio_role: clip.audio_role.map(|r| r.id().to_string()),
                 })
                 .collect(),
         })

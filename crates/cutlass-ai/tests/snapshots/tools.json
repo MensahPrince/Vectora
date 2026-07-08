@@ -1042,72 +1042,112 @@
       }
     },
     {
-      "description": "Duck music clips under voice/narration clips (sidechain): measures speech-band loudness on the voice clips and writes volume keyframes that dip the music while the voice talks, recovering in the gaps. amount 0..1 sets how far it dips (default ~0.66). Pass the clip ids that carry the sound for both lists (a video clip with audio, or an audio clip). The result is ordinary, editable volume automation.",
-      "name": "duck",
+      "description": "Set or clear a shaped alpha mask on a media-backed visual clip. Mask kinds: linear, mirror, circle, rectangle, heart, star. Pass null for mask to clear.",
+      "name": "set_clip_mask",
       "parameters": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Duck the music clips under the voice clips (CapCut sidechain ducking). The\neditor measures how loud the voice clips are in the speech band and writes\nvolume keyframes that dip the music while the voice talks, recovering in\nthe gaps. The result is ordinary, editable volume automation on each music\nclip. Target the clips that carry the sound by id — a video clip with\naudio, or an audio clip.",
+        "description": "Set (or clear) a per-clip mask on a media-backed visual clip.",
         "properties": {
-          "amount": {
-            "description": "How far to dip the music while the voice plays: 0.0 leaves it alone,\n1.0 ducks to silence. Defaults to 0.66 (about a third of the level\nstays).",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
           },
-          "attack": {
-            "description": "Seconds for the music to dip once the voice starts (the \"grab\").\nDefaults to 0.08.",
-            "format": "double",
-            "type": [
-              "number",
-              "null"
-            ]
-          },
-          "music": {
-            "description": "Ids of the music / background clips to duck (at least one).",
-            "items": {
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
+          "mask": {
+            "description": "Mask to apply. `null` clears the mask.",
+            "properties": {
+              "feather": {
+                "description": "Edge softness, 0 (hard) … 1 (fully feathered). Defaults to 0.",
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "invert": {
+                "description": "Keep the outside instead of the inside.",
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "kind": {
+                "description": "Mask shape kinds (CapCut mask presets).",
+                "enum": [
+                  "linear",
+                  "mirror",
+                  "circle",
+                  "rectangle",
+                  "heart",
+                  "star"
+                ],
+                "type": "string"
+              }
             },
-            "type": "array"
-          },
-          "release": {
-            "description": "Seconds for the music to recover once the voice stops. Defaults to\n0.32.",
-            "format": "double",
+            "required": [
+              "kind"
+            ],
             "type": [
-              "number",
+              "object",
               "null"
             ]
-          },
-          "voice": {
-            "description": "Ids of the voice / narration clips that drive the ducking (at least\none).",
-            "items": {
-              "format": "uint64",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "type": "array"
           }
         },
         "required": [
-          "voice",
-          "music"
+          "clip"
         ],
-        "title": "Duck",
+        "title": "SetClipMask",
         "type": "object"
       }
     },
     {
-      "description": "Detect beat positions on a media clip's audio (onset/tempo analysis) and store them as beat markers the timeline magnet snaps clip edges to — use this to set up beat-synced cuts. Target a media-backed clip with sound — a video clip with audio, or an audio clip. Not valid for generated clips.",
-      "name": "detect_beats",
+      "description": "Set or clear chroma keying (green screen) on a media-backed visual clip. Pass null for chroma to clear.",
+      "name": "set_clip_chroma",
       "parameters": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "description": "Detect beat positions on a media clip's audio (CapCut \"Beat\" markers). The\neditor runs onset/tempo analysis and drops a beat grid the timeline magnet\nsnaps clip edges to — the substrate for beat-synced cutting. Target a\nmedia-backed clip with sound — a video clip with audio, or an audio clip.",
+        "description": "Set (or clear) chroma keying on a media-backed visual clip.",
         "properties": {
+          "chroma": {
+            "description": "Chroma settings. `null` clears chroma key.",
+            "properties": {
+              "rgb": {
+                "description": "Key color as `[red, green, blue]`, each 0-255.",
+                "items": {
+                  "format": "uint8",
+                  "maximum": 255,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "maxItems": 3,
+                "minItems": 3,
+                "type": "array"
+              },
+              "shadow": {
+                "description": "Shadow retention, 0 … 1. Defaults to 0.",
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "strength": {
+                "description": "Keying strength (tolerance), 0 … 1. Defaults to 0.",
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "rgb"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "clip": {
-            "description": "Id of the media clip to analyze.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -1116,7 +1156,210 @@
         "required": [
           "clip"
         ],
-        "title": "DetectBeats",
+        "title": "SetClipChroma",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Set or clear video stabilization on a media-backed video clip (not still images). Levels: recommended, smooth, max_smooth. Pass null for level to clear.",
+      "name": "set_clip_stabilize",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Set (or clear) video stabilization on a media-backed video clip (not stills).",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "level": {
+            "description": "Stabilization preset. `null` clears stabilization.",
+            "enum": [
+              "recommended",
+              "smooth",
+              "max_smooth",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "clip"
+        ],
+        "title": "SetClipStabilize",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Set or clear a color-grade filter preset on any visual clip. Filter ids include vivid, warm, cool, noir, sunset, and others from the catalog. Pass null for filter to clear.",
+      "name": "set_clip_filter",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Set (or clear) a color-grade filter preset on any visual clip.",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "filter": {
+            "description": "Filter preset. `null` clears the filter.",
+            "properties": {
+              "id": {
+                "description": "Catalog id (e.g. \"vivid\", \"warm\", \"noir\").",
+                "type": "string"
+              },
+              "intensity": {
+                "description": "Blend of the graded result over the original, 0 … 1. Defaults to 0.8.",
+                "format": "double",
+                "type": [
+                  "number",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "id"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "clip"
+        ],
+        "title": "SetClipFilter",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Set manual color adjustments (brightness, contrast, saturation, exposure, temperature) on any visual clip. Each slider is -1..1; omitted sliders keep their current value.",
+      "name": "set_clip_adjustments",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Set manual color adjustments (CapCut adjust) on any visual clip. Omitted\nsliders keep their current value; all-neutral clears the grade.",
+        "properties": {
+          "brightness": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "contrast": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "exposure": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "saturation": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "temperature": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "clip"
+        ],
+        "title": "SetClipAdjustments",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Set or clear a look animation preset on any visual clip. Slots: in (entrance), out (exit), combo (looping). Animation ids include fade_in, slide_up, pulse, etc. Pass null for animation to clear the slot.",
+      "name": "set_clip_animation",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Set (or clear) a look animation preset on any visual clip.",
+        "properties": {
+          "animation": {
+            "description": "Catalog animation id (e.g. \"fade_in\", \"pulse\"). `null` clears the slot.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "slot": {
+            "description": "Which animation slot to set.",
+            "enum": [
+              "in",
+              "out",
+              "combo"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "clip",
+          "slot"
+        ],
+        "title": "SetClipAnimation",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Tag or untag what an audio-lane clip is: music, sfx, voiceover, or extracted. Pass null for role to clear the tag. Audio-track clips only.",
+      "name": "set_audio_role",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Tag (or untag) what an audio-lane clip is (music / sfx / voiceover / extracted).",
+        "properties": {
+          "clip": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "role": {
+            "description": "Role to apply. `null` clears the tag.",
+            "enum": [
+              "music",
+              "sfx",
+              "voiceover",
+              "extracted",
+              null
+            ],
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "clip"
+        ],
+        "title": "SetAudioRole",
         "type": "object"
       }
     },
@@ -1629,5 +1872,5 @@
       }
     }
   ],
-  "version": 19
+  "version": 20
 }

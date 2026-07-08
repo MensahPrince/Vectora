@@ -880,6 +880,57 @@ fn fade_in_with_opacity_keyframes() {
 }
 
 #[test]
+fn add_fade_in_animation_preset() {
+    let (mut host, _, _, clip) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "set_clip_animation",
+            serde_json::json!({
+                "clip": clip,
+                "slot": "in",
+                "animation": "fade_in",
+            }),
+        )]),
+        text_turn("Added a fade-in animation."),
+    ]);
+
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "add a fade in animation to the clip",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 1);
+    assert_eq!(
+        outcome.actions[0].description,
+        format!("set fade_in animation on clip {clip} (in slot)")
+    );
+
+    let placed = host
+        .engine
+        .project()
+        .clip(cutlass_models::ClipId::from_raw(clip))
+        .unwrap();
+    assert_eq!(
+        placed.animation_in.as_ref().map(|a| a.id.as_str()),
+        Some("fade_in")
+    );
+
+    assert!(host.engine.undo());
+    let restored = host
+        .engine
+        .project()
+        .clip(cutlass_models::ClipId::from_raw(clip))
+        .unwrap();
+    assert!(restored.animation_in.is_none());
+    assert!(!host.engine.undo());
+}
+
+#[test]
 fn speed_up_and_reverse_clip() {
     let (mut host, _, _, clip) = fixture();
     let provider = ScriptedProvider::new(vec![
