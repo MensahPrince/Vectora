@@ -20,16 +20,13 @@ const R24: Rational = Rational::FPS_24;
 /// A real engine behind the loop's bridge.
 struct EngineHost {
     engine: Engine,
-    _dir: tempfile::TempDir,
 }
 
 impl EngineHost {
     fn new(project: Project) -> Self {
-        let dir = tempfile::tempdir().expect("tempdir");
         let config = EngineConfig { undo_limit: 64 };
         Self {
             engine: Engine::with_project(config, project).expect("engine"),
-            _dir: dir,
         }
     }
 }

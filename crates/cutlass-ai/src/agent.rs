@@ -571,9 +571,15 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             None => format!("cleared chroma key on clip {}", a.clip),
         },
         WireCommand::SetClipStabilize(a) => match a.level {
-            Some(level) => {
-                format!("set {:?} stabilization on clip {}", level, a.clip).to_lowercase()
-            }
+            Some(level) => format!(
+                "set {} stabilization on clip {}",
+                match level {
+                    crate::wire::WireStabilizeLevel::Recommended => "recommended",
+                    crate::wire::WireStabilizeLevel::Smooth => "smooth",
+                    crate::wire::WireStabilizeLevel::MaxSmooth => "max smooth",
+                },
+                a.clip
+            ),
             None => format!("cleared stabilization on clip {}", a.clip),
         },
         WireCommand::SetClipFilter(a) => match &a.filter {
@@ -602,14 +608,17 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             }
             format!("set clip {} {}", a.clip, parts.join(", "))
         }
-        WireCommand::SetClipAnimation(a) => match &a.animation {
-            Some(id) => format!(
-                "set {} animation on clip {} ({:?} slot)",
-                id, a.clip, a.slot
-            )
-            .to_lowercase(),
-            None => format!("cleared {:?} animation on clip {}", a.slot, a.clip).to_lowercase(),
-        },
+        WireCommand::SetClipAnimation(a) => {
+            let slot = match a.slot {
+                crate::wire::WireAnimationSlot::In => "in",
+                crate::wire::WireAnimationSlot::Out => "out",
+                crate::wire::WireAnimationSlot::Combo => "combo",
+            };
+            match &a.animation {
+                Some(id) => format!("set {} animation on clip {} ({} slot)", id, a.clip, slot),
+                None => format!("cleared {} animation on clip {}", slot, a.clip),
+            }
+        }
         WireCommand::SetAudioRole(a) => match a.role {
             Some(role) => format!(
                 "tagged clip {} as {}",

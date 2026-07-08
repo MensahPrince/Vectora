@@ -1224,7 +1224,6 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
- "tempfile",
  "ureq",
 ]
 
@@ -1299,6 +1298,7 @@ version = "0.5.3-alpha.0"
 dependencies = [
  "cpal",
  "crossbeam-channel",
+ "cutlass-ai",
  "cutlass-commands",
  "cutlass-compositor",
  "cutlass-decoder",

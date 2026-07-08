@@ -5315,8 +5315,9 @@ fn nearest_boundary(track: &Track, tick: i64) -> i64 {
     best
 }
 
-/// one history group, re-validated step by step, with sandbox-allocated
-/// ids remapped onto the ids the live engine hands out. `after_step` runs
+/// Replay a rehearsed agent plan on the live engine as one history group,
+/// re-validated step by step, with sandbox-allocated ids remapped onto the
+/// ids the live engine hands out. `after_step` runs
 /// after every applied step (the worker publishes there, so the user
 /// watches the plan land) and after the rollback/commit. Any failure rolls
 /// the whole group back — the project changed mid-prompt is the only way

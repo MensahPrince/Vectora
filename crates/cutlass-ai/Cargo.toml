@@ -18,4 +18,3 @@ ureq = "2"
 [dev-dependencies]
 cutlass-engine = { path = "../cutlass-engine" }
 cutlass-settings = { path = "../cutlass-settings" }
-tempfile = "3"

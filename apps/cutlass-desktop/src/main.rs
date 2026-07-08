@@ -449,9 +449,8 @@ fn main() -> Result<(), slint::PlatformError> {
     // User settings (~/.cutlass/config.toml). A missing/broken file falls
     // back to defaults so launch never depends on it; the theme applies
     // immediately, the AI fields seed the Settings dialog for later phases.
-    let app_settings =
-        cutlass_settings::load(&cutlass_settings::default_config_path()).unwrap_or_default();
     let config_path = cutlass_settings::default_config_path();
+    let app_settings = cutlass_settings::load(&config_path).unwrap_or_default();
 
     // AI assistant: a dedicated worker rehearses each prompt on a sandbox
     // engine, then replays the validated plan through the preview worker as

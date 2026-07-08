@@ -12,11 +12,9 @@ use cutlass_models::{MediaSource, Project, Rational};
 
 const R24: Rational = Rational::FPS_24;
 
-fn temp_engine_with(project: Project) -> (tempfile::TempDir, Engine) {
-    let dir = tempfile::tempdir().expect("tempdir");
+fn engine_with(project: Project) -> Engine {
     let config = EngineConfig { undo_limit: 64 };
-    let engine = Engine::with_project(config, project).expect("engine");
-    (dir, engine)
+    Engine::with_project(config, project).expect("engine")
 }
 
 fn apply(engine: &mut Engine, command: WireCommand) -> ApplyOutcome {
@@ -54,7 +52,7 @@ fn prompt_sized_scenario_round_trips_and_unwinds() {
             true,
         ))
         .raw();
-    let (_dir, mut engine) = temp_engine_with(project);
+    let mut engine = engine_with(project);
 
     // "Lay down 10s of footage, cut it at 4s, keep the tail trimmed to 4s,
     // ripple the head away, then add a styled title and link it."
@@ -210,7 +208,7 @@ fn engine_rejections_leave_state_untouched() {
             true,
         ))
         .raw();
-    let (_dir, mut engine) = temp_engine_with(project);
+    let mut engine = engine_with(project);
 
     let video = created_track(apply(
         &mut engine,
@@ -257,7 +255,7 @@ fn engine_rejections_leave_state_untouched() {
 
 #[test]
 fn validate_is_pure_against_engine_state() {
-    let (_dir, engine) = temp_engine_with(Project::new("empty", R24));
+    let engine = engine_with(Project::new("empty", R24));
 
     let rejection = validate(
         &WireCommand::RemoveClip(wire::RemoveClip { clip: 1 }),
