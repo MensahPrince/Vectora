@@ -136,7 +136,9 @@ fn media_extension_supported(path: &std::path::Path) -> bool {
         return false;
     };
     let ext = ext.to_ascii_lowercase();
-    MEDIA_IMPORT_EXTENSIONS.iter().any(|&supported| supported == ext)
+    MEDIA_IMPORT_EXTENSIONS
+        .iter()
+        .any(|&supported| supported == ext)
 }
 
 async fn pick_import_paths() -> Vec<std::path::PathBuf> {
