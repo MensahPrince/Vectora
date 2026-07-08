@@ -384,6 +384,7 @@ fn resolve_clip(
                 ch,
                 xf.scale,
                 local_tick,
+                local_tick as f64 * t.rate.seconds_per_unit(),
                 effects,
             )
             .map(|mut layer| {
@@ -429,6 +430,7 @@ pub(crate) fn resolve_generator(
     ch: f32,
     scale: f32,
     tick: i64,
+    local_seconds: f64,
     effects: Vec<ResolvedPass>,
 ) -> Option<SceneLayer> {
     let ref_scale = ch / REFERENCE_HEIGHT;
@@ -497,9 +499,33 @@ pub(crate) fn resolve_generator(
         ),
         Generator::Effect => canvas_pass(effects, None, cw, ch),
         Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), color_grade, cw, ch),
-        // Stickers are not composited yet.
-        // Skip rather than draw something wrong.
-        Generator::Sticker { .. } => None,
+        Generator::Sticker { asset } => {
+            // Unknown/empty ids place nothing — the legacy payload-less
+            // sticker behavior, never an error.
+            let spec = cutlass_models::sticker_spec(asset)?;
+            // Intrinsic pixels are *reference pixels* (1080p canvas), the
+            // same convention as shapes: a 256 px sticker lands at a
+            // CapCut-like overlay size and samples ~1:1 instead of being
+            // blown up to canvas height like aspect-fit media.
+            let px = ref_scale * scale;
+            Some(SceneLayer {
+                clip: None,
+                source: LayerSource::Sticker {
+                    asset: asset.clone(),
+                    local_time: local_seconds,
+                },
+                center,
+                anchor_point,
+                size: SizeSpec::Fixed([spec.width as f32 * px, spec.height as f32 * px]),
+                rotation,
+                opacity,
+                uv,
+                effects,
+                mask: None,
+                chroma_key: None,
+                color_grade,
+            })
+        }
     }
 }
 
@@ -899,6 +925,79 @@ mod tests {
             SizeSpec::Fixed(size) => approx2(size, [1920.0, 1080.0]),
             other => panic!("expected fixed size, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sticker_generator_resolves_to_a_reference_scaled_layer() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(track, Generator::sticker("heart"), tr(0, 100))
+            .unwrap();
+
+        let scene = resolve(&project, rt(12)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        let layer = &scene.layers[0];
+        approx2(layer.center, [960.0, 540.0]);
+        // The heart asset is 256×256; intrinsic pixels are reference pixels,
+        // which map 1:1 on the 1080p canvas.
+        match layer.size {
+            SizeSpec::Fixed(size) => approx2(size, [256.0, 256.0]),
+            other => panic!("expected fixed size, got {other:?}"),
+        }
+        match &layer.source {
+            LayerSource::Sticker { asset, local_time } => {
+                assert_eq!(asset, "heart");
+                approx(*local_time as f32, 0.5); // tick 12 at 24 fps
+            }
+            other => panic!("expected sticker source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sticker_local_time_is_clip_relative() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(track, Generator::sticker("star_spin"), tr(24, 100))
+            .unwrap();
+
+        let scene = resolve(&project, rt(36)).unwrap();
+        match &scene.layers[0].source {
+            LayerSource::Sticker { local_time, .. } => approx(*local_time as f32, 0.5),
+            other => panic!("expected sticker source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_or_unknown_sticker_asset_places_nothing() {
+        // The legacy payload-less sticker (empty asset) loads but draws
+        // nothing, exactly like before the catalog existed.
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(track, Generator::sticker(""), tr(0, 100))
+            .unwrap();
+        assert!(resolve(&project, rt(5)).unwrap().layers.is_empty());
+
+        // Unknown ids can't enter via commands (validation), but the
+        // resolver stays graceful if one ever reaches it.
+        let layer = resolve_generator(
+            &Generator::sticker("not-a-sticker"),
+            [960.0, 540.0],
+            [0.5, 0.5],
+            0.0,
+            1.0,
+            [0.0, 0.0, 1.0, 1.0],
+            None,
+            1920.0,
+            1080.0,
+            1.0,
+            0,
+            0.0,
+            Vec::new(),
+        );
+        assert!(layer.is_none());
     }
 
     #[test]
