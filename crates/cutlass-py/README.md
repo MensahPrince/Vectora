@@ -77,21 +77,27 @@ Project
 
 ## Media import
 
-`import_media` accepts probed **video and audio** files. Still images are deferred
-(the renderer has no still decoder yet); PNG/JPEG/etc. raise `MediaError`.
+`import_media` accepts probed **video, audio, and still images** (PNG, JPEG, and
+other formats the decoder recognizes). Stills register with `kind == "image"`,
+a default duration of 5 seconds, and no audio. Place them on `video` tracks;
+the placement duration can exceed the pool default (the same frame holds).
 
 ```python
 clip = p.import_media("footage.mp4")
+still = p.import_media("photo.png")
 main = p.add_track("video")
 main.add(clip.subclip(3.0, 8.0), start=0.0)
 main.add(clip[3:8], start=0.0)   # slicing sugar
+main.add(still, start=0.0, duration=10.0)  # hold the still for 10s
 ```
 
 ## Track kinds
 
 `video`, `audio`, `text`, `sticker`, `effect`, `filter`, `adjustment` — the kind
 must match the clip content (`TrackKindError` on mismatch): media goes on
-`video`/`audio`, `Text` on `text`, `Solid` and shapes on `sticker`.
+`video`/`audio`, `Text` on `text`, `Solid`, shapes, and `Sticker` on `sticker`.
+`Sticker("heart")` places a bundled sticker (static or animated); browse ids
+with `cutlass.stickers()`.
 
 ## Errors
 
@@ -99,7 +105,7 @@ must match the clip content (`TrackKindError` on mismatch): media goes on
 |-----------|------|
 | `OverlapError` | Clips overlap on the same track |
 | `TrackKindError` | Wrong track kind for content |
-| `MediaError` | Import/probe failure, still images |
+| `MediaError` | Import/probe failure |
 | `RenderError` | GPU frame or export failure |
 
 ## Development

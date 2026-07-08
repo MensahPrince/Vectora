@@ -361,6 +361,9 @@ impl Template {
         // Keep the file's original schema as provenance; the writer re-stamps
         // the current version on save (mirroring the project loader).
         template.schema = schema;
+        // Mirror the project loader: pre-main-track files re-derive the
+        // lane-zone / main-track invariants on entry.
+        template.project.timeline_mut().normalize_lanes();
         Ok(template)
     }
 }

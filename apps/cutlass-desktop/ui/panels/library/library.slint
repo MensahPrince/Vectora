@@ -15,7 +15,7 @@ import {
 import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
 import { Media, TrackKind, CatalogEntry } from "../../models/index.slint";
 import { EffectsBackend } from "../../lib/index.slint";
-import { MediaTile, GeneratedTile, CatalogTile } from "tiles.slint";
+import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile } from "tiles.slint";
 import { SectionPlaceholder } from "placeholder.slint";
 import { CutlassScrollView } from "../../components/scroll-view.slint";
 
@@ -434,7 +434,7 @@ export component LibraryPanel inherits PanelBase {
                     }
                 }
 
-                // ---- Stickers (shapes) --------------------------------------
+                // ---- Stickers (bundled pack + shapes) -----------------------
                 if LibraryState.active-tab == "stickers": shape-grid := CutlassGridView {
                     width: parent.width;
                     height: parent.height;
@@ -447,11 +447,23 @@ export component LibraryPanel inherits PanelBase {
                     cell-height: 100px;
                     spacing: AppStore.theme.metrics.spacing.md;
                     inset: AppStore.theme.metrics.spacing.md;
-                    item-count: 3;
+                    item-count: EffectsBackend.sticker-catalog.length + 3;
+
+                    for sticker[i] in EffectsBackend.sticker-catalog: GeneratedTile {
+                        x: shape-grid.cell-x(i);
+                        y: shape-grid.cell-y(i);
+                        width: shape-grid.cell-width;
+                        height: shape-grid.cell-height;
+                        generator: "sticker:" + sticker.id;
+                        label: sticker.label;
+                        icon: sticker.icon;
+                        lane-kind: TrackKind.sticker;
+                        seconds: 5;
+                    }
 
                     GeneratedTile {
-                        x: shape-grid.cell-x(0);
-                        y: shape-grid.cell-y(0);
+                        x: shape-grid.cell-x(EffectsBackend.sticker-catalog.length + 0);
+                        y: shape-grid.cell-y(EffectsBackend.sticker-catalog.length + 0);
                         width: shape-grid.cell-width;
                         height: shape-grid.cell-height;
                         generator: "solid";
@@ -462,8 +474,8 @@ export component LibraryPanel inherits PanelBase {
                     }
 
                     GeneratedTile {
-                        x: shape-grid.cell-x(1);
-                        y: shape-grid.cell-y(1);
+                        x: shape-grid.cell-x(EffectsBackend.sticker-catalog.length + 1);
+                        y: shape-grid.cell-y(EffectsBackend.sticker-catalog.length + 1);
                         width: shape-grid.cell-width;
                         height: shape-grid.cell-height;
                         generator: "rect";
@@ -474,8 +486,8 @@ export component LibraryPanel inherits PanelBase {
                     }
 
                     GeneratedTile {
-                        x: shape-grid.cell-x(2);
-                        y: shape-grid.cell-y(2);
+                        x: shape-grid.cell-x(EffectsBackend.sticker-catalog.length + 2);
+                        y: shape-grid.cell-y(EffectsBackend.sticker-catalog.length + 2);
                         width: shape-grid.cell-width;
                         height: shape-grid.cell-height;
                         generator: "ellipse";
@@ -488,8 +500,9 @@ export component LibraryPanel inherits PanelBase {
                 }
 
                 // ---- Effects ------------------------------------------------
-                // Click applies to the selected clip (no lane drop — effects
-                // ride a clip's chain). Disabled tiles when nothing's selected.
+                // Click applies to the selected clip's chain; drag drops a
+                // standalone effect segment onto an effect lane (CapCut's
+                // effect-as-track-clip, affecting everything beneath it).
                 if LibraryState.active-tab == "effects": VerticalLayout {
                     spacing: AppStore.theme.metrics.spacing.none;
 
@@ -502,8 +515,8 @@ export component LibraryPanel inherits PanelBase {
                             height: parent.height;
                             vertical-alignment: center;
                             text: TimelineStore.selected-clip-id == ""
-                                ? "Select a clip to add an effect"
-                                : "Click an effect to add it to the selected clip";
+                                ? "Drag an effect to the timeline, or select a clip and click"
+                                : "Click to add to the selected clip, or drag to the timeline";
                             style: AppStore.theme.typography.caption;
                             foreground: AppStore.theme.text.secondary;
                             overflow: elide;
@@ -532,6 +545,9 @@ export component LibraryPanel inherits PanelBase {
                             label: fx.label;
                             swatch: #6C4AC8;
                             enabled: TimelineStore.selected-clip-id != "";
+                            generator: "effect:" + fx.id;
+                            lane-kind: TrackKind.effect;
+                            seconds: 3;
                             apply => {
                                 EffectsBackend.add-effect(TimelineStore.selected-clip-id, fx.id);
                             }
@@ -540,8 +556,8 @@ export component LibraryPanel inherits PanelBase {
                 }
 
                 // ---- Transitions --------------------------------------------
-                // Click applies at the selected clip's right junction; the
-                // engine rejects when there's no abutting neighbor.
+                // Drag onto a clip junction, or click to apply at the selected
+                // clip's right edge.
                 if LibraryState.active-tab == "transitions": VerticalLayout {
                     spacing: AppStore.theme.metrics.spacing.none;
 
@@ -553,9 +569,7 @@ export component LibraryPanel inherits PanelBase {
                             width: parent.width - 2 * AppStore.theme.metrics.spacing.md;
                             height: parent.height;
                             vertical-alignment: center;
-                            text: TimelineStore.selected-clip-id == ""
-                                ? "Select a clip to add a transition after it"
-                                : "Click to add a transition at the selected clip's end";
+                            text: "Drag onto a cut, or click with a clip selected";
                             style: AppStore.theme.typography.caption;
                             foreground: AppStore.theme.text.secondary;
                             overflow: elide;
@@ -576,17 +590,13 @@ export component LibraryPanel inherits PanelBase {
                         inset: AppStore.theme.metrics.spacing.md;
                         item-count: EffectsBackend.transition-catalog.length;
 
-                        for tr[i] in EffectsBackend.transition-catalog: CatalogTile {
+                        for tr[i] in EffectsBackend.transition-catalog: TransitionCatalogTile {
                             x: transitions-grid.cell-x(i);
                             y: transitions-grid.cell-y(i);
                             width: transitions-grid.cell-width;
                             height: transitions-grid.cell-height;
+                            transition-id: tr.id;
                             label: tr.label;
-                            swatch: #C84A8F;
-                            enabled: TimelineStore.selected-clip-id != "";
-                            apply => {
-                                EffectsBackend.add-transition(TimelineStore.selected-clip-id, tr.id);
-                            }
                         }
                     }
                 }

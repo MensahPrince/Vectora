@@ -13,7 +13,9 @@ It's still alpha and moving fast, but it's a real editor now, not a toy.
 - Import video, audio, and images onto a multi-lane timeline.
 - Cut, trim, split, move, duplicate, link/unlink, ripple-delete, multi-select.
 - Change speed and reverse, crop and flip, move/scale/rotate, set opacity.
-- Add styled text, solid colors, and shapes.
+- Add styled text, solid colors, shapes, and bundled stickers (static or
+  animated).
+- Apply entrance/exit/combo look animations from the catalog.
 - Pick a canvas shape (16:9, 9:16, 1:1, 4:5, 21:9) and a background color.
 - Keyframe almost anything — animate transforms and effect settings over time.
 
@@ -43,9 +45,8 @@ It's still alpha and moving fast, but it's a real editor now, not a toy.
 Describe an edit in plain language and the assistant makes it on your timeline.
 It uses the same actions you would, so every change stays visible, undoable, and
 reviewable — nothing happens behind your back. It's optional; the editor works
-fine without it. (The assistant is still being ported to this native-media
-line: the desktop panel and provider settings are in place, the model bridge
-isn't wired yet.)
+fine without it. Configure an OpenAI-compatible endpoint in
+`~/.cutlass/config.toml` (see below); dry-run preview is on by default.
 
 ## Install
 

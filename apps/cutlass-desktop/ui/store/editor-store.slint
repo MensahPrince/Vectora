@@ -21,6 +21,10 @@ export global EditorStore {
     // request a preview frame for `tick`. Requests coalesce to the
     // newest tick on the worker thread, so this can fire per-frame.
     callback on-playhead-changed(tick: int);
+    // Preview axis hover scrub: preview `tick` without moving the playhead
+    // (no audio scrub). `on-hover-preview-ended` restores the playhead frame.
+    callback on-hover-preview(tick: int);
+    callback on-hover-preview-ended();
     callback on-import-clicked();
     // A library tile was dropped on the timeline. `track-id` is the video lane
     // under the cursor, or empty when there is none — the engine then creates
@@ -94,6 +98,12 @@ export global EditorStore {
     // A track header toggle was clicked. `flag` is "enabled" | "muted" |
     // "locked"; `value` is the new state. The worker applies it undoably.
     callback on-track-flag-toggled(track-id: string, flag: string, value: bool);
+    // Manual track management (timeline header context menu / reorder).
+    // `kind` is a TrackKind string; `index` is stack order (0 = bottom).
+    // `pinned` true for user-created lanes (survive empty auto-removal).
+    callback on-track-removed(track-id: string);
+    callback on-track-moved(track-id: string, index: int);
+    callback on-track-renamed(track-id: string, name: string);
     // The linkage toggle flipped; the worker mirrors the flag so trims/splits/
     // selection follow existing link groups (a video drop keeps its own sound,
     // so it no longer creates a linked audio pair).

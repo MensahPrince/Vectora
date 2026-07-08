@@ -9,15 +9,21 @@ reviewable change (or a short series). Update this file as items complete.
   (`crates/cutlass-render/src/export.rs`), wired into the engine
   (`Command::Project(Export)`), the desktop export job
   (`apps/cutlass-desktop/src/preview_worker.rs`), and mobile
-  (`crates/cutlass-mobile/src/export_job.rs`).
-- `cutlass-py`: functional v2 track-first API (`Project`, `Track`, `Clip`,
-  `get_frame() -> numpy`, `export()`), with a passing integration suite.
+  (`crates/cutlass-mobile/src/export_job.rs`). Apple and Windows encoders ship;
+  Linux export still returns `Unsupported` (see item 9).
+- `cutlass-py`: v2 track-first API (`Project`, `Track`, `Clip`, still import,
+  `Sticker` / `stickers()`, look `animations()` / `set_animation`, `get_frame()
+  -> numpy`, `export()`), PyPI wheels via maturin, passing integration suite.
 - Param/keyframe system (`crates/cutlass-models/src/param.rs`) including speed
-  curves; Phase I "look" data model (`crates/cutlass-models/src/look.rs`)
-  persisted + validated but render-neutral.
+  curves; look data model (`crates/cutlass-models/src/look.rs`) drives clip
+  grades, masks/chroma, effects/transitions, lane passes, stickers, and
+  entrance/exit/combo animations at resolve time.
+- Export audio: shared `ExportAudioMixer` varispeed-resamples retimed clips and
+  RNNoise-denoises flagged clips in preview and export (pitch-preserving stretch
+  and reversed-clip audio still deferred).
 - Compositor pipeline benchmark over real media
   (`crates/cutlass-render/examples/composite_bench.rs`) — use it to guard GPU
-  cost regressions for the render work below.
+  cost regressions for render work.
 
 ## 1. Render clip color adjustments and filter presets — DONE
 
@@ -66,34 +72,82 @@ composited beneath their track.
 - Resolver, compositor, and render smoke tests cover lane pass ordering,
   no-op elision, gesture fallback, grade, and effect execution.
 
-## 5. Stickers
+## 5. Stickers — DONE
 
-Last skipped generator kind. Needs asset handling (animated sticker sources)
-plus compositing as `Rgba`/`Frame` layers.
+Stickers are first-class generated content end to end.
 
-## 6. Look animations (entrance / exit / combo)
+- `Generator::Sticker { asset }` references a bundled catalog
+  (`cutlass-models/src/sticker.rs`, bytes embedded from `assets/stickers/`);
+  legacy payload-less `"Sticker"` documents still deserialize.
+- `cutlass-decoder` decodes animations from bytes (GIF/APNG portable via
+  `gif`/`png`, plus animated WebP through ImageIO on Apple).
+- Resolve emits `LayerSource::Sticker` (intrinsic pixels as reference pixels,
+  the shape convention); the renderer caches decoded frame sequences and
+  composites the looping frame as an `Rgba` layer in preview and export.
+- Desktop Library tiles (with real thumbnails), mobile `AddSticker { asset }`,
+  and Python `Sticker(asset)` / `cutlass.stickers()` are wired up.
+- The starter pack is placeholder art; swapping in real artwork only touches
+  `assets/stickers/` and the catalog table (a drift test pins them together).
+
+## 6. Look animations (entrance / exit / combo) — DONE
 
 Drive the persisted animation catalogs from `look.rs` through the param system
 at resolve time (transform/opacity over the clip's local timeline).
 
-## 7. Export audio: retimed and denoised clips
+- `cutlass-render/src/animation.rs` maps every catalog id to transform/opacity
+  deltas; sampled in `resolve_clip` after the clip's keyframed transform.
+- Combo presets loop over a fixed period; in/out windows default to ~0.5 s
+  (clamped to half the clip length). A catalog drift test pins coverage.
+- Desktop inspector Animation tab wires In/Out/Combo pickers to
+  `SetClipAnimation`; cutlass-py exposes `animations()` and
+  `clip.set_animation(slot, id)`.
 
-Video retimes via speed curves, but affected clips currently export **silent**
-(`crates/cutlass-render/src/export_audio.rs`). Implement varispeed resampling
-for speed-ramped audio and run RNNoise in the export mix.
+## 7. Export audio: retimed and denoised clips — DONE
 
-## 8. cutlass-py polish
+Retimed clips (speed / speed-curve ramps) and denoise-flagged clips now mix in
+preview and export via the shared [`ExportAudioMixer`](crates/cutlass-render/src/export_audio.rs).
 
-- Allow still-image `import_media` (renderer already supports
-  `LayerSource::Still`; the Python side may still reject PNGs).
-- Sync README with current capabilities; optional PyPI packaging via maturin.
+- [`audio_dsp.rs`](crates/cutlass-render/src/audio_dsp.rs): `DenoiseReader` wraps
+  each channel through RNNoise (`nnnoiseless`); varispeed source-frame mapping
+  reuses `speed_curve_integral` / `speed_curve_source_fraction` from the model.
+- Warped spans linearly interpolate decoded source PCM; unity-speed spans keep
+  the fast seek-and-stream path. Pitch-preserving time-stretch and reversed-
+  clip audio are deferred (reversed clips still export silent).
+
+## 8. cutlass-py polish — DONE
+
+Still-image import, docs, and PyPI packaging are aligned with the engine.
+
+- `import_media` already probed stills (`MediaSource::image` → `LayerSource::Still`);
+  this pass added positive PNG import/placement/`get_frame` tests and renamed the
+  negative test to cover missing/corrupt files only.
+- README and `api-design.md` now document still images (`kind == "image"`, 5 s
+  default duration, any placement length on `video` tracks).
+- PyPI wheels ship via maturin (`pyproject.toml`, `pywheels.yml` CI).
 
 ## 9. Non-Apple export backends
 
 `crates/cutlass-encoder` returns `Unsupported` on Linux/Windows. Add a backend
 (e.g. FFmpeg libx264 or platform encoders) if cross-platform export matters.
 
-## 10. Docs debt
+## 11. AI assistant (cutlass-ai + desktop wiring) — DONE
 
-- Keep `.cursor/rules/overview.mdc` and this roadmap in sync as stickers,
-  look animations, export audio, and Python packaging land.
+Restored the `cutlass-ai` crate from pre-mobile-pivot history and wired the
+desktop assistant panel end to end.
+
+- `crates/cutlass-ai`: wire format, validation, OpenAI-compatible provider,
+  agent loop, eval harness, tool schema v20 (look commands; `duck` /
+  `detect_beats` removed — engine returns `Unsupported` on this line).
+- `apps/cutlass-desktop/src/agent.rs`: sandbox rehearsal + plan replay via
+  `preview_worker` (`SnapshotProject`, `AgentApplyPlan`, `agent_replay`).
+- `AgentStore` callbacks, provider settings, and connection test in `main.rs`.
+- `docs/ai-agent-roadmap.md` restored as the phase-by-phase reference.
+
+## 10. Docs debt — DONE
+
+- `.cursor/rules/overview.mdc` and this file now reflect stickers, look
+  animations, export audio, and cutlass-py (still import, PyPI wheels).
+- [CONTRIBUTING.md](CONTRIBUTING.md) points at this roadmap (replacing stale
+  `docs/v1-roadmap.md` references).
+- `crates/cutlass-py/api-design.md` intro updated from a v2 proposal to the
+  shipped API reference.

@@ -1,3 +1,4 @@
+mod agent;
 mod audio;
 mod drafts;
 mod inspector;
@@ -47,6 +48,16 @@ slint::include_modules!();
 /// (via the inspector); `None` for unknown keys.
 fn generator_from_key(key: &str) -> Option<cutlass_models::Generator> {
     use cutlass_models::{Generator, Shape};
+    if let Some(asset) = key.strip_prefix("sticker:") {
+        // Only catalog ids drop; a stale key would place an invisible clip.
+        cutlass_models::sticker_spec(asset)?;
+        return Some(Generator::sticker(asset));
+    }
+    // A standalone effect-lane segment; the id after the prefix seeds the
+    // clip's effect chain (validated by the engine's AddEffect).
+    if key.strip_prefix("effect:").is_some() {
+        return Some(Generator::Effect);
+    }
     Some(match key {
         "text" => Generator::text("Title"),
         "solid" => Generator::SolidColor {
@@ -56,6 +67,21 @@ fn generator_from_key(key: &str) -> Option<cutlass_models::Generator> {
         "ellipse" => Generator::shape(Shape::Ellipse, [255, 255, 255, 255]),
         _ => return None,
     })
+}
+
+/// A bundled sticker's first frame as a Slint image — the Library tile
+/// thumbnail. Blank when decode fails (the tile shows its label only).
+fn sticker_thumbnail(spec: &cutlass_models::StickerSpec) -> slint::Image {
+    let Ok(frames) = cutlass_decoder::decode_animation(spec.bytes) else {
+        return slint::Image::default();
+    };
+    let first = &frames[0].image;
+    let buffer = slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(
+        &first.pixels,
+        first.width,
+        first.height,
+    );
+    slint::Image::from_rgba8(buffer)
 }
 
 /// Map an inspector param key to the engine's `ClipParam` plus the matching
@@ -428,15 +454,16 @@ fn main() -> Result<(), slint::PlatformError> {
     // User settings (~/.cutlass/config.toml). A missing/broken file falls
     // back to defaults so launch never depends on it; the theme applies
     // immediately, the AI fields seed the Settings dialog for later phases.
-    let app_settings =
-        cutlass_settings::load(&cutlass_settings::default_config_path()).unwrap_or_default();
+    let config_path = cutlass_settings::default_config_path();
+    let app_settings = cutlass_settings::load(&config_path).unwrap_or_default();
 
-    // AI assistant: not ported yet (the `cutlass-ai` crate arrives after the
-    // engine phases). The panel stays in its "connect a provider" state and
-    // its callbacks are inert.
+    // AI assistant: a dedicated worker rehearses each prompt on a sandbox
+    // engine, then replays the validated plan through the preview worker as
+    // one undoable group.
     let agent_store = app.global::<AgentStore>();
     agent_store.set_transcript(ModelRc::new(VecModel::<AgentEntry>::default()));
-    agent_store.set_configured(false);
+    agent_store.set_configured(app_settings.ai.is_configured());
+    agent_store.set_config_path(config_path.display().to_string().into());
 
     let editor = app.global::<EditorStore>();
 
@@ -522,6 +549,55 @@ fn main() -> Result<(), slint::PlatformError> {
         "engine session ready"
     );
 
+    let agent_worker = agent::AgentWorker::spawn(preview_worker.handle(), agent_store.as_weak())
+        .map_err(slint::PlatformError::from)?;
+
+    let agent_send = agent_worker.handle();
+    let agent_app = app.as_weak();
+    agent_store.on_send(move |prompt| {
+        let Some(app) = agent_app.upgrade() else {
+            return;
+        };
+        let timeline = app.global::<TimelineStore>();
+        let fps = app.global::<EditorStore>().get_project().sequence.fps;
+        let spf = if fps.num > 0 {
+            f64::from(fps.den) / f64::from(fps.num)
+        } else {
+            0.0
+        };
+        let to_seconds = |tick: i32| f64::from(tick) * spf;
+        let context = cutlass_ai::EditorContext {
+            selected_clips: timeline
+                .get_selected_ids()
+                .iter()
+                .filter_map(|id| id.parse().ok())
+                .collect(),
+            playhead_seconds: to_seconds(timeline.get_playhead_tick()),
+            in_point_seconds: (timeline.get_range_in_tick() >= 0)
+                .then(|| to_seconds(timeline.get_range_in_tick())),
+            out_point_seconds: (timeline.get_range_out_tick() >= 0)
+                .then(|| to_seconds(timeline.get_range_out_tick())),
+        };
+        let dry_run = app.global::<AgentStore>().get_dry_run();
+        agent_send.prompt(prompt.to_string(), context, dry_run);
+    });
+
+    let agent_cancel = agent_worker.handle();
+    agent_store.on_cancel(move || agent_cancel.cancel());
+
+    let agent_apply = agent_worker.handle();
+    agent_store.on_apply_plan(move || agent_apply.apply_plan());
+
+    let agent_discard = agent_worker.handle();
+    agent_store.on_discard_plan(move || agent_discard.discard_plan());
+
+    let agent_session = agent_worker.handle();
+    agent_store.on_session_changed(move || {
+        agent_session.cancel();
+        agent_session.discard_plan();
+        agent_session.reset_history();
+    });
+
     // Playhead moves (ruler scrub, frame-step keys, Home/End) become preview
     // frame requests; the worker coalesces a burst to the newest tick.
     let frame_handle = preview_worker.handle();
@@ -540,6 +616,20 @@ fn main() -> Result<(), slint::PlatformError> {
             .is_some_and(|app| app.global::<TimelineStore>().get_playing());
         if !playing {
             scrub_audio.scrub(i64::from(tick));
+        }
+    });
+
+    // Preview axis: hover-scrub frames without moving the playhead (no audio).
+    let hover_frame_handle = preview_worker.handle();
+    let hover_playhead_weak = app.as_weak();
+    editor.on_on_hover_preview(move |tick| {
+        hover_frame_handle.request_frame(i64::from(tick));
+    });
+    let hover_restore_handle = preview_worker.handle();
+    editor.on_on_hover_preview_ended(move || {
+        if let Some(app) = hover_playhead_weak.upgrade() {
+            let tick = app.global::<TimelineStore>().get_playhead_tick();
+            hover_restore_handle.request_frame(i64::from(tick));
         }
     });
 
@@ -573,6 +663,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let generated_drop_handle = preview_worker.handle();
     editor.on_on_generated_dropped(
         move |generator, track_id, start_tick, duration_ticks, drop_row| {
+            // "effect:<id>" drops a standalone effect-lane segment: a bare
+            // Effect generator whose chain is seeded with the catalog effect.
+            let effect = generator
+                .strip_prefix("effect:")
+                .map(std::string::ToString::to_string);
             let Some(generator) = generator_from_key(generator.as_str()) else {
                 tracing::warn!(%generator, "ignoring drop of unknown generator key");
                 return;
@@ -583,6 +678,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 i64::from(start_tick),
                 i64::from(duration_ticks),
                 i64::from(drop_row),
+                effect,
             );
         },
     );
@@ -726,6 +822,15 @@ fn main() -> Result<(), slint::PlatformError> {
     timeline_store.on_on_marker_removed(move |marker_id| {
         marker_remove_handle.remove_marker(marker_id.to_string());
     });
+    let marker_set_handle = preview_worker.handle();
+    timeline_store.on_on_marker_set(move |marker_id, at_tick, name, color| {
+        marker_set_handle.set_marker(
+            marker_id.to_string(),
+            i64::from(at_tick),
+            name.to_string(),
+            color.to_string(),
+        );
+    });
 
     // Clipboard ops (Cmd/Ctrl+C / V / D, context menu): the worker owns the
     // clipboard as project-independent snapshots.
@@ -766,6 +871,19 @@ fn main() -> Result<(), slint::PlatformError> {
             }
         };
         track_flag_handle.set_track_flag(track_id.to_string(), flag, value);
+    });
+
+    let remove_track_handle = preview_worker.handle();
+    editor.on_on_track_removed(move |track_id| {
+        remove_track_handle.remove_track_manual(track_id.to_string());
+    });
+    let move_track_handle = preview_worker.handle();
+    editor.on_on_track_moved(move |track_id, index| {
+        move_track_handle.move_track_manual(track_id.to_string(), index as usize);
+    });
+    let rename_track_handle = preview_worker.handle();
+    editor.on_on_track_renamed(move |track_id, name| {
+        rename_track_handle.set_track_name(track_id.to_string(), name.to_string());
     });
 
     // Canvas settings (title bar → dialog → engine thread).
@@ -899,7 +1017,6 @@ fn main() -> Result<(), slint::PlatformError> {
     // --- app settings (gear / Cutlass menu → dialog → config.toml) -------
 
     let settings_backend = app.global::<SettingsBackend>();
-    let config_path = cutlass_settings::default_config_path();
 
     // Seed the dialog from the loaded config. The theme rides AppStore so it
     // drives the live theme binding the whole shell reads.
@@ -939,23 +1056,54 @@ fn main() -> Result<(), slint::PlatformError> {
 
             if let Err(e) = cutlass_settings::save(&config_path, &s) {
                 tracing::error!("failed to save settings: {e}");
+                return;
             }
-            // The agent isn't ported yet, so `AgentStore.configured` stays
-            // false regardless of the provider fields (Phase 1+ flips this).
+            app.global::<AgentStore>()
+                .set_configured(s.ai.is_configured());
         });
     }
 
-    // Endpoint test requires the AI crate; report that instead of hanging
-    // the button.
     {
         let app_weak = app.as_weak();
         settings_backend.on_test_connection(move || {
-            if let Some(app) = app_weak.upgrade() {
-                let sb = app.global::<SettingsBackend>();
-                sb.set_ai_testing(false);
-                sb.set_ai_test_ok(false);
-                sb.set_ai_test_status("The AI assistant isn't wired up in this build yet.".into());
-            }
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let sb = app.global::<SettingsBackend>();
+            let base_url = sb.get_ai_base_url().trim().to_string();
+            let model = sb.get_ai_model().trim().to_string();
+            let api_key = non_empty(&sb.get_ai_api_key());
+            let api_key_env = non_empty(&sb.get_ai_api_key_env());
+            sb.set_ai_testing(true);
+            sb.set_ai_test_ok(false);
+            sb.set_ai_test_status(SharedString::new());
+
+            let app_weak = app.as_weak();
+            std::thread::spawn(move || {
+                let result =
+                    cutlass_ai::config::resolve_api_key(api_key.as_deref(), api_key_env.as_deref())
+                        .and_then(|key| {
+                            cutlass_ai::providers::OpenAiCompatProvider::new(&base_url, &model, key)
+                                .test_connection()
+                                .map_err(|e| e.to_string())
+                        });
+                let _ = slint::invoke_from_event_loop(move || {
+                    if let Some(app) = app_weak.upgrade() {
+                        let sb = app.global::<SettingsBackend>();
+                        sb.set_ai_testing(false);
+                        match result {
+                            Ok(msg) => {
+                                sb.set_ai_test_ok(true);
+                                sb.set_ai_test_status(msg.into());
+                            }
+                            Err(e) => {
+                                sb.set_ai_test_ok(false);
+                                sb.set_ai_test_status(e.into());
+                            }
+                        }
+                    }
+                });
+            });
         });
     }
 
@@ -1179,6 +1327,17 @@ fn main() -> Result<(), slint::PlatformError> {
                 playhead_tick,
                 snap_threshold_ticks,
                 main_magnet,
+            )
+        },
+    );
+
+    app.global::<DragBackend>().on_resolve_transition_junction(
+        |sequence, cursor_tick, hover_row, snap_threshold_ticks| {
+            snap::resolve_transition_junction(
+                &sequence,
+                cursor_tick,
+                hover_row,
+                snap_threshold_ticks,
             )
         },
     );
@@ -1695,6 +1854,16 @@ fn main() -> Result<(), slint::PlatformError> {
             );
         });
 
+    let set_animation_handle = preview_worker.handle();
+    app.global::<InspectorBackend>()
+        .on_set_clip_animation(move |clip_id, slot, animation_id| {
+            set_animation_handle.set_clip_animation(
+                clip_id.to_string(),
+                slot.to_string(),
+                animation_id.to_string(),
+            );
+        });
+
     let set_adjust_handle = preview_worker.handle();
     app.global::<InspectorBackend>().on_set_clip_adjust(
         move |clip_id, brightness, contrast, saturation, exposure, temperature| {
@@ -1831,6 +2000,47 @@ fn main() -> Result<(), slint::PlatformError> {
             })
             .collect();
         inspector.set_filter_catalog(ModelRc::new(VecModel::from(filter_rows)));
+
+        let animation_in: Vec<CatalogEntry> = cutlass_models::animation_catalog()
+            .iter()
+            .filter(|s| s.slot == cutlass_models::AnimationSlot::In)
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector.set_animation_in_catalog(ModelRc::new(VecModel::from(animation_in)));
+
+        let animation_out: Vec<CatalogEntry> = cutlass_models::animation_catalog()
+            .iter()
+            .filter(|s| s.slot == cutlass_models::AnimationSlot::Out)
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector.set_animation_out_catalog(ModelRc::new(VecModel::from(animation_out)));
+
+        let animation_combo: Vec<CatalogEntry> = cutlass_models::animation_catalog()
+            .iter()
+            .filter(|s| s.slot == cutlass_models::AnimationSlot::Combo && !s.text_only)
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector.set_animation_combo_catalog(ModelRc::new(VecModel::from(animation_combo)));
+
+        let animation_text_combo: Vec<CatalogEntry> = cutlass_models::animation_catalog()
+            .iter()
+            .filter(|s| s.slot == cutlass_models::AnimationSlot::Combo)
+            .map(|s| CatalogEntry {
+                id: s.id.into(),
+                label: s.label.into(),
+            })
+            .collect();
+        inspector
+            .set_animation_text_combo_catalog(ModelRc::new(VecModel::from(animation_text_combo)));
     }
     {
         let effects = app.global::<EffectsBackend>();
@@ -1850,6 +2060,15 @@ fn main() -> Result<(), slint::PlatformError> {
             })
             .collect();
         effects.set_transition_catalog(ModelRc::new(VecModel::from(transition_rows)));
+        let sticker_rows: Vec<StickerTile> = cutlass_models::sticker_catalog()
+            .iter()
+            .map(|s| StickerTile {
+                id: s.id.into(),
+                label: s.label.into(),
+                icon: sticker_thumbnail(s),
+            })
+            .collect();
+        effects.set_sticker_catalog(ModelRc::new(VecModel::from(sticker_rows)));
     }
     let add_effect_handle = preview_worker.handle();
     app.global::<EffectsBackend>()

@@ -207,6 +207,8 @@ fn track_to_slint(
         muted: track.muted,
         locked: track.locked,
         duck_source: track.duck_source,
+        pinned: track.pinned,
+        is_main: track.main,
         transitions: project_transitions(track),
     }
 }
@@ -257,6 +259,9 @@ fn clip_to_slint(
     let clip_start = clip.timeline.start.value;
     let (shape_width, shape_height) = clip_shape_size(clip);
     let (filter_id, filter_label, filter_intensity) = clip_filter(clip);
+    let (animation_in_id, animation_in_label) = clip_animation(clip.animation_in.as_ref());
+    let (animation_out_id, animation_out_label) = clip_animation(clip.animation_out.as_ref());
+    let (animation_combo_id, animation_combo_label) = clip_animation(clip.animation_combo.as_ref());
     let caps = clip_capabilities(clip, track_kind);
 
     Clip {
@@ -319,6 +324,12 @@ fn clip_to_slint(
         adjust_saturation: clip.adjust.saturation,
         adjust_exposure: clip.adjust.exposure,
         adjust_temperature: clip.adjust.temperature,
+        animation_in_id: animation_in_id.into(),
+        animation_in_label: animation_in_label.into(),
+        animation_out_id: animation_out_id.into(),
+        animation_out_label: animation_out_label.into(),
+        animation_combo_id: animation_combo_id.into(),
+        animation_combo_label: animation_combo_label.into(),
         kf_position: keyframes_to_slint(&clip.transform.position, clip_start, |v| (v[0], v[1])),
         kf_anchor: keyframes_to_slint(&clip.transform.anchor_point, clip_start, |v| (v[0], v[1])),
         kf_scale: keyframes_to_slint(&clip.transform.scale, clip_start, |v| (*v, 0.0)),
@@ -356,6 +367,17 @@ fn clip_filter(clip: &EngineClip) -> (String, String, f32) {
         .unwrap_or(filter.id.as_str())
         .to_string();
     (filter.id.clone(), label, filter.intensity)
+}
+
+fn clip_animation(animation: Option<&cutlass_models::AnimationRef>) -> (String, String) {
+    let Some(animation) = animation else {
+        return (String::new(), String::new());
+    };
+    let label = cutlass_models::animation_spec(&animation.id)
+        .map(|s| s.label)
+        .unwrap_or(animation.id.as_str())
+        .to_string();
+    (animation.id.clone(), label)
 }
 
 /// Project a clip's speed ramp keyframes (M2 speed curves) as the inspector's
@@ -664,7 +686,11 @@ fn clip_labels(project: &EngineProject, clip: &EngineClip) -> (String, String) {
             Generator::Text { content, .. } => ("Text".to_owned(), content.clone()),
             Generator::SolidColor { .. } => ("Solid".to_owned(), String::new()),
             Generator::Shape { .. } => ("Shape".to_owned(), String::new()),
-            Generator::Sticker => ("Sticker".to_owned(), String::new()),
+            Generator::Sticker { asset } => (
+                cutlass_models::sticker_spec(asset)
+                    .map_or_else(|| "Sticker".to_owned(), |s| s.label.to_owned()),
+                String::new(),
+            ),
             Generator::Effect => ("Effect".to_owned(), String::new()),
             Generator::Filter => ("Filter".to_owned(), String::new()),
             Generator::Adjustment => ("Adjustment".to_owned(), String::new()),
@@ -699,6 +725,13 @@ fn clip_generator_visual(clip: &EngineClip) -> (&'static str, Color) {
                 _ => "rect",
             };
             (tag, rgba_color(rgba.sample(0)))
+        }
+        // Only catalog-backed stickers tag as composited (drives preview
+        // hit-testing); a legacy empty asset draws nothing, so no tag.
+        ClipSource::Generated(Generator::Sticker { asset })
+            if cutlass_models::sticker_spec(asset).is_some() =>
+        {
+            ("sticker", transparent)
         }
         _ => ("", transparent),
     }
@@ -798,13 +831,14 @@ fn aspect_to_index(aspect: cutlass_models::CanvasAspect) -> i32 {
         .map_or(0, |i| i as i32)
 }
 
-/// Lane kinds the UI surfaces today. Effect / filter lanes are still phantom
-/// until their engines land (v1 roadmap M0 "hide phantom kinds", M5): the
-/// model keeps them — they round-trip through save/load untouched and
-/// composite nothing — but the projection skips them so users never see lanes
-/// that do nothing. Adjustment lanes became real in M4 and are now shown.
+/// Lane kinds the UI surfaces today. Filter lanes are still phantom until
+/// their engine lands (v1 roadmap M0 "hide phantom kinds", M5): the model
+/// keeps them — they round-trip through save/load untouched and composite
+/// nothing — but the projection skips them so users never see lanes that do
+/// nothing. Adjustment lanes became real in M4; effect lanes surfaced with
+/// standalone effect segments (CapCut effects-as-track-clips).
 fn kind_visible(kind: EngineKind) -> bool {
-    !matches!(kind, EngineKind::Effect | EngineKind::Filter)
+    kind != EngineKind::Filter
 }
 
 fn track_kind(kind: EngineKind) -> TrackKind {
@@ -858,6 +892,21 @@ fn marker_to_slint(marker: &EngineMarker) -> TimelineMarker {
         tick: clamp_i32(marker.tick.value),
         name: marker.name.clone().into(),
         color: Color::from_argb_u8(a, r, g, b),
+        color_name: marker_color_name(marker.color).into(),
+    }
+}
+
+fn marker_color_name(color: cutlass_models::MarkerColor) -> &'static str {
+    use cutlass_models::MarkerColor;
+    match color {
+        MarkerColor::Teal => "teal",
+        MarkerColor::Blue => "blue",
+        MarkerColor::Purple => "purple",
+        MarkerColor::Pink => "pink",
+        MarkerColor::Red => "red",
+        MarkerColor::Orange => "orange",
+        MarkerColor::Yellow => "yellow",
+        MarkerColor::Green => "green",
     }
 }
 
@@ -913,6 +962,17 @@ mod tests {
 
     fn t(value: i64, num: i32, den: i32) -> EngineTime {
         EngineTime::new(value, EngineRational { num, den })
+    }
+
+    #[test]
+    fn sticker_card_gets_catalog_label_and_composited_tag() {
+        use cutlass_models::{Clip as MClip, Generator, Rational, TimeRange};
+        let span = TimeRange::at_rate(0, 100, Rational::FPS_24);
+        let heart = MClip::generated(Generator::sticker("heart"), span);
+        assert_eq!(clip_generator_visual(&heart).0, "sticker");
+        // Legacy payload-less stickers draw nothing: no composited tag.
+        let legacy = MClip::generated(Generator::sticker(""), span);
+        assert_eq!(clip_generator_visual(&legacy).0, "");
     }
 
     #[test]
@@ -978,13 +1038,15 @@ mod tests {
 
         let projected = project_to_slint(&project, &HashMap::new(), &HashSet::new());
         let tracks = &projected.sequence.tracks;
-        // Top-first: sticker, then the now-real adjustment lane (M4), then
-        // video; the effect / filter lanes stay model-only (M0 "hide phantom
-        // kinds", their engines land in M5).
-        assert_eq!(tracks.row_count(), 3);
+        // Top-first: sticker, adjustment (M4), effect (standalone effect
+        // segments), then the main video lane; only the filter lane stays
+        // model-only (M0 "hide phantom kinds", its engine lands in M5).
+        assert_eq!(tracks.row_count(), 4);
         assert_eq!(tracks.row_data(0).unwrap().kind, TrackKind::Sticker);
         assert_eq!(tracks.row_data(1).unwrap().kind, TrackKind::Adjustment);
-        assert_eq!(tracks.row_data(2).unwrap().kind, TrackKind::Video);
+        assert_eq!(tracks.row_data(2).unwrap().kind, TrackKind::Effect);
+        assert_eq!(tracks.row_data(3).unwrap().kind, TrackKind::Video);
+        assert!(tracks.row_data(3).unwrap().is_main, "main flag projected");
     }
 
     #[test]

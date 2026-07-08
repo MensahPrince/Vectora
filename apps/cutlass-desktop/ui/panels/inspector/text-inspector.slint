@@ -27,6 +27,7 @@ import {
     LineTextInput,
     SliderRow,
 } from "inspector-widgets.slint";
+import { AnimationInspector } from "animation-inspector.slint";
 
 component PillTab inherits Rectangle {
     in property <string> label;
@@ -436,6 +437,7 @@ export component TextInspector inherits VerticalLayout {
         && PreviewStore.gesture.valid;
     private property <float> pos-x: live ? PreviewStore.gesture.position-x : sample.position-x;
     private property <float> pos-y: live ? PreviewStore.gesture.position-y : sample.position-y;
+    private property <int> selected-tab: 0;
     private property <float> anchor-x: live ? PreviewStore.gesture.anchor-x : sample.anchor-x;
     private property <float> anchor-y: live ? PreviewStore.gesture.anchor-y : sample.anchor-y;
     private property <float> scale-v: live ? PreviewStore.gesture.scale : sample.scale;
@@ -557,8 +559,12 @@ export component TextInspector inherits VerticalLayout {
     }
 
     InspectorTabHeader {
-        tabs: ["Text", "Animation", "Tracking", "Text to speech", "AI avatars"];
-        selected: 0;
+        tabs: ["Text", "Animation", "Text to speech"];
+        tab-enabled: [true, true, false];
+        selected: root.selected-tab;
+        tab-selected(idx) => {
+            root.selected-tab = idx;
+        }
     }
 
     body-scroll := CutlassScrollView {
@@ -585,6 +591,15 @@ export component TextInspector inherits VerticalLayout {
             spacing: AppStore.theme.metrics.spacing.lg;
             alignment: LayoutAlignment.start;
             padding: AppStore.theme.metrics.spacing.lg;
+
+            if root.selected-tab == 1: AnimationInspector {
+                model: root.model;
+                text-only-combos: true;
+            }
+
+            if root.selected-tab == 0: VerticalLayout {
+                spacing: AppStore.theme.metrics.spacing.lg;
+                alignment: LayoutAlignment.start;
 
             HorizontalLayout {
                 spacing: 1px;
@@ -1432,6 +1447,7 @@ export component TextInspector inherits VerticalLayout {
                         vertical-alignment: center;
                     }
                 }
+            }
             }
         }
     }

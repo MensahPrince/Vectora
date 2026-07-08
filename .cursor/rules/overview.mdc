@@ -16,12 +16,23 @@ Open-source **AI-first, prompt-to-edit** video editing (CapCut-inspired): users 
 
 Ship a **small but real** editor: cut, trim, and other **basic timeline editing**. On top sits an **AI agent** that emits **structured commands**; Rust **executes** those commands against project/timeline state (deterministic edits, auditable undo-friendly actions).
 
-## Planned: Python bindings (side feature)
+## Timeline semantics (CapCut lane rules)
 
-A **MoviePy-style Python library** so the engine can be scripted from Python. This is a **side feature** — the editor, AI agent, and all core stay pure Rust; Python only wraps the existing `Engine`.
+The model (`cutlass-models::Timeline`) enforces these invariants on every mutation; UI and agent layers rely on them:
 
-- **Shape**: separate optional crate `cutlass-py` (`crate-type = ["cdylib"]`, PyO3 + `maturin`), depending on `cutlass-engine`/`-compositor`/`-models`. Kept off the default workspace build and shipped to PyPI on its own.
-- **API**: thin, Pythonic wrapper over `Engine` (`add_clip`, `split`, `export`, `get_frame`) — do **not** expose the raw `EditCommand` enum to Python.
-- **Prerequisite (landed)**: the **timeline → video file exporter** exists — `export_to_file(_observed)` in `cutlass-render` composites every frame and muxes H.264/AAC via `cutlass-encoder`, wired into the engine, desktop, and mobile.
+- **Main track**: exactly one video lane carries `Track::main` — designated automatically (first video lane added), permanent (delete is refused in the desktop UI and rejected by AI validation; removing it in the model promotes the next video lane), and the default landing spot for the first video dropped on the timeline.
+- **Lane zones**: `order` is always partitioned bottom-to-top into audio → main video → other visual lanes (overlay video / sticker / effect / filter / adjustment) → text. Nothing but audio ever sits below the main track; moves/inserts clamp into their zone.
+- **Empty lanes**: non-main lanes with no clips are auto-removed (desktop); only the main lane may exist empty.
+
+## Python bindings (side feature)
+
+A **MoviePy-style Python library** (`cutlass-py`) scripts the engine from Python.
+This is a **side feature** — the editor, AI agent, and all core stay pure Rust;
+Python only wraps the existing renderer and model.
+
+- **Shape**: separate optional crate `cutlass-py` (`crate-type = ["cdylib"]`, PyO3 + `maturin`), depending on `cutlass-engine`/`-compositor`/`-models`. Kept off the default workspace build and shipped to PyPI on its own (`pip install --pre cutlass-py`).
+- **API**: track-first v2 wrapper (`Project`, `Track`, `Clip`, `import_media`, `get_frame`, `export`) — do **not** expose the raw `EditCommand` enum to Python. `import_media` probes video, audio, and still images (`kind == "image"`, 5 s default duration). Bundled stickers via `Sticker(asset)` / `cutlass.stickers()`; look animations via `animations()` / `clip.set_animation(slot, id)`.
+- **Prerequisite (landed)**: the **timeline → video file exporter** exists — `export_to_file(_observed)` in `cutlass-render` composites every frame and muxes H.264/AAC via `cutlass-encoder` (Apple VideoToolbox and Windows Media Foundation; Linux returns `Unsupported`), wired into the engine, desktop, and mobile.
 - **`get_frame(t) -> numpy`**: easy given `RgbaImage` is already `width/height/Vec<u8>`.
-- **Gap to close**: `CompositeLayer` handles video frames, RGBA bitmaps (text/stills/pen paths), solids, SDF shapes, per-layer color grades (clip filters/adjustments), and canvas-wide lane effect/filter/adjustment passes. Stickers still aren't composited, so they'd be dropped on export until filled in (see `ROADMAP.md`).
+- **Composited content**: `CompositeLayer` handles video frames, RGBA bitmaps (text/stills/pen paths/bundled stickers, including animated GIF/APNG/WebP sticker frames), solids, SDF shapes, per-clip masks/chroma and effect/transition chains, per-layer color grades (clip filters/adjustments), canvas-wide lane effect/filter/adjustment passes, and catalog look animations (entrance/exit/combo presets sampled at resolve time).
+- **Export audio**: the shared `ExportAudioMixer` varispeed-resamples retimed clips (speed / speed-curve ramps; pitch follows rate for now) and runs RNNoise on denoise-flagged clips; pitch-preserving time-stretch and reversed-clip audio are still deferred.

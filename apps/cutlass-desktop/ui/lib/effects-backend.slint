@@ -1,4 +1,4 @@
-import { CatalogEntry }from "../models/index.slint";
+import { CatalogEntry, StickerTile } from "../models/index.slint";
 
 // Effects & transitions backend (M4). The Library tabs browse the catalogs,
 // the inspector's Effects section edits a clip's chain, and the timeline's
@@ -9,6 +9,7 @@ export global EffectsBackend {
     // Browsable catalogs, populated once at startup.
     in-out property <[CatalogEntry]> effect-catalog: [];
     in-out property <[CatalogEntry]> transition-catalog: [];
+    in-out property <[StickerTile]> sticker-catalog: [];
 
     // Append `effect-id` to the clip's chain (one undoable edit).
     callback add-effect(clip-id: string, effect-id: string);

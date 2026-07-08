@@ -30,6 +30,7 @@ use cutlass_models::{
 use cutlass_shapes::{BezierPath, PathPoint, SDF_AA, SdfParams, Stroke};
 use cutlass_text::{FontFamily, TextAlign, TextStyle};
 
+use crate::animation::apply_look_animations;
 use crate::grade::resolve_color_grade;
 use crate::scene::{LayerSource, ResolvedPass, Scene, SceneLayer, SizeSpec};
 
@@ -301,11 +302,15 @@ fn resolve_clip(
 ) -> Result<Option<SceneLayer>, cutlass_models::ModelError> {
     // Clip-relative tick at the timeline rate (both `t` and the clip start are
     // expressed at it), which is what animated transforms key against.
-    let local_tick = t.value - clip.timeline.start.value;
+    let local_tick = clip.animation_tick(t.value);
+    let local_tick_f = clip.animation_tick_f(t.value as f64);
     // A live gesture replaces the whole sampled transform for its clip.
     let xf = match overrides.transform {
         Some((id, xf)) if id == clip.id => xf,
-        _ => clip.transform.sample(local_tick),
+        _ => {
+            let base = clip.transform.sample(local_tick);
+            apply_look_animations(clip, base, local_tick, local_tick_f, t.rate)
+        }
     };
 
     // `position` is the anchor's offset from the canvas center, as a fraction
@@ -384,6 +389,7 @@ fn resolve_clip(
                 ch,
                 xf.scale,
                 local_tick,
+                local_tick as f64 * t.rate.seconds_per_unit(),
                 effects,
             )
             .map(|mut layer| {
@@ -429,6 +435,7 @@ pub(crate) fn resolve_generator(
     ch: f32,
     scale: f32,
     tick: i64,
+    local_seconds: f64,
     effects: Vec<ResolvedPass>,
 ) -> Option<SceneLayer> {
     let ref_scale = ch / REFERENCE_HEIGHT;
@@ -497,9 +504,33 @@ pub(crate) fn resolve_generator(
         ),
         Generator::Effect => canvas_pass(effects, None, cw, ch),
         Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), color_grade, cw, ch),
-        // Stickers are not composited yet.
-        // Skip rather than draw something wrong.
-        Generator::Sticker => None,
+        Generator::Sticker { asset } => {
+            // Unknown/empty ids place nothing — the legacy payload-less
+            // sticker behavior, never an error.
+            let spec = cutlass_models::sticker_spec(asset)?;
+            // Intrinsic pixels are *reference pixels* (1080p canvas), the
+            // same convention as shapes: a 256 px sticker lands at a
+            // CapCut-like overlay size and samples ~1:1 instead of being
+            // blown up to canvas height like aspect-fit media.
+            let px = ref_scale * scale;
+            Some(SceneLayer {
+                clip: None,
+                source: LayerSource::Sticker {
+                    asset: asset.clone(),
+                    local_time: local_seconds,
+                },
+                center,
+                anchor_point,
+                size: SizeSpec::Fixed([spec.width as f32 * px, spec.height as f32 * px]),
+                rotation,
+                opacity,
+                uv,
+                effects,
+                mask: None,
+                chroma_key: None,
+                color_grade,
+            })
+        }
     }
 }
 
@@ -736,9 +767,9 @@ mod tests {
     use crate::grade::effective_grade;
     use crate::scene::{LayerSource, SizeSpec};
     use cutlass_models::{
-        CanvasAspect, CanvasSettings, ClipTransform, ColorAdjustments, CropRect, Filter, Generator,
-        MediaSource, Project, Rational, RationalTime, Shape, TextStyle as ModelTextStyle,
-        TimeRange, TrackKind,
+        AnimationRef, AnimationSlot, CanvasAspect, CanvasSettings, ClipTransform, ColorAdjustments,
+        CropRect, Filter, Generator, MediaSource, Project, Rational, RationalTime, Shape,
+        TextStyle as ModelTextStyle, TimeRange, TrackKind,
     };
 
     const FPS_24: Rational = Rational::FPS_24;
@@ -902,6 +933,79 @@ mod tests {
     }
 
     #[test]
+    fn sticker_generator_resolves_to_a_reference_scaled_layer() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(track, Generator::sticker("heart"), tr(0, 100))
+            .unwrap();
+
+        let scene = resolve(&project, rt(12)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        let layer = &scene.layers[0];
+        approx2(layer.center, [960.0, 540.0]);
+        // The heart asset is 256×256; intrinsic pixels are reference pixels,
+        // which map 1:1 on the 1080p canvas.
+        match layer.size {
+            SizeSpec::Fixed(size) => approx2(size, [256.0, 256.0]),
+            other => panic!("expected fixed size, got {other:?}"),
+        }
+        match &layer.source {
+            LayerSource::Sticker { asset, local_time } => {
+                assert_eq!(asset, "heart");
+                approx(*local_time as f32, 0.5); // tick 12 at 24 fps
+            }
+            other => panic!("expected sticker source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sticker_local_time_is_clip_relative() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(track, Generator::sticker("star_spin"), tr(24, 100))
+            .unwrap();
+
+        let scene = resolve(&project, rt(36)).unwrap();
+        match &scene.layers[0].source {
+            LayerSource::Sticker { local_time, .. } => approx(*local_time as f32, 0.5),
+            other => panic!("expected sticker source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_or_unknown_sticker_asset_places_nothing() {
+        // The legacy payload-less sticker (empty asset) loads but draws
+        // nothing, exactly like before the catalog existed.
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        project
+            .add_generated(track, Generator::sticker(""), tr(0, 100))
+            .unwrap();
+        assert!(resolve(&project, rt(5)).unwrap().layers.is_empty());
+
+        // Unknown ids can't enter via commands (validation), but the
+        // resolver stays graceful if one ever reaches it.
+        let layer = resolve_generator(
+            &Generator::sticker("not-a-sticker"),
+            [960.0, 540.0],
+            [0.5, 0.5],
+            0.0,
+            1.0,
+            [0.0, 0.0, 1.0, 1.0],
+            None,
+            1920.0,
+            1080.0,
+            1.0,
+            0,
+            0.0,
+            Vec::new(),
+        );
+        assert!(layer.is_none());
+    }
+
+    #[test]
     fn crop_and_horizontal_flip_set_uv() {
         let mut project = Project::new("p", FPS_24);
         let media = project.add_media(video(1920, 1080));
@@ -979,6 +1083,106 @@ mod tests {
             other => panic!("expected fixed size, got {other:?}"),
         }
         approx(layer.opacity, 0.5);
+    }
+
+    #[test]
+    fn look_animation_fade_in_ramps_opacity_at_clip_start() {
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_animation(clip, AnimationSlot::In, Some(AnimationRef::new("fade_in")))
+            .unwrap();
+
+        let start = resolve(&project, rt(0)).unwrap();
+        assert!(start.layers[0].opacity < 0.05);
+        let mid = resolve(&project, rt(50)).unwrap();
+        approx(mid.layers[0].opacity, 1.0);
+    }
+
+    #[test]
+    fn look_animation_slide_up_offsets_center_at_start() {
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_animation(clip, AnimationSlot::In, Some(AnimationRef::new("slide_up")))
+            .unwrap();
+
+        let start = resolve(&project, rt(0)).unwrap();
+        assert!(start.layers[0].center[1] > 540.0);
+        let mid = resolve(&project, rt(50)).unwrap();
+        approx2(mid.layers[0].center, [960.0, 540.0]);
+    }
+
+    #[test]
+    fn look_animation_zoom_in_scales_size_at_start() {
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_animation(clip, AnimationSlot::In, Some(AnimationRef::new("zoom_in")))
+            .unwrap();
+
+        let start = resolve(&project, rt(0)).unwrap();
+        match start.layers[0].size {
+            SizeSpec::Fixed(size) => assert!(size[0] < 1920.0 * 0.5),
+            other => panic!("expected fixed size, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn look_animation_fade_out_ramps_at_clip_tail() {
+        let mut project = Project::new("p", FPS_24);
+        let media = project.add_media(video(1920, 1080));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let clip = project.add_clip(track, media, tr(0, 100), rt(0)).unwrap();
+        project
+            .set_clip_animation(
+                clip,
+                AnimationSlot::Out,
+                Some(AnimationRef::new("fade_out")),
+            )
+            .unwrap();
+
+        let tail = resolve(&project, rt(99)).unwrap();
+        assert!(tail.layers[0].opacity < 0.05);
+        let mid = resolve(&project, rt(40)).unwrap();
+        approx(mid.layers[0].opacity, 1.0);
+    }
+
+    #[test]
+    fn look_animation_combo_loops_and_clears_in_out() {
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Sticker, "S1");
+        let clip = project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                tr(0, 100),
+            )
+            .unwrap();
+        project
+            .set_clip_animation(clip, AnimationSlot::In, Some(AnimationRef::new("fade_in")))
+            .unwrap();
+        project
+            .set_clip_animation(clip, AnimationSlot::Combo, Some(AnimationRef::new("pulse")))
+            .unwrap();
+
+        let a = resolve(&project, rt(0)).unwrap();
+        let b = resolve(&project, rt(6)).unwrap();
+        approx(a.layers[0].opacity, 1.0);
+        match (a.layers[0].size, b.layers[0].size) {
+            (SizeSpec::Fixed(sa), SizeSpec::Fixed(sb)) => {
+                assert!((sa[0] - sb[0]).abs() > 1.0);
+            }
+            other => panic!("expected fixed sizes, got {other:?}"),
+        }
     }
 
     #[test]

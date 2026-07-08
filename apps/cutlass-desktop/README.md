@@ -24,12 +24,13 @@ validation live in the shared engine and model crates.
 - Manage selection, snapping, trims, drag/drop, keyboard shortcuts, and canvas
   gestures.
 - Present export controls and progress.
-- The assistant panel ships stubbed on this line (`cutlass-ai` is a separate
-  port); the settings dialog carries the provider fields for when it lands.
+- Run the AI assistant panel: sandbox rehearsal, dry-run preview card, and
+  one-undo plan replay via `cutlass-ai` and `src/agent.rs`.
 
 ## Main Areas
 
 - `src/main.rs`: application startup and high-level UI callbacks.
+- `src/agent.rs`: AI assistant worker (sandbox rehearsal, plan replay).
 - `src/preview_worker.rs`: background engine owner — edits, autosave, preview
   pump, audio snapshots, export thread, live-gesture overrides.
 - `src/preview_view.rs`, `src/preview_select.rs`, `src/preview_gesture.rs`,

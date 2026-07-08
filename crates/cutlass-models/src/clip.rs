@@ -21,7 +21,10 @@ pub enum ClipSource {
 /// A synthetic clip with no source media. Parameters are intentionally minimal
 /// for now; richer styling (fonts, transforms, gradients) can be added per
 /// variant without touching the timeline model.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// `Deserialize` is hand-written (below the enum) for sticker back-compat;
+/// keep the mirror enum in that impl in sync when changing variants here.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum Generator {
     /// A title / text layer.
     ///
@@ -65,14 +68,139 @@ pub enum Generator {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stroke: Option<ShapeStroke>,
     },
-    /// Image or animated sticker (asset wiring TBD).
-    Sticker,
+    /// An image or animated sticker from the bundled catalog
+    /// ([`crate::sticker::sticker_catalog`]). `asset` is a catalog id. The
+    /// empty string — what payload-less pre-catalog projects deserialize to —
+    /// is valid and renders nothing, exactly like the old unit variant.
+    Sticker { asset: String },
     /// Motion / composited VFX layer (implementation TBD).
     Effect,
     /// Blur, mask, and similar pixel filters (implementation TBD).
     Filter,
     /// Color grade / pass-through layer affecting tracks beneath it.
     Adjustment,
+}
+
+/// Hand-written for one reason: sticker back-compat. `Sticker` used to be a
+/// unit variant (the bare JSON string `"Sticker"`); it now carries `{asset}`.
+/// A derived externally-tagged enum can't accept both shapes, so this looks
+/// at the input first: a bare string is one of the unit variants (including
+/// the legacy sticker), a map is the current tagged form, delegated to a
+/// derived mirror enum. Projects persist as JSON (self-describing), so
+/// `deserialize_any` is safe here.
+impl<'de> Deserialize<'de> for Generator {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        /// Field-for-field mirror of [`Generator`]'s tagged (map) forms,
+        /// carrying the deserialize-side serde attributes. The round-trip
+        /// test (`generator_roundtrips_through_custom_deserialize`) breaks
+        /// if it drifts from the real enum.
+        #[derive(Deserialize)]
+        #[serde(rename = "Generator")]
+        enum Tagged {
+            Text {
+                content: String,
+                #[serde(default)]
+                style: TextStyle,
+            },
+            SolidColor {
+                rgba: [u8; 4],
+            },
+            Shape {
+                shape: Shape,
+                #[serde(default = "default_shape_rgba")]
+                rgba: Param<[u8; 4]>,
+                #[serde(default = "default_shape_width")]
+                width: Param<f32>,
+                #[serde(default = "default_shape_height")]
+                height: Param<f32>,
+                #[serde(default = "zero_param")]
+                corner_radius: Param<f32>,
+                #[serde(default)]
+                stroke: Option<ShapeStroke>,
+            },
+            Sticker {
+                #[serde(default)]
+                asset: String,
+            },
+            Effect,
+            Filter,
+            Adjustment,
+        }
+
+        impl From<Tagged> for Generator {
+            fn from(t: Tagged) -> Generator {
+                match t {
+                    Tagged::Text { content, style } => Generator::Text { content, style },
+                    Tagged::SolidColor { rgba } => Generator::SolidColor { rgba },
+                    Tagged::Shape {
+                        shape,
+                        rgba,
+                        width,
+                        height,
+                        corner_radius,
+                        stroke,
+                    } => Generator::Shape {
+                        shape,
+                        rgba,
+                        width,
+                        height,
+                        corner_radius,
+                        stroke,
+                    },
+                    Tagged::Sticker { asset } => Generator::Sticker { asset },
+                    Tagged::Effect => Generator::Effect,
+                    Tagged::Filter => Generator::Filter,
+                    Tagged::Adjustment => Generator::Adjustment,
+                }
+            }
+        }
+
+        const VARIANTS: &[&str] = &[
+            "Text",
+            "SolidColor",
+            "Shape",
+            "Sticker",
+            "Effect",
+            "Filter",
+            "Adjustment",
+        ];
+
+        struct GeneratorVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for GeneratorVisitor {
+            type Value = Generator;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a Generator variant (bare string or single-key map)")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Generator, E> {
+                match v {
+                    // Legacy payload-less sticker (pre-catalog projects).
+                    "Sticker" => Ok(Generator::Sticker {
+                        asset: String::new(),
+                    }),
+                    "Effect" => Ok(Generator::Effect),
+                    "Filter" => Ok(Generator::Filter),
+                    "Adjustment" => Ok(Generator::Adjustment),
+                    other => Err(E::unknown_variant(other, VARIANTS)),
+                }
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Generator, A::Error> {
+                Tagged::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+                    .map(Generator::from)
+            }
+        }
+
+        deserializer.deserialize_any(GeneratorVisitor)
+    }
 }
 
 /// The geometry of a [`Generator::Shape`]: parametric figures the compositor
@@ -218,6 +346,13 @@ impl Generator {
         }
     }
 
+    /// A sticker generator referencing a bundled catalog asset.
+    pub fn sticker(asset: impl Into<String>) -> Self {
+        Generator::Sticker {
+            asset: asset.into(),
+        }
+    }
+
     /// A shape generator with the default drop size and fill color.
     pub fn shape(shape: Shape, rgba: [u8; 4]) -> Self {
         Generator::Shape {
@@ -258,6 +393,15 @@ impl Generator {
     /// [`crate::Project::add_generated`] / [`crate::Project::set_generator`]
     /// so a project never holds a shape the renderer would have to clamp.
     pub fn validate(&self) -> Result<(), ModelError> {
+        if let Generator::Sticker { asset } = self {
+            // Empty = legacy payload-less sticker; renders nothing but loads.
+            if !asset.is_empty() && crate::sticker::sticker_spec(asset).is_none() {
+                return Err(ModelError::InvalidParam(format!(
+                    "unknown sticker '{asset}'"
+                )));
+            }
+            return Ok(());
+        }
         let Generator::Shape {
             shape,
             rgba,
@@ -1489,9 +1633,10 @@ pub struct Clip {
     /// Noise reduction (CapCut "Reduce noise", M8 Phase 5): run this clip's
     /// audio through RNNoise to suppress steady background noise (hiss, hum,
     /// room tone) while keeping speech. Both audio mixers render the cleaned
-    /// signal and serve it 1:1; meaningful for clips on audio lanes, ignored
-    /// elsewhere. `false` (and absent from saves) when off, so old files load
-    /// unchanged.
+    /// signal; meaningful for clips on audio lanes, ignored elsewhere. Pitch-
+    /// preserving time-stretch for retimed clips is still deferred — varispeed
+    /// resampling is used today. `false` (and absent from saves) when off, so
+    /// old files load unchanged.
     #[serde(default, skip_serializing_if = "is_false")]
     pub denoise: bool,
     /// Normalized crop window into the content (CapCut crop, M1): only the
@@ -2206,6 +2351,59 @@ mod tests {
 
     fn media_clip(media: MediaId, source: TimeRange, timeline: TimeRange) -> Clip {
         Clip::from_media(media, source, timeline)
+    }
+
+    // --- generator serde compat -------------------------------------------
+
+    #[test]
+    fn legacy_bare_sticker_string_deserializes_to_empty_asset() {
+        let g: Generator = serde_json::from_value(serde_json::json!("Sticker")).unwrap();
+        assert_eq!(
+            g,
+            Generator::Sticker {
+                asset: String::new()
+            }
+        );
+        // Payload form without the field also defaults to empty.
+        let g: Generator = serde_json::from_value(serde_json::json!({"Sticker": {}})).unwrap();
+        assert_eq!(
+            g,
+            Generator::Sticker {
+                asset: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn generator_roundtrips_through_custom_deserialize() {
+        // One of each variant — pins the Deserialize mirror to the real enum.
+        let all = [
+            Generator::text("hi"),
+            Generator::SolidColor { rgba: [1, 2, 3, 4] },
+            Generator::shape(Shape::Ellipse, [9, 8, 7, 6]),
+            Generator::sticker("heart"),
+            Generator::Effect,
+            Generator::Filter,
+            Generator::Adjustment,
+        ];
+        for g in all {
+            let json = serde_json::to_value(&g).unwrap();
+            let back: Generator = serde_json::from_value(json.clone()).unwrap();
+            assert_eq!(back, g, "round-trip of {json}");
+        }
+    }
+
+    #[test]
+    fn unknown_generator_variant_errors_with_variant_name() {
+        let err = serde_json::from_value::<Generator>(serde_json::json!("Wombat")).unwrap_err();
+        assert!(err.to_string().contains("Wombat"), "{err}");
+    }
+
+    #[test]
+    fn sticker_validate_accepts_catalog_and_empty_ids_only() {
+        assert!(Generator::sticker("heart").validate().is_ok());
+        assert!(Generator::sticker("").validate().is_ok());
+        assert!(Generator::sticker("nope").validate().is_err());
     }
 
     // --- constructors -----------------------------------------------------

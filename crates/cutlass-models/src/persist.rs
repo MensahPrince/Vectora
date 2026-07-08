@@ -58,6 +58,9 @@ impl Project {
         // Keep the file's original (normalized) schema as provenance; the
         // writer re-stamps the current version on save.
         project.schema = schema;
+        // Files written before the main-track flag (or edited externally)
+        // re-derive the lane-zone / main-track invariants on entry.
+        project.timeline_mut().normalize_lanes();
         Ok(project)
     }
 }

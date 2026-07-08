@@ -104,11 +104,15 @@ pub enum Intent {
         #[serde(default = "default_overlay_seconds")]
         duration_seconds: f64,
     },
-    /// Drop a sticker clip (asset wiring comes with the sticker catalog).
+    /// Drop a sticker clip. `asset` is a catalog id
+    /// ([`cutlass_models::sticker_catalog`]); omitted (older callers) means
+    /// the first bundled sticker.
     AddSticker {
         at_seconds: f64,
         #[serde(default = "default_overlay_seconds")]
         duration_seconds: f64,
+        #[serde(default)]
+        asset: Option<String>,
     },
     /// Drop an effect / filter / adjustment bar.
     AddEffect {
@@ -254,11 +258,20 @@ pub fn run(engine: &mut Engine, intent: Intent) -> Result<serde_json::Value, Eng
         Intent::AddSticker {
             at_seconds,
             duration_seconds,
+            asset,
         } => grouped(engine, |e| {
+            let asset = asset
+                .clone()
+                .or_else(|| {
+                    cutlass_models::sticker_catalog()
+                        .first()
+                        .map(|s| s.id.to_owned())
+                })
+                .unwrap_or_default();
             add_generated(
                 e,
                 TrackKind::Sticker,
-                Generator::Sticker,
+                Generator::Sticker { asset },
                 at_seconds,
                 duration_seconds,
             )
@@ -513,6 +526,7 @@ fn ensure_host_lane(
                 kind,
                 name: default_lane_name(kind).into(),
                 index,
+                pinned: false,
             },
         ),
     }
@@ -529,6 +543,7 @@ fn ensure_main(engine: &mut Engine) -> Result<TrackId, EngineError> {
             kind: TrackKind::Video,
             name: "Main".into(),
             index: Some(0),
+            pinned: false,
         },
     )
 }

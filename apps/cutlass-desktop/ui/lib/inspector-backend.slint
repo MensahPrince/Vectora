@@ -58,6 +58,11 @@ export struct AudioSample {
 export global InspectorBackend {
     // Clip-level filter preset catalog, populated once at startup.
     in-out property <[CatalogEntry]> filter-catalog: [];
+    // Look animation preset catalogs, populated once at startup.
+    in-out property <[CatalogEntry]> animation-in-catalog: [];
+    in-out property <[CatalogEntry]> animation-out-catalog: [];
+    in-out property <[CatalogEntry]> animation-combo-catalog: [];
+    in-out property <[CatalogEntry]> animation-text-combo-catalog: [];
 
     pure callback resolve-selection(
         sequence: Sequence,
@@ -203,6 +208,10 @@ export global InspectorBackend {
     // Set (or clear with an empty id) a visual clip's filter preset. Intensity
     // is normalized 0..=1; the inspector displays it as 0..=100%.
     callback set-clip-filter(clip-id: string, filter-id: string, intensity: float);
+
+    // Set (or clear with an empty id) one look-animation slot: "in", "out",
+    // or "combo". One undoable edit; combo exclusivity is enforced by the model.
+    callback set-clip-animation(clip-id: string, slot: string, animation-id: string);
 
     // Set all five manual color adjustment sliders in one undoable edit.
     // Values are normalized -1..=1.

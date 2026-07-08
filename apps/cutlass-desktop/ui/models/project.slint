@@ -122,6 +122,15 @@ export struct CatalogEntry {
     label: string,
 }
 
+// A bundled sticker for the Library's Stickers tab: catalog id, display
+// label, and the decoded first-frame thumbnail. UI-only (the image isn't
+// serializable), unlike `CatalogEntry`.
+export struct StickerTile {
+    id: string,
+    label: string,
+    icon: image,
+}
+
 // Derived per-clip capabilities (inspector sections + context-menu gates).
 // Computed in src/projection.rs from engine content + lane kind — not
 // persisted.
@@ -291,6 +300,14 @@ export struct Clip {
     adjust-saturation: float,
     adjust-exposure: float,
     adjust-temperature: float,
+    // Look animation presets (CapCut In / Out / Combo tabs). Projected
+    // read-only — edits go through `InspectorBackend.set-clip-animation`.
+    animation-in-id: string,
+    animation-in-label: string,
+    animation-out-id: string,
+    animation-out-label: string,
+    animation-combo-id: string,
+    animation-combo-label: string,
     // Keyframe curves per animatable property (M2), in tick order with
     // ABSOLUTE sequence ticks. Empty ⇔ the property is a constant (read it
     // from `transform-*` above). Edits go through
@@ -376,6 +393,12 @@ export struct Track {
     muted: bool,
     locked: bool,
     duck-source: bool,
+    // Manual lanes survive empty auto-removal until explicitly deleted.
+    pinned: bool,
+    // CapCut's main track: the permanent magnetic video lane. Exactly one
+    // once any video lane exists; it can't be deleted or reordered and is
+    // the only lane rendered while empty.
+    is-main: bool,
     // Transitions at this track's clip junctions (M4), keyed by the left
     // (outgoing) clip. Empty ⇔ none.
     transitions: [TransitionView],
@@ -388,6 +411,8 @@ export struct TimelineMarker {
     tick: int,
     name: string,
     color: color,
+    // Palette name for round-tripping edits ("teal", "blue", …).
+    color-name: string,
 }
 
 @rust-attr(derive(serde::Serialize, serde::Deserialize))

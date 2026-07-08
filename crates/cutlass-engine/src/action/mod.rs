@@ -43,7 +43,25 @@ impl EditAction for CompoundAction {
     ) -> Result<Box<dyn EditAction>, EngineError> {
         let mut inverses = Vec::with_capacity(self.actions.len());
         for action in self.actions.into_iter().rev() {
-            inverses.push(action.apply(ctx)?);
+            match action.apply(ctx) {
+                Ok(inverse) => inverses.push(inverse),
+                Err(e) => {
+                    // A partially-applied compound would corrupt state (some
+                    // inner edits done, others not). Revert what we did apply
+                    // — running the produced inverses in reverse — so the
+                    // compound is all-or-nothing.
+                    for inverse in inverses.into_iter().rev() {
+                        if inverse.apply(ctx).is_err() {
+                            tracing::error!(
+                                "compound rollback failed after a partial apply; \
+                                 state may be inconsistent"
+                            );
+                            break;
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
         Ok(Box::new(CompoundAction { actions: inverses }))
     }
@@ -630,7 +648,8 @@ mod tests {
         // Gesture: AddTrack + AddGenerated. Inverses are stored in execution
         // order; undo must run them in reverse (remove the clip before its
         // track) or the second inverse hits an unknown clip.
-        let (track, inv_track) = add_track::execute(&mut ctx, TrackKind::Text, "T1", None).unwrap();
+        let (track, inv_track) =
+            add_track::execute(&mut ctx, TrackKind::Text, "T1", None, false).unwrap();
         let (clip, inv_clip) =
             add_generated::execute(&mut ctx, track, Generator::text("x"), tr(0, 10)).unwrap();
 
@@ -909,6 +928,75 @@ mod tests {
         ) -> Result<Box<dyn EditAction>, EngineError> {
             Ok(Box::new(NoopAction))
         }
+    }
+
+    /// Adds a throwaway track; its inverse removes it. Lets a compound test
+    /// observe a real, reversible mutation.
+    struct AddTrackTest;
+
+    impl EditAction for AddTrackTest {
+        fn apply(
+            self: Box<Self>,
+            ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            let id = ctx.project.add_track(TrackKind::Video, "tmp");
+            Ok(Box::new(RemoveTrackTest { id }))
+        }
+    }
+
+    struct RemoveTrackTest {
+        id: cutlass_models::TrackId,
+    }
+
+    impl EditAction for RemoveTrackTest {
+        fn apply(
+            self: Box<Self>,
+            ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            ctx.project
+                .timeline_mut()
+                .remove_track(self.id)
+                .ok_or(cutlass_models::ModelError::UnknownTrack(self.id))?;
+            Ok(Box::new(AddTrackTest))
+        }
+    }
+
+    /// Always fails without touching the project.
+    struct FailAction;
+
+    impl EditAction for FailAction {
+        fn apply(
+            self: Box<Self>,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            Err(cutlass_models::ModelError::InvalidRange.into())
+        }
+    }
+
+    #[test]
+    fn compound_rolls_back_when_an_inner_action_fails() {
+        let mut project = setup();
+        let mut project_path = None;
+        let mut history = History::new(8);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
+
+        // Inverses run in reverse of the vec: AddTrackTest applies first (adds
+        // a track), then FailAction fails. The already-applied AddTrackTest
+        // must be rolled back, leaving the project untouched.
+        let compound: Box<dyn EditAction> = Box::new(CompoundAction {
+            actions: vec![Box::new(FailAction), Box::new(AddTrackTest)],
+        });
+
+        let before = ctx.project.timeline().track_count();
+        assert!(
+            compound.apply(&mut ctx).is_err(),
+            "a failing inner action fails the compound"
+        );
+        assert_eq!(
+            ctx.project.timeline().track_count(),
+            before,
+            "the partial mutation was rolled back"
+        );
     }
 
     #[test]

@@ -101,6 +101,11 @@ pub struct Renderer {
     /// the project's still count, with each entry capped at
     /// [`cutlass_decoder::image::MAX_DECODE_DIMENSION`] on the long side.
     stills: HashMap<MediaId, RgbaImage>,
+    /// Decode-once cache for bundled stickers, keyed by catalog id: the whole
+    /// frame sequence (a static sticker is one frame) plus per-frame delays.
+    /// Bounded by the catalog (small, embedded assets); frame lookup on the
+    /// hot path is O(frames) over the delay table, no decode.
+    stickers: HashMap<String, StickerSequence>,
     /// Preferred decoder output mode. Apple and Windows start in
     /// [`OutputMode::Gpu`] so hardware-decoded surfaces (`CVPixelBuffer` /
     /// shared D3D11 NV12 textures) import into the compositor with no CPU
@@ -139,6 +144,7 @@ impl Renderer {
             paths: PathRaster::new(),
             decoders: HashMap::new(),
             stills: HashMap::new(),
+            stickers: HashMap::new(),
             decode_mode: default_decode_mode(),
             proxies: HashMap::new(),
             use_proxies: true,
@@ -527,6 +533,25 @@ impl Renderer {
                         color_grade,
                     });
                 }
+                LayerSource::Sticker { asset, local_time } => {
+                    // The resolver only emits catalog ids, but stay graceful:
+                    // an unknown id draws nothing rather than failing a frame.
+                    let Some(spec) = cutlass_models::sticker_spec(asset) else {
+                        continue;
+                    };
+                    self.ensure_sticker(spec)?;
+                    let frame_index = self.stickers[spec.id].frame_at(*local_time);
+                    let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                    realized.push(Realized::Sticker {
+                        asset: asset.clone(),
+                        frame_index,
+                        placement: place(size),
+                        uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
+                        color_grade,
+                    });
+                }
                 LayerSource::Shape {
                     params,
                     fill,
@@ -645,6 +670,7 @@ impl Renderer {
                     layer_storage.push(composite_from_realized(
                         outgoing.as_ref(),
                         &self.stills,
+                        &self.stickers,
                         out_effects,
                     ));
                     let out_idx = layer_storage.len() - 1;
@@ -660,6 +686,7 @@ impl Renderer {
                     layer_storage.push(composite_from_realized(
                         incoming.as_ref(),
                         &self.stills,
+                        &self.stickers,
                         in_effects,
                     ));
                     let in_idx = layer_storage.len() - 1;
@@ -680,7 +707,12 @@ impl Renderer {
                             chain.as_slice()
                         })
                         .unwrap_or(&[]);
-                    layer_storage.push(composite_from_realized(other, &self.stills, effects));
+                    layer_storage.push(composite_from_realized(
+                        other,
+                        &self.stills,
+                        &self.stickers,
+                        effects,
+                    ));
                     jobs.push(LayerJob::Plain {
                         storage_idx: layer_storage.len() - 1,
                     });
@@ -827,6 +859,22 @@ impl Renderer {
                     color_grade,
                 }
             }
+            LayerSource::Sticker { asset, local_time } => {
+                let spec = cutlass_models::sticker_spec(asset)
+                    .ok_or_else(|| RenderError::unsupported("unknown sticker asset"))?;
+                self.ensure_sticker(spec)?;
+                let frame_index = self.stickers[spec.id].frame_at(*local_time);
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                Realized::Sticker {
+                    asset: asset.clone(),
+                    frame_index,
+                    placement: place(size),
+                    uv: layer.uv,
+                    effects: layer.effects.clone(),
+                    fx,
+                    color_grade,
+                }
+            }
             LayerSource::Shape {
                 params,
                 fill,
@@ -959,6 +1007,8 @@ impl Renderer {
             canvas_h as f32,
             1.0,
             tick,
+            // Sizing doesn't depend on the animation clock.
+            0.0,
             Vec::new(),
         )?;
         match layer.size {
@@ -997,6 +1047,55 @@ impl Renderer {
         let image = cutlass_decoder::decode_image(src.path())?;
         self.stills.insert(media, image);
         Ok(())
+    }
+
+    /// Decode a bundled sticker's whole frame sequence into the cache on
+    /// first use (mirrors [`ensure_still`](Self::ensure_still)).
+    fn ensure_sticker(&mut self, spec: &cutlass_models::StickerSpec) -> Result<(), RenderError> {
+        if self.stickers.contains_key(spec.id) {
+            return Ok(());
+        }
+        let decoded = cutlass_decoder::decode_animation(spec.bytes)?;
+        let delays_ms: Vec<u32> = decoded.iter().map(|f| f.delay_ms).collect();
+        let total_ms = delays_ms.iter().map(|d| u64::from(*d)).sum();
+        self.stickers.insert(
+            spec.id.to_owned(),
+            StickerSequence {
+                frames: decoded.into_iter().map(|f| f.image).collect(),
+                delays_ms,
+                total_ms,
+            },
+        );
+        Ok(())
+    }
+}
+
+/// A decoded sticker asset: every frame up front plus per-frame delays, so
+/// per-composite frame selection is a table walk instead of a decode.
+struct StickerSequence {
+    frames: Vec<RgbaImage>,
+    /// Display duration per frame in milliseconds (parallel to `frames`).
+    delays_ms: Vec<u32>,
+    /// Sum of `delays_ms`.
+    total_ms: u64,
+}
+
+impl StickerSequence {
+    /// Index of the frame on screen at `local_time` seconds, looping over
+    /// the sequence. Static stickers (one frame) always show frame 0.
+    fn frame_at(&self, local_time: f64) -> usize {
+        if self.frames.len() <= 1 || self.total_ms == 0 {
+            return 0;
+        }
+        let ms = (local_time.max(0.0) * 1000.0) as u64 % self.total_ms;
+        let mut acc = 0u64;
+        for (index, delay) in self.delays_ms.iter().enumerate() {
+            acc += u64::from(*delay);
+            if ms < acc {
+                return index;
+            }
+        }
+        self.frames.len() - 1
     }
 }
 
@@ -1037,6 +1136,7 @@ fn pack_effects(resolved: &[ResolvedPass]) -> EffectChain {
 fn composite_from_realized<'a>(
     r: &'a Realized,
     stills: &'a HashMap<MediaId, RgbaImage>,
+    stickers: &'a HashMap<String, StickerSequence>,
     effects: &'a [PassInstance<'a>],
 ) -> CompositeLayer<'a> {
     match r {
@@ -1086,6 +1186,19 @@ fn composite_from_realized<'a>(
             .with_fx(*fx)
             .with_effects(effects)
             .with_color_grade(*color_grade),
+        Realized::Sticker {
+            asset,
+            frame_index,
+            placement,
+            uv,
+            fx,
+            color_grade,
+            ..
+        } => CompositeLayer::rgba(&stickers[asset].frames[*frame_index], *placement)
+            .with_uv(*uv)
+            .with_fx(*fx)
+            .with_effects(effects)
+            .with_color_grade(*color_grade),
         Realized::Sdf {
             shape,
             placement,
@@ -1130,6 +1243,15 @@ enum Realized {
         fx: LayerEffects,
         color_grade: Option<ColorGrade>,
     },
+    Sticker {
+        asset: String,
+        frame_index: usize,
+        placement: LayerPlacement,
+        uv: [f32; 4],
+        effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
+        color_grade: Option<ColorGrade>,
+    },
     Bitmap {
         image: RgbaImage,
         placement: LayerPlacement,
@@ -1161,6 +1283,7 @@ impl Realized {
             Realized::CanvasPass { effects, .. } => Some(effects),
             Realized::Frame { effects, .. }
             | Realized::Still { effects, .. }
+            | Realized::Sticker { effects, .. }
             | Realized::Bitmap { effects, .. }
             | Realized::Solid { effects, .. }
             | Realized::Sdf { effects, .. } => Some(effects),
@@ -1267,4 +1390,41 @@ fn open_decoder(_path: &Path, _mode: OutputMode) -> Result<Box<dyn VideoDecoder>
     Err(RenderError::unsupported(
         "no native video decoder for this platform",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StickerSequence;
+    use cutlass_core::RgbaImage;
+
+    fn seq(delays_ms: &[u32]) -> StickerSequence {
+        StickerSequence {
+            frames: delays_ms
+                .iter()
+                .map(|_| RgbaImage::new(1, 1, vec![0; 4]))
+                .collect(),
+            delays_ms: delays_ms.to_vec(),
+            total_ms: delays_ms.iter().map(|d| u64::from(*d)).sum(),
+        }
+    }
+
+    #[test]
+    fn sticker_frame_selection_walks_delays_and_loops() {
+        let s = seq(&[100, 50, 100]);
+        assert_eq!(s.frame_at(0.0), 0);
+        assert_eq!(s.frame_at(0.099), 0);
+        assert_eq!(s.frame_at(0.100), 1);
+        assert_eq!(s.frame_at(0.149), 1);
+        assert_eq!(s.frame_at(0.150), 2);
+        // Loops at total (250 ms) and clamps negatives to the first frame.
+        assert_eq!(s.frame_at(0.250), 0);
+        assert_eq!(s.frame_at(0.601), 1);
+        assert_eq!(s.frame_at(-1.0), 0);
+    }
+
+    #[test]
+    fn static_stickers_always_show_frame_zero() {
+        let s = seq(&[100]);
+        assert_eq!(s.frame_at(12.34), 0);
+    }
 }

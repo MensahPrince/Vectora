@@ -1,15 +1,13 @@
 # cutlass-py API design (v2)
 
-A redesign proposal for the `cutlass` Python package. The current API is a
-flat `Project` with a handful of `add_*` calls; this document proposes a
-track-first object model that matches how the Rust engine actually works,
-with code samples for every surface. Nothing here requires new engine
-features — every call maps onto an existing `cutlass-models` /
-`cutlass-render` / `cutlass-decoder` API (see the mapping table at the end).
+Reference for the shipped v2 `cutlass` Python package: a track-first object
+model that matches how the Rust engine works, with code samples for every
+surface. Every call maps onto an existing `cutlass-models` / `cutlass-render` /
+`cutlass-decoder` API (see the mapping table at the end).
 
-## Why redesign
+## Motivation
 
-Problems with the shipped API:
+Problems with the retired flat v1 API:
 
 - **Tracks exist but do nothing.** `add_track()` returns an id that no other
   method accepts. `add_solid()` / `add_text()` silently create a *new* track
@@ -121,7 +119,7 @@ Project.load(path) -> Project
 
 | Member | Description |
 |---|---|
-| `p.import_media(path) -> Media` | Probe a video or audio file and register it in the pool. Still images are deferred (renderer has no still decoder yet). |
+| `p.import_media(path) -> Media` | Probe a video, audio, or still-image file and register it in the pool. Stills get `kind == "image"` and a 5 s default duration. |
 | `p.remove_media(media)` | Drop a pool entry; errors if any clip references it. |
 | `p.media -> list[Media]` | The pool. |
 | `p.add_track(kind, name="", index=None) -> Track` | New track. `kind` is `"video" \| "audio" \| "text" \| "sticker" \| "effect" \| "filter" \| "adjustment"`. `index=None` stacks on top; `0` is the bottom. |
@@ -143,7 +141,7 @@ on the timeline many times.
 ```python
 m = p.import_media("beach.mp4")
 m.path        # "/abs/path/beach.mp4"
-m.kind        # "video" | "audio"
+m.kind        # "video" | "audio" | "image"
 m.duration    # seconds
 m.size        # (w, h)   — (0, 0) for audio-only
 m.fps         # native frame rate
@@ -208,6 +206,9 @@ track.end              # content end in seconds (0.0 when empty)
 
 track.name             # get/set
 track.kind             # "video" | "audio" | …  (read-only)
+track.main             # True on the main video track (read-only; CapCut
+                       # semantics: designated automatically, audio-only
+                       # lanes may sit below it, everything else stacks above)
 track.enabled = False  # video: excluded from the composite
 track.muted   = True   # audio: silenced
 track.locked  = True   # editing lock (engine semantics)
@@ -448,9 +449,6 @@ failure.
 
 ## Out of scope for v1 (deliberately)
 
-- **Still images** — the model supports `MediaSource::image`, but the renderer
-  skips non-video media until a still decoder lands; `import_media` rejects
-  common still extensions with `MediaError` in v1.
 - **Speed curves** (`set_clip_speed_curve`) — the normalized-ramp domain
   needs its own design; flat speed + reverse covers the common cases.
 - **Markers, templates, linked audio detach** — engine features that can

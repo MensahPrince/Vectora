@@ -14,12 +14,12 @@
 //!   hovering it resolves to an *insertion* between clips (caret instead of
 //!   a free landing ghost); the commit shifts later clips right.
 
-use slint::{Model, ModelRc, VecModel};
+use slint::{Model, ModelRc, SharedString, VecModel};
 use std::rc::Rc;
 
 use crate::{
     ClipDragResolution, ClipTrimResolution, GroupGhost, LibraryDropResolution, Sequence,
-    SnapResult, TrackKind,
+    SnapResult, TrackKind, TransitionJunctionResolution,
 };
 
 pub fn compute_drag_snap(
@@ -63,6 +63,12 @@ pub fn compute_drag_snap(
 
     consider(0);
     consider(playhead_tick);
+
+    for marker_idx in 0..sequence.markers.row_count() {
+        if let Some(marker) = sequence.markers.row_data(marker_idx) {
+            consider(marker.tick);
+        }
+    }
 
     for track_idx in 0..sequence.tracks.row_count() {
         let Some(track) = sequence.tracks.row_data(track_idx) else {
@@ -245,11 +251,26 @@ pub fn resolve_library_drop(
     main_magnet: bool,
 ) -> LibraryDropResolution {
     let track_count = sequence.tracks.row_count() as i32;
-    let row_track = (0..track_count)
+    let mut drop_row = drop_row;
+    let mut row_track = (0..track_count)
         .contains(&drop_row)
         .then(|| sequence.tracks.row_data(drop_row as usize))
         .flatten()
         .filter(|t| t.kind == lane_kind && !t.locked);
+
+    // A video drop that misses every video lane falls back to the *empty*
+    // main track (CapCut: the first video dragged anywhere fills the main
+    // lane) — mirrors the worker's landing so the ghost never lies.
+    if lane_kind == TrackKind::Video
+        && row_track.is_none()
+        && let Some(main_row) = main_video_row(sequence)
+        && let Some(main) = sequence.tracks.row_data(main_row as usize)
+        && main.clips.row_count() == 0
+        && !main.locked
+    {
+        drop_row = main_row;
+        row_track = Some(main);
+    }
 
     if lane_kind == TrackKind::Video
         && main_magnet
@@ -293,20 +314,104 @@ pub fn resolve_library_drop(
     }
 }
 
-/// Lane-list row of the main track: the *bottom* video lane. Rows are
-/// top-first, so that's the last video row; `None` without any video lane.
-fn main_video_row(sequence: &Sequence) -> Option<i32> {
-    let mut main = None;
-    for idx in 0..sequence.tracks.row_count() {
-        if sequence
-            .tracks
-            .row_data(idx)
-            .is_some_and(|t| t.kind == TrackKind::Video)
-        {
-            main = Some(idx as i32);
+/// Find the nearest abutting clip junction on `hover_row` within
+/// `snap_threshold_ticks` of `cursor_tick` (transition drag-and-drop).
+pub fn resolve_transition_junction(
+    sequence: &Sequence,
+    cursor_tick: i32,
+    hover_row: i32,
+    snap_threshold_ticks: i32,
+) -> TransitionJunctionResolution {
+    if snap_threshold_ticks <= 0 {
+        return TransitionJunctionResolution {
+            valid: false,
+            left_clip_id: Default::default(),
+            cut_tick: 0,
+            row: hover_row,
+        };
+    }
+    let track_count = sequence.tracks.row_count() as i32;
+    if hover_row < 0 || hover_row >= track_count {
+        return TransitionJunctionResolution {
+            valid: false,
+            left_clip_id: Default::default(),
+            cut_tick: 0,
+            row: hover_row,
+        };
+    }
+    let Some(track) = sequence.tracks.row_data(hover_row as usize) else {
+        return TransitionJunctionResolution {
+            valid: false,
+            left_clip_id: Default::default(),
+            cut_tick: 0,
+            row: hover_row,
+        };
+    };
+    if track.locked {
+        return TransitionJunctionResolution {
+            valid: false,
+            left_clip_id: Default::default(),
+            cut_tick: 0,
+            row: hover_row,
+        };
+    }
+
+    let mut spans: Vec<(SharedString, i32, i32)> = Vec::new();
+    for idx in 0..track.clips.row_count() {
+        let Some(clip) = track.clips.row_data(idx) else {
+            continue;
+        };
+        let start = clip.timeline_start.value;
+        let end = start.saturating_add(clip.source_range.duration.value);
+        spans.push((clip.id.clone(), start, end));
+    }
+    spans.sort_by_key(|(_, start, _)| *start);
+
+    let mut best_dist = snap_threshold_ticks + 1;
+    let mut best_left = SharedString::default();
+    let mut best_cut = 0;
+    for window in spans.windows(2) {
+        let (left_id, _, left_end) = &window[0];
+        let (_, right_start, _) = &window[1];
+        if left_end != right_start {
+            continue;
+        }
+        let cut = *left_end;
+        let dist = (cut - cursor_tick).abs();
+        if dist <= snap_threshold_ticks && dist < best_dist {
+            best_dist = dist;
+            best_left = left_id.clone();
+            best_cut = cut;
         }
     }
-    main
+
+    if best_dist <= snap_threshold_ticks {
+        TransitionJunctionResolution {
+            valid: true,
+            left_clip_id: best_left,
+            cut_tick: best_cut,
+            row: hover_row,
+        }
+    } else {
+        TransitionJunctionResolution {
+            valid: false,
+            left_clip_id: Default::default(),
+            cut_tick: 0,
+            row: hover_row,
+        }
+    }
+}
+
+/// Lane-list row of the main track (the projection's `is-main` flag).
+/// `None` without any video lane.
+fn main_video_row(sequence: &Sequence) -> Option<i32> {
+    (0..sequence.tracks.row_count()).find_map(|idx| {
+        sequence
+            .tracks
+            .row_data(idx)
+            .is_some_and(|t| t.is_main)
+            .then_some(idx as i32)
+    })
 }
 
 /// An insertion slot on the (gapless) main lane.
@@ -756,11 +861,19 @@ mod tests {
             muted: false,
             locked: false,
             duck_source: false,
+            pinned: false,
+            is_main: false,
             transitions: ModelRc::default(),
         }
     }
 
-    fn sequence(tracks: Vec<Track>) -> Sequence {
+    fn sequence(mut tracks: Vec<Track>) -> Sequence {
+        // The model designates the bottom video lane as the main track and
+        // the projection publishes the flag; mirror that here (rows are
+        // top-first, so the bottom lane is the last video entry).
+        if let Some(main) = tracks.iter_mut().rev().find(|t| t.kind == TrackKind::Video) {
+            main.is_main = true;
+        }
         Sequence {
             id: SharedString::from("1"),
             name: SharedString::from("Sequence 1"),

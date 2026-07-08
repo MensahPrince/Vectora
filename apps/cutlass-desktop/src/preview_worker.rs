@@ -3,8 +3,7 @@
 //! Ported from main's crates/cutlass-ui onto this branch's engine: engine
 //! ownership, the full edit/project message set, debounced autosave, the
 //! fit-sized preview pump, audio snapshots, thumbnail/strip registration,
-//! export, and live gesture/generator overrides. Still pending: the AI agent
-//! bridge (separate port).
+//! export, live gesture/generator overrides, and the AI agent bridge.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -20,12 +19,13 @@ use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, SeekPolicy};
 use cutlass_models::{
     AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
     Easing, Filter, Generator, LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param,
-    ParamValue, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
+    ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
 };
 use cutlass_render::{ExportSettings, RenderError, Renderer};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
 use tracing::{debug, error, info, warn};
 
+use crate::agent::{AgentCreated, AgentPlanStep};
 use crate::proxy::ProxyHandle;
 use crate::strips::StripHandle;
 use crate::thumbnails::{ThumbKind, ThumbnailHandle};
@@ -92,16 +92,20 @@ enum WorkerMsg {
         drop_row: i64,
         insert: bool,
     },
-    /// Place a generated clip (text title, solid, shape) at `start_tick` on
-    /// `track` (raw id of a matching-kind lane), or create a lane of the
-    /// generator's kind at `drop_row` when `track` is empty. Generated lanes
-    /// are never the main track, so there's no ripple-insert path.
+    /// Place a generated clip (text title, solid, shape, effect) at
+    /// `start_tick` on `track` (raw id of a matching-kind lane), or create a
+    /// lane of the generator's kind at `drop_row` when `track` is empty.
+    /// Generated lanes are never the main track, so there's no ripple-insert
+    /// path. `effect` seeds the new clip's effect chain — a standalone
+    /// effect-lane segment dropped from the Effects catalog (CapCut's
+    /// effect-as-track-clip).
     AddGenerated {
         generator: Generator,
         track: String,
         start_tick: i64,
         duration_ticks: i64,
         drop_row: i64,
+        effect: Option<String>,
     },
     /// Move `clip` (raw id) to `track` at `start_tick`, or — when `track` is
     /// empty — to a new lane of the clip's kind inserted at `insert_row`.
@@ -261,6 +265,12 @@ enum WorkerMsg {
         clip: String,
         adjust: ColorAdjustments,
     },
+    /// Set (or clear) one look-animation slot on a visual clip.
+    SetClipAnimation {
+        clip: String,
+        slot: String,
+        animation_id: String,
+    },
     /// Live color-grading preview: replace one clip's filter + adjustments
     /// through the engine's session-only look override. Bursts coalesce to
     /// the newest like transform/generator overrides.
@@ -413,6 +423,27 @@ enum WorkerMsg {
     RemoveMarker {
         marker: String,
     },
+    /// Move / rename / recolor a ruler marker. One undoable history entry.
+    SetMarker {
+        marker: String,
+        at_tick: i64,
+        name: String,
+        color: String,
+    },
+    /// Remove a track explicitly (context menu), even when non-empty.
+    RemoveTrackManual {
+        track: String,
+    },
+    /// Reorder a track in the stack (0 = bottom layer).
+    MoveTrackManual {
+        track: String,
+        index: usize,
+    },
+    /// Rename a track lane.
+    SetTrackName {
+        track: String,
+        name: String,
+    },
     /// Step the engine history one entry back / forward.
     Undo,
     Redo,
@@ -510,9 +541,19 @@ enum WorkerMsg {
     RenameProject {
         name: String,
     },
-    // PORT (later): main's `SnapshotProject` / `AgentApplyPlan` round-trips
-    // return with the cutlass-ai port (the agent rehearses on a sandbox
-    // clone, then replays the plan here as one history group).
+    /// Clone the live project for the AI agent's sandbox rehearsal
+    /// (`src/agent.rs`). Ordered with mutations, so the snapshot always
+    /// reflects every edit sent before it.
+    SnapshotProject {
+        reply: Sender<Project>,
+    },
+    /// Replay a rehearsed agent plan as one history group, re-validating
+    /// every step against the live project and remapping ids the sandbox
+    /// allocated. All-or-nothing: any failure rolls the group back.
+    AgentApplyPlan {
+        steps: Vec<AgentPlanStep>,
+        reply: Sender<Result<(), String>>,
+    },
 }
 
 /// Dialog settings for one export job (see `ui/lib/export-backend.slint`).
@@ -616,6 +657,24 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::RenameProject { name });
     }
 
+    /// Synchronous round-trip: clone of the live project as of every edit
+    /// sent before this call. `None` only if the worker thread is gone.
+    pub fn snapshot_project(&self) -> Option<Project> {
+        let (reply, rx) = bounded(1);
+        self.tx.send(WorkerMsg::SnapshotProject { reply }).ok()?;
+        rx.recv().ok()
+    }
+
+    /// Synchronous round-trip: replay a rehearsed agent plan as one undo
+    /// entry. `None` only if the worker thread is gone.
+    pub fn agent_apply_plan(&self, steps: Vec<AgentPlanStep>) -> Option<Result<(), String>> {
+        let (reply, rx) = bounded(1);
+        self.tx
+            .send(WorkerMsg::AgentApplyPlan { steps, reply })
+            .ok()?;
+        rx.recv().ok()
+    }
+
     pub fn relink_media(&self, media: String, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::RelinkMedia { media, path });
     }
@@ -660,6 +719,7 @@ impl WorkerHandle {
         start_tick: i64,
         duration_ticks: i64,
         drop_row: i64,
+        effect: Option<String>,
     ) {
         let _ = self.tx.send(WorkerMsg::AddGenerated {
             generator,
@@ -667,6 +727,7 @@ impl WorkerHandle {
             start_tick,
             duration_ticks,
             drop_row,
+            effect,
         });
     }
 
@@ -725,6 +786,27 @@ impl WorkerHandle {
 
     pub fn remove_marker(&self, marker: String) {
         let _ = self.tx.send(WorkerMsg::RemoveMarker { marker });
+    }
+
+    pub fn set_marker(&self, marker: String, at_tick: i64, name: String, color: String) {
+        let _ = self.tx.send(WorkerMsg::SetMarker {
+            marker,
+            at_tick,
+            name,
+            color,
+        });
+    }
+
+    pub fn remove_track_manual(&self, track: String) {
+        let _ = self.tx.send(WorkerMsg::RemoveTrackManual { track });
+    }
+
+    pub fn move_track_manual(&self, track: String, index: usize) {
+        let _ = self.tx.send(WorkerMsg::MoveTrackManual { track, index });
+    }
+
+    pub fn set_track_name(&self, track: String, name: String) {
+        let _ = self.tx.send(WorkerMsg::SetTrackName { track, name });
     }
 
     pub fn set_generator(&self, clip: String, generator: Generator) {
@@ -839,6 +921,14 @@ impl WorkerHandle {
 
     pub fn set_clip_adjust(&self, clip: String, adjust: ColorAdjustments) {
         let _ = self.tx.send(WorkerMsg::SetClipAdjust { clip, adjust });
+    }
+
+    pub fn set_clip_animation(&self, clip: String, slot: String, animation_id: String) {
+        let _ = self.tx.send(WorkerMsg::SetClipAnimation {
+            clip,
+            slot,
+            animation_id,
+        });
     }
 
     pub fn preview_clip_look(
@@ -1217,6 +1307,7 @@ fn worker_loop(
                 start_tick,
                 duration_ticks,
                 drop_row,
+                effect,
             } => add_generated_and_publish(
                 engine,
                 generator,
@@ -1224,6 +1315,7 @@ fn worker_loop(
                 start_tick,
                 duration_ticks,
                 drop_row,
+                effect.as_deref(),
                 &ui,
             ),
             WorkerMsg::MoveClip {
@@ -1340,6 +1432,11 @@ fn worker_loop(
             WorkerMsg::SetClipAdjust { clip, adjust } => {
                 set_clip_adjust_and_publish(engine, &clip, adjust, &ui)
             }
+            WorkerMsg::SetClipAnimation {
+                clip,
+                slot,
+                animation_id,
+            } => set_clip_animation_and_publish(engine, &clip, &slot, &animation_id, &ui),
             // Only reached when a look-preview burst interleaves with another
             // coalesced gesture's drain. The dedicated loop arm coalesces the
             // common case.
@@ -1492,6 +1589,21 @@ fn worker_loop(
                 color,
             } => add_marker_and_publish(engine, at_tick, &name, &color, tl_rate, &ui),
             WorkerMsg::RemoveMarker { marker } => remove_marker_and_publish(engine, &marker, &ui),
+            WorkerMsg::SetMarker {
+                marker,
+                at_tick,
+                name,
+                color,
+            } => set_marker_and_publish(engine, &marker, at_tick, &name, &color, tl_rate, &ui),
+            WorkerMsg::RemoveTrackManual { track } => {
+                remove_track_manual_and_publish(engine, &track, &ui)
+            }
+            WorkerMsg::MoveTrackManual { track, index } => {
+                move_track_manual_and_publish(engine, &track, index, &ui)
+            }
+            WorkerMsg::SetTrackName { track, name } => {
+                set_track_name_and_publish(engine, &track, &name, &ui)
+            }
             WorkerMsg::Undo => history_step_and_publish(engine, false, &ui),
             WorkerMsg::Redo => history_step_and_publish(engine, true, &ui),
             WorkerMsg::CopyClips { clips } => {
@@ -1540,6 +1652,12 @@ fn worker_loop(
             }
             WorkerMsg::NewProject => new_project_and_publish(engine, &ui),
             WorkerMsg::RenameProject { name } => rename_project_and_publish(engine, name, &ui),
+            WorkerMsg::SnapshotProject { reply } => {
+                let _ = reply.send(engine.project().clone());
+            }
+            WorkerMsg::AgentApplyPlan { steps, reply } => {
+                let _ = reply.send(agent_apply_and_publish(engine, steps, &ui));
+            }
             WorkerMsg::Frame(_) => unreachable!("frames are handled by the drain below"),
             WorkerMsg::TransformOverride { .. } => {
                 unreachable!("overrides are handled by the drain below")
@@ -2092,6 +2210,9 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::DuplicateClips { .. }
             | WorkerMsg::Undo
             | WorkerMsg::Redo
+            // A replayed agent plan can create/move/restyle any clip; repaint
+            // the canvas so the result is visible without a scrub.
+            | WorkerMsg::AgentApplyPlan { .. }
             | WorkerMsg::SetMainMagnet(_)
             | WorkerMsg::SetTrackFlag { .. }
             | WorkerMsg::OpenProject { .. }
@@ -2915,8 +3036,13 @@ fn add_clip_and_publish(
     let desired = start_tick.max(0);
 
     // One history entry per drop, even when it creates the landing lane.
+    // A video drop that misses every lane falls back to the empty main
+    // track before creating an overlay lane (CapCut: the first video
+    // dragged anywhere fills the main track).
     engine.begin_group();
-    let (track_id, start_value) = match lane_of_kind(engine, track, lane_kind) {
+    let (track_id, start_value) = match lane_of_kind(engine, track, lane_kind)
+        .or_else(|| empty_main_lane(engine, lane_kind))
+    {
         Some(lane) => {
             let lane_track = engine
                 .project()
@@ -2967,9 +3093,11 @@ fn add_clip_and_publish(
     }
 }
 
-/// Place a generated clip (text/solid/shape) from a library-tile drop. One
-/// history entry, even when it creates the landing lane; rolled back on a
-/// rejected placement so a lane made for the drop doesn't linger.
+/// Place a generated clip (text/solid/shape/effect) from a library-tile
+/// drop. One history entry, even when it creates the landing lane; rolled
+/// back on a rejected placement so a lane made for the drop doesn't linger.
+/// `effect` seeds the new clip's chain (standalone effect-lane segments).
+#[allow(clippy::too_many_arguments)]
 fn add_generated_and_publish(
     engine: &mut Engine,
     generator: Generator,
@@ -2977,6 +3105,7 @@ fn add_generated_and_publish(
     start_tick: i64,
     duration_ticks: i64,
     drop_row: i64,
+    effect: Option<&str>,
     ui: &UiSink,
 ) {
     let Some(lane_kind) = TrackKind::for_generator(&generator) else {
@@ -3017,6 +3146,19 @@ fn add_generated_and_publish(
     let content = ClipSource::Generated(generator);
     match add_clip_content(engine, track_id, &content, duration, start_value) {
         Ok(clip) => {
+            // Effect drops carry the catalog effect onto the fresh segment's
+            // chain, still inside the drop's history group.
+            if let Some(effect_id) = effect
+                && let Err(e) = engine.apply(Command::Edit(EditCommand::AddEffect {
+                    clip,
+                    effect_id: effect_id.to_string(),
+                }))
+            {
+                error!(%clip, effect_id, "effect drop failed adding effect: {e}");
+                engine.rollback_group();
+                publish_projection(engine, ui);
+                return;
+            }
             engine.commit_group();
             info!(%clip, %track_id, start_tick = start_value, "added generated clip from drop");
             publish_projection(engine, ui);
@@ -3484,6 +3626,47 @@ fn set_clip_adjust_and_publish(
     publish_projection(engine, ui);
 }
 
+fn set_clip_animation_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    slot: &str,
+    animation_id: &str,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-animation ignored: unparsable clip id");
+        return;
+    };
+    let Some(animation_slot) = parse_animation_slot(slot) else {
+        error!(slot, "set-clip-animation ignored: unknown slot");
+        return;
+    };
+    let animation = if animation_id.is_empty() {
+        None
+    } else {
+        Some(cutlass_models::AnimationRef::new(animation_id))
+    };
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipAnimation {
+        clip: clip_id,
+        slot: animation_slot,
+        animation,
+    })) {
+        error!(%clip_id, slot, animation_id, "set clip animation failed: {e}");
+        return;
+    }
+    info!(%clip_id, slot, animation_id, "set clip animation");
+    publish_projection(engine, ui);
+}
+
+fn parse_animation_slot(slot: &str) -> Option<cutlass_models::AnimationSlot> {
+    match slot {
+        "in" => Some(cutlass_models::AnimationSlot::In),
+        "out" => Some(cutlass_models::AnimationSlot::Out),
+        "combo" => Some(cutlass_models::AnimationSlot::Combo),
+        _ => None,
+    }
+}
+
 /// Append a catalog effect to a clip's chain (M4). One undoable entry; the
 /// composite repaints because effects are visual.
 fn add_effect_and_publish(engine: &mut Engine, clip: &str, effect_id: &str, ui: &UiSink) {
@@ -3651,6 +3834,102 @@ fn remove_marker_and_publish(engine: &mut Engine, marker: &str, ui: &UiSink) {
     }
 }
 
+/// Move / rename / recolor a ruler marker (M1). One undoable history entry.
+fn set_marker_and_publish(
+    engine: &mut Engine,
+    marker: &str,
+    at_tick: i64,
+    name: &str,
+    color: &str,
+    tl_rate: Rational,
+    ui: &UiSink,
+) {
+    let Some(marker_id) = parse_raw_id(marker).map(MarkerId::from_raw) else {
+        error!(marker, "set-marker ignored: unparsable marker id");
+        return;
+    };
+    let at = RationalTime::new(at_tick.max(0), tl_rate);
+    let color = parse_marker_color(color)
+        .or_else(|| {
+            engine
+                .project()
+                .timeline()
+                .marker(marker_id)
+                .map(|m| m.color)
+        })
+        .unwrap_or(MarkerColor::Teal);
+    match engine.apply(Command::Edit(EditCommand::SetMarker {
+        marker: marker_id,
+        at,
+        name: name.to_string(),
+        color,
+    })) {
+        Ok(_) => {
+            info!(%marker_id, at_tick, "updated timeline marker");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!(%marker_id, "set marker failed: {e}"),
+    }
+}
+
+fn remove_track_manual_and_publish(engine: &mut Engine, track: &str, ui: &UiSink) {
+    let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
+        error!(track, "remove-track ignored: unparsable track id");
+        return;
+    };
+    // CapCut never deletes the main track (the UI hides the menu item; this
+    // guards races where the projection lagged a main-lane promotion).
+    if Some(track_id) == main_video_track(engine) {
+        info!(%track_id, "remove-track ignored: main track is permanent");
+        return;
+    }
+    match engine.apply(Command::Edit(EditCommand::RemoveTrack { track: track_id })) {
+        Ok(_) => {
+            info!(%track_id, "removed track");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!(%track_id, "remove track failed: {e}"),
+    }
+}
+
+fn move_track_manual_and_publish(engine: &mut Engine, track: &str, index: usize, ui: &UiSink) {
+    let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
+        error!(track, "move-track ignored: unparsable track id");
+        return;
+    };
+    match engine.apply(Command::Edit(EditCommand::MoveTrack {
+        track: track_id,
+        index,
+    })) {
+        Ok(_) => {
+            info!(%track_id, index, "moved track");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!(%track_id, index, "move track failed: {e}"),
+    }
+}
+
+fn set_track_name_and_publish(engine: &mut Engine, track: &str, name: &str, ui: &UiSink) {
+    let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
+        error!(track, "set-track-name ignored: unparsable track id");
+        return;
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    match engine.apply(Command::Edit(EditCommand::SetTrackName {
+        track: track_id,
+        name: trimmed.to_string(),
+    })) {
+        Ok(_) => {
+            info!(%track_id, name = trimmed, "renamed track");
+            publish_projection(engine, ui);
+        }
+        Err(e) => error!(%track_id, "rename track failed: {e}"),
+    }
+}
+
 fn parse_marker_color(name: &str) -> Option<MarkerColor> {
     match name {
         "teal" => Some(MarkerColor::Teal),
@@ -3750,6 +4029,20 @@ fn lane_of_kind(engine: &Engine, track: &str, kind: TrackKind) -> Option<TrackId
         .track(id)
         .is_some_and(|t| t.kind == kind)
         .then_some(id)
+}
+
+/// The main lane while it's still empty — CapCut lands the first video
+/// dropped *anywhere* on the main track rather than spawning an overlay lane.
+fn empty_main_lane(engine: &Engine, kind: TrackKind) -> Option<TrackId> {
+    if kind != TrackKind::Video {
+        return None;
+    }
+    let timeline = engine.project().timeline();
+    let main = timeline.main_track()?;
+    timeline
+        .track(main)
+        .is_some_and(cutlass_models::Track::is_empty)
+        .then_some(main)
 }
 
 /// Move a dragged clip to its resolved landing spot: an existing lane
@@ -5191,15 +5484,10 @@ fn pack_main_track_and_publish(engine: &mut Engine, ui: &UiSink) {
     publish_projection(engine, ui);
 }
 
-/// The main track under CapCut's magnet: the *bottom* video lane (the engine
-/// stacks bottom→top, so the first video track in stack order).
+/// The main track under CapCut's magnet: the video lane the model designates
+/// (`Track::main` — the timeline keeps it directly above the audio floor).
 fn main_video_track(engine: &Engine) -> Option<TrackId> {
-    let timeline = engine.project().timeline();
-    timeline.order().iter().copied().find(|id| {
-        timeline
-            .track(*id)
-            .is_some_and(|t| t.kind == TrackKind::Video)
-    })
+    engine.project().timeline().main_track()
 }
 
 /// Clip boundary on `track` nearest to `tick`: every clip start plus the
@@ -5221,9 +5509,74 @@ fn nearest_boundary(track: &Track, tick: i64) -> i64 {
     best
 }
 
-// PORT (later): main's `agent_replay` lived here — the AI agent's rehearsed
-// plan replayed on the live engine as one history group, with sandbox ids
-// remapped. It returns with the cutlass-ai port.
+/// Replay a rehearsed agent plan on the live engine as one history group,
+/// re-validated step by step, with sandbox-allocated ids remapped onto the
+/// ids the live engine hands out. `after_step` runs
+/// after every applied step (the worker publishes there, so the user
+/// watches the plan land) and after the rollback/commit. Any failure rolls
+/// the whole group back — the project changed mid-prompt is the only way
+/// a rehearsed step can fail here.
+pub(crate) fn agent_replay(
+    engine: &mut Engine,
+    steps: Vec<AgentPlanStep>,
+    mut after_step: impl FnMut(&mut Engine),
+) -> Result<(), String> {
+    use std::collections::HashMap as Map;
+    let mut clip_map: Map<u64, u64> = Map::new();
+    let mut track_map: Map<u64, u64> = Map::new();
+    let mut marker_map: Map<u64, u64> = Map::new();
+
+    let total = steps.len();
+    engine.begin_group();
+    for (index, mut step) in steps.into_iter().enumerate() {
+        step.command.remap_ids(&clip_map, &track_map, &marker_map);
+        let outcome = cutlass_ai::validate(&step.command, engine.project())
+            .map_err(|r| r.message)
+            .and_then(|lowered| engine.apply(lowered).map_err(|e| e.to_string()));
+        match outcome {
+            Ok(ApplyOutcome::Edited(edited)) => {
+                match (step.created, &edited) {
+                    (Some(AgentCreated::Clip(sandbox)), EditOutcome::Created(live)) => {
+                        clip_map.insert(sandbox, live.raw());
+                    }
+                    (Some(AgentCreated::Track(sandbox)), EditOutcome::CreatedTrack(live)) => {
+                        track_map.insert(sandbox, live.raw());
+                    }
+                    (Some(AgentCreated::Marker(sandbox)), EditOutcome::CreatedMarker(live)) => {
+                        marker_map.insert(sandbox, live.raw());
+                    }
+                    _ => {}
+                }
+                after_step(engine);
+            }
+            Ok(other) => {
+                engine.rollback_group();
+                after_step(engine);
+                return Err(format!(
+                    "step {}/{total}: unexpected engine outcome {other:?}",
+                    index + 1
+                ));
+            }
+            Err(reason) => {
+                engine.rollback_group();
+                after_step(engine);
+                return Err(format!("step {}/{total}: {reason}", index + 1));
+            }
+        }
+    }
+    engine.commit_group();
+    info!(steps = total, "agent plan applied");
+    after_step(engine);
+    Ok(())
+}
+
+fn agent_apply_and_publish(
+    engine: &mut Engine,
+    steps: Vec<AgentPlanStep>,
+    ui: &UiSink,
+) -> Result<(), String> {
+    agent_replay(engine, steps, |engine| publish_projection(engine, ui))
+}
 
 /// Apply a single edit command, flattening the outcome — for compositions
 /// where only success/failure matters (the group publishes once at the end).
@@ -5265,12 +5618,13 @@ fn add_clip_content(
 }
 
 /// Remove `track` when an edit left it empty (CapCut removes emptied lanes).
+/// The main track is exempt: it's the one lane that exists without clips.
 fn remove_track_if_empty(engine: &mut Engine, track: TrackId) {
     let emptied = engine
         .project()
         .timeline()
         .track(track)
-        .is_some_and(|t| t.is_empty());
+        .is_some_and(|t| t.is_empty() && !t.pinned && !t.main);
     if !emptied {
         return;
     }
@@ -5295,6 +5649,7 @@ fn create_track(engine: &mut Engine, kind: TrackKind, drop_row: i64) -> Result<T
         kind,
         name: format!("{}{}", kind_prefix(kind), count + 1),
         index: Some(order_index),
+        pinned: false,
     })) {
         Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(id))) => Ok(id),
         Ok(other) => Err(format!("unexpected add-track outcome: {other:?}")),
@@ -6164,6 +6519,7 @@ mod tests {
                 kind: TrackKind::Video,
                 name: name.into(),
                 index: None,
+                pinned: false,
             }))
             .expect("add track")
         {
@@ -6459,6 +6815,7 @@ mod tests {
                 kind: TrackKind::Audio,
                 name: "A1".into(),
                 index: None,
+                pinned: false,
             }))
             .expect("add audio track")
         {

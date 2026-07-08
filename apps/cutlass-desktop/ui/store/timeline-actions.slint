@@ -9,6 +9,7 @@
 
 import { EditorStore } from "editor-store.slint";
 import { TimelineStore } from "timeline-store.slint";
+import { AppStore } from "app-store.slint";
 import { TimelineViewState } from "../panels/timeline/state.slint";
 import { InspectorBackend, SelectedClipInfo } from "../lib/inspector-backend.slint";
 import { SelectionBackend, SelectionUpdate } from "../lib/selection-backend.slint";
@@ -104,6 +105,57 @@ export global TimelineActions {
         if (marker-id != "") {
             TimelineStore.on-marker-removed(marker-id);
         }
+    }
+
+    // Move / rename / recolor a ruler marker (drag or editor popover).
+    public function set-marker(marker-id: string, at-tick: int, name: string, color: string) {
+        if (marker-id != "") {
+            TimelineStore.on-marker-set(marker-id, at-tick, name, color);
+        }
+    }
+
+    public function toggle-preview-axis() {
+        TimelineStore.preview-axis-enabled = !TimelineStore.preview-axis-enabled;
+    }
+
+    public function cycle-track-height() {
+        TimelineStore.track-height-preset =
+            Math.mod(TimelineStore.track-height-preset + 1, 3);
+    }
+
+    public pure function track-lane-height() -> length {
+        return TimelineStore.track-height-preset == 0 ? 45px
+            : TimelineStore.track-height-preset == 2 ? 80px
+            : 60px;
+    }
+
+    // Commit a finished track-head vertical reorder gesture.
+    private property <int> pending-track-row;
+    private property <int> pending-track-index;
+
+    public function commit-track-reorder() {
+        if (TimelineViewState.track-drag-id == "") {
+            return;
+        }
+        self.pending-track-row = clamp(
+            floor(((TimelineViewState.track-drag-source-row + 1)
+                    * self.track-lane-height()
+                    + AppStore.theme.metrics.spacing.sm
+                    + TimelineViewState.track-drag-dy-px
+                    + self.track-lane-height() / 2)
+                / (self.track-lane-height() + AppStore.theme.metrics.spacing.sm))
+                - 1,
+            0,
+            max(0, EditorStore.project.sequence.tracks.length - 1));
+        self.pending-track-index = max(
+            0,
+            EditorStore.project.sequence.tracks.length - 1 - self.pending-track-row);
+        EditorStore.on-track-moved(
+            TimelineViewState.track-drag-id,
+            self.pending-track-index);
+        TimelineViewState.track-drag-id = "";
+        TimelineViewState.track-drag-dy-px = 0px;
+        TimelineViewState.track-drag-released = false;
     }
 
     // Copy/duplicate act on the whole multi-selection (one block, one
@@ -463,6 +515,19 @@ export global TimelineActions {
 
     public function set-zoom(new-zoom: float) {
         self.set-zoom-anchored(new-zoom, self.zoom-anchor-tick());
+    }
+
+    // Keyboard / toolbar step zoom (same log-space notch as Ctrl+wheel).
+    public function zoom-in() {
+        self.set-zoom(TimelineActions.slider-to-zoom(clamp(
+            TimelineActions.zoom-to-slider(TimelineStore.zoom) + 8,
+            0, 100)));
+    }
+
+    public function zoom-out() {
+        self.set-zoom(TimelineActions.slider-to-zoom(clamp(
+            TimelineActions.zoom-to-slider(TimelineStore.zoom) - 8,
+            0, 100)));
     }
 
     // Fit the whole sequence into the lane viewport (CapCut's zoom-to-fit),

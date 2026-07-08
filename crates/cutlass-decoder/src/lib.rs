@@ -69,7 +69,14 @@ pub use peaks::{AudioPeaks, audio_peaks, audio_peaks_per_second};
 pub mod image;
 #[cfg(target_vendor = "apple")]
 mod image_apple;
-pub use image::{ImageFormat, ImageInfo, decode_image, probe_image, sniff_image};
+pub use image::{
+    ImageFormat, ImageInfo, decode_image, decode_image_bytes, probe_image, sniff_image,
+};
+
+mod animation;
+pub use animation::{
+    AnimationFrame, MAX_ANIMATION_DIMENSION, MAX_ANIMATION_FRAMES, decode_animation,
+};
 
 use std::path::Path;
 

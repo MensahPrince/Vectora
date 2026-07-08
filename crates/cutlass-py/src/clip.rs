@@ -1,8 +1,8 @@
 //! [`Clip`] timeline placement handles.
 
 use cutlass_models::{
-    ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator, ParamValue, RationalTime, Shape,
-    ShapeParam,
+    AnimationRef, AnimationSlot, ClipId, ClipParam, ClipTransform, CropRect, Easing, Generator,
+    ParamValue, RationalTime, Shape, ShapeParam,
 };
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -307,6 +307,53 @@ impl Clip {
             let mut t = Self::current_transform(project, self.id)?;
             t.opacity = value;
             Self::set_transform_constant(project, self.id, t)
+        })
+    }
+
+    #[getter]
+    fn animation_in(&self, py: Python) -> PyResult<Option<String>> {
+        self.with_project(py, |project| {
+            Ok(Self::require(project, self.id)?
+                .animation_in
+                .as_ref()
+                .map(|a| a.id.clone()))
+        })
+    }
+
+    #[getter]
+    fn animation_out(&self, py: Python) -> PyResult<Option<String>> {
+        self.with_project(py, |project| {
+            Ok(Self::require(project, self.id)?
+                .animation_out
+                .as_ref()
+                .map(|a| a.id.clone()))
+        })
+    }
+
+    #[getter]
+    fn animation_combo(&self, py: Python) -> PyResult<Option<String>> {
+        self.with_project(py, |project| {
+            Ok(Self::require(project, self.id)?
+                .animation_combo
+                .as_ref()
+                .map(|a| a.id.clone()))
+        })
+    }
+
+    #[pyo3(signature = (slot, animation_id=None))]
+    fn set_animation(
+        &self,
+        py: Python,
+        slot: &str,
+        animation_id: Option<&str>,
+    ) -> PyResult<()> {
+        let animation_slot = parse_animation_slot(slot)?;
+        let animation = animation_id.map(AnimationRef::new);
+        self.with_project(py, |project| {
+            project
+                .model_mut()
+                .set_clip_animation(self.id, animation_slot, animation)
+                .map_err(model_err)
         })
     }
 
@@ -848,4 +895,15 @@ fn apply_clip_animation(
         .model_mut()
         .set_param_keyframe(clip_id, param, abs, val, default_easing)
         .map_err(model_err)
+}
+
+fn parse_animation_slot(slot: &str) -> PyResult<AnimationSlot> {
+    match slot {
+        "in" => Ok(AnimationSlot::In),
+        "out" => Ok(AnimationSlot::Out),
+        "combo" => Ok(AnimationSlot::Combo),
+        _ => Err(PyValueError::new_err(
+            "slot must be one of: 'in', 'out', 'combo'",
+        )),
+    }
 }

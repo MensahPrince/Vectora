@@ -133,6 +133,22 @@ pub fn decode_image(path: &Path) -> Result<RgbaImage, DecodeError> {
     Ok(image)
 }
 
+/// [`decode_image`] for an in-memory encoded image (embedded assets such as
+/// bundled stickers). Same output contract: straight-alpha RGBA8, oriented
+/// upright, longest side capped at [`MAX_DECODE_DIMENSION`].
+pub fn decode_image_bytes(bytes: &[u8]) -> Result<RgbaImage, DecodeError> {
+    let format = sniff_bytes(bytes).ok_or_else(|| {
+        DecodeError::Open("embedded image: not a recognized image container".into())
+    })?;
+    let image = backend_decode_bytes(bytes, format)?;
+    if image.width == 0 || image.height == 0 {
+        return Err(DecodeError::Decode(
+            "embedded image: decoded to zero pixels".into(),
+        ));
+    }
+    Ok(image)
+}
+
 /// Upper bound on a decoded still's longest side (Apple backend). 4096 px
 /// keeps a worst-case bitmap at ~50 MB RGBA while comfortably out-resolving
 /// a 4K canvas.
@@ -168,6 +184,17 @@ fn backend_decode(path: &Path, format: ImageFormat) -> Result<RgbaImage, DecodeE
     portable::decode(path, format)
 }
 
+#[cfg(target_vendor = "apple")]
+fn backend_decode_bytes(bytes: &[u8], format: ImageFormat) -> Result<RgbaImage, DecodeError> {
+    crate::image_apple::decode_bytes(bytes)
+        .or_else(|apple_err| portable::decode_bytes(bytes, format).map_err(|_| apple_err))
+}
+
+#[cfg(not(target_vendor = "apple"))]
+fn backend_decode_bytes(bytes: &[u8], format: ImageFormat) -> Result<RgbaImage, DecodeError> {
+    portable::decode_bytes(bytes, format)
+}
+
 /// Pure-Rust PNG/JPEG backend, compiled on every platform.
 pub mod portable {
     use std::path::Path;
@@ -180,7 +207,7 @@ pub mod portable {
         match format {
             ImageFormat::Png => png_probe(path),
             ImageFormat::Jpeg => jpeg_probe(path),
-            other => Err(unsupported(path, other)),
+            other => Err(unsupported(&path.display().to_string(), other)),
         }
     }
 
@@ -188,14 +215,23 @@ pub mod portable {
         match format {
             ImageFormat::Png => png_decode(path),
             ImageFormat::Jpeg => jpeg_decode(path),
-            other => Err(unsupported(path, other)),
+            other => Err(unsupported(&path.display().to_string(), other)),
         }
     }
 
-    fn unsupported(path: &Path, format: ImageFormat) -> DecodeError {
+    /// [`decode`] for in-memory encoded bytes (embedded assets).
+    pub fn decode_bytes(bytes: &[u8], format: ImageFormat) -> Result<RgbaImage, DecodeError> {
+        const CTX: &str = "embedded image";
+        match format {
+            ImageFormat::Png => png_decode_reader(std::io::Cursor::new(bytes), CTX),
+            ImageFormat::Jpeg => jpeg_decode_bytes(bytes.to_vec(), CTX),
+            other => Err(unsupported(CTX, other)),
+        }
+    }
+
+    fn unsupported(ctx: &str, format: ImageFormat) -> DecodeError {
         DecodeError::unsupported(format!(
-            "{}: no portable decoder for {format:?} stills on this platform",
-            path.display()
+            "{ctx}: no portable decoder for {format:?} stills on this platform"
         ))
     }
 
@@ -217,16 +253,20 @@ pub mod portable {
     }
 
     fn png_decode(path: &Path) -> Result<RgbaImage, DecodeError> {
-        let mut decoder = png::Decoder::new(open(path)?);
+        png_decode_reader(open(path)?, &path.display().to_string())
+    }
+
+    fn png_decode_reader(reader: impl std::io::Read, ctx: &str) -> Result<RgbaImage, DecodeError> {
+        let mut decoder = png::Decoder::new(reader);
         // Palette/gray expansion + 16→8 bit strip: everything below is 8-bit.
         decoder.set_transformations(png::Transformations::normalize_to_color8());
         let mut reader = decoder
             .read_info()
-            .map_err(|e| DecodeError::Open(format!("{}: {e}", path.display())))?;
+            .map_err(|e| DecodeError::Open(format!("{ctx}: {e}")))?;
         let mut buf = vec![0u8; reader.output_buffer_size()];
         let frame = reader
             .next_frame(&mut buf)
-            .map_err(|e| DecodeError::Decode(format!("{}: {e}", path.display())))?;
+            .map_err(|e| DecodeError::Decode(format!("{ctx}: {e}")))?;
         buf.truncate(frame.buffer_size());
         let (width, height) = (frame.width, frame.height);
         let pixels = match frame.color_type {
@@ -236,10 +276,7 @@ pub mod portable {
             png::ColorType::GrayscaleAlpha => expand(&buf, 2, |px| [px[0], px[0], px[0], px[1]]),
             png::ColorType::Indexed => {
                 // normalize_to_color8 expands palettes; reaching here is a bug.
-                return Err(DecodeError::Decode(format!(
-                    "{}: palette not expanded",
-                    path.display()
-                )));
+                return Err(DecodeError::Decode(format!("{ctx}: palette not expanded")));
             }
         };
         Ok(RgbaImage::new(width, height, pixels))
@@ -262,20 +299,24 @@ pub mod portable {
     }
 
     fn jpeg_decode(path: &Path) -> Result<RgbaImage, DecodeError> {
+        let bytes =
+            std::fs::read(path).map_err(|e| DecodeError::Io(format!("{}: {e}", path.display())))?;
+        jpeg_decode_bytes(bytes, &path.display().to_string())
+    }
+
+    fn jpeg_decode_bytes(bytes: Vec<u8>, ctx: &str) -> Result<RgbaImage, DecodeError> {
         use zune_jpeg::zune_core::colorspace::ColorSpace;
         use zune_jpeg::zune_core::options::DecoderOptions;
 
-        let bytes =
-            std::fs::read(path).map_err(|e| DecodeError::Io(format!("{}: {e}", path.display())))?;
         let options = DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA);
         let mut decoder =
             zune_jpeg::JpegDecoder::new_with_options(std::io::Cursor::new(bytes), options);
         let data = decoder
             .decode()
-            .map_err(|e| DecodeError::Decode(format!("{}: {e:?}", path.display())))?;
+            .map_err(|e| DecodeError::Decode(format!("{ctx}: {e:?}")))?;
         let (width, height) = decoder
             .dimensions()
-            .ok_or_else(|| DecodeError::Decode(format!("{}: no dimensions", path.display())))?;
+            .ok_or_else(|| DecodeError::Decode(format!("{ctx}: no dimensions")))?;
         // The decoder may override the requested colorspace (e.g. CMYK
         // sources); normalize whatever it actually produced.
         let pixels = match decoder.output_colorspace() {
@@ -285,16 +326,14 @@ pub mod portable {
             Some(ColorSpace::LumaA) => expand(&data, 2, |px| [px[0], px[0], px[0], px[1]]),
             other => {
                 return Err(DecodeError::unsupported(format!(
-                    "{}: jpeg decoded to unsupported colorspace {other:?}",
-                    path.display()
+                    "{ctx}: jpeg decoded to unsupported colorspace {other:?}"
                 )));
             }
         };
         let expected = width * height * 4;
         if pixels.len() != expected {
             return Err(DecodeError::Decode(format!(
-                "{}: decoded {} bytes, expected {expected}",
-                path.display(),
+                "{ctx}: decoded {} bytes, expected {expected}",
                 pixels.len()
             )));
         }

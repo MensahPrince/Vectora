@@ -42,7 +42,9 @@ impl TrackKind {
                 | (
                     Self::Sticker,
                     ClipSource::Generated(
-                        Generator::Sticker | Generator::SolidColor { .. } | Generator::Shape { .. },
+                        Generator::Sticker { .. }
+                            | Generator::SolidColor { .. }
+                            | Generator::Shape { .. },
                     ),
                 )
                 | (Self::Effect, ClipSource::Generated(Generator::Effect))
@@ -63,7 +65,7 @@ impl TrackKind {
     pub const fn for_generator(generator: &Generator) -> Option<Self> {
         match generator {
             Generator::Text { .. } => Some(Self::Text),
-            Generator::SolidColor { .. } | Generator::Shape { .. } | Generator::Sticker => {
+            Generator::SolidColor { .. } | Generator::Shape { .. } | Generator::Sticker { .. } => {
                 Some(Self::Sticker)
             }
             Generator::Effect => Some(Self::Effect),
@@ -91,6 +93,18 @@ pub struct Track {
     /// trimmed. Compositing/playback are unaffected (CapCut semantics).
     #[serde(default)]
     pub locked: bool,
+    /// When true, an empty lane is not auto-removed by implicit cleanup —
+    /// only an explicit user delete removes it (manual "Add track").
+    #[serde(default)]
+    pub pinned: bool,
+    /// CapCut's main track: the single privileged video lane every other
+    /// visual lane stacks above. It persists when emptied (the only lane
+    /// allowed to exist without clips) and sits directly above the audio
+    /// floor. At most one track carries the flag and it must be a
+    /// [`TrackKind::Video`] lane — [`Timeline`](crate::Timeline) maintains
+    /// both invariants on every structural edit.
+    #[serde(default)]
+    pub main: bool,
     /// Audio: whether this lane is a sidechain "voice" source — its clips
     /// drive audio ducking (M8 Phase 4), so a "duck under voice" gesture dips
     /// music under the talkers on every lane flagged here. Additive: old
@@ -116,6 +130,8 @@ impl Track {
             enabled: true,
             muted: false,
             locked: false,
+            pinned: false,
+            main: false,
             duck_source: false,
             clips: Map::default(),
             transitions: Vec::new(),

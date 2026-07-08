@@ -215,6 +215,39 @@ impl Solid {
     }
 }
 
+/// A bundled sticker descriptor: `asset` is a catalog id (e.g. `"heart"`,
+/// `"star_spin"`). Unknown ids error here rather than placing an invisible
+/// clip.
+#[pyclass(skip_from_py_object)]
+#[derive(Clone)]
+pub struct Sticker {
+    pub(crate) asset: String,
+}
+
+#[pymethods]
+impl Sticker {
+    #[new]
+    fn new(asset: &str) -> PyResult<Self> {
+        if cutlass_models::sticker_spec(asset).is_none() {
+            let ids: Vec<&str> = cutlass_models::sticker_catalog()
+                .iter()
+                .map(|s| s.id)
+                .collect();
+            return Err(PyValueError::new_err(format!(
+                "unknown sticker '{asset}' (available: {})",
+                ids.join(", ")
+            )));
+        }
+        Ok(Self {
+            asset: asset.to_owned(),
+        })
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Sticker({:?})", self.asset)
+    }
+}
+
 /// Outline for a shape (Python name: `ShapeStroke`).
 #[pyclass(name = "ShapeStroke", from_py_object)]
 #[derive(Clone)]
@@ -403,6 +436,11 @@ pub(crate) fn generator_from(obj: &Bound<'_, PyAny>) -> PyResult<Generator> {
             style: t.style.clone(),
         });
     }
+    if let Ok(s) = obj.extract::<PyRef<Sticker>>() {
+        return Ok(Generator::Sticker {
+            asset: s.asset.clone(),
+        });
+    }
     if let Ok(r) = obj.extract::<PyRef<Rect>>() {
         return Ok(shape_generator(
             Shape::Rectangle,
@@ -477,7 +515,7 @@ pub(crate) fn generator_from(obj: &Bound<'_, PyAny>) -> PyResult<Generator> {
         ));
     }
     Err(PyValueError::new_err(
-        "content must be Media, MediaSlice, Text, Solid, or a shape descriptor",
+        "content must be Media, MediaSlice, Text, Solid, Sticker, or a shape descriptor",
     ))
 }
 

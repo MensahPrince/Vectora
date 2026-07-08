@@ -82,6 +82,7 @@ impl Scene {
                 LayerSource::CanvasPass
                 | LayerSource::Media { .. }
                 | LayerSource::Still { .. }
+                | LayerSource::Sticker { .. }
                 | LayerSource::Text { .. }
                 | LayerSource::Solid(_)
                 | LayerSource::Transition { .. } => {}
@@ -212,6 +213,15 @@ pub enum LayerSource {
     /// A still image: decode `media`'s single frame once (the renderer
     /// caches it) and place it for the clip's whole extent.
     Still { media: MediaId },
+    /// A bundled sticker (static or animated): the renderer decodes the
+    /// catalog asset once into a frame sequence and picks the frame at
+    /// `local_time`, looping.
+    Sticker {
+        /// Catalog id (see [`cutlass_models::sticker_catalog`]).
+        asset: String,
+        /// Seconds since the clip's timeline start.
+        local_time: f64,
+    },
     /// A rasterized text run.
     Text { content: String, style: TextStyle },
     /// A solid RGBA fill across the placed quad.

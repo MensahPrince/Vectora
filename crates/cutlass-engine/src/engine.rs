@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use cutlass_commands::{Command, ProjectCommand};
 use cutlass_models::{
     ClipId, ClipTransform, ColorAdjustments, Filter, Generator, MediaId, Project, Rational,
-    RationalTime,
+    RationalTime, TrackKind,
 };
 use cutlass_render::{
     FrameSink, Renderer, ResolveOverrides, RgbaImage, SeekPolicy, export_to_file,
@@ -146,9 +146,15 @@ impl Engine {
         }
     }
 
-    /// Replace the session with a fresh, empty, unsaved project (File → New).
+    /// Replace the session with a fresh, unsaved project (File → New).
+    ///
+    /// The project starts with the persistent main video track (CapCut's
+    /// magnetic lane): it is the only lane that exists without clips, and
+    /// the timeline UI renders it even when empty.
     pub fn new_session(&mut self) {
-        self.reset_project(Project::new("untitled", Rational::FPS_24));
+        let mut project = Project::new("untitled", Rational::FPS_24);
+        project.add_track(TrackKind::Video, "Main");
+        self.reset_project(project);
     }
 
     /// Replace the session with `project` (e.g. the AI-agent sandbox replaying
@@ -187,6 +193,12 @@ impl Engine {
         let (outcome, inverse) = dispatch(command, &mut ctx)?;
         match outcome {
             ApplyOutcome::Opened | ApplyOutcome::Loaded => {
+                // Every session shows the magnetic main lane; files saved
+                // without any video track (audio-only cuts, old versions)
+                // gain an empty one on entry. Pre-history, not undoable.
+                if self.project.timeline().main_track().is_none() {
+                    self.project.add_track(TrackKind::Video, "Main");
+                }
                 // Same media-id hazard as `reset_project`: the incoming
                 // file's ids owe nothing to the outgoing registry.
                 self.renderer.clear_proxies();
@@ -411,9 +423,17 @@ impl Engine {
                 self.revision += 1;
                 true
             }
-            // Inverses are written to be infallible once recorded; on failure
-            // the action is already popped and lost.
-            Err(_) => false,
+            // Inverses are meant to be infallible once recorded. A failure
+            // here means the project no longer matches what history expects,
+            // so the remaining stacks can't be trusted either — clearing both
+            // is safer than silently dropping one entry and marching on (which
+            // is what once turned an id collision into permanent data loss).
+            Err(e) => {
+                tracing::error!("undo failed ({e}); clearing history to avoid corruption");
+                self.history.clear();
+                self.revision += 1;
+                false
+            }
         }
     }
 
@@ -431,7 +451,14 @@ impl Engine {
                 self.revision += 1;
                 true
             }
-            Err(_) => false,
+            // See `undo`: a failed redo means history and project have
+            // diverged, so drop both stacks rather than corrupt further.
+            Err(e) => {
+                tracing::error!("redo failed ({e}); clearing history to avoid corruption");
+                self.history.clear();
+                self.revision += 1;
+                false
+            }
         }
     }
 
@@ -456,3 +483,58 @@ const _: () = {
     const fn assert_send<T: Send>() {}
     assert_send::<Engine>()
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An inverse that always fails, simulating a corrupted/mismatched history
+    /// entry.
+    struct FailAction;
+
+    impl EditAction for FailAction {
+        fn apply(
+            self: Box<Self>,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            Err(cutlass_models::ModelError::InvalidRange.into())
+        }
+    }
+
+    struct NoopAction;
+
+    impl EditAction for NoopAction {
+        fn apply(
+            self: Box<Self>,
+            _ctx: &mut ApplyContext<'_>,
+        ) -> Result<Box<dyn EditAction>, EngineError> {
+            Ok(Box::new(NoopAction))
+        }
+    }
+
+    #[test]
+    fn failed_undo_clears_both_stacks() {
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        // A redo entry that WOULD apply, plus a failing undo entry on top.
+        engine.history.push_redo(Box::new(NoopAction));
+        engine.history.push_undo(Box::new(FailAction));
+        assert!(engine.can_undo() && engine.can_redo());
+
+        assert!(!engine.undo(), "a failing inverse reports no step");
+        assert!(
+            !engine.can_undo() && !engine.can_redo(),
+            "a diverged history is dropped wholesale rather than trusted"
+        );
+    }
+
+    #[test]
+    fn failed_redo_clears_both_stacks() {
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        engine.history.push_undo(Box::new(NoopAction));
+        engine.history.push_redo(Box::new(FailAction));
+        assert!(engine.can_undo() && engine.can_redo());
+
+        assert!(!engine.redo());
+        assert!(!engine.can_undo() && !engine.can_redo());
+    }
+}

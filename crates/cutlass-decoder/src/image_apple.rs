@@ -16,20 +16,25 @@ use std::ffi::c_void;
 use std::path::Path;
 
 use objc2_core_foundation::{
-    CFBoolean, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL, CGRect,
+    CFBoolean, CFData, CFDictionary, CFNumber, CFRetained, CFString, CFType, CFURL, CGRect,
 };
 use objc2_core_graphics::{
     CGBitmapContextCreate, CGColorSpace, CGContext, CGImage, CGImageAlphaInfo,
 };
 use objc2_image_io::{
-    CGImageSource, kCGImagePropertyOrientation, kCGImagePropertyPixelHeight,
-    kCGImagePropertyPixelWidth, kCGImageSourceCreateThumbnailFromImageAlways,
+    CGImageSource, kCGImagePropertyAPNGDelayTime, kCGImagePropertyAPNGUnclampedDelayTime,
+    kCGImagePropertyGIFDelayTime, kCGImagePropertyGIFDictionary,
+    kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyOrientation,
+    kCGImagePropertyPNGDictionary, kCGImagePropertyPixelHeight, kCGImagePropertyPixelWidth,
+    kCGImagePropertyWebPDelayTime, kCGImagePropertyWebPDictionary,
+    kCGImagePropertyWebPUnclampedDelayTime, kCGImageSourceCreateThumbnailFromImageAlways,
     kCGImageSourceCreateThumbnailWithTransform, kCGImageSourceShouldCache,
     kCGImageSourceThumbnailMaxPixelSize,
 };
 
 use cutlass_core::{DecodeError, RgbaImage};
 
+use crate::animation::{AnimationFrame, MAX_ANIMATION_DIMENSION, MAX_ANIMATION_FRAMES};
 use crate::image::{ImageInfo, MAX_DECODE_DIMENSION};
 
 /// Read display dimensions from the image's properties (no pixel decode).
@@ -65,7 +70,51 @@ pub fn probe(path: &Path) -> Result<ImageInfo, DecodeError> {
 /// side capped at [`MAX_DECODE_DIMENSION`].
 pub fn decode(path: &Path) -> Result<RgbaImage, DecodeError> {
     let source = open_source(path)?;
-    let max = CFNumber::new_i64(i64::from(MAX_DECODE_DIMENSION));
+    decode_frame(
+        &source,
+        0,
+        MAX_DECODE_DIMENSION,
+        &path.display().to_string(),
+    )
+}
+
+/// [`decode`] for in-memory encoded bytes (embedded assets).
+pub fn decode_bytes(bytes: &[u8]) -> Result<RgbaImage, DecodeError> {
+    let source = open_source_bytes(bytes)?;
+    decode_frame(&source, 0, MAX_DECODE_DIMENSION, "embedded image")
+}
+
+/// Decode every frame of an animated image (GIF / APNG / animated WebP) from
+/// in-memory bytes, with per-frame delays from the container's properties.
+/// A static image yields one frame.
+pub fn decode_animation_bytes(bytes: &[u8]) -> Result<Vec<AnimationFrame>, DecodeError> {
+    let source = open_source_bytes(bytes)?;
+    let count = unsafe { source.count() }.clamp(1, MAX_ANIMATION_FRAMES);
+    let mut frames = Vec::with_capacity(count);
+    for index in 0..count {
+        let image = decode_frame(
+            &source,
+            index,
+            MAX_ANIMATION_DIMENSION,
+            &format!("embedded image frame {index}"),
+        )?;
+        frames.push(AnimationFrame {
+            image,
+            delay_ms: frame_delay_ms(&source, index),
+        });
+    }
+    Ok(frames)
+}
+
+/// Decode one frame of `source` to straight-alpha RGBA8, oriented upright,
+/// longest side capped at `max_dimension`.
+fn decode_frame(
+    source: &CGImageSource,
+    index: usize,
+    max_dimension: u32,
+    ctx: &str,
+) -> Result<RgbaImage, DecodeError> {
+    let max = CFNumber::new_i64(i64::from(max_dimension));
     let max: &CFType = max.as_ref();
     let yes: &CFType = CFBoolean::new(true).as_ref();
     let options = CFDictionary::<CFString, CFType>::from_slices(
@@ -76,15 +125,14 @@ pub fn decode(path: &Path) -> Result<RgbaImage, DecodeError> {
         ],
         &[yes, yes, max],
     );
-    let image = unsafe { source.thumbnail_at_index(0, Some(options.as_opaque())) }
-        .ok_or_else(|| DecodeError::Decode(format!("{}: image decode failed", path.display())))?;
+    let image = unsafe { source.thumbnail_at_index(index, Some(options.as_opaque())) }
+        .ok_or_else(|| DecodeError::Decode(format!("{ctx}: image decode failed")))?;
 
     let width = CGImage::width(Some(&image));
     let height = CGImage::height(Some(&image));
     if width == 0 || height == 0 {
         return Err(DecodeError::Decode(format!(
-            "{}: decoded image is empty",
-            path.display()
+            "{ctx}: decoded image is empty"
         )));
     }
 
@@ -117,11 +165,62 @@ pub fn decode(path: &Path) -> Result<RgbaImage, DecodeError> {
     Ok(RgbaImage::new(width as u32, height as u32, pixels))
 }
 
+/// Read frame `index`'s display delay in milliseconds from the container's
+/// per-frame properties (GIF, APNG, or WebP dictionary; unclamped delay
+/// preferred). Missing or zero delays fall back to the shared default.
+fn frame_delay_ms(source: &CGImageSource, index: usize) -> u32 {
+    let no: &CFType = CFBoolean::new(false).as_ref();
+    let options = CFDictionary::<CFString, CFType>::from_slices(
+        &[unsafe { kCGImageSourceShouldCache }],
+        &[no],
+    );
+    let seconds = unsafe { source.properties_at_index(index, Some(options.as_opaque())) }
+        .and_then(|props| {
+            let containers: [(&CFString, [&CFString; 2]); 3] = unsafe {
+                [
+                    (
+                        kCGImagePropertyGIFDictionary,
+                        [
+                            kCGImagePropertyGIFUnclampedDelayTime,
+                            kCGImagePropertyGIFDelayTime,
+                        ],
+                    ),
+                    (
+                        kCGImagePropertyPNGDictionary,
+                        [
+                            kCGImagePropertyAPNGUnclampedDelayTime,
+                            kCGImagePropertyAPNGDelayTime,
+                        ],
+                    ),
+                    (
+                        kCGImagePropertyWebPDictionary,
+                        [
+                            kCGImagePropertyWebPUnclampedDelayTime,
+                            kCGImagePropertyWebPDelayTime,
+                        ],
+                    ),
+                ]
+            };
+            containers.iter().find_map(|(container, keys)| {
+                let dict = dict_dict(&props, container)?;
+                keys.iter().find_map(|key| dict_f64(dict, key))
+            })
+        })
+        .unwrap_or(0.0);
+    crate::animation::normalize_delay_ms((seconds * 1000.0).round().max(0.0) as u32)
+}
+
 fn open_source(path: &Path) -> Result<CFRetained<CGImageSource>, DecodeError> {
     let url = CFURL::from_file_path(path)
         .ok_or_else(|| DecodeError::Open(format!("{}: bad path", path.display())))?;
     unsafe { CGImageSource::with_url(&url, None) }
         .ok_or_else(|| DecodeError::Open(format!("{}: unreadable image", path.display())))
+}
+
+fn open_source_bytes(bytes: &[u8]) -> Result<CFRetained<CGImageSource>, DecodeError> {
+    let data = CFData::from_bytes(bytes);
+    unsafe { CGImageSource::with_data(&data, None) }
+        .ok_or_else(|| DecodeError::Open("embedded image: unreadable bytes".into()))
 }
 
 /// Read a numeric property from an untyped `CFDictionary`.
@@ -134,6 +233,28 @@ fn dict_i64(dict: &CFDictionary, key: &CFString) -> Option<i64> {
     // dictionary retains the value for its own lifetime and we only read.
     let number = unsafe { &*value.cast::<CFNumber>() };
     number.as_i64()
+}
+
+/// Read a float property from an untyped `CFDictionary`.
+fn dict_f64(dict: &CFDictionary, key: &CFString) -> Option<f64> {
+    let value = unsafe { dict.value(key as *const CFString as *const c_void) };
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: ImageIO documents delay values as CFNumber; read-only access.
+    let number = unsafe { &*value.cast::<CFNumber>() };
+    number.as_f64()
+}
+
+/// Read a nested dictionary property from an untyped `CFDictionary`.
+fn dict_dict<'a>(dict: &'a CFDictionary, key: &CFString) -> Option<&'a CFDictionary> {
+    let value = unsafe { dict.value(key as *const CFString as *const c_void) };
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: ImageIO documents per-container frame properties (GIF/PNG/WebP
+    // keys) as CFDictionary; the parent retains it and we only read.
+    Some(unsafe { &*value.cast::<CFDictionary>() })
 }
 
 fn clamp_dim(v: i64) -> u32 {

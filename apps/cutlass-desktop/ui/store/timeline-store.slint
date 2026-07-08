@@ -60,8 +60,15 @@ export global TimelineStore {
     // persist, dormant). Mirrored to the worker via
     // EditorStore.on-linkage-changed (trims/splits/selection need the flag).
     in-out property <bool> link-enabled: true;
+    // CapCut preview axis: hover over the lanes previews frames in the player
+    // without moving the playhead. Toggle from the timeline toolbar.
+    in-out property <bool> preview-axis-enabled: true;
+    // Track lane height preset: 0 = compact (45px), 1 = medium (60px),
+    // 2 = large (80px). Scales lane rows, clip cards, and track heads.
+    in-out property <int> track-height-preset: 1;
 
     // Ruler marker gestures (M1): wired from main.rs to the preview worker.
     callback on-marker-added(at-tick: int, name: string, color: string);
     callback on-marker-removed(marker-id: string);
+    callback on-marker-set(marker-id: string, at-tick: int, name: string, color: string);
 }

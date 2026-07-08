@@ -4,8 +4,9 @@
 //!
 //! These persist and validate like every other clip property. Color
 //! adjustments and filter presets are composited per-clip (see
-//! `cutlass-render` / `cutlass-compositor`); mask, chroma key,
-//! stabilization, and animations remain render-neutral this milestone.
+//! `cutlass-render` / `cutlass-compositor`); mask and chroma key are
+//! composited per-clip; look animations drive transform/opacity at
+//! resolve time; stabilization remains render-neutral this milestone.
 //!
 //! The catalogs here follow the effect-catalog pattern: they are the
 //! validation *and* UI source of truth (stable ids, display labels), so the

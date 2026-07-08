@@ -189,9 +189,17 @@ impl Marker {
 /// - `order` is the z-stack from bottom (index 0) to top; the topmost enabled
 ///   video track wins when compositing. The UI renders it top-first, so index 0
 ///   shows at the *bottom* of the lane list.
-/// - **Audio-floor invariant:** every [`TrackKind::Audio`] lane sits below every
-///   visual lane in `order`, so audio always renders at the bottom of the
-///   timeline (CapCut behavior). Maintained by every add/insert/restore path.
+/// - **Lane-zone invariant (CapCut):** `order` is always partitioned into four
+///   zones, bottom to top: every [`TrackKind::Audio`] lane, then the main
+///   video track ([`Track::main`]), then every other visual lane (overlay
+///   video / sticker / effect / filter / adjustment), then every
+///   [`TrackKind::Text`] lane. So audio renders at the bottom, text on top,
+///   and nothing but audio ever sits below the main track. Maintained by
+///   every add/insert/move/restore path.
+/// - **Main-track invariant:** at most one track is flagged [`Track::main`],
+///   it is always a video lane, and one exists whenever any video lane does
+///   (the first video track added is designated automatically; removing the
+///   main lane promotes the next bottom-most video lane).
 /// - `clip_index` maps every [`ClipId`] to the track containing it, so a clip
 ///   can be found across the whole timeline in O(1) without scanning tracks.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,56 +249,107 @@ impl Timeline {
 
     /// Append a track to the top of the stack. Returns its [`TrackId`].
     ///
-    /// Audio lanes are sunk to the bottom of the stack to keep the audio-floor
-    /// invariant (see [`Timeline`]), so a new audio track lands at the top of
-    /// the audio block — still below every visual lane.
+    /// The lane-zone invariant (see [`Timeline`]) is re-applied afterwards,
+    /// so an audio lane sinks to the audio floor, a text lane rises to the
+    /// top, and the first video lane ever added becomes the main track and
+    /// lands directly above the audio block.
     pub fn add_track(&mut self, track: Track) -> TrackId {
         let id = track.id;
         self.tracks.insert(id, track);
         self.order.push(id);
-        self.enforce_audio_floor();
+        self.designate_main();
+        self.enforce_lane_zones();
         id
     }
 
     /// Insert a track at `order_index` in the stack (0 = bottom layer),
     /// clamped to the current stack height. Returns its [`TrackId`].
     ///
-    /// The audio-floor invariant (see [`Timeline`]) is re-applied afterwards:
-    /// a visual track requested below the audio block is lifted just above it,
-    /// and an audio track requested above visual lanes sinks back down.
+    /// The lane-zone invariant (see [`Timeline`]) is re-applied afterwards:
+    /// the requested index only decides the lane's position *within its
+    /// zone* — a visual track requested below the audio block or the main
+    /// track is lifted just above them, a text lane rises above the overlay
+    /// block, and an audio track requested above visual lanes sinks back
+    /// down.
     pub fn insert_track(&mut self, track: Track, order_index: usize) -> TrackId {
         let id = track.id;
         self.tracks.insert(id, track);
         let idx = order_index.min(self.order.len());
         self.order.insert(idx, id);
-        self.enforce_audio_floor();
+        self.designate_main();
+        self.enforce_lane_zones();
         id
     }
 
-    /// Stable-partition `order` so every audio lane sits below every visual
-    /// lane (index 0 = bottom of the stack / bottom of the UI lane list).
-    /// Relative order within the audio group and within the visual group is
-    /// preserved, so the only movement is sinking audio under video.
-    ///
-    /// This is the single chokepoint that guarantees the audio-floor invariant
-    /// for every add/insert/restore (and therefore for AI commands, drag-drop,
-    /// and undo/redo). O(n) on the track count — a cold, per-track-edit path.
-    fn enforce_audio_floor(&mut self) {
-        let mut audio: Vec<TrackId> = Vec::with_capacity(self.order.len());
-        let mut visual: Vec<TrackId> = Vec::with_capacity(self.order.len());
-        for &id in &self.order {
-            if self
-                .tracks
-                .get(&id)
-                .is_some_and(|t| t.kind == TrackKind::Audio)
-            {
-                audio.push(id);
-            } else {
-                visual.push(id);
+    /// The main track (CapCut's magnetic lane): the single video lane flagged
+    /// [`Track::main`]. `None` until a video track exists.
+    pub fn main_track(&self) -> Option<TrackId> {
+        self.order
+            .iter()
+            .copied()
+            .find(|id| self.tracks.get(id).is_some_and(|t| t.main))
+    }
+
+    /// Re-derive the lane-zone and main-track invariants from scratch —
+    /// the chokepoint for projects loaded from disk (files written before
+    /// the main-track flag existed, or edited externally).
+    pub fn normalize_lanes(&mut self) {
+        self.designate_main();
+        self.enforce_lane_zones();
+    }
+
+    /// Keep the main-track invariant: clear the flag from non-video lanes,
+    /// keep only the bottom-most flagged video lane when several claim it,
+    /// and designate the bottom-most video lane when none does.
+    fn designate_main(&mut self) {
+        let mut seen_main = false;
+        let mut first_video: Option<TrackId> = None;
+        for id in self.order.clone() {
+            let Some(track) = self.tracks.get_mut(&id) else {
+                continue;
+            };
+            if track.kind != TrackKind::Video {
+                track.main = false;
+                continue;
+            }
+            if first_video.is_none() {
+                first_video = Some(id);
+            }
+            if track.main {
+                if seen_main {
+                    track.main = false;
+                } else {
+                    seen_main = true;
+                }
             }
         }
-        audio.extend(visual);
-        self.order = audio;
+        if !seen_main && let Some(id) = first_video {
+            self.tracks.get_mut(&id).expect("track exists").main = true;
+        }
+    }
+
+    /// Stable-partition `order` into the four CapCut zones (bottom to top):
+    /// audio, the main video track, other visual lanes, text. Relative order
+    /// *within* each zone is preserved, so the only movement is lanes sinking
+    /// or rising to their zone boundary.
+    ///
+    /// This is the single chokepoint that guarantees the lane-zone invariant
+    /// for every add/insert/move/restore (and therefore for AI commands,
+    /// drag-drop, and undo/redo). O(n log n) on the track count — a cold,
+    /// per-track-edit path.
+    fn enforce_lane_zones(&mut self) {
+        let zone = |id: &TrackId| -> u8 {
+            match self.tracks.get(id) {
+                Some(t) if t.kind == TrackKind::Audio => 0,
+                Some(t) if t.main => 1,
+                Some(t) if t.kind == TrackKind::Text => 3,
+                _ => 2,
+            }
+        };
+        // Vec::sort_by_key is stable: ties keep their relative order.
+        let mut order = std::mem::take(&mut self.order);
+        order.sort_by_key(zone);
+        self.order = order;
     }
 
     pub fn track(&self, id: TrackId) -> Option<&Track> {
@@ -316,13 +375,38 @@ impl Timeline {
     }
 
     /// Remove a track and all its clips (also purging the clip index).
+    /// Removing the main track promotes the next bottom-most video lane.
     pub fn remove_track(&mut self, id: TrackId) -> Option<Track> {
         let track = self.tracks.remove(&id)?;
         self.order.retain(|t| *t != id);
         for clip in track.clips() {
             self.clip_index.remove(&clip.id);
         }
+        if track.main {
+            self.designate_main();
+            self.enforce_lane_zones();
+        }
         Some(track)
+    }
+
+    /// Reorder a track within the stack. The lane-zone invariant is
+    /// re-applied afterwards, so the move only takes effect within the
+    /// track's zone — in particular, the main track never moves, and no
+    /// visual lane can cross below it or below the audio floor.
+    pub fn move_track(&mut self, id: TrackId, new_index: usize) -> Result<(), ModelError> {
+        let current = self
+            .order
+            .iter()
+            .position(|&t| t == id)
+            .ok_or(ModelError::UnknownTrack(id))?;
+        if current == new_index {
+            return Ok(());
+        }
+        self.order.remove(current);
+        let idx = new_index.min(self.order.len());
+        self.order.insert(idx, id);
+        self.enforce_lane_zones();
+        Ok(())
     }
 
     /// Re-insert a removed track at its prior stack position (undo of [`remove_track`]).
@@ -344,7 +428,11 @@ impl Timeline {
         let idx = order_index.min(self.order.len());
         self.order.insert(idx, id);
         self.tracks.insert(id, track);
-        self.enforce_audio_floor();
+        // A restored main lane may collide with an interim promotion (undo of
+        // remove-main); `designate_main` keeps the bottom-most claim and
+        // clears the other, so the invariant holds either way.
+        self.designate_main();
+        self.enforce_lane_zones();
         for clip_id in clip_ids {
             self.clip_index.insert(clip_id, id);
         }
@@ -353,8 +441,15 @@ impl Timeline {
 
     // --- clips ------------------------------------------------------------
 
-    /// Place `clip` on `track_id`, rejecting unknown tracks and overlaps.
+    /// Place `clip` on `track_id`, rejecting unknown tracks, duplicate ids,
+    /// and overlaps.
     pub fn add_clip(&mut self, track_id: TrackId, clip: Clip) -> Result<ClipId, ModelError> {
+        // Defense in depth against id collisions: a plain map insert would
+        // silently overwrite an existing clip (and its index entry), which is
+        // how a cross-session id clash used to destroy a clip. Reject instead.
+        if self.clip_index.contains_key(&clip.id) {
+            return Err(ModelError::DuplicateClip(clip.id));
+        }
         let track = self
             .tracks
             .get(&track_id)
@@ -577,8 +672,9 @@ mod tests {
 
     #[test]
     fn audio_always_sinks_below_video_regardless_of_add_order() {
-        // Interleave kinds and confirm every audio lane ends up below every
-        // visual lane, with relative order preserved inside each group.
+        // Interleave kinds and confirm the CapCut zones: audio at the bottom,
+        // the main video lane above it, overlay lanes next, text on top —
+        // with relative order preserved inside each zone.
         let mut timeline = Timeline::new(R24);
         let a1 = timeline.add_track(Track::new(TrackKind::Audio, "A1"));
         let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
@@ -586,23 +682,47 @@ mod tests {
         let t1 = timeline.add_track(Track::new(TrackKind::Text, "T1"));
         let v2 = timeline.add_track(Track::new(TrackKind::Video, "V2"));
 
-        assert_eq!(timeline.order(), &[a1, a2, v1, t1, v2]);
+        assert_eq!(timeline.order(), &[a1, a2, v1, v2, t1]);
+        assert_eq!(timeline.main_track(), Some(v1));
     }
 
     #[test]
-    fn insert_track_audio_sinks_and_visual_clamps_above_audio() {
+    fn insert_track_audio_sinks_and_visual_clamps_above_main() {
         let mut timeline = Timeline::new(R24);
         let a1 = timeline.add_track(Track::new(TrackKind::Audio, "A1"));
         let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
 
-        // Requesting a visual track at the very bottom (index 0) lifts it just
-        // above the audio block rather than under it.
+        // Requesting a video track at the very bottom (index 0) lifts it
+        // above the audio block *and* the main lane: nothing but audio may
+        // sit below the main track.
         let v0 = timeline.insert_track(Track::new(TrackKind::Video, "V0"), 0);
-        assert_eq!(timeline.order(), &[a1, v0, v1]);
+        assert_eq!(timeline.order(), &[a1, v1, v0]);
+        assert_eq!(timeline.main_track(), Some(v1), "main status is sticky");
 
         // Requesting an audio track at the top sinks back into the audio block.
         let a2 = timeline.insert_track(Track::new(TrackKind::Audio, "A2"), 99);
-        assert_eq!(timeline.order(), &[a1, a2, v0, v1]);
+        assert_eq!(timeline.order(), &[a1, a2, v1, v0]);
+    }
+
+    #[test]
+    fn move_track_reorders_within_zone_only() {
+        let mut timeline = Timeline::new(Rational::new(24, 1));
+        let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
+        let v2 = timeline.add_track(Track::new(TrackKind::Video, "V2"));
+        let v3 = timeline.add_track(Track::new(TrackKind::Video, "V3"));
+        let a1 = timeline.add_track(Track::new(TrackKind::Audio, "A1"));
+        assert_eq!(timeline.order(), &[a1, v1, v2, v3]);
+
+        // Overlay lanes reorder freely within the overlay zone.
+        timeline.move_track(v2, 3).unwrap();
+        assert_eq!(timeline.order(), &[a1, v1, v3, v2]);
+
+        // The main lane snaps back: it can't rise above overlays…
+        timeline.move_track(v1, 3).unwrap();
+        assert_eq!(timeline.order(), &[a1, v1, v3, v2]);
+        // …and no overlay can sink below it.
+        timeline.move_track(v3, 0).unwrap();
+        assert_eq!(timeline.order(), &[a1, v1, v3, v2]);
     }
 
     #[test]
@@ -611,12 +731,120 @@ mod tests {
         let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
         let v2 = timeline.add_track(Track::new(TrackKind::Video, "V2"));
 
-        let bottom = timeline.insert_track(Track::new(TrackKind::Video, "V3"), 0);
+        // V1 is the main lane, so a bottom insert clamps to just above it.
+        let above_main = timeline.insert_track(Track::new(TrackKind::Video, "V3"), 0);
         let middle = timeline.insert_track(Track::new(TrackKind::Video, "V4"), 2);
         let top = timeline.insert_track(Track::new(TrackKind::Video, "V5"), 99);
 
-        assert_eq!(timeline.order(), &[bottom, v1, middle, v2, top]);
+        assert_eq!(timeline.order(), &[v1, above_main, middle, v2, top]);
         assert_eq!(timeline.track_count(), 5);
+    }
+
+    #[test]
+    fn first_video_track_becomes_main_and_persists() {
+        let mut timeline = Timeline::new(R24);
+        assert_eq!(timeline.main_track(), None);
+
+        // Non-video lanes never claim main status.
+        timeline.add_track(Track::new(TrackKind::Text, "T1"));
+        timeline.add_track(Track::new(TrackKind::Audio, "A1"));
+        assert_eq!(timeline.main_track(), None);
+
+        let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
+        assert_eq!(timeline.main_track(), Some(v1));
+        assert!(timeline.track(v1).unwrap().main);
+
+        // Later video lanes are overlays.
+        let v2 = timeline.add_track(Track::new(TrackKind::Video, "V2"));
+        assert_eq!(timeline.main_track(), Some(v1));
+        assert!(!timeline.track(v2).unwrap().main);
+    }
+
+    #[test]
+    fn removing_main_promotes_next_bottom_video() {
+        let mut timeline = Timeline::new(R24);
+        let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
+        let v2 = timeline.add_track(Track::new(TrackKind::Video, "V2"));
+        let v3 = timeline.add_track(Track::new(TrackKind::Video, "V3"));
+
+        timeline.remove_track(v1);
+        assert_eq!(timeline.main_track(), Some(v2));
+        assert_eq!(timeline.order(), &[v2, v3]);
+
+        timeline.remove_track(v2);
+        assert_eq!(timeline.main_track(), Some(v3));
+
+        timeline.remove_track(v3);
+        assert_eq!(timeline.main_track(), None);
+    }
+
+    #[test]
+    fn text_lanes_stay_on_top_and_only_audio_below_main() {
+        let mut timeline = Timeline::new(R24);
+        let t1 = timeline.add_track(Track::new(TrackKind::Text, "T1"));
+        let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
+        let s1 = timeline.add_track(Track::new(TrackKind::Sticker, "ST1"));
+        let adj = timeline.add_track(Track::new(TrackKind::Adjustment, "ADJ1"));
+        let t2 = timeline.add_track(Track::new(TrackKind::Text, "T2"));
+        let a1 = timeline.add_track(Track::new(TrackKind::Audio, "A1"));
+
+        // Zones bottom→top: audio, main video, overlays, text.
+        assert_eq!(timeline.order(), &[a1, v1, s1, adj, t1, t2]);
+
+        // A text lane moved to the bottom snaps back above the overlays.
+        timeline.move_track(t1, 0).unwrap();
+        assert_eq!(timeline.order(), &[a1, v1, s1, adj, t1, t2]);
+
+        // An adjustment lane can never sink below the main track.
+        timeline.move_track(adj, 0).unwrap();
+        assert_eq!(timeline.order(), &[a1, v1, adj, s1, t1, t2]);
+    }
+
+    #[test]
+    fn normalize_lanes_derives_main_and_zones_for_legacy_files() {
+        // Simulate a pre-main-flag file: build the raw state without going
+        // through add_track (serde would produce exactly this shape).
+        let mut timeline = Timeline::new(R24);
+        let t1 = timeline.add_track(Track::new(TrackKind::Text, "T1"));
+        let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
+        let v2 = timeline.add_track(Track::new(TrackKind::Video, "V2"));
+        // Strip the flags to fake the legacy load.
+        timeline.track_mut(v1).unwrap().main = false;
+        timeline.track_mut(v2).unwrap().main = false;
+
+        timeline.normalize_lanes();
+        assert_eq!(timeline.main_track(), Some(v1), "bottom video lane wins");
+        assert_eq!(timeline.order(), &[v1, v2, t1]);
+
+        // A corrupt file flagging a non-video lane is repaired.
+        timeline.track_mut(t1).unwrap().main = true;
+        timeline.track_mut(v1).unwrap().main = false;
+        timeline.normalize_lanes();
+        assert!(!timeline.track(t1).unwrap().main);
+        assert_eq!(timeline.main_track(), Some(v1));
+    }
+
+    #[test]
+    fn main_flag_serde_round_trips_and_defaults_false() {
+        let mut timeline = Timeline::new(R24);
+        let v1 = timeline.add_track(Track::new(TrackKind::Video, "V1"));
+
+        let json = serde_json::to_value(&timeline).unwrap();
+        let back: Timeline = serde_json::from_value(json).unwrap();
+        assert_eq!(back.main_track(), Some(v1));
+
+        // Pre-main-flag track JSON loads as not-main (normalize_lanes
+        // re-derives on file load).
+        let legacy = serde_json::json!({
+            "id": 1,
+            "kind": "Video",
+            "name": "V1",
+            "enabled": true,
+            "muted": false,
+            "clips": []
+        });
+        let track: Track = serde_json::from_value(legacy).unwrap();
+        assert!(!track.main);
     }
 
     #[test]
@@ -723,6 +951,31 @@ mod tests {
             timeline.add_clip(track, generated_clip(25, 50)),
             Err(ModelError::Overlap(track))
         );
+    }
+
+    #[test]
+    fn add_clip_rejects_duplicate_id_without_mutating() {
+        // Defense in depth for the id-collision bug: a clip whose id already
+        // lives on the timeline must be rejected, never silently overwrite the
+        // existing clip (which would drop it from its track/index).
+        let mut timeline = Timeline::new(R24);
+        let v1 = timeline.add_track(Track::new(TrackKind::Adjustment, "FX1"));
+        let v2 = timeline.add_track(Track::new(TrackKind::Adjustment, "FX2"));
+        let clip = generated_clip(0, 50);
+        let id = clip.id;
+        let mut dup = generated_clip(200, 10);
+        dup.id = id;
+
+        timeline.add_clip(v1, clip).unwrap();
+        assert_eq!(
+            timeline.add_clip(v2, dup),
+            Err(ModelError::DuplicateClip(id))
+        );
+        // The original is untouched: still on v1, still 50 ticks at start 0.
+        assert_eq!(timeline.clip_count(), 1);
+        assert_eq!(timeline.track_of(id), Some(v1));
+        assert_eq!(timeline.clip(id).unwrap().timeline, tr(0, 50));
+        assert!(timeline.track(v2).unwrap().is_empty());
     }
 
     #[test]

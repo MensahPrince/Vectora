@@ -72,13 +72,14 @@ pub(crate) fn canvas_config(sequence: &Sequence) -> CompositorConfig {
 }
 
 /// Whether the composite path draws this clip at all: media, or a generator
-/// the raster step supports. Sticker/effect/filter/adjustment clips aren't
-/// composited yet, so they can't be picked (mirrors `resolve_layers`).
+/// the raster step supports. Effect/filter/adjustment clips (and stickers
+/// with no valid asset) aren't composited, so they can't be picked (mirrors
+/// `resolve_layers`).
 pub(crate) fn is_composited(clip: &Clip) -> bool {
     !clip.media_id.is_empty()
         || matches!(
             clip.generator_kind.as_str(),
-            "text" | "solid" | "rect" | "ellipse"
+            "text" | "solid" | "rect" | "ellipse" | "sticker"
         )
 }
 
@@ -594,6 +595,8 @@ mod tests {
             muted: false,
             locked: false,
             duck_source: false,
+            pinned: false,
+            is_main: false,
             transitions: ModelRc::default(),
         }
     }
@@ -769,7 +772,8 @@ mod tests {
     #[test]
     fn generators_without_bounds_hit_at_canvas_size() {
         let clip = generated_clip("T", "text", 0, 0);
-        let mut sticker = generated_clip("S", "", 0, 0); // not composited yet
+        // A legacy empty-asset sticker: draws nothing, so no composited tag.
+        let mut sticker = generated_clip("S", "", 0, 0);
         sticker.generator_kind = SharedString::default();
         let seq = sequence(vec![
             track("2", TrackKind::Video, vec![sticker]),
