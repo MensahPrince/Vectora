@@ -14,7 +14,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
-use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
+use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand, TemplatePick};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, SeekPolicy};
 use cutlass_models::{
     AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
@@ -547,6 +547,17 @@ enum WorkerMsg {
     /// `project.cutlass` is written by the `SaveProject` that follows).
     /// Same epoch bump as `OpenProject`.
     NewProject,
+    /// Replace the session with an installed `.cutlasst` template filled by
+    /// `picks` (CapCut "use template"). On success a fresh draft directory
+    /// is created and the filled project saved into it (the engine resets
+    /// the project path, so the bind happens here, not via a queued
+    /// `SaveProject` that would also run after a failure). Same epoch bump
+    /// as `OpenProject`; failure publishes `session-error` and leaves the
+    /// current session untouched.
+    ApplyTemplate {
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+    },
     /// Rename the current draft (its display name). Applied as one undoable
     /// edit; the projection republish updates the title bar and the next
     /// auto-save writes the name into the draft's project file and meta.
@@ -665,6 +676,10 @@ impl WorkerHandle {
 
     pub fn open_project(&self, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::OpenProject { path });
+    }
+
+    pub fn apply_template(&self, path: PathBuf, picks: Vec<TemplatePick>) {
+        let _ = self.tx.send(WorkerMsg::ApplyTemplate { path, picks });
     }
 
     pub fn new_project(&self) {
@@ -1672,6 +1687,9 @@ fn worker_loop(
                 remove_media_and_publish(engine, &media, force, &ui)
             }
             WorkerMsg::NewProject => new_project_and_publish(engine, &ui),
+            WorkerMsg::ApplyTemplate { path, picks } => {
+                apply_template_and_publish(engine, path, picks, &ui)
+            }
             WorkerMsg::RenameProject { name } => rename_project_and_publish(engine, name, &ui),
             WorkerMsg::SnapshotProject { reply } => {
                 let _ = reply.send(engine.project().clone());
@@ -2238,6 +2256,8 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::SetTrackFlag { .. }
             | WorkerMsg::OpenProject { .. }
             | WorkerMsg::NewProject
+            // A filled template is a whole new composite.
+            | WorkerMsg::ApplyTemplate { .. }
             // Relinked media decodes again — refresh the stale composite.
             | WorkerMsg::RelinkMedia { .. }
             | WorkerMsg::RelinkFolder { .. }
@@ -2928,6 +2948,60 @@ fn open_project_and_publish(engine: &mut Engine, path: PathBuf, ui: &UiSink) {
         Err(e) => {
             error!(path = %path.display(), "open failed: {e}");
             publish_session_error(ui, format!("Couldn't open {}: {e}", path.display()));
+        }
+    }
+}
+
+/// Replace the session with an installed template filled by the user's
+/// picks (the launch gallery's "Use template"). `ApplyTemplate` is atomic
+/// engine-side — a failed pick probe or fill leaves the current session
+/// untouched, surfaced through `session-error`. Success yields a *new
+/// unsaved* project, so a fresh draft directory is created here and the
+/// filled project saved into it (the same bind `New` performs via its
+/// queued save — done inline so a failure never litters an empty draft).
+/// Media registration, projection republish, and the session-epoch bump
+/// mirror `open_project_and_publish`; the epoch bump also dismisses the
+/// launch screen.
+fn apply_template_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    picks: Vec<TemplatePick>,
+    ui: &UiSink,
+) {
+    match engine.apply(Command::Project(ProjectCommand::ApplyTemplate {
+        path: path.clone(),
+        picks,
+    })) {
+        Ok(ApplyOutcome::AppliedTemplate) => {
+            info!(
+                template = %path.display(),
+                pool = engine.project().media_count(),
+                "applied template"
+            );
+            match crate::drafts::create() {
+                Ok(draft) => save_project_and_publish(engine, Some(draft), ui),
+                Err(e) => {
+                    error!("couldn't create a draft for the filled template: {e}");
+                    publish_session_error(
+                        ui,
+                        format!(
+                            "The template was applied but a project draft couldn't be created: {e}"
+                        ),
+                    );
+                }
+            }
+            for media in engine.project().media_iter() {
+                if media.path().exists() {
+                    register_media_with_workers(media, ui);
+                }
+            }
+            publish_projection(engine, ui);
+            bump_session_epoch(ui);
+        }
+        Ok(other) => error!(template = %path.display(), "unexpected apply outcome: {other:?}"),
+        Err(e) => {
+            error!(template = %path.display(), "apply template failed: {e}");
+            publish_session_error(ui, format!("Couldn't use the template: {e}"));
         }
     }
 }

@@ -18,6 +18,7 @@ mod ruler;
 mod selection;
 mod snap;
 mod strips;
+mod templates;
 mod thumbnails;
 mod timecode;
 mod timeline;
@@ -646,6 +647,24 @@ fn main() -> Result<(), slint::PlatformError> {
         cloud_backend.on_stock_import(move |index| {
             if index >= 0 {
                 import_handle.import(index as usize);
+            }
+        });
+    }
+
+    // Launch-screen templates gallery: catalog fetches, bundle installs, and
+    // the pick flow on their own thread (src/templates.rs); the filled
+    // template swaps the session through the preview worker.
+    let templates_worker =
+        templates::TemplatesWorker::spawn(app.as_weak(), preview_worker.handle())
+            .map_err(slint::PlatformError::Other)?;
+    {
+        let templates_backend = app.global::<TemplatesBackend>();
+        let refresh_handle = templates_worker.handle();
+        templates_backend.on_refresh(move |category| refresh_handle.refresh(category.to_string()));
+        let use_handle = templates_worker.handle();
+        templates_backend.on_use_template(move |index| {
+            if index >= 0 {
+                use_handle.use_template(index as usize);
             }
         });
     }

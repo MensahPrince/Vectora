@@ -14,10 +14,11 @@
 //     grid; copy is plain and task-first.
 // All colour/spacing/type comes from AppStore.theme tokens.
 
-import { CutlassText } from "components/index.slint";
+import { CutlassText, CutlassGridView, SubtleButton } from "components/index.slint";
 import { AppStore, EditorStore } from "store/index.slint";
 import { AppState } from "state.slint";
 import { WindowBackend } from "lib/window-backend.slint";
+import { TemplatesBackend, TemplateTile } from "lib/templates-backend.slint";
 
 // Frameless-window caption button (mirrors title-bar.slint's CaptionButton):
 // the launch screen has no editor TitleBar, so it carries its own window
@@ -321,8 +322,200 @@ component ProjectRow inherits Rectangle {
     }
 }
 
+// One template-category filter chip (gallery header row).
+component CategoryChip inherits Rectangle {
+    in property <string> value;
+    in property <string> label;
+
+    property <bool> active: TemplatesBackend.category == value;
+
+    width: chip-text.preferred-width + 2 * AppStore.theme.metrics.spacing.md;
+    height: 26px;
+    border-radius: 13px;
+    background: active ? #ffffff1e
+        : ta.has-hover ? #ffffff0f
+        : #ffffff08;
+
+    chip-text := CutlassText {
+        width: parent.width;
+        height: parent.height;
+        text: root.label;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        style: AppStore.theme.typography.label;
+        foreground: active ? AppStore.theme.text.primary : AppStore.theme.text.secondary;
+    }
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => {
+            TemplatesBackend.category = root.value;
+            TemplatesBackend.refresh(root.value);
+        }
+    }
+}
+
+// One template gallery card: 16:9 preview on top, name + author below, a
+// state overlay while a use is in flight. The whole card is the click
+// target ("Use this template").
+component TemplateCard inherits Rectangle {
+    in property <TemplateTile> tile;
+    in property <int> index;
+
+    border-radius: AppStore.theme.metrics.radius.lg;
+    border-width: AppStore.theme.metrics.stroke.hairline;
+    border-color: ta.has-hover ? #ffffff33 : #ffffff14;
+    background: ta.has-hover ? AppStore.theme.panel.header-background : AppStore.theme.panel.background;
+    clip: true;
+
+    VerticalLayout {
+        spacing: AppStore.theme.metrics.spacing.none;
+
+        // Preview frame (16:9 slice of the card).
+        Rectangle {
+            height: parent.width * 9 / 16;
+            background: #1c1c1c;
+            clip: true;
+
+            if tile.has-preview: Image {
+                width: parent.width;
+                height: parent.height;
+                source: tile.preview;
+                image-fit: cover;
+            }
+
+            if !tile.has-preview: CutlassText {
+                width: parent.width;
+                height: parent.height;
+                text: "▶";
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                style: AppStore.theme.typography.heading-md;
+                foreground: AppStore.theme.text.muted;
+            }
+
+            // Corner chip: duration + slot count.
+            if tile.label != "": Rectangle {
+                x: 6px;
+                y: 6px;
+                width: chip.preferred-width + 10px;
+                height: 18px;
+                border-radius: 4px;
+                background: #000000a0;
+
+                chip := CutlassText {
+                    width: parent.width;
+                    text: tile.label;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    style: AppStore.theme.typography.caption;
+                    foreground: #ffffffcc;
+                }
+            }
+
+            // Hover hint.
+            if ta.has-hover && tile.state == "": Rectangle {
+                background: #00000066;
+
+                CutlassText {
+                    width: parent.width;
+                    height: parent.height;
+                    text: "Use template";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    style: AppStore.theme.typography.label;
+                    foreground: AppStore.theme.text.primary;
+                }
+            }
+
+            // In-flight states.
+            if tile.state == "downloading" || tile.state == "installing" || tile.state == "picking": Rectangle {
+                background: #000000a0;
+
+                VerticalLayout {
+                    alignment: center;
+                    padding: AppStore.theme.metrics.spacing.md;
+                    spacing: AppStore.theme.metrics.spacing.sm;
+
+                    CutlassText {
+                        text: tile.state == "downloading" ? "Downloading…"
+                            : tile.state == "installing" ? "Installing…"
+                            : "Choose your media…";
+                        horizontal-alignment: center;
+                        style: AppStore.theme.typography.caption;
+                    }
+
+                    if tile.state == "downloading": Rectangle {
+                        height: 3px;
+                        border-radius: 1.5px;
+                        background: #ffffff22;
+
+                        Rectangle {
+                            x: 0;
+                            width: parent.width * max(0.05, tile.progress);
+                            height: parent.height;
+                            border-radius: parent.border-radius;
+                            background: AppStore.theme.accent.primary;
+                        }
+                    }
+                }
+            }
+
+            if tile.state == "unsupported" || tile.state == "failed": Rectangle {
+                background: #000000a0;
+
+                CutlassText {
+                    width: parent.width - 2 * AppStore.theme.metrics.spacing.md;
+                    x: AppStore.theme.metrics.spacing.md;
+                    height: parent.height;
+                    text: tile.state == "unsupported"
+                        ? "Needs a newer Cutlass"
+                        : "Couldn't install — click to retry";
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                    style: AppStore.theme.typography.caption;
+                    foreground: tile.state == "unsupported" ? AppStore.theme.text.secondary : #ff8888;
+                }
+            }
+        }
+
+        // Name + author.
+        VerticalLayout {
+            padding: AppStore.theme.metrics.spacing.sm;
+            padding-left: AppStore.theme.metrics.spacing.md;
+            padding-right: AppStore.theme.metrics.spacing.md;
+            spacing: 1px;
+
+            CutlassText {
+                text: tile.name;
+                style: AppStore.theme.typography.label;
+                overflow: elide;
+            }
+
+            CutlassText {
+                text: tile.author;
+                style: AppStore.theme.typography.caption;
+                foreground: AppStore.theme.text.muted;
+                overflow: elide;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        enabled: tile.state == "" || tile.state == "failed";
+        mouse-cursor: self.enabled ? pointer : default;
+        clicked => {
+            TemplatesBackend.use-template(root.index);
+        }
+    }
+}
+
 export component LaunchScreen inherits Rectangle {
     background: AppStore.theme.surface.app-background;
+
+    // "home" | "templates" — which screen the left rail has selected.
+    property <string> active-screen: "home";
 
     VerticalLayout {
         spacing: AppStore.theme.metrics.spacing.none;
@@ -440,13 +633,21 @@ export component LaunchScreen inherits Rectangle {
 
                         RailNav {
                             label: "Home";
-                            active: true;
+                            active: root.active-screen == "home";
+                            clicked => {
+                                root.active-screen = "home";
+                            }
                         }
 
                         RailNav {
                             label: "Templates";
-                            enabled: false;
-                            tag: "Soon";
+                            active: root.active-screen == "templates";
+                            clicked => {
+                                root.active-screen = "templates";
+                                if TemplatesBackend.status == "idle" {
+                                    TemplatesBackend.refresh(TemplatesBackend.category);
+                                }
+                            }
                         }
 
                         RailNav {
@@ -508,7 +709,7 @@ export component LaunchScreen inherits Rectangle {
                 horizontal-stretch: 1;
                 background: AppStore.theme.surface.app-background;
 
-                VerticalLayout {
+                if root.active-screen == "home": VerticalLayout {
                     // Cap the content column so rows stay readable on a wide,
                     // maximized window; a layout child of a plain Rectangle
                     // pins to the left, so this keeps the home left-set rather
@@ -646,6 +847,177 @@ export component LaunchScreen inherits Rectangle {
                             Rectangle {
                                 vertical-stretch: 1;
                             }
+                        }
+                    }
+                }
+
+                // ---- Templates gallery ----------------------------------
+                if root.active-screen == "templates": VerticalLayout {
+                    max-width: 1040px;
+                    padding-left: AppStore.theme.metrics.spacing.xxl;
+                    padding-right: AppStore.theme.metrics.spacing.xxl;
+                    padding-top: AppStore.theme.metrics.spacing.lg;
+                    padding-bottom: AppStore.theme.metrics.spacing.none;
+                    spacing: AppStore.theme.metrics.spacing.lg;
+
+                    VerticalLayout {
+                        spacing: AppStore.theme.metrics.spacing.xs;
+
+                        CutlassText {
+                            text: "Templates";
+                            style: { size: 22px, weight: 600, italic: false };
+                        }
+
+                        CutlassText {
+                            text: "Pick a template, swap in your clips, and start from a finished edit.";
+                            style: AppStore.theme.typography.body;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+                    }
+
+                    // Category filter chips (mirror TemplateCategory).
+                    HorizontalLayout {
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        CategoryChip {
+                            value: "all";
+                            label: "All";
+                        }
+
+                        CategoryChip {
+                            value: "trending";
+                            label: "Trending";
+                        }
+
+                        CategoryChip {
+                            value: "travel";
+                            label: "Travel";
+                        }
+
+                        CategoryChip {
+                            value: "lifestyle";
+                            label: "Lifestyle";
+                        }
+
+                        CategoryChip {
+                            value: "birthday";
+                            label: "Birthday";
+                        }
+
+                        CategoryChip {
+                            value: "wedding";
+                            label: "Wedding";
+                        }
+
+                        CategoryChip {
+                            value: "slideshow";
+                            label: "Slideshow";
+                        }
+
+                        CategoryChip {
+                            value: "vlog";
+                            label: "Vlog";
+                        }
+
+                        CategoryChip {
+                            value: "gaming";
+                            label: "Gaming";
+                        }
+
+                        CategoryChip {
+                            value: "business";
+                            label: "Business";
+                        }
+
+                        Rectangle {
+                            horizontal-stretch: 1;
+                        }
+                    }
+
+                    if TemplatesBackend.status == "loading": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+
+                        CutlassText {
+                            text: "Loading templates…";
+                            horizontal-alignment: center;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+                    }
+
+                    if TemplatesBackend.status == "empty": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        spacing: AppStore.theme.metrics.spacing.xs;
+
+                        CutlassText {
+                            text: "No templates here yet";
+                            horizontal-alignment: center;
+                            style: AppStore.theme.typography.body;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+
+                        CutlassText {
+                            text: "New templates land in the catalog regularly — check back soon.";
+                            horizontal-alignment: center;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.muted;
+                        }
+                    }
+
+                    if TemplatesBackend.status == "error": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        CutlassText {
+                            text: "Couldn't load templates";
+                            horizontal-alignment: center;
+                            style: AppStore.theme.typography.heading-sm;
+                        }
+
+                        CutlassText {
+                            text: TemplatesBackend.error;
+                            horizontal-alignment: center;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+
+                            SubtleButton {
+                                label: "Retry";
+                                clicked => {
+                                    TemplatesBackend.refresh(TemplatesBackend.category);
+                                }
+                            }
+                        }
+                    }
+
+                    if TemplatesBackend.status == "results": template-grid := CutlassGridView {
+                        show-horizontal-scrollbar: false;
+                        show-vertical-scrollbar: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        columns: max(1, floor((self.width + AppStore.theme.metrics.spacing.md)
+                            / (232px + AppStore.theme.metrics.spacing.md)));
+                        cell-width: 232px;
+                        cell-height: 186px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.none;
+                        item-count: TemplatesBackend.items.length;
+
+                        for tile[i] in TemplatesBackend.items: TemplateCard {
+                            x: template-grid.cell-x(i);
+                            y: template-grid.cell-y(i);
+                            width: template-grid.cell-width;
+                            height: template-grid.cell-height;
+                            tile: tile;
+                            index: i;
                         }
                     }
                 }
