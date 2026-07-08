@@ -108,4 +108,7 @@ export global AppState {
     in-out property <length> transition-drag-cursor-x: 0px;
     in-out property <length> transition-drag-cursor-y: 0px;
     in-out property <bool> transition-drag-over-timeline: false;
+
+    // True while the OS is hovering supported files over the window (Finder drag).
+    in-out property <bool> os-drop-hover: false;
 }

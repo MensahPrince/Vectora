@@ -30,7 +30,9 @@ use slint::ModelRc;
 use slint::SharedString;
 use slint::VecModel;
 use slint::wgpu_28::WGPUConfiguration;
+use slint::winit_030::EventResult;
 use slint::winit_030::WinitWindowAccessor;
+use slint::winit_030::winit::event::WindowEvent;
 use tracing_subscriber::EnvFilter;
 
 slint::include_modules!();
@@ -711,6 +713,39 @@ fn main() -> Result<(), slint::PlatformError> {
         if let Err(e) = task {
             tracing::error!("failed to open import dialog: {e}");
         }
+    });
+
+    // OS file drag-and-drop (Finder / Explorer): winit emits one event per
+    // file. Drops import into the media pool — same path as the Import button.
+    let drop_import_handle = preview_worker.handle();
+    let drop_app_weak = app.as_weak();
+    app.window().on_winit_window_event(move |_window, event| {
+        match event {
+            WindowEvent::HoveredFile(path) => {
+                if media_extension_supported(path) {
+                    if let Some(app) = drop_app_weak.upgrade() {
+                        app.global::<AppState>().set_os_drop_hover(true);
+                    }
+                }
+            }
+            WindowEvent::DroppedFile(path) => {
+                if let Some(app) = drop_app_weak.upgrade() {
+                    app.global::<AppState>().set_os_drop_hover(false);
+                }
+                if media_extension_supported(path) {
+                    drop_import_handle.import(path.clone());
+                } else {
+                    tracing::warn!(path = %path.display(), "ignored unsupported dropped file");
+                }
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if let Some(app) = drop_app_weak.upgrade() {
+                    app.global::<AppState>().set_os_drop_hover(false);
+                }
+            }
+            _ => {}
+        }
+        EventResult::Propagate
     });
 
     // Library asset delete: right-click a media tile → Remove from project.
