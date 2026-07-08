@@ -14,6 +14,7 @@
 //! The export path (`composite every frame 0..duration → encode`) builds on
 //! `render_frame` and drives a [`cutlass_core::VideoEncoder`].
 
+mod animation;
 mod error;
 mod export;
 mod export_audio;
