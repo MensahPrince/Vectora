@@ -1212,6 +1212,7 @@ name = "cutlass-decoder"
 version = "0.5.3-alpha.0"
 dependencies = [
  "cutlass-core",
+ "gif",
  "ndk-sys",
  "objc2 0.6.4",
  "objc2-av-foundation",

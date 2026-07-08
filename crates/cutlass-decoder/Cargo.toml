@@ -17,6 +17,8 @@ tracing = { workspace = true }
 # `png` is pinned to the same 0.17 line cutlass-render already uses.
 png = "0.17"
 zune-jpeg = "0.5"
+# Portable animated-sticker decode: GIF frames (APNG rides on `png` above).
+gif = "0.14"
 
 # Apple backend: AVFoundation reader (demux + VideoToolbox decode) producing
 # IOSurface-backed CVPixelBuffers. objc2 framework crates are pinned to the same
