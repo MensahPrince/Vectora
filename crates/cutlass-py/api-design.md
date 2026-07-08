@@ -121,7 +121,7 @@ Project.load(path) -> Project
 
 | Member | Description |
 |---|---|
-| `p.import_media(path) -> Media` | Probe a video or audio file and register it in the pool. Still images are deferred (renderer has no still decoder yet). |
+| `p.import_media(path) -> Media` | Probe a video, audio, or still-image file and register it in the pool. Stills get `kind == "image"` and a 5 s default duration. |
 | `p.remove_media(media)` | Drop a pool entry; errors if any clip references it. |
 | `p.media -> list[Media]` | The pool. |
 | `p.add_track(kind, name="", index=None) -> Track` | New track. `kind` is `"video" \| "audio" \| "text" \| "sticker" \| "effect" \| "filter" \| "adjustment"`. `index=None` stacks on top; `0` is the bottom. |
@@ -143,7 +143,7 @@ on the timeline many times.
 ```python
 m = p.import_media("beach.mp4")
 m.path        # "/abs/path/beach.mp4"
-m.kind        # "video" | "audio"
+m.kind        # "video" | "audio" | "image"
 m.duration    # seconds
 m.size        # (w, h)   — (0, 0) for audio-only
 m.fps         # native frame rate
@@ -448,9 +448,6 @@ failure.
 
 ## Out of scope for v1 (deliberately)
 
-- **Still images** — the model supports `MediaSource::image`, but the renderer
-  skips non-video media until a still decoder lands; `import_media` rejects
-  common still extensions with `MediaError` in v1.
 - **Speed curves** (`set_clip_speed_curve`) — the normalized-ramp domain
   needs its own design; flat speed + reverse covers the common cases.
 - **Markers, templates, linked audio detach** — engine features that can

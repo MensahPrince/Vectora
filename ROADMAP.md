@@ -108,11 +108,16 @@ preview and export via the shared [`ExportAudioMixer`](crates/cutlass-render/src
   the fast seek-and-stream path. Pitch-preserving time-stretch and reversed-
   clip audio are deferred (reversed clips still export silent).
 
-## 8. cutlass-py polish
+## 8. cutlass-py polish — DONE
 
-- Allow still-image `import_media` (renderer already supports
-  `LayerSource::Still`; the Python side may still reject PNGs).
-- Sync README with current capabilities; optional PyPI packaging via maturin.
+Still-image import, docs, and PyPI packaging are aligned with the engine.
+
+- `import_media` already probed stills (`MediaSource::image` → `LayerSource::Still`);
+  this pass added positive PNG import/placement/`get_frame` tests and renamed the
+  negative test to cover missing/corrupt files only.
+- README and `api-design.md` now document still images (`kind == "image"`, 5 s
+  default duration, any placement length on `video` tracks).
+- PyPI wheels ship via maturin (`pyproject.toml`, `pywheels.yml` CI).
 
 ## 9. Non-Apple export backends
 

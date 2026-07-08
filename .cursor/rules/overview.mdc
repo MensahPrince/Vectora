@@ -16,12 +16,14 @@ Open-source **AI-first, prompt-to-edit** video editing (CapCut-inspired): users 
 
 Ship a **small but real** editor: cut, trim, and other **basic timeline editing**. On top sits an **AI agent** that emits **structured commands**; Rust **executes** those commands against project/timeline state (deterministic edits, auditable undo-friendly actions).
 
-## Planned: Python bindings (side feature)
+## Python bindings (side feature)
 
-A **MoviePy-style Python library** so the engine can be scripted from Python. This is a **side feature** — the editor, AI agent, and all core stay pure Rust; Python only wraps the existing `Engine`.
+A **MoviePy-style Python library** (`cutlass-py`) scripts the engine from Python.
+This is a **side feature** — the editor, AI agent, and all core stay pure Rust;
+Python only wraps the existing renderer and model.
 
 - **Shape**: separate optional crate `cutlass-py` (`crate-type = ["cdylib"]`, PyO3 + `maturin`), depending on `cutlass-engine`/`-compositor`/`-models`. Kept off the default workspace build and shipped to PyPI on its own.
-- **API**: thin, Pythonic wrapper over `Engine` (`add_clip`, `split`, `export`, `get_frame`) — do **not** expose the raw `EditCommand` enum to Python.
+- **API**: track-first v2 wrapper (`Project`, `Track`, `Clip`, `import_media`, `get_frame`, `export`) — do **not** expose the raw `EditCommand` enum to Python.
 - **Prerequisite (landed)**: the **timeline → video file exporter** exists — `export_to_file(_observed)` in `cutlass-render` composites every frame and muxes H.264/AAC via `cutlass-encoder`, wired into the engine, desktop, and mobile.
 - **`get_frame(t) -> numpy`**: easy given `RgbaImage` is already `width/height/Vec<u8>`.
 - **Composited content**: `CompositeLayer` handles video frames, RGBA bitmaps (text/stills/pen paths/bundled stickers, including animated GIF/APNG sticker frames), solids, SDF shapes, per-layer color grades (clip filters/adjustments), canvas-wide lane effect/filter/adjustment passes, and catalog look animations (entrance/exit/combo presets sampled at resolve time).
