@@ -18,6 +18,7 @@ cutlass-text = { path = "../cutlass-text" }
 thiserror.workspace = true
 tracing.workspace = true
 png = "0.17"
+nnnoiseless = "0.5"
 
 [dev-dependencies]
 tempfile = "3"

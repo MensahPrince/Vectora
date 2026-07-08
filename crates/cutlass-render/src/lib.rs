@@ -15,6 +15,7 @@
 //! `render_frame` and drives a [`cutlass_core::VideoEncoder`].
 
 mod animation;
+mod audio_dsp;
 mod error;
 mod export;
 mod export_audio;
