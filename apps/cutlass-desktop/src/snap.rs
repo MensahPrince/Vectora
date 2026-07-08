@@ -871,11 +871,7 @@ mod tests {
         // The model designates the bottom video lane as the main track and
         // the projection publishes the flag; mirror that here (rows are
         // top-first, so the bottom lane is the last video entry).
-        if let Some(main) = tracks
-            .iter_mut()
-            .rev()
-            .find(|t| t.kind == TrackKind::Video)
-        {
+        if let Some(main) = tracks.iter_mut().rev().find(|t| t.kind == TrackKind::Video) {
             main.is_main = true;
         }
         Sequence {
