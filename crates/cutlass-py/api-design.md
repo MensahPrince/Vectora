@@ -206,6 +206,9 @@ track.end              # content end in seconds (0.0 when empty)
 
 track.name             # get/set
 track.kind             # "video" | "audio" | …  (read-only)
+track.main             # True on the main video track (read-only; CapCut
+                       # semantics: designated automatically, audio-only
+                       # lanes may sit below it, everything else stacks above)
 track.enabled = False  # video: excluded from the composite
 track.muted   = True   # audio: silenced
 track.locked  = True   # editing lock (engine semantics)

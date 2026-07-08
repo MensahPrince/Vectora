@@ -116,7 +116,12 @@ pub fn system_prompt(summary: &ProjectSummary, context: &EditorContext) -> Strin
          last N seconds, keep start and decrease duration.\n\
          - Tracks stack bottom-to-top; later (higher) tracks composite on \
          top. Media clips need video/audio tracks; titles need a text \
-         track; solids and shapes need a sticker track.\n\
+         track; solids and shapes need a sticker track. Lanes keep fixed \
+         zones: audio at the bottom, then the main video track (marked \
+         \"main\" in the state; it is permanent and cannot be removed), \
+         overlay lanes above it, text lanes on top. Put primary footage \
+         on the main track and prefer reusing existing lanes over adding \
+         new ones.\n\
          - If a tool call is rejected, read the error and correct course; \
          do not repeat the identical call.\n\
          - The state below is a fresh snapshot of the project as it is \

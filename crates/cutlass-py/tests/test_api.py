@@ -148,8 +148,19 @@ class TestTracks:
     def test_tracks_are_ordered_and_insertable(self, p: Project) -> None:
         p.add_track("video", name="A")
         p.add_track("video", name="B")
-        p.add_track("video", name="bottom", index=0)
-        assert [t.name for t in p.tracks] == ["bottom", "A", "B"]
+        # The first video lane is the main track; nothing but audio may sit
+        # below it, so an insert at index 0 clamps to just above it.
+        p.add_track("video", name="above-main", index=0)
+        assert [t.name for t in p.tracks] == ["A", "above-main", "B"]
+
+    def test_first_video_track_is_main(self, p: Project) -> None:
+        audio = p.add_track("audio")
+        assert audio.main is False
+        v1 = p.add_track("video", name="A")
+        v2 = p.add_track("video", name="B")
+        assert (v1.main, v2.main) == (True, False)
+        v1.remove()
+        assert v2.main is True
 
     def test_lookup_by_name(self, p: Project) -> None:
         p.add_track("video", name="Main")

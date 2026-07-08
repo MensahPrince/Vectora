@@ -1,7 +1,7 @@
 {
   "tools": [
     {
-      "description": "Add a track to the timeline stack (video, audio, text, or sticker overlay lane).",
+      "description": "Add a track to the timeline stack (video, audio, text, or sticker overlay lane). Lanes keep CapCut zones: audio at the bottom, then the main video track, overlays above it, text on top — the index only orders a lane within its zone.",
       "name": "add_track",
       "parameters": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1475,7 +1475,7 @@
       }
     },
     {
-      "description": "Remove a track and any clips still on it.",
+      "description": "Remove a track and any clips still on it. The main track (marked in describe_project) is permanent and cannot be removed.",
       "name": "remove_track",
       "parameters": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

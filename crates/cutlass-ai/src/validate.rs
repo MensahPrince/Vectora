@@ -697,9 +697,17 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
         WireCommand::RemoveClip(args) => EditCommand::RemoveClip {
             clip: clip_ref(project, args.clip)?.id,
         },
-        WireCommand::RemoveTrack(args) => EditCommand::RemoveTrack {
-            track: track_ref(project, args.track)?.id,
-        },
+        WireCommand::RemoveTrack(args) => {
+            let track = track_ref(project, args.track)?;
+            if track.main {
+                return Err(Rejection::new(format!(
+                    "track {} is the main track and cannot be removed; \
+                     it is the permanent video lane every edit builds on",
+                    args.track,
+                )));
+            }
+            EditCommand::RemoveTrack { track: track.id }
+        }
         WireCommand::SetTrackEnabled(args) => EditCommand::SetTrackEnabled {
             track: track_ref(project, args.track)?.id,
             enabled: args.enabled,
@@ -1582,6 +1590,30 @@ mod tests {
             }),
         );
         assert!(msg.contains("media 999 does not exist"), "{msg}");
+    }
+
+    #[test]
+    fn remove_track_rejects_the_main_track() {
+        let (mut project, _, video, text, _, _) = fixture();
+
+        let msg = reject(
+            &project,
+            WireCommand::RemoveTrack(wire::RemoveTrack { track: video }),
+        );
+        assert!(msg.contains("main track"), "{msg}");
+
+        // Non-main lanes stay removable.
+        let overlay = project.add_track(TrackKind::Video, "V2");
+        lower(
+            &project,
+            WireCommand::RemoveTrack(wire::RemoveTrack {
+                track: overlay.raw(),
+            }),
+        );
+        lower(
+            &project,
+            WireCommand::RemoveTrack(wire::RemoveTrack { track: text }),
+        );
     }
 
     #[test]

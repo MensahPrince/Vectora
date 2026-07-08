@@ -154,6 +154,14 @@ impl Track {
         })
     }
 
+    /// Whether this is the main video track (CapCut semantics): the
+    /// bottom-most video lane every other visual lane stacks above.
+    /// Designated automatically; removing it promotes the next video lane.
+    #[getter]
+    fn main(&self, py: Python) -> PyResult<bool> {
+        self.with_project(py, |project| Ok(Self::require(project, self.id)?.main))
+    }
+
     #[getter]
     fn enabled(&self, py: Python) -> PyResult<bool> {
         self.with_project(py, |project| Ok(Self::require(project, self.id)?.enabled))

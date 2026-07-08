@@ -1029,7 +1029,7 @@ macro_rules! tools {
 
 tools! {
     "add_track" => AddTrack(AddTrack),
-        "Add a track to the timeline stack (video, audio, text, or sticker overlay lane).";
+        "Add a track to the timeline stack (video, audio, text, or sticker overlay lane). Lanes keep CapCut zones: audio at the bottom, then the main video track, overlays above it, text on top — the index only orders a lane within its zone.";
     "add_clip" => AddClip(AddClip),
         "Place a trimmed range of an imported media file on a video or audio track. Times are in seconds.";
     "add_generated" => AddGenerated(AddGenerated),
@@ -1091,7 +1091,7 @@ tools! {
     "remove_clip" => RemoveClip(RemoveClip),
         "Remove a clip, leaving a gap where it sat.";
     "remove_track" => RemoveTrack(RemoveTrack),
-        "Remove a track and any clips still on it.";
+        "Remove a track and any clips still on it. The main track (marked in describe_project) is permanent and cannot be removed.";
     "set_track_enabled" => SetTrackEnabled(SetTrackEnabled),
         "Show or hide a visual track in the composite.";
     "set_track_muted" => SetTrackMuted(SetTrackMuted),

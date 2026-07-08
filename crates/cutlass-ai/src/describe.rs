@@ -78,6 +78,10 @@ pub struct TrackSummary {
     pub enabled: bool,
     pub muted: bool,
     pub locked: bool,
+    /// The permanent main video track (CapCut's magnetic lane). It cannot be
+    /// removed; every other visual lane stacks above it. Omitted elsewhere.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub main: bool,
     /// Clips in timeline order.
     pub clips: Vec<ClipSummary>,
 }
@@ -303,6 +307,7 @@ pub fn summarize(project: &Project) -> ProjectSummary {
             enabled: track.enabled,
             muted: track.muted,
             locked: track.locked,
+            main: track.main,
             clips: track
                 .clips_ordered()
                 .into_iter()
