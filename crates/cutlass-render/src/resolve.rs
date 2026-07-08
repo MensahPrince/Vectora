@@ -199,20 +199,23 @@ fn resolve_track_at(
             let progress = (t.value - window_start) as f32 / transition.duration as f32;
             let outgoing_t = RationalTime::new(left.timeline.end_tick() - 1, t.rate);
             let incoming_t = RationalTime::new(right.timeline.start.value, t.rate);
-            let outgoing = resolve_clip(project, left, outgoing_t, cw, ch, overrides)?
-                .map(Box::new)
-                .ok_or_else(|| {
-                    cutlass_models::ModelError::InvalidParam(
-                        "transition outgoing clip produced no layer".into(),
-                    )
-                })?;
-            let incoming = resolve_clip(project, right, incoming_t, cw, ch, overrides)?
-                .map(Box::new)
-                .ok_or_else(|| {
-                    cutlass_models::ModelError::InvalidParam(
-                        "transition incoming clip produced no layer".into(),
-                    )
-                })?;
+            // A side that produces no layer (e.g. empty text) or a canvas-wide
+            // pass (effect/filter/adjustment segments) can't be composited as
+            // a transition frame — the renderer rejects nested canvas passes.
+            // Skip the transition and resolve the track normally so the
+            // preview keeps updating instead of erroring every frame.
+            let outgoing = resolve_clip(project, left, outgoing_t, cw, ch, overrides)?;
+            let incoming = resolve_clip(project, right, incoming_t, cw, ch, overrides)?;
+            let (Some(outgoing), Some(incoming)) = (outgoing, incoming) else {
+                break;
+            };
+            if matches!(outgoing.source, LayerSource::CanvasPass)
+                || matches!(incoming.source, LayerSource::CanvasPass)
+            {
+                break;
+            }
+            let outgoing = Box::new(outgoing);
+            let incoming = Box::new(incoming);
             return Ok(Some(SceneLayer {
                 clip: None,
                 source: LayerSource::Transition {
@@ -1962,6 +1965,49 @@ mod tests {
             }
             other => panic!("expected transition layer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transition_between_canvas_passes_falls_back_to_plain_clip() {
+        // Legacy project files may carry transitions on effect/filter/
+        // adjustment lanes (the model now rejects creating them). Both sides
+        // resolve to CanvasPass, which the renderer can't nest — the resolver
+        // must skip the transition and resolve the track normally, not error.
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Adjustment, "A1");
+        let left = project
+            .add_generated(track, Generator::Adjustment, tr(0, 24))
+            .unwrap();
+        let right = project
+            .add_generated(track, Generator::Adjustment, tr(24, 24))
+            .unwrap();
+        for clip in [left, right] {
+            project
+                .set_clip_adjustments(
+                    clip,
+                    ColorAdjustments {
+                        exposure: 1.0,
+                        ..ColorAdjustments::default()
+                    },
+                )
+                .unwrap();
+        }
+        // Inject the transition through the persistence path, the way a
+        // project saved before the model-level guard would carry it.
+        let mut doc = serde_json::to_value(&project).unwrap();
+        doc["timeline"]["tracks"][0][1]["transitions"] = serde_json::json!([{
+            "left": left.raw(),
+            "right": right.raw(),
+            "transition_id": "crossfade",
+            "duration": 24,
+        }]);
+        let project: Project = serde_json::from_value(doc).unwrap();
+
+        // Midpoint of the window [12, 36): no Transition layer, just the
+        // plain canvas pass of the clip under the playhead.
+        let scene = resolve(&project, rt(24)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        assert!(matches!(scene.layers[0].source, LayerSource::CanvasPass));
     }
 
     #[test]
