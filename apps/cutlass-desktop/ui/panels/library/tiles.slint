@@ -90,6 +90,13 @@ export component CatalogTile inherits Rectangle {
             if event.kind == PointerEventKind.up {
                 AppState.library-drag-active = false;
             }
+            if event.kind == PointerEventKind.cancel {
+                // Move cursor off-window so the timeline drop handler won't
+                // commit if the grab was stolen mid-drag.
+                AppState.library-drag-cursor-x = -10000px;
+                AppState.library-drag-cursor-y = -10000px;
+                AppState.library-drag-active = false;
+            }
         }
 
         moved => {
@@ -168,6 +175,11 @@ export component TransitionCatalogTile inherits Rectangle {
             if event.kind == PointerEventKind.up {
                 AppState.transition-drag-active = false;
             }
+            if event.kind == PointerEventKind.cancel {
+                AppState.transition-drag-cursor-x = -10000px;
+                AppState.transition-drag-cursor-y = -10000px;
+                AppState.transition-drag-active = false;
+            }
         }
 
         moved => {
@@ -240,6 +252,11 @@ export component MediaTile inherits Rectangle {
                 menu-popup.show();
             }
             if event.kind == PointerEventKind.up {
+                AppState.library-drag-active = false;
+            }
+            if event.kind == PointerEventKind.cancel {
+                AppState.library-drag-cursor-x = -10000px;
+                AppState.library-drag-cursor-y = -10000px;
                 AppState.library-drag-active = false;
             }
         }
@@ -462,6 +479,11 @@ export component GeneratedTile inherits Rectangle {
                 AppState.library-drag-active = true;
             }
             if event.kind == PointerEventKind.up {
+                AppState.library-drag-active = false;
+            }
+            if event.kind == PointerEventKind.cancel {
+                AppState.library-drag-cursor-x = -10000px;
+                AppState.library-drag-cursor-y = -10000px;
                 AppState.library-drag-active = false;
             }
         }
