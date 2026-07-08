@@ -3,6 +3,7 @@ mod audio;
 mod drafts;
 mod inspector;
 mod interaction;
+mod os_drop;
 mod params;
 mod paths;
 mod placement;
@@ -21,6 +22,12 @@ mod timecode;
 mod timeline;
 mod transport;
 mod window;
+
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
 
 use cutlass_engine::EngineConfig;
 use slint::BackendSelector;
@@ -139,6 +146,53 @@ fn media_extension_supported(path: &std::path::Path) -> bool {
     MEDIA_IMPORT_EXTENSIONS
         .iter()
         .any(|&supported| supported == ext)
+}
+
+/// Extension-only audio check for files still owned by the OS drag (the
+/// probe runs after the drop): drives the hover preview's lane kind.
+fn audio_extension(path: &std::path::Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    AUDIO_IMPORT_EXTENSIONS
+        .iter()
+        .any(|&supported| supported == ext)
+}
+
+/// Where an OS file drop at window-space `cursor` (logical points) lands on
+/// the timeline: `Some((lane row, sequence tick))` when the cursor is over
+/// the timeline panel, `None` anywhere else — the caller falls back to the
+/// pool-only import. Geometry comes from the AppState mirror TimelinePanel
+/// maintains (`sync-os-drop-geometry`); the launch-screen and maximized-
+/// preview guards cover the states where that mirror is stale because the
+/// panel is unmounted.
+fn os_drop_timeline_target(app: &AppWindow, cursor: (f32, f32)) -> Option<(i64, i64)> {
+    let state = app.global::<AppState>();
+    if state.get_launch_visible() || state.get_preview_maximized() {
+        return None;
+    }
+    let (cx, cy) = cursor;
+    let (px, py) = (state.get_timeline_panel_x(), state.get_timeline_panel_y());
+    let (pw, ph) = (state.get_timeline_panel_w(), state.get_timeline_panel_h());
+    if pw <= 0.0 || ph <= 0.0 || cx < px || cx >= px + pw || cy < py || cy >= py + ph {
+        return None;
+    }
+    let pitch = state.get_timeline_row_pitch();
+    let zoom = app.global::<TimelineStore>().get_zoom();
+    if pitch <= 0.0 || zoom <= 0.0 {
+        return None;
+    }
+    let view = app.global::<TimelineViewState>();
+    // Same math as the library drag targeting in timeline.slint: cursor →
+    // lane-content space → tick / row (row 0 is the head spacer, lanes
+    // start at row 1).
+    let tick = ((cx - state.get_timeline_lanes_x() - view.get_scroll_x()) / zoom)
+        .round()
+        .max(0.0) as i64;
+    let row =
+        ((cy - state.get_timeline_lanes_y() - view.get_scroll_y()) / pitch).floor() as i64 - 1;
+    Some((row, tick))
 }
 
 async fn pick_import_paths() -> Vec<std::path::PathBuf> {
@@ -717,32 +771,122 @@ fn main() -> Result<(), slint::PlatformError> {
         }
     });
 
-    // OS file drag-and-drop (Finder / Explorer): winit emits one event per
-    // file. Drops import into the media pool — same path as the Import button.
+    // OS file drag-and-drop (Finder / Explorer): winit 0.30 emits one event
+    // per file, with no pointer position (the position-carrying drag API is
+    // winit 0.31). A gesture's paths are batched and flushed on a short
+    // timer; the flush queries the OS cursor (src/os_drop.rs) snapshotted at
+    // the first DroppedFile and hit-tests it against the timeline panel: a
+    // drop over the timeline imports *and places* the files end-to-end at
+    // the cursor's lane row + tick (one undo group), anywhere else keeps the
+    // pool-only import. While files hover, a poll timer feeds the cursor to
+    // the timeline's landing preview — there are no hover-move events to
+    // react to.
     let drop_import_handle = preview_worker.handle();
     let drop_app_weak = app.as_weak();
-    app.window().on_winit_window_event(move |_window, event| {
+    // (visual, audio) counts of the hovered files, by extension — the
+    // preview targets a video lane unless the whole set is audio.
+    let hover_counts: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
+    let hover_poll: Rc<slint::Timer> = Rc::new(slint::Timer::default());
+    let pending_drop: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+    let drop_cursor: Rc<Cell<Option<(f32, f32)>>> = Rc::new(Cell::new(None));
+    // Clear every hover-preview state the drag set (drop and cancel paths).
+    let end_hover = {
+        let hover_counts = hover_counts.clone();
+        let hover_poll = hover_poll.clone();
+        let app_weak = drop_app_weak.clone();
+        move || {
+            hover_poll.stop();
+            hover_counts.set((0, 0));
+            if let Some(app) = app_weak.upgrade() {
+                let state = app.global::<AppState>();
+                state.set_os_drop_hover(false);
+                state.set_os_drop_over_timeline(false);
+                state.set_os_drop_file_count(0);
+                state.set_os_drop_cursor_x(-1.0);
+                state.set_os_drop_cursor_y(-1.0);
+            }
+        }
+    };
+    app.window().on_winit_window_event(move |window, event| {
         match event {
             WindowEvent::HoveredFile(path) if media_extension_supported(path) => {
+                let (visual, audio) = hover_counts.get();
+                let counts = if audio_extension(path) {
+                    (visual, audio + 1)
+                } else {
+                    (visual + 1, audio)
+                };
+                hover_counts.set(counts);
                 if let Some(app) = drop_app_weak.upgrade() {
-                    app.global::<AppState>().set_os_drop_hover(true);
+                    let state = app.global::<AppState>();
+                    state.set_os_drop_hover(true);
+                    state.set_os_drop_file_count(counts.0 + counts.1);
+                    state.set_os_drop_lane_kind(if counts.0 == 0 {
+                        TrackKind::Audio
+                    } else {
+                        TrackKind::Video
+                    });
                 }
+                // ~30 Hz cursor poll for the landing preview, running for
+                // the hover's lifetime (restarting per file is harmless —
+                // HoveredFile only fires once per file, at drag entry).
+                let poll_weak = drop_app_weak.clone();
+                hover_poll.start(
+                    slint::TimerMode::Repeated,
+                    Duration::from_millis(33),
+                    move || {
+                        let Some(app) = poll_weak.upgrade() else {
+                            return;
+                        };
+                        if let Some((x, y)) = app
+                            .window()
+                            .with_winit_window(os_drop::cursor_in_window)
+                            .flatten()
+                        {
+                            let state = app.global::<AppState>();
+                            state.set_os_drop_cursor_x(x);
+                            state.set_os_drop_cursor_y(y);
+                        }
+                    },
+                );
             }
             WindowEvent::DroppedFile(path) => {
-                if let Some(app) = drop_app_weak.upgrade() {
-                    app.global::<AppState>().set_os_drop_hover(false);
-                }
-                if media_extension_supported(path) {
-                    drop_import_handle.import(path.clone());
-                } else {
+                end_hover();
+                if !media_extension_supported(path) {
                     tracing::warn!(path = %path.display(), "ignored unsupported dropped file");
+                } else {
+                    let mut pending = pending_drop.borrow_mut();
+                    if pending.is_empty() {
+                        // First file of the gesture: snapshot the cursor now
+                        // (the flush runs a beat later, when the pointer may
+                        // have moved on) and schedule one flush for the whole
+                        // batch — the backends deliver a multi-file drop
+                        // back-to-back from a single OS callback.
+                        drop_cursor.set(
+                            window
+                                .with_winit_window(os_drop::cursor_in_window)
+                                .flatten(),
+                        );
+                        let pending_drop = pending_drop.clone();
+                        let drop_cursor = drop_cursor.clone();
+                        let app_weak = drop_app_weak.clone();
+                        let handle = drop_import_handle.clone();
+                        slint::Timer::single_shot(Duration::from_millis(30), move || {
+                            let paths = std::mem::take(&mut *pending_drop.borrow_mut());
+                            if paths.is_empty() {
+                                return;
+                            }
+                            let target = app_weak.upgrade().and_then(|app| {
+                                let cursor = drop_cursor.take()?;
+                                os_drop_timeline_target(&app, cursor)
+                            });
+                            handle.drop_files(paths, target);
+                        });
+                    }
+                    pending.push(path.clone());
                 }
             }
-            WindowEvent::HoveredFileCancelled => {
-                if let Some(app) = drop_app_weak.upgrade() {
-                    app.global::<AppState>().set_os_drop_hover(false);
-                }
-            }
+            WindowEvent::HoveredFileCancelled => end_hover(),
             _ => {}
         }
         EventResult::Propagate

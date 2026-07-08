@@ -582,8 +582,10 @@ export component AppWindow inherits Window {
     }
 
     // OS file-drop target — accent border + hint while Finder/Explorer hovers
-    // supported files over the window.
-    if AppState.os-drop-hover: Rectangle {
+    // supported files over the window. Hidden while the cursor is over the
+    // timeline: the panel shows a landing preview there instead (dropping on
+    // the timeline places clips rather than just importing).
+    if AppState.os-drop-hover && !AppState.os-drop-over-timeline: Rectangle {
         width: root.width;
         height: root.height;
         background: #ffffff08;

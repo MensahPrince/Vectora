@@ -111,4 +111,34 @@ export global AppState {
 
     // True while the OS is hovering supported files over the window (Finder drag).
     in-out property <bool> os-drop-hover: false;
+
+    // --- OS file drop → timeline placement -------------------------------
+    // TimelinePanel mirrors its own and its lane viewport's window-space
+    // geometry here (see sync-os-drop-geometry in timeline.slint) so the
+    // Rust drop handler (src/main.rs) can hit-test the drop cursor and
+    // convert it to a lane row + tick — winit's file-drop events carry no
+    // pointer position, so the handler works from a polled OS cursor query
+    // (src/os_drop.rs) instead of a pointer event.
+    in-out property <length> timeline-panel-x: 0px;
+    in-out property <length> timeline-panel-y: 0px;
+    in-out property <length> timeline-panel-w: 0px;
+    in-out property <length> timeline-panel-h: 0px;
+    in-out property <length> timeline-lanes-x: 0px;
+    in-out property <length> timeline-lanes-y: 0px;
+    in-out property <length> timeline-row-pitch: 0px;
+
+    // Cursor + payload of an in-flight OS file drag, for the timeline's
+    // landing preview: a Rust polling timer feeds the cursor while
+    // `os-drop-hover` (there are no hover events to react to); the lane
+    // kind/count come from the hovered files' extensions. Negative cursor ⇔
+    // not yet polled.
+    in-out property <length> os-drop-cursor-x: -1px;
+    in-out property <length> os-drop-cursor-y: -1px;
+    in-out property <TrackKind> os-drop-lane-kind: TrackKind.video;
+    in-out property <int> os-drop-file-count: 0;
+
+    // Written by TimelinePanel; the window-wide "Drop to import" overlay
+    // hides while the cursor is over the timeline (the panel shows a
+    // landing preview there instead).
+    in-out property <bool> os-drop-over-timeline: false;
 }

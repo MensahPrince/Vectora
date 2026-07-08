@@ -174,6 +174,70 @@ export component TimelinePanel inherits PanelBase {
         }
     }
 
+    // --- OS file-drop targeting (Finder / Explorer) ---------------------
+    // Mirror the panel + lane-viewport geometry into AppState so the Rust
+    // drop handler (src/main.rs) can hit-test the OS drop cursor and convert
+    // it to a lane row + tick. winit's file-drop events carry no pointer
+    // position, so the handler works from a polled cursor (src/os_drop.rs)
+    // rather than a pointer event — the geometry has to be readable outside
+    // this component.
+    function sync-os-drop-geometry() {
+        AppState.timeline-panel-x = self.absolute-position.x;
+        AppState.timeline-panel-y = self.absolute-position.y;
+        AppState.timeline-panel-w = self.width;
+        AppState.timeline-panel-h = self.height;
+        AppState.timeline-lanes-x = lanes.absolute-position.x;
+        AppState.timeline-lanes-y = lanes.absolute-position.y;
+        AppState.timeline-row-pitch = root.row-pitch;
+    }
+    // A change to any mirrored value flips this sum; the handler re-syncs.
+    private property <length> os-drop-geometry-watch:
+        self.absolute-position.x + self.absolute-position.y + self.width + self.height
+        + lanes.absolute-position.x + lanes.absolute-position.y + root.row-pitch;
+    changed os-drop-geometry-watch => {
+        self.sync-os-drop-geometry();
+    }
+
+    // Landing preview while the OS drag hovers this panel (cursor fed by the
+    // Rust polling timer). Same coordinate math as the library drag above.
+    private property <bool> os-drop-cursor-inside:
+        AppState.os-drop-hover
+        && AppState.os-drop-cursor-x >= self.absolute-position.x
+        && AppState.os-drop-cursor-x < self.absolute-position.x + self.width
+        && AppState.os-drop-cursor-y >= self.absolute-position.y
+        && AppState.os-drop-cursor-y < self.absolute-position.y + self.height;
+
+    changed os-drop-cursor-inside => {
+        AppState.os-drop-over-timeline = self.os-drop-cursor-inside;
+    }
+
+    private property <int> os-drop-cursor-tick: max(0, round(
+        (AppState.os-drop-cursor-x - lanes.absolute-position.x - TimelineViewState.scroll-x)
+        / TimelineStore.zoom / 1px));
+
+    private property <int> os-drop-row: floor(
+        (AppState.os-drop-cursor-y - lanes.absolute-position.y - TimelineViewState.scroll-y)
+        / (root.track-height + root.track-spacing)) - 1;
+
+    // Placeholder span for the preview — real durations aren't known until
+    // the drop probes the files: 3 seconds at the sequence rate.
+    private property <int> os-drop-ghost-ticks:
+        max(1, 3 * root.sequence.fps.num / max(1, root.sequence.fps.den));
+
+    // Row + caret resolution through the library-drop resolver so the
+    // preview honors the same landing rules the worker applies (empty-main
+    // fallback, main-track magnet insertion). Snap threshold 0: the OS drop
+    // commit doesn't edge-snap, so the preview must not either.
+    private property <LibraryDropResolution> os-drop-res: DragBackend.resolve-library-drop(
+        root.sequence,
+        AppState.os-drop-lane-kind,
+        root.os-drop-ghost-ticks,
+        root.os-drop-cursor-tick,
+        root.os-drop-row,
+        TimelineStore.playhead-tick,
+        0,
+        TimelineStore.main-magnet-enabled);
+
     private property <length> track-spacing: AppStore.theme.metrics.spacing.sm;
     private property <length> track-height: TimelineActions.track-lane-height();
     // Lane rows repeat every `row-pitch`; row 0 is the ForceHeadSpace spacer,
@@ -460,6 +524,7 @@ export component TimelinePanel inherits PanelBase {
 
     init => {
         TimelineViewState.viewport-w = lanes.width;
+        self.sync-os-drop-geometry();
     }
 
     // The playhead → preview-frame-request watcher lives at window scope
@@ -814,6 +879,61 @@ export component TimelinePanel inherits PanelBase {
                     width: 1px;
                     height: max(parent.height, content-height);
                     background: AppStore.theme.accent.primary;
+                }
+
+                // --- OS file-drop landing preview -----------------------------
+                // Same visuals as a library drag: caret + slot on the main lane
+                // (magnet insert), placeholder-length ghost elsewhere. Position
+                // is honest (the worker lands the first file exactly here);
+                // length is a stand-in until the drop probes the files.
+                if os-drop-cursor-inside && os-drop-res.is-insert: Rectangle {
+                    Rectangle {
+                        x: os-drop-res.caret-tick * TimelineStore.zoom * 1px;
+                        y: (os-drop-res.target-row + 1) * row-pitch;
+                        width: root.os-drop-ghost-ticks * TimelineStore.zoom * 1px;
+                        height: track-height - 5px;
+                        background: AppStore.theme.accent.primary.with-alpha(0.28);
+                        border-width: 1px;
+                        border-color: AppStore.theme.accent.primary;
+                        border-radius: AppStore.theme.track-lane.clip.radius;
+                    }
+                    Rectangle {
+                        x: os-drop-res.caret-tick * TimelineStore.zoom * 1px - self.width / 2;
+                        y: (os-drop-res.target-row + 1) * row-pitch - 2px;
+                        width: 9px;
+                        height: track-height - 1px;
+                        border-radius: 4.5px;
+                        background: AppStore.theme.accent.primary.with-alpha(0.35);
+                    }
+                    Rectangle {
+                        x: os-drop-res.caret-tick * TimelineStore.zoom * 1px - self.width / 2;
+                        y: (os-drop-res.target-row + 1) * row-pitch - 2px;
+                        width: 3px;
+                        height: track-height - 1px;
+                        background: AppStore.theme.accent.primary;
+                    }
+                }
+
+                if os-drop-cursor-inside && !os-drop-res.is-insert: Rectangle {
+                    x: os-drop-res.resolved-start * TimelineStore.zoom * 1px;
+                    y: (os-drop-res.target-row + 1) * row-pitch;
+                    width: root.os-drop-ghost-ticks * TimelineStore.zoom * 1px;
+                    height: track-height - 5px;
+                    background: AppStore.theme.accent.primary.with-alpha(0.3);
+                    border-width: 1px;
+                    border-color: AppStore.theme.accent.primary;
+                    border-radius: AppStore.theme.track-lane.clip.radius;
+                }
+
+                // File-count badge above the landing spot.
+                if os-drop-cursor-inside: DragTooltip {
+                    x: (os-drop-res.is-insert
+                            ? os-drop-res.caret-tick : os-drop-res.resolved-start)
+                        * TimelineStore.zoom * 1px;
+                    y: (os-drop-res.target-row + 1) * row-pitch - self.height - 4px;
+                    text: AppState.os-drop-file-count <= 1
+                        ? "Drop to add"
+                        : "Drop to add " + AppState.os-drop-file-count + " files";
                 }
 
                 // Vertical magnet guide at the snapped edge (CapCut-style).

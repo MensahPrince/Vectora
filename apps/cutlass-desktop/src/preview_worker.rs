@@ -69,6 +69,18 @@ enum WorkerMsg {
         height: u32,
     },
     Import(PathBuf),
+    /// OS files dropped on the window (Finder / Explorer). With `target`
+    /// — the drop landed on the timeline: (lane-list row, sequence tick)
+    /// under the cursor — every file is imported and placed end-to-end from
+    /// the drop point in one undo group: videos/images on a video lane
+    /// (falling back to the empty main track, CapCut-style), audio-only
+    /// files on an audio lane (the model's lane zones keep audio at the
+    /// bottom). Without `target` the drop is a plain pool import, the same
+    /// as [`WorkerMsg::Import`] per file.
+    DropFiles {
+        paths: Vec<PathBuf>,
+        target: Option<(i64, i64)>,
+    },
     /// A preview proxy for pool media `media_id` is ready at `proxy`
     /// (from the proxy worker thread). `source` is the file the job was
     /// keyed to; the handler binds the proxy only while the pool entry
@@ -629,6 +641,12 @@ impl WorkerHandle {
 
     pub fn import(&self, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::Import(path));
+    }
+
+    /// OS file drop: import `paths` and, when `target` names a timeline
+    /// landing spot (lane row, tick), place them end-to-end from there.
+    pub fn drop_files(&self, paths: Vec<PathBuf>, target: Option<(i64, i64)>) {
+        let _ = self.tx.send(WorkerMsg::DropFiles { paths, target });
     }
 
     /// A preview proxy landed for pool media `media_id` (raw id), generated
@@ -1289,6 +1307,9 @@ fn worker_loop(
                 fit.set_viewport(width, height);
             }
             WorkerMsg::Import(path) => import_and_publish(engine, &path, &ui),
+            WorkerMsg::DropFiles { paths, target } => {
+                drop_files_and_publish(engine, &paths, target, *main_magnet, &ui);
+            }
             WorkerMsg::ProxyReady {
                 media_id,
                 source,
@@ -2638,6 +2659,211 @@ fn import_and_publish(engine: &mut Engine, path: &Path, ui: &UiSink) {
         Ok(other) => error!(path = %path.display(), "unexpected import outcome: {other:?}"),
         Err(e) => error!(path = %path.display(), "import failed: {e}"),
     }
+}
+
+/// One pool entry imported by an OS drop, ready to place: id, full source
+/// range, and that range resampled to timeline ticks (what the clip will
+/// occupy).
+struct DroppedMedia {
+    media: MediaId,
+    source: TimeRange,
+    duration_ticks: i64,
+}
+
+/// OS files dropped on the timeline (Finder / Explorer): import every path
+/// and place the results end-to-end from the drop point — videos and images
+/// on a video lane, audio-only files on an audio lane (the model's lane
+/// zones keep audio at the bottom) — as **one undo group**, mobile
+/// `append_main`-style. Without `target` the drop missed the timeline and
+/// each path takes the plain pool-import path (today's behavior).
+///
+/// A file whose import/probe fails is skipped without aborting the rest;
+/// the group commits with whatever landed.
+fn drop_files_and_publish(
+    engine: &mut Engine,
+    paths: &[PathBuf],
+    target: Option<(i64, i64)>,
+    main_magnet: bool,
+    ui: &UiSink,
+) {
+    let Some((drop_row, drop_tick)) = target else {
+        for path in paths {
+            import_and_publish(engine, path, ui);
+        }
+        return;
+    };
+    let tl_rate = engine.project().timeline().frame_rate;
+
+    engine.begin_group();
+    // Import first (inside the group, so one undo also clears the pool
+    // entries this gesture added), classifying per landing lane kind. Order
+    // within each kind is the order the OS delivered the files.
+    let mut imported: Vec<MediaId> = Vec::new();
+    let mut visual: Vec<DroppedMedia> = Vec::new();
+    let mut audio: Vec<DroppedMedia> = Vec::new();
+    for path in paths {
+        match engine.apply(Command::Project(ProjectCommand::Import {
+            path: path.clone(),
+        })) {
+            Ok(ApplyOutcome::Imported { media }) => {
+                let Some(entry) = engine.project().media(media) else {
+                    continue;
+                };
+                let source = entry.full_range();
+                let dropped = DroppedMedia {
+                    media,
+                    source,
+                    // Mirror Project::add_clip's source→timeline resampling
+                    // so the plan sees the same extent the engine validates.
+                    duration_ticks: resample(source.duration, tl_rate).value.max(1),
+                };
+                if entry.is_audio_only() {
+                    audio.push(dropped);
+                } else {
+                    visual.push(dropped);
+                }
+                imported.push(media);
+            }
+            Ok(other) => {
+                error!(path = %path.display(), "unexpected drop-import outcome: {other:?}");
+            }
+            Err(e) => error!(path = %path.display(), "drop import failed, file skipped: {e}"),
+        }
+    }
+
+    place_drop_group(
+        engine,
+        &visual,
+        TrackKind::Video,
+        drop_row,
+        drop_tick,
+        main_magnet,
+    );
+    place_drop_group(engine, &audio, TrackKind::Audio, drop_row, drop_tick, false);
+
+    // Commit whatever landed (an empty group is a no-op); pool bookkeeping
+    // and the projection republish mirror import_and_publish.
+    engine.commit_group();
+    info!(
+        files = paths.len(),
+        placed = visual.len() + audio.len(),
+        drop_row,
+        drop_tick,
+        "placed OS file drop on the timeline"
+    );
+    for media in imported {
+        if let Some(source) = engine.project().media(media) {
+            register_media_with_workers(source, ui);
+        }
+    }
+    publish_projection(engine, ui);
+}
+
+/// Place one kind-group of an OS drop end-to-end. The landing lane mirrors
+/// the library-drop policy (`add_clip_and_publish`): the lane of `kind` at
+/// the drop row, else — for video — the *empty* main track (CapCut: video
+/// dropped anywhere lands on the empty main lane), else a fresh lane
+/// inserted at the drop row (lane zones then clamp it: audio sinks below the
+/// main track). On the main lane with the magnet on, files ripple-insert at
+/// the caret boundary; otherwise the chain first-fit slides past existing
+/// clips. Failures skip the file, never the group.
+fn place_drop_group(
+    engine: &mut Engine,
+    items: &[DroppedMedia],
+    kind: TrackKind,
+    drop_row: i64,
+    drop_tick: i64,
+    main_magnet: bool,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let tl_rate = engine.project().timeline().frame_rate;
+    let lane = track_at_row(engine, drop_row)
+        .filter(|t| t.kind == kind && !t.locked)
+        .map(|t| t.id)
+        .or_else(|| empty_main_lane(engine, kind));
+    let lane = match lane {
+        Some(id) => id,
+        None => match create_track(engine, kind, drop_row) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("drop failed creating {kind:?} track: {e}");
+                return;
+            }
+        },
+    };
+
+    let timeline = engine.project().timeline();
+    let spans = timeline.track(lane).map(occupied_spans).unwrap_or_default();
+    let insert = main_magnet && kind == TrackKind::Video && timeline.main_track() == Some(lane);
+    let durations: Vec<i64> = items.iter().map(|m| m.duration_ticks).collect();
+    let starts: Vec<i64> = if insert {
+        // Magnet insert: chain from the caret boundary; every RippleInsert
+        // shifts later clips right, so each next file lands at the previous
+        // one's end.
+        let boundary = crate::os_drop::insertion_boundary(&spans, drop_tick);
+        durations
+            .iter()
+            .scan(boundary, |at, d| {
+                let start = *at;
+                *at += d;
+                Some(start)
+            })
+            .collect()
+    } else {
+        crate::os_drop::plan_sequential_starts(&spans, drop_tick, &durations)
+    };
+
+    for (item, start) in items.iter().zip(starts) {
+        let command = if insert {
+            EditCommand::RippleInsert {
+                track: lane,
+                media: item.media,
+                source: item.source,
+                at: RationalTime::new(start, tl_rate),
+            }
+        } else {
+            EditCommand::AddClip {
+                track: lane,
+                media: item.media,
+                source: item.source,
+                start: RationalTime::new(start, tl_rate),
+            }
+        };
+        match engine.apply(Command::Edit(command)) {
+            Ok(ApplyOutcome::Edited(EditOutcome::Created(clip))) => {
+                info!(%clip, %lane, media = %item.media, start, insert, "placed dropped file");
+            }
+            Ok(other) => {
+                error!(media = %item.media, "unexpected drop placement outcome: {other:?}");
+            }
+            Err(e) => error!(media = %item.media, %lane, start, "drop placement failed: {e}"),
+        }
+    }
+}
+
+/// The track at UI lane-list row `row` (top-first), if any. The engine
+/// stacks bottom→top while the lane list renders top-first (projection.rs),
+/// so row r ↔ stack index (count − 1 − r).
+fn track_at_row(engine: &Engine, row: i64) -> Option<&Track> {
+    let timeline = engine.project().timeline();
+    let count = timeline.order().len() as i64;
+    if !(0..count).contains(&row) {
+        return None;
+    }
+    let id = timeline.order()[(count - 1 - row) as usize];
+    timeline.track(id)
+}
+
+/// Sorted, non-overlapping `[start, end)` tick spans of every clip on
+/// `track` — the occupancy input to the OS-drop placement planner.
+fn occupied_spans(track: &Track) -> Vec<(i64, i64)> {
+    track
+        .clips_ordered()
+        .iter()
+        .map(|c| (c.timeline.start.value, c.timeline.end_tick()))
+        .collect()
 }
 
 /// Persist the session to its draft file. `path` is the draft's
@@ -6856,5 +7082,158 @@ mod tests {
         // Downstream on both lanes shifted left by 20, staying aligned.
         assert_eq!(extent(&engine, c), (180, 100));
         assert_eq!(extent(&engine, q), (180, 100));
+    }
+
+    // --- OS file drop → timeline placement -----------------------------------
+
+    /// A pool entry wrapped the way `drop_files_and_publish` hands it to the
+    /// placement: full source range + duration resampled to timeline ticks.
+    fn dropped(engine: &Engine, media: MediaId) -> DroppedMedia {
+        let entry = engine.project().media(media).expect("pool entry");
+        let source = entry.full_range();
+        let tl_rate = engine.project().timeline().frame_rate;
+        DroppedMedia {
+            media,
+            source,
+            duration_ticks: resample(source.duration, tl_rate).value.max(1),
+        }
+    }
+
+    /// Engine over an empty timeline whose pool holds a 1000-tick base video
+    /// (for pre-placed clips), dropped videos of `video_ticks`, and dropped
+    /// audio-only entries of `audio_ms` — no real files, nothing decodes.
+    fn drop_fixture(
+        video_ticks: &[i64],
+        audio_ms: &[i64],
+    ) -> (Engine, MediaId, Vec<MediaId>, Vec<MediaId>) {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("drop-fixture", r);
+        let base = project.add_media(cutlass_models::MediaSource::new(
+            "/tmp/base.mp4",
+            1920,
+            1080,
+            r,
+            1000,
+            false,
+        ));
+        let videos = video_ticks
+            .iter()
+            .enumerate()
+            .map(|(i, &ticks)| {
+                project.add_media(cutlass_models::MediaSource::new(
+                    format!("/tmp/drop-v{i}.mp4"),
+                    1920,
+                    1080,
+                    r,
+                    ticks,
+                    false,
+                ))
+            })
+            .collect();
+        let audios = audio_ms
+            .iter()
+            .enumerate()
+            .map(|(i, &ms)| {
+                project.add_media(cutlass_models::MediaSource::new(
+                    format!("/tmp/drop-a{i}.wav"),
+                    0,
+                    0,
+                    Rational::new(1000, 1),
+                    ms,
+                    true,
+                ))
+            })
+            .collect();
+        let engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+        (engine, base, videos, audios)
+    }
+
+    fn lane_clip_extents(engine: &Engine, track: TrackId) -> Vec<(i64, i64)> {
+        occupied_spans(engine.project().timeline().track(track).expect("track"))
+    }
+
+    /// Dropped videos land on the targeted video lane end-to-end from the
+    /// drop tick, first-fit sliding past a clip that blocks the anchor.
+    #[test]
+    fn os_drop_places_videos_end_to_end_on_the_target_lane() {
+        let (mut engine, base, videos, _) = drop_fixture(&[50, 30], &[]);
+        let track = add_video_track(&mut engine, "V1");
+        add_media_clip(&mut engine, track, base, 80, 100); // occupies [80, 180)
+        let items = [dropped(&engine, videos[0]), dropped(&engine, videos[1])];
+
+        // Row 0 is the only lane (single track). Anchor 100 is inside the
+        // existing clip → slide to 180, then chain: 180+50 = 230.
+        place_drop_group(&mut engine, &items, TrackKind::Video, 0, 100, false);
+
+        assert_eq!(
+            lane_clip_extents(&engine, track),
+            vec![(80, 180), (180, 230), (230, 260)]
+        );
+    }
+
+    /// Audio-only files never land on a video lane: a drop anywhere creates
+    /// (or reuses) an audio lane, and the model's lane zones keep it below
+    /// the main track.
+    #[test]
+    fn os_drop_routes_audio_to_an_audio_lane_below_main() {
+        // 4000 ms of audio ≙ 96 ticks at the FPS_24 timeline rate.
+        let (mut engine, base, _, audios) = drop_fixture(&[], &[4000]);
+        let track = add_video_track(&mut engine, "V1");
+        add_media_clip(&mut engine, track, base, 0, 100);
+        let items = [dropped(&engine, audios[0])];
+
+        // Dropped on the main video row: wrong kind → new audio lane.
+        place_drop_group(&mut engine, &items, TrackKind::Audio, 0, 240, false);
+
+        let timeline = engine.project().timeline();
+        let bottom = timeline.order()[0];
+        let lane = timeline.track(bottom).expect("bottom lane");
+        assert_eq!(lane.kind, TrackKind::Audio, "audio sits at the stack floor");
+        assert_eq!(lane_clip_extents(&engine, bottom), vec![(240, 336)]);
+        assert_eq!(
+            timeline.main_track(),
+            Some(track),
+            "main track unchanged above the audio floor"
+        );
+    }
+
+    /// Videos dropped on empty space (no video lane at the row) fall back to
+    /// the *empty* main track instead of spawning an overlay lane.
+    #[test]
+    fn os_drop_falls_back_to_the_empty_main_lane() {
+        let (mut engine, _, videos, _) = drop_fixture(&[50, 40], &[]);
+        let main = add_video_track(&mut engine, "V1"); // empty main lane
+        let items = [dropped(&engine, videos[0]), dropped(&engine, videos[1])];
+
+        // Row 7 hits no lane at all; the empty main catches the drop.
+        place_drop_group(&mut engine, &items, TrackKind::Video, 7, 60, false);
+
+        assert_eq!(lane_clip_extents(&engine, main), vec![(60, 110), (110, 150)]);
+        assert_eq!(
+            engine.project().timeline().order().len(),
+            1,
+            "no overlay lane spawned"
+        );
+    }
+
+    /// With the magnet on, a drop on the main lane ripple-inserts the whole
+    /// set at the caret boundary: existing downstream clips shift right by
+    /// the sum of the inserted durations.
+    #[test]
+    fn os_drop_magnet_inserts_ripple_on_the_main_lane() {
+        let (mut engine, base, videos, _) = drop_fixture(&[60, 40], &[]);
+        let track = add_video_track(&mut engine, "V1");
+        add_media_clip(&mut engine, track, base, 0, 100); // A [0, 100)
+        add_media_clip(&mut engine, track, base, 100, 100); // B [100, 200)
+        let items = [dropped(&engine, videos[0]), dropped(&engine, videos[1])];
+
+        // Tick 120: past A's midpoint, before B's → boundary at B's start.
+        place_drop_group(&mut engine, &items, TrackKind::Video, 0, 120, true);
+
+        assert_eq!(
+            lane_clip_extents(&engine, track),
+            vec![(0, 100), (100, 160), (160, 200), (200, 300)],
+            "inserted end-to-end at the boundary, B shifted right by 100"
+        );
     }
 }
