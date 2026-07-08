@@ -2145,6 +2145,9 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::DuplicateClips { .. }
             | WorkerMsg::Undo
             | WorkerMsg::Redo
+            // A replayed agent plan can create/move/restyle any clip; repaint
+            // the canvas so the result is visible without a scrub.
+            | WorkerMsg::AgentApplyPlan { .. }
             | WorkerMsg::SetMainMagnet(_)
             | WorkerMsg::SetTrackFlag { .. }
             | WorkerMsg::OpenProject { .. }
