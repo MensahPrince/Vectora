@@ -45,9 +45,8 @@ It's still alpha and moving fast, but it's a real editor now, not a toy.
 Describe an edit in plain language and the assistant makes it on your timeline.
 It uses the same actions you would, so every change stays visible, undoable, and
 reviewable — nothing happens behind your back. It's optional; the editor works
-fine without it. (The assistant is still being ported to this native-media
-line: the desktop panel and provider settings are in place, the model bridge
-isn't wired yet.)
+fine without it. Configure an OpenAI-compatible endpoint in
+`~/.cutlass/config.toml` (see below); dry-run preview is on by default.
 
 ## Install
 

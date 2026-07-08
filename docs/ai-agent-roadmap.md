@@ -1,5 +1,11 @@
 # AI Agent Roadmap — prompt-to-edit foundation (v1 M3)
 
+**Status (macos-dev, Jul 2026):** Phases 0–5 shipped. `cutlass-ai` and the
+desktop assistant panel (`apps/cutlass-desktop/src/agent.rs`) are wired end to
+end. Tool schema v20 adds look commands; `duck` and `detect_beats` were removed
+from the vocabulary because their engine arms return `Unsupported` on this line.
+Guarded `Import` (Phase 5 stretch) remains deferred.
+
 Policy: **the agent is the reason Cutlass exists.** CapCut has no real
 equivalent of a prompt box that edits the timeline; this is the
 differentiator, and it ships early because it depends only on the command

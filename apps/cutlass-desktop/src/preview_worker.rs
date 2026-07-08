@@ -3,8 +3,7 @@
 //! Ported from main's crates/cutlass-ui onto this branch's engine: engine
 //! ownership, the full edit/project message set, debounced autosave, the
 //! fit-sized preview pump, audio snapshots, thumbnail/strip registration,
-//! export, and live gesture/generator overrides. Still pending: the AI agent
-//! bridge (separate port).
+//! export, live gesture/generator overrides, and the AI agent bridge.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

@@ -130,6 +130,19 @@ Still-image import, docs, and PyPI packaging are aligned with the engine.
 `crates/cutlass-encoder` returns `Unsupported` on Linux/Windows. Add a backend
 (e.g. FFmpeg libx264 or platform encoders) if cross-platform export matters.
 
+## 11. AI assistant (cutlass-ai + desktop wiring) — DONE
+
+Restored the `cutlass-ai` crate from pre-mobile-pivot history and wired the
+desktop assistant panel end to end.
+
+- `crates/cutlass-ai`: wire format, validation, OpenAI-compatible provider,
+  agent loop, eval harness, tool schema v20 (look commands; `duck` /
+  `detect_beats` removed — engine returns `Unsupported` on this line).
+- `apps/cutlass-desktop/src/agent.rs`: sandbox rehearsal + plan replay via
+  `preview_worker` (`SnapshotProject`, `AgentApplyPlan`, `agent_replay`).
+- `AgentStore` callbacks, provider settings, and connection test in `main.rs`.
+- `docs/ai-agent-roadmap.md` restored as the phase-by-phase reference.
+
 ## 10. Docs debt — DONE
 
 - `.cursor/rules/overview.mdc` and this file now reflect stickers, look
