@@ -707,29 +707,21 @@ export component TimelinePanel inherits PanelBase {
                     viewport-y <=> TimelineViewState.scroll-y;
                     viewport-x <=> TimelineViewState.scroll-x;
 
-                    // Explicit width, not the implicit viewport fill: zooming
-                    // (pinch / Ctrl+wheel) grows `content-width` without a
-                    // scroll event, and the Flickable doesn't re-lay-out its
-                    // content for a viewport-width change alone — the lane
-                    // backdrops kept their stale width until the next scroll.
-                    // A direct binding re-evaluates the moment zoom changes
-                    // (same idiom as the overlay bands below).
-                    VerticalLayout {
-                    width: max(content-width, parent.width);
-                    vertical-stretch: 1;
-                    spacing: track-spacing;
-
-                    ForceHeadSpace { }
-
+                    // Lane backdrops are absolutely positioned in content
+                    // space — deliberately NOT a layout. Width bindings on
+                    // layout children go stale when zoom grows content-width
+                    // without a scroll event: the layout solver owns child
+                    // geometry and its cached pass survives the binding change
+                    // (a5f43dd bound the enclosing VerticalLayout, then the
+                    // per-lane width — pinch out→in still glitched). The
+                    // overlay bands below use plain x/y/width bindings and
+                    // never go stale, so the lanes now use the same idiom;
+                    // the y math mirrors the head column's spacer + spacing.
                     for t[lane-idx] in sequence.tracks: TrackLane {
-                        // Explicit width, not layout stretch: pinch/wheel zoom
-                        // grows `content-width` without a scroll event, and the
-                        // Flickable's cached layout leaves stretched children at
-                        // their stale width (regression of a5f43dd, which only
-                        // bound the enclosing VerticalLayout). A direct binding
-                        // re-evaluates the moment zoom changes, same as the
-                        // overlay bands below.
+                        x: 0;
+                        y: (lane-idx + 1) * row-pitch;
                         width: max(content-width, lanes.width);
+                        height: track-height;
                         track-id: t.id;
                         kind: t.kind;
                         for c in t.clips: ClipView {
@@ -744,7 +736,6 @@ export component TimelinePanel inherits PanelBase {
                             zoom: TimelineStore.zoom;
                         }
                     }
-                }
 
                 // --- transition junction pills (M4, above the clips) ---------
                 // One overlay band per lane; each transition pill is centered
