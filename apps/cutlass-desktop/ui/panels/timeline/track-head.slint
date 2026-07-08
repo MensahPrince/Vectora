@@ -68,9 +68,6 @@ export component TrackHead inherits Rectangle {
 
     private property <int> track-count: EditorStore.project.sequence.tracks.length;
 
-    // Stack index (0 = bottom) for insert/move helpers.
-    private property <int> stack-index: max(0, track-count - 1 - track-row);
-
     width: 100%;
     height: lane-height;
     background: AppStore.theme.track-lane.background;
@@ -84,7 +81,9 @@ export component TrackHead inherits Rectangle {
         height: 100%;
 
         pointer-event(event) => {
-            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+            // The main track is pinned in place (CapCut): no reorder drag.
+            if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left
+                && !root.track.is-main) {
                 root.drag-press-y = self.mouse-y;
                 TimelineViewState.track-drag-id = root.track.id;
                 TimelineViewState.track-drag-source-row = root.track-row;
@@ -122,9 +121,13 @@ export component TrackHead inherits Rectangle {
             overflow: elide;
             text: root.track.name;
             font-size: 11px;
-            color: root.track.enabled
-                ? AppStore.theme.text.primary
-                : AppStore.theme.text.secondary;
+            // The main track's name reads in the accent so the permanent
+            // magnetic lane is identifiable at a glance (CapCut labels it).
+            color: root.track.is-main
+                ? AppStore.theme.accent.primary
+                : root.track.enabled
+                    ? AppStore.theme.text.primary
+                    : AppStore.theme.text.secondary;
         }
 
         if root.track.kind != TrackKind.audio: HeadToggle {
@@ -175,34 +178,9 @@ export component TrackHead inherits Rectangle {
                 padding: 4px;
                 spacing: 0;
 
-                TrackMenuItem {
-                    label: "Add video track above";
-                    clicked => {
-                        EditorStore.on-track-added("video", stack-index + 1, true);
-                        menu-popup.close();
-                    }
-                }
-                TrackMenuItem {
-                    label: "Add video track below";
-                    clicked => {
-                        EditorStore.on-track-added("video", stack-index, true);
-                        menu-popup.close();
-                    }
-                }
-                TrackMenuItem {
-                    label: "Add audio track above";
-                    clicked => {
-                        EditorStore.on-track-added("audio", stack-index + 1, true);
-                        menu-popup.close();
-                    }
-                }
-                TrackMenuItem {
-                    label: "Add audio track below";
-                    clicked => {
-                        EditorStore.on-track-added("audio", stack-index, true);
-                        menu-popup.close();
-                    }
-                }
+                // No "add empty track" items: CapCut lanes exist only while
+                // they hold clips (drops create lanes), and only the main
+                // track may sit empty — which also can't be deleted.
                 TrackMenuItem {
                     label: "Rename track…";
                     clicked => {
@@ -210,7 +188,7 @@ export component TrackHead inherits Rectangle {
                         rename-popup.show();
                     }
                 }
-                TrackMenuItem {
+                if !root.track.is-main: TrackMenuItem {
                     label: "Delete track";
                     clicked => {
                         EditorStore.on-track-removed(root.track.id);

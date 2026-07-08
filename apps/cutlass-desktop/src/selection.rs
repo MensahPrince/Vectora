@@ -515,6 +515,7 @@ mod tests {
             locked: false,
             duck_source: false,
             pinned: false,
+            is_main: false,
             transitions: ModelRc::default(),
         }
     }

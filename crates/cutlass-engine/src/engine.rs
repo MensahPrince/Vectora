@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use cutlass_commands::{Command, ProjectCommand};
 use cutlass_models::{
     ClipId, ClipTransform, ColorAdjustments, Filter, Generator, MediaId, Project, Rational,
-    RationalTime,
+    RationalTime, TrackKind,
 };
 use cutlass_render::{
     FrameSink, Renderer, ResolveOverrides, RgbaImage, SeekPolicy, export_to_file,
@@ -146,9 +146,15 @@ impl Engine {
         }
     }
 
-    /// Replace the session with a fresh, empty, unsaved project (File → New).
+    /// Replace the session with a fresh, unsaved project (File → New).
+    ///
+    /// The project starts with the persistent main video track (CapCut's
+    /// magnetic lane): it is the only lane that exists without clips, and
+    /// the timeline UI renders it even when empty.
     pub fn new_session(&mut self) {
-        self.reset_project(Project::new("untitled", Rational::FPS_24));
+        let mut project = Project::new("untitled", Rational::FPS_24);
+        project.add_track(TrackKind::Video, "Main");
+        self.reset_project(project);
     }
 
     /// Replace the session with `project` (e.g. the AI-agent sandbox replaying
@@ -187,6 +193,12 @@ impl Engine {
         let (outcome, inverse) = dispatch(command, &mut ctx)?;
         match outcome {
             ApplyOutcome::Opened | ApplyOutcome::Loaded => {
+                // Every session shows the magnetic main lane; files saved
+                // without any video track (audio-only cuts, old versions)
+                // gain an empty one on entry. Pre-history, not undoable.
+                if self.project.timeline().main_track().is_none() {
+                    self.project.add_track(TrackKind::Video, "Main");
+                }
                 // Same media-id hazard as `reset_project`: the incoming
                 // file's ids owe nothing to the outgoing registry.
                 self.renderer.clear_proxies();

@@ -101,7 +101,6 @@ export global EditorStore {
     // Manual track management (timeline header context menu / reorder).
     // `kind` is a TrackKind string; `index` is stack order (0 = bottom).
     // `pinned` true for user-created lanes (survive empty auto-removal).
-    callback on-track-added(kind: string, index: int, pinned: bool);
     callback on-track-removed(track-id: string);
     callback on-track-moved(track-id: string, index: int);
     callback on-track-renamed(track-id: string, name: string);

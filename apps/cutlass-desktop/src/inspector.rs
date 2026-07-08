@@ -218,6 +218,7 @@ mod tests {
             locked: false,
             duck_source,
             pinned: false,
+            is_main: false,
             transitions: ModelRc::default(),
         }
     }

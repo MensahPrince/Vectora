@@ -69,7 +69,11 @@ fn new_session_resets_project_path_history_and_dirty() {
     );
     assert_eq!(engine.project().timeline().clip_count(), 0);
     assert_eq!(engine.project().media_count(), 0);
-    assert_eq!(engine.project().timeline().tracks_ordered().count(), 0);
+    // A fresh session is seeded with the persistent main track (the one
+    // lane that exists without clips), and nothing else.
+    let tracks: Vec<_> = engine.project().timeline().tracks_ordered().collect();
+    assert_eq!(tracks.len(), 1);
+    assert!(tracks[0].main && tracks[0].kind == TrackKind::Video);
 
     // The old session's file is untouched and reopenable.
     common::open_project(&mut engine, &project_file);

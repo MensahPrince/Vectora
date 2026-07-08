@@ -208,6 +208,7 @@ fn track_to_slint(
         locked: track.locked,
         duck_source: track.duck_source,
         pinned: track.pinned,
+        is_main: track.main,
         transitions: project_transitions(track),
     }
 }

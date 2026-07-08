@@ -251,11 +251,26 @@ pub fn resolve_library_drop(
     main_magnet: bool,
 ) -> LibraryDropResolution {
     let track_count = sequence.tracks.row_count() as i32;
-    let row_track = (0..track_count)
+    let mut drop_row = drop_row;
+    let mut row_track = (0..track_count)
         .contains(&drop_row)
         .then(|| sequence.tracks.row_data(drop_row as usize))
         .flatten()
         .filter(|t| t.kind == lane_kind && !t.locked);
+
+    // A video drop that misses every video lane falls back to the *empty*
+    // main track (CapCut: the first video dragged anywhere fills the main
+    // lane) — mirrors the worker's landing so the ghost never lies.
+    if lane_kind == TrackKind::Video
+        && row_track.is_none()
+        && let Some(main_row) = main_video_row(sequence)
+        && let Some(main) = sequence.tracks.row_data(main_row as usize)
+        && main.clips.row_count() == 0
+        && !main.locked
+    {
+        drop_row = main_row;
+        row_track = Some(main);
+    }
 
     if lane_kind == TrackKind::Video
         && main_magnet
@@ -387,20 +402,16 @@ pub fn resolve_transition_junction(
     }
 }
 
-/// Lane-list row of the main track: the *bottom* video lane. Rows are
-/// top-first, so that's the last video row; `None` without any video lane.
+/// Lane-list row of the main track (the projection's `is-main` flag).
+/// `None` without any video lane.
 fn main_video_row(sequence: &Sequence) -> Option<i32> {
-    let mut main = None;
-    for idx in 0..sequence.tracks.row_count() {
-        if sequence
+    (0..sequence.tracks.row_count()).find_map(|idx| {
+        sequence
             .tracks
             .row_data(idx)
-            .is_some_and(|t| t.kind == TrackKind::Video)
-        {
-            main = Some(idx as i32);
-        }
-    }
-    main
+            .is_some_and(|t| t.is_main)
+            .then_some(idx as i32)
+    })
 }
 
 /// An insertion slot on the (gapless) main lane.
@@ -851,11 +862,22 @@ mod tests {
             locked: false,
             duck_source: false,
             pinned: false,
+            is_main: false,
             transitions: ModelRc::default(),
         }
     }
 
-    fn sequence(tracks: Vec<Track>) -> Sequence {
+    fn sequence(mut tracks: Vec<Track>) -> Sequence {
+        // The model designates the bottom video lane as the main track and
+        // the projection publishes the flag; mirror that here (rows are
+        // top-first, so the bottom lane is the last video entry).
+        if let Some(main) = tracks
+            .iter_mut()
+            .rev()
+            .find(|t| t.kind == TrackKind::Video)
+        {
+            main.is_main = true;
+        }
         Sequence {
             id: SharedString::from("1"),
             name: SharedString::from("Sequence 1"),

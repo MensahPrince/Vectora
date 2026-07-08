@@ -395,6 +395,10 @@ export struct Track {
     duck-source: bool,
     // Manual lanes survive empty auto-removal until explicitly deleted.
     pinned: bool,
+    // CapCut's main track: the permanent magnetic video lane. Exactly one
+    // once any video lane exists; it can't be deleted or reordered and is
+    // the only lane rendered while empty.
+    is-main: bool,
     // Transitions at this track's clip junctions (M4), keyed by the left
     // (outgoing) clip. Empty ⇔ none.
     transitions: [TransitionView],

@@ -426,12 +426,6 @@ enum WorkerMsg {
         name: String,
         color: String,
     },
-    /// Add a track from the timeline UI (`pinned` survives empty auto-removal).
-    AddTrackManual {
-        kind: TrackKind,
-        index: usize,
-        pinned: bool,
-    },
     /// Remove a track explicitly (context menu), even when non-empty.
     RemoveTrackManual {
         track: String,
@@ -794,14 +788,6 @@ impl WorkerHandle {
             at_tick,
             name,
             color,
-        });
-    }
-
-    pub fn add_track_manual(&self, kind: TrackKind, index: usize, pinned: bool) {
-        let _ = self.tx.send(WorkerMsg::AddTrackManual {
-            kind,
-            index,
-            pinned,
         });
     }
 
@@ -1601,11 +1587,6 @@ fn worker_loop(
                 name,
                 color,
             } => set_marker_and_publish(engine, &marker, at_tick, &name, &color, tl_rate, &ui),
-            WorkerMsg::AddTrackManual {
-                kind,
-                index,
-                pinned,
-            } => add_track_manual_and_publish(engine, kind, index, pinned, &ui),
             WorkerMsg::RemoveTrackManual { track } => {
                 remove_track_manual_and_publish(engine, &track, &ui)
             }
@@ -3047,8 +3028,13 @@ fn add_clip_and_publish(
     let desired = start_tick.max(0);
 
     // One history entry per drop, even when it creates the landing lane.
+    // A video drop that misses every lane falls back to the empty main
+    // track before creating an overlay lane (CapCut: the first video
+    // dragged anywhere fills the main track).
     engine.begin_group();
-    let (track_id, start_value) = match lane_of_kind(engine, track, lane_kind) {
+    let (track_id, start_value) = match lane_of_kind(engine, track, lane_kind)
+        .or_else(|| empty_main_lane(engine, lane_kind))
+    {
         Some(lane) => {
             let lane_track = engine
                 .project()
@@ -3862,39 +3848,17 @@ fn set_marker_and_publish(
     }
 }
 
-fn add_track_manual_and_publish(
-    engine: &mut Engine,
-    kind: TrackKind,
-    index: usize,
-    pinned: bool,
-    ui: &UiSink,
-) {
-    let count = engine
-        .project()
-        .timeline()
-        .tracks_ordered()
-        .filter(|t| t.kind == kind)
-        .count();
-    match engine.apply(Command::Edit(EditCommand::AddTrack {
-        kind,
-        name: format!("{}{}", kind_prefix(kind), count + 1),
-        index: Some(index),
-        pinned,
-    })) {
-        Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(id))) => {
-            info!(%id, ?kind, index, pinned, "added manual track");
-            publish_projection(engine, ui);
-        }
-        Ok(other) => error!(?kind, index, "unexpected add-track outcome: {other:?}"),
-        Err(e) => error!(?kind, index, "add track failed: {e}"),
-    }
-}
-
 fn remove_track_manual_and_publish(engine: &mut Engine, track: &str, ui: &UiSink) {
     let Some(track_id) = parse_raw_id(track).map(TrackId::from_raw) else {
         error!(track, "remove-track ignored: unparsable track id");
         return;
     };
+    // CapCut never deletes the main track (the UI hides the menu item; this
+    // guards races where the projection lagged a main-lane promotion).
+    if Some(track_id) == main_video_track(engine) {
+        info!(%track_id, "remove-track ignored: main track is permanent");
+        return;
+    }
     match engine.apply(Command::Edit(EditCommand::RemoveTrack { track: track_id })) {
         Ok(_) => {
             info!(%track_id, "removed track");
@@ -4041,6 +4005,20 @@ fn lane_of_kind(engine: &Engine, track: &str, kind: TrackKind) -> Option<TrackId
         .track(id)
         .is_some_and(|t| t.kind == kind)
         .then_some(id)
+}
+
+/// The main lane while it's still empty — CapCut lands the first video
+/// dropped *anywhere* on the main track rather than spawning an overlay lane.
+fn empty_main_lane(engine: &Engine, kind: TrackKind) -> Option<TrackId> {
+    if kind != TrackKind::Video {
+        return None;
+    }
+    let timeline = engine.project().timeline();
+    let main = timeline.main_track()?;
+    timeline
+        .track(main)
+        .is_some_and(cutlass_models::Track::is_empty)
+        .then_some(main)
 }
 
 /// Move a dragged clip to its resolved landing spot: an existing lane
@@ -5482,15 +5460,10 @@ fn pack_main_track_and_publish(engine: &mut Engine, ui: &UiSink) {
     publish_projection(engine, ui);
 }
 
-/// The main track under CapCut's magnet: the *bottom* video lane (the engine
-/// stacks bottom→top, so the first video track in stack order).
+/// The main track under CapCut's magnet: the video lane the model designates
+/// (`Track::main` — the timeline keeps it directly above the audio floor).
 fn main_video_track(engine: &Engine) -> Option<TrackId> {
-    let timeline = engine.project().timeline();
-    timeline.order().iter().copied().find(|id| {
-        timeline
-            .track(*id)
-            .is_some_and(|t| t.kind == TrackKind::Video)
-    })
+    engine.project().timeline().main_track()
 }
 
 /// Clip boundary on `track` nearest to `tick`: every clip start plus the
@@ -5621,12 +5594,13 @@ fn add_clip_content(
 }
 
 /// Remove `track` when an edit left it empty (CapCut removes emptied lanes).
+/// The main track is exempt: it's the one lane that exists without clips.
 fn remove_track_if_empty(engine: &mut Engine, track: TrackId) {
     let emptied = engine
         .project()
         .timeline()
         .track(track)
-        .is_some_and(|t| t.is_empty() && !t.pinned);
+        .is_some_and(|t| t.is_empty() && !t.pinned && !t.main);
     if !emptied {
         return;
     }

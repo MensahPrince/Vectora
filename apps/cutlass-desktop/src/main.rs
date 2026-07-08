@@ -862,20 +862,6 @@ fn main() -> Result<(), slint::PlatformError> {
         track_flag_handle.set_track_flag(track_id.to_string(), flag, value);
     });
 
-    let add_track_handle = preview_worker.handle();
-    editor.on_on_track_added(move |kind, index, pinned| {
-        let kind = match kind.as_str() {
-            "video" => cutlass_models::TrackKind::Video,
-            "audio" => cutlass_models::TrackKind::Audio,
-            "text" => cutlass_models::TrackKind::Text,
-            "sticker" => cutlass_models::TrackKind::Sticker,
-            other => {
-                tracing::error!(kind = other, "ignoring unknown track kind");
-                return;
-            }
-        };
-        add_track_handle.add_track_manual(kind, index as usize, pinned);
-    });
     let remove_track_handle = preview_worker.handle();
     editor.on_on_track_removed(move |track_id| {
         remove_track_handle.remove_track_manual(track_id.to_string());
