@@ -11,8 +11,8 @@ mod project;
 mod track;
 
 use content::{
-    Arrow, Ellipse, Heart, Line, Polygon, Rect, ShapeStrokeSpec, Solid, Star, Text, TextBackground,
-    TextShadow, TextStroke,
+    Arrow, Ellipse, Heart, Line, Polygon, Rect, ShapeStrokeSpec, Solid, Star, Sticker, Text,
+    TextBackground, TextShadow, TextStroke,
 };
 use pyo3::prelude::*;
 
@@ -40,6 +40,7 @@ fn cutlass(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TextBackground>()?;
     m.add_class::<TextShadow>()?;
     m.add_class::<Solid>()?;
+    m.add_class::<Sticker>()?;
     m.add_class::<ShapeStrokeSpec>()?;
     m.add_class::<Rect>()?;
     m.add_class::<Ellipse>()?;

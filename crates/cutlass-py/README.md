@@ -91,7 +91,9 @@ main.add(clip[3:8], start=0.0)   # slicing sugar
 
 `video`, `audio`, `text`, `sticker`, `effect`, `filter`, `adjustment` — the kind
 must match the clip content (`TrackKindError` on mismatch): media goes on
-`video`/`audio`, `Text` on `text`, `Solid` and shapes on `sticker`.
+`video`/`audio`, `Text` on `text`, `Solid`, shapes, and `Sticker` on `sticker`.
+`Sticker("heart")` places a bundled sticker (static or animated); browse ids
+with `cutlass.stickers()`.
 
 ## Errors
 

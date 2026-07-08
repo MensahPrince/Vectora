@@ -206,6 +206,25 @@ class TestPlacement:
         with pytest.raises(ValueError):
             t.add("not content", start=0.0, duration=1.0)  # type: ignore[arg-type]
 
+    def test_sticker_places_and_renders(self, p: Project) -> None:
+        t = p.add_track("sticker")
+        t.add(cutlass.Sticker("heart"), start=0.0, duration=2.0)
+        frame = p.get_frame(0.5)
+        h, w = frame.shape[0], frame.shape[1]
+        # The bundled heart's red fill lands at the canvas center.
+        assert frame[h // 2, w // 2][0] > 150
+
+    def test_unknown_sticker_rejected(self) -> None:
+        with pytest.raises(ValueError):
+            cutlass.Sticker("not-a-sticker")
+
+    def test_sticker_catalog_lists_bundled_pack(self) -> None:
+        stickers = cutlass.stickers()
+        ids = {s["id"] for s in stickers}
+        assert {"heart", "star_spin"} <= ids
+        animated = {s["id"] for s in stickers if s["animated"]}
+        assert "star_spin" in animated
+
 
 # --- clip structure ----------------------------------------------------------
 
