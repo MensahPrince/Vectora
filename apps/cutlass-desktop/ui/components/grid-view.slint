@@ -86,6 +86,11 @@ export component CutlassGridView inherits Rectangle {
     in property <bool> show-horizontal-scrollbar: content-width > self.width;
     in property <bool> show-vertical-scrollbar: content-height > self.height;
 
+    // Forwarded to the inner `CutlassScrollView`. Set `false` on grids whose
+    // tiles own press-and-drag gestures — otherwise the Flickable steals the
+    // pointer grab mid-drag and the ghost freezes.
+    in property <bool> interactive: true;
+
     // ---- Derived geometry --------------------------------------------------
 
     // Ceiling division so a partial last row still counts. Exposed so
@@ -131,6 +136,7 @@ export component CutlassGridView inherits Rectangle {
         viewport-height: root.content-height;
         show-horizontal-scrollbar: root.show-horizontal-scrollbar;
         show-vertical-scrollbar: root.show-vertical-scrollbar;
+        interactive: root.interactive;
 
         @children
     }
