@@ -197,8 +197,23 @@ fn resolve_track_at(
         let window_end = window_start + transition.duration;
         if t.value >= window_start && t.value < window_end {
             let progress = (t.value - window_start) as f32 / transition.duration as f32;
-            let outgoing_t = RationalTime::new(left.timeline.end_tick() - 1, t.rate);
-            let incoming_t = RationalTime::new(right.timeline.start.value, t.rate);
+            // Each side plays live wherever it has material and holds its
+            // boundary frame past it: the outgoing clip runs until the cut
+            // then freezes on its last frame, the incoming holds its first
+            // frame until the cut then runs — CapCut's motion, and the tail
+            // frame is only requested for the window's back half. Clamped
+            // into each clip's extent (not just at the cut) because the
+            // model doesn't bound the duration by the clips' lengths.
+            let outgoing_t = RationalTime::new(
+                t.value
+                    .clamp(left.timeline.start.value, left.timeline.end_tick() - 1),
+                t.rate,
+            );
+            let incoming_t = RationalTime::new(
+                t.value
+                    .clamp(right.timeline.start.value, right.timeline.end_tick() - 1),
+                t.rate,
+            );
             // A side that produces no layer (e.g. empty text) or a canvas-wide
             // pass (effect/filter/adjustment segments) can't be composited as
             // a transition frame — the renderer rejects nested canvas passes.
