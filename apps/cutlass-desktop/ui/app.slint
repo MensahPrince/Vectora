@@ -2,6 +2,7 @@ import {
     HSplitGripLead,
     HSplitGripTrail,
     VSplitGripTimeline,
+    CutlassText,
 } from "components/index.slint";
 import {
     AgentPanel,
@@ -578,6 +579,24 @@ export component AppWindow inherits Window {
         y: AppState.transition-drag-cursor-y - AppState.transition-drag-tile-anchor-y;
         background: #C84A8F;
         border-radius: AppStore.theme.track-lane.clip.radius;
+    }
+
+    // OS file-drop target — accent border + hint while Finder/Explorer hovers
+    // supported files over the window.
+    if AppState.os-drop-hover: Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #ffffff08;
+        border-width: 2px;
+        border-color: AppStore.theme.accent.primary;
+
+        CutlassText {
+            text: "Drop to import";
+            style: AppStore.theme.typography.heading-sm;
+            foreground: AppStore.theme.accent.primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 
     // Export settings dialog — declared last so the modal paints above
