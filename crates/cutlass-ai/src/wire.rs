@@ -45,8 +45,9 @@ pub const TOOL_SCHEMA_VERSION: u32 = 20;
 
 /// Track lane categories the agent may create or target.
 ///
-/// The engine has more kinds (effect / filter / adjustment lanes); they are
-/// placeholders that render nothing today, so the agent cannot create them.
+/// The engine has more kinds (effect / filter / adjustment lanes); the agent
+/// cannot create those yet — it applies effects, filters, and adjustments to
+/// clips directly instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum WireTrackKind {

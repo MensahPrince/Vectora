@@ -17,7 +17,7 @@
             ]
           },
           "kind": {
-            "description": "Track lane categories the agent may create or target.\n\nThe engine has more kinds (effect / filter / adjustment lanes); they are\nplaceholders that render nothing today, so the agent cannot create them.",
+            "description": "Track lane categories the agent may create or target.\n\nThe engine has more kinds (effect / filter / adjustment lanes); the agent\ncannot create those yet — it applies effects, filters, and adjustments to\nclips directly instead.",
             "oneOf": [
               {
                 "const": "video",
