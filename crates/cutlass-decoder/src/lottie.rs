@@ -57,8 +57,8 @@ pub struct LottieAnimation {
 }
 
 impl LottieAnimation {
-    /// Parse a Lottie JSON document.
-    pub fn from_str(source: &str) -> Result<Self, DecodeError> {
+    /// Parse a Lottie JSON document from a string.
+    pub fn parse(source: &str) -> Result<Self, DecodeError> {
         // catch_unwind: velato's importer panics (todo!) on some
         // unsupported features rather than erroring.
         let composition = catch_unwind(|| source.parse::<velato::Composition>())
@@ -77,7 +77,7 @@ impl LottieAnimation {
 
         let frame_rate = composition.frame_rate;
         let frame_span = composition.frames.end - composition.frames.start;
-        if !(frame_rate.is_finite() && frame_rate > 0.0) || !(frame_span.is_finite()) {
+        if !frame_rate.is_finite() || frame_rate <= 0.0 || !frame_span.is_finite() {
             return Err(DecodeError::Decode(
                 "lottie: composition has a degenerate timebase".to_string(),
             ));
@@ -101,7 +101,7 @@ impl LottieAnimation {
     pub fn load(path: &std::path::Path) -> Result<Self, DecodeError> {
         let source = std::fs::read_to_string(path)
             .map_err(|e| DecodeError::Io(format!("lottie {}: {e}", path.display())))?;
-        Self::from_str(&source)
+        Self::parse(&source)
     }
 
     /// The composition's intrinsic size in its own pixels (what placement
@@ -141,8 +141,8 @@ impl LottieAnimation {
     /// [`frame_index_at`]: Self::frame_index_at
     pub fn render_frame(&mut self, index: usize) -> Result<RgbaImage, DecodeError> {
         let index = index.min(self.frame_count.saturating_sub(1));
-        let frame = self.composition.frames.start + index as f64 / self.sample_fps
-            * self.composition.frame_rate;
+        let frame = self.composition.frames.start
+            + index as f64 / self.sample_fps * self.composition.frame_rate;
         // Never exceed the last frame (float accumulation at loop ends).
         let frame = frame.min(self.composition.frames.end);
 
@@ -182,7 +182,11 @@ impl LottieAnimation {
             .into_iter()
             .flat_map(|px| [px.r, px.g, px.b, px.a])
             .collect();
-        Ok(RgbaImage::new(self.render_width, self.render_height, pixels))
+        Ok(RgbaImage::new(
+            self.render_width,
+            self.render_height,
+            pixels,
+        ))
     }
 }
 
@@ -283,7 +287,7 @@ mod tests {
 
     #[test]
     fn parses_and_renders_the_red_rect() {
-        let mut anim = LottieAnimation::from_str(RED_RECT).unwrap();
+        let mut anim = LottieAnimation::parse(RED_RECT).unwrap();
         assert_eq!(anim.intrinsic_size(), (100, 100));
         assert!((anim.duration_seconds() - 2.0).abs() < 1e-9);
         // 2 s at the 20 fps cap (native 30 fps is above the cap).
@@ -298,7 +302,7 @@ mod tests {
 
     #[test]
     fn frame_indices_quantize_and_loop() {
-        let anim = LottieAnimation::from_str(RED_RECT).unwrap();
+        let anim = LottieAnimation::parse(RED_RECT).unwrap();
         assert_eq!(anim.frame_index_at(0.0), 0);
         assert_eq!(anim.frame_index_at(0.049), 0);
         assert_eq!(anim.frame_index_at(0.051), 1);
@@ -311,7 +315,7 @@ mod tests {
     #[test]
     fn oversized_compositions_render_capped() {
         let big = RED_RECT.replace(r#""w": 100, "h": 100"#, r#""w": 2000, "h": 1000"#);
-        let mut anim = LottieAnimation::from_str(&big).unwrap();
+        let mut anim = LottieAnimation::parse(&big).unwrap();
         assert_eq!(anim.intrinsic_size(), (2000, 1000));
         let frame = anim.render_frame(0).unwrap();
         assert_eq!((frame.width, frame.height), (512, 256));
@@ -319,8 +323,8 @@ mod tests {
 
     #[test]
     fn garbage_and_non_lottie_json_error() {
-        assert!(LottieAnimation::from_str("not json").is_err());
-        assert!(LottieAnimation::from_str("{}").is_err());
+        assert!(LottieAnimation::parse("not json").is_err());
+        assert!(LottieAnimation::parse("{}").is_err());
     }
 
     #[test]
@@ -330,6 +334,6 @@ mod tests {
             r#""r": {"a": 0, "k": 0}"#,
             r#""rx": {"a": 0, "k": 0}, "ry": {"a": 0, "k": 0}"#,
         );
-        assert!(LottieAnimation::from_str(&split).is_err());
+        assert!(LottieAnimation::parse(&split).is_err());
     }
 }

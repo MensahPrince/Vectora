@@ -1139,10 +1139,10 @@ impl Renderer {
         let stamp = self.lottie_stamp;
         let state = self.lottie.entry(path.to_owned()).or_insert_with(|| {
             match cutlass_decoder::LottieAnimation::load(std::path::Path::new(path)) {
-                Ok(animation) => LottieState::Loaded(LottiePlayer {
+                Ok(animation) => LottieState::Loaded(Box::new(LottiePlayer {
                     animation,
                     frames: HashMap::new(),
-                }),
+                })),
                 Err(e) => {
                     tracing::warn!("lottie '{path}' failed to load: {e}");
                     LottieState::Failed
@@ -1194,7 +1194,7 @@ const LOTTIE_CACHE_BYTES: usize = 32 << 20;
 /// A Lottie path the renderer has seen: parsed and playable, or failed
 /// (missing/unsupported file — draws nothing, logged once at load).
 enum LottieState {
-    Loaded(LottiePlayer),
+    Loaded(Box<LottiePlayer>),
     Failed,
 }
 

@@ -86,7 +86,11 @@ fn renders_a_lottie_clip_and_advances_frames() {
         center[0] > 150,
         "center should carry the red rect, got {center:?}"
     );
-    assert_eq!(pixel(&first, 10, 10), [0, 0, 0, 255], "corner is background");
+    assert_eq!(
+        pixel(&first, 10, 10),
+        [0, 0, 0, 255],
+        "corner is background"
+    );
 
     // 1.5 s in, the rect has faded to 25% opacity — visibly darker.
     let faded = renderer

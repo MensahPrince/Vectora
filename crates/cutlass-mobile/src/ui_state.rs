@@ -408,9 +408,7 @@ fn describe_content(
                     .map_or_else(|| "Sticker".into(), |s| s.label.to_owned());
                 ("sticker", label, None, None, None)
             }
-            Generator::Lottie { path, .. } => {
-                ("sticker", lottie_label(path), None, None, None)
-            }
+            Generator::Lottie { path, .. } => ("sticker", lottie_label(path), None, None, None),
             Generator::Effect => ("effect", "Effect".into(), None, None, None),
             Generator::Filter => ("filter", "Filter".into(), None, None, None),
             Generator::Adjustment => ("adjustment", "Adjustment".into(), None, None, None),
