@@ -1223,6 +1223,11 @@ fn main() -> Result<(), slint::PlatformError> {
         reverse_handle.reverse_clip(clip_id.to_string());
     });
 
+    let extract_audio_handle = preview_worker.handle();
+    editor.on_on_clip_audio_extracted(move |clip_id| {
+        extract_audio_handle.extract_audio(clip_id.to_string());
+    });
+
     let split_handle = preview_worker.handle();
     editor.on_on_clip_split(move |clip_id, at_tick| {
         split_handle.split_clip(clip_id.to_string(), i64::from(at_tick));

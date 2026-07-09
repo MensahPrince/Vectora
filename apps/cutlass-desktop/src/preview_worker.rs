@@ -17,10 +17,10 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand, TemplatePick};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, SeekPolicy};
 use cutlass_models::{
-    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
-    Easing, Filter, Generator, LinkId, Lut, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId,
-    Param, ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind,
-    resample,
+    AnimatedTransform, AudioRole, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments,
+    CropRect, Easing, Filter, Generator, LinkId, Lut, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId,
+    MediaId, Param, ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId,
+    TrackKind, resample,
 };
 use cutlass_render::{ExportSettings, RenderError, Renderer};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -163,6 +163,12 @@ enum WorkerMsg {
     /// Toggle reverse playback on a media clip: reads the clip's current
     /// speed and flips `reversed`. One undoable history entry.
     ReverseClip {
+        clip: String,
+    },
+    /// CapCut "extract audio": place the video clip's sound on an audio lane
+    /// (same media, no new library asset), link the pair, and tag the audio
+    /// half as `Extracted`. The video goes silent via `carries_own_audio`.
+    ExtractAudio {
         clip: String,
     },
     /// Replace a generated clip's content (raw id) — e.g. an inspector title
@@ -825,6 +831,10 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::ReverseClip { clip });
     }
 
+    pub fn extract_audio(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::ExtractAudio { clip });
+    }
+
     pub fn split_clip(&self, clip: String, at_tick: i64) {
         let _ = self.tx.send(WorkerMsg::SplitClip { clip, at_tick });
     }
@@ -1427,6 +1437,7 @@ fn worker_loop(
             WorkerMsg::ReverseClip { clip } => {
                 reverse_clip_and_publish(engine, &clip, *linkage, &ui)
             }
+            WorkerMsg::ExtractAudio { clip } => extract_audio_and_publish(engine, &clip, &ui),
             WorkerMsg::SetGenerator { clip, generator } => {
                 set_generator_and_publish(engine, &clip, generator, &ui)
             }
@@ -3344,8 +3355,8 @@ fn add_clip_and_publish(
 
     // CapCut keeps a video's sound on the video clip itself — a drop lands one
     // clip and the audio mixers read its audio from that lane (see
-    // `audio_snapshot`). No companion lane is spawned; "Separate audio" is a
-    // later, explicit gesture.
+    // `audio_snapshot`). No companion lane is spawned; use Extract audio
+    // (`extract_audio_and_publish`) for the explicit detach gesture.
 
     // The main-track magnet only applies to the main *video* lane.
     if insert
@@ -5255,6 +5266,178 @@ fn reverse_clip_and_publish(engine: &mut Engine, clip: &str, linkage: bool, ui: 
         linkage,
         ui,
     );
+}
+
+/// CapCut "extract audio": place a linked audio-lane companion that reuses the
+/// video clip's media (no new library asset). The video half goes silent via
+/// [`Timeline::carries_own_audio`] once linked to the audio partner.
+fn extract_audio_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "extract audio ignored: unparsable clip id");
+        return;
+    };
+    match extract_audio(engine, clip_id) {
+        Ok(audio_clip) => {
+            info!(%clip_id, %audio_clip, "extracted audio onto audio lane");
+            publish_projection(engine, ui);
+        }
+        Err(e) => {
+            // Soft ignore for already-detached / wrong target; hard failures
+            // still republish so the UI stays consistent after a rolled-back
+            // group (extract_audio rolls back before returning Err).
+            if e.starts_with("ignored:") {
+                info!(%clip_id, "{e}");
+            } else {
+                error!(%clip_id, "extract audio failed: {e}");
+                publish_projection(engine, ui);
+            }
+        }
+    }
+}
+
+/// Core CapCut extract-audio sequence. Returns the new audio-lane clip id.
+fn extract_audio(engine: &mut Engine, clip_id: ClipId) -> Result<ClipId, String> {
+    let (track_kind, already_detached, snapshot) = {
+        let project = engine.project();
+        let timeline = project.timeline();
+        let track_id = timeline
+            .track_of(clip_id)
+            .ok_or_else(|| format!("ignored: clip {clip_id} not on the timeline"))?;
+        let track = timeline
+            .track(track_id)
+            .ok_or_else(|| format!("ignored: unknown track for {clip_id}"))?;
+        let kind = track.kind;
+        let detached = timeline.detached_to_audio_lane(clip_id);
+        let snapshot = project
+            .clip(clip_id)
+            .cloned()
+            .ok_or_else(|| format!("ignored: clip {clip_id} missing"))?;
+        (kind, detached, snapshot)
+    };
+    if track_kind != TrackKind::Video {
+        return Err(format!("ignored: {clip_id} is not a video-lane clip"));
+    }
+    if already_detached {
+        return Err(format!("ignored: {clip_id} already detached"));
+    }
+    let ClipSource::Media { media, source } = snapshot.content else {
+        return Err(format!("ignored: {clip_id} is not a media clip"));
+    };
+    if !engine.project().media(media).is_some_and(|m| m.has_audio) {
+        return Err(format!("ignored: {clip_id} media has no audio stream"));
+    }
+
+    let rate = engine.project().timeline().frame_rate;
+    let s = snapshot.timeline.start.value;
+    let d = snapshot.timeline.duration.value;
+    let placed_len = resample(source.duration, rate).value.max(1);
+    let reserve = placed_len.max(d);
+    let range = TimeRange::at_rate(s, reserve, rate);
+
+    engine.begin_group();
+
+    let lane = match ensure_audio_host_lane(engine, range) {
+        Ok(id) => id,
+        Err(e) => {
+            engine.rollback_group();
+            return Err(format!("finding audio lane: {e}"));
+        }
+    };
+
+    let audio_clip = match engine.apply(Command::Edit(EditCommand::AddClip {
+        track: lane,
+        media,
+        source,
+        start: RationalTime::new(s, rate),
+    })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::Created(id))) => id,
+        Ok(other) => {
+            engine.rollback_group();
+            return Err(format!("unexpected AddClip outcome: {other:?}"));
+        }
+        Err(e) => {
+            engine.rollback_group();
+            return Err(format!("AddClip failed: {e}"));
+        }
+    };
+
+    if snapshot.speed != Rational::new(1, 1) || snapshot.reversed {
+        if let Err(e) = apply_edit(
+            engine,
+            EditCommand::SetClipSpeed {
+                clip: audio_clip,
+                speed: snapshot.speed,
+                reversed: snapshot.reversed,
+            },
+        ) {
+            engine.rollback_group();
+            return Err(format!("SetClipSpeed failed: {e}"));
+        }
+    }
+
+    if let Err(e) = apply_edit(
+        engine,
+        EditCommand::LinkClips {
+            clips: vec![clip_id, audio_clip],
+        },
+    ) {
+        engine.rollback_group();
+        return Err(format!("LinkClips failed: {e}"));
+    }
+
+    if let Err(e) = apply_edit(
+        engine,
+        EditCommand::SetAudioRole {
+            clip: audio_clip,
+            role: Some(AudioRole::Extracted),
+        },
+    ) {
+        engine.rollback_group();
+        return Err(format!("SetAudioRole failed: {e}"));
+    }
+
+    engine.commit_group();
+    Ok(audio_clip)
+}
+
+/// First unlocked audio lane that can host `range` without overlap, or a new
+/// audio lane appended at the stack floor (`index: None`).
+fn ensure_audio_host_lane(engine: &mut Engine, range: TimeRange) -> Result<TrackId, String> {
+    let (existing, count) = {
+        let timeline = engine.project().timeline();
+        let mut existing = None;
+        for track in timeline.tracks_ordered() {
+            if track.kind != TrackKind::Audio || track.locked {
+                continue;
+            }
+            match track.has_overlap(range, None) {
+                Ok(false) => {
+                    existing = Some(track.id);
+                    break;
+                }
+                Ok(true) => continue,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let count = timeline
+            .tracks_ordered()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .count();
+        (existing, count)
+    };
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    match engine.apply(Command::Edit(EditCommand::AddTrack {
+        kind: TrackKind::Audio,
+        name: format!("{}{}", kind_prefix(TrackKind::Audio), count + 1),
+        index: None,
+        pinned: false,
+    })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(id))) => Ok(id),
+        Ok(other) => Err(format!("unexpected add-track outcome: {other:?}")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Split a clip into two abutting clips at `at_tick`. The UI only offers the
@@ -7407,5 +7590,309 @@ mod tests {
             vec![(0, 100), (100, 160), (160, 200), (200, 300)],
             "inserted end-to-end at the boundary, B shifted right by 100"
         );
+    }
+
+    // --- extract audio -------------------------------------------------------
+
+    /// Video-with-audio on a video lane at timeline start `start`, duration
+    /// `duration` (source window starts at 0).
+    fn extract_fixture(has_audio: bool, start: i64, duration: i64) -> (Engine, ClipId, MediaId) {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("extract-audio", r);
+        let media = project.add_media(cutlass_models::MediaSource::new(
+            "/tmp/extract-audio.mp4",
+            1920,
+            1080,
+            r,
+            1000,
+            has_audio,
+        ));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let video = project
+            .add_clip(
+                track,
+                media,
+                TimeRange::at_rate(0, duration, r),
+                RationalTime::new(start, r),
+            )
+            .expect("video clip");
+        let engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+        (engine, video, media)
+    }
+
+    fn audio_lane_count(engine: &Engine) -> usize {
+        engine
+            .project()
+            .timeline()
+            .tracks_ordered()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .count()
+    }
+
+    fn audio_clip_count(engine: &Engine) -> usize {
+        engine
+            .project()
+            .timeline()
+            .tracks_ordered()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .map(|t| t.clips_ordered().len())
+            .sum()
+    }
+
+    #[test]
+    fn extract_audio_lands_linked_extracted_companion() {
+        let (mut engine, video, media) = extract_fixture(true, 24, 96);
+        assert!(engine.project().timeline().carries_own_audio(video));
+        assert_eq!(audio_lane_count(&engine), 0);
+
+        let audio = extract_audio(&mut engine, video).expect("extract");
+        let audio_track = engine
+            .project()
+            .timeline()
+            .track_of(audio)
+            .expect("audio track");
+        assert_eq!(
+            engine
+                .project()
+                .timeline()
+                .track(audio_track)
+                .expect("track")
+                .kind,
+            TrackKind::Audio
+        );
+        assert_eq!(audio_lane_count(&engine), 1);
+
+        let video_clip = engine.project().clip(video).expect("video").clone();
+        let audio_clip = engine.project().clip(audio).expect("audio").clone();
+        assert_eq!(video_clip.link, audio_clip.link);
+        assert!(video_clip.link.is_some());
+        assert_eq!(audio_clip.audio_role, Some(AudioRole::Extracted));
+        assert_eq!(audio_clip.timeline.start.value, 24);
+        assert_eq!(audio_clip.timeline.duration.value, 96);
+        match (&video_clip.content, &audio_clip.content) {
+            (
+                ClipSource::Media {
+                    media: vm,
+                    source: vs,
+                },
+                ClipSource::Media {
+                    media: am,
+                    source: asrc,
+                },
+            ) => {
+                assert_eq!(*vm, media);
+                assert_eq!(vm, am);
+                assert_eq!(vs, asrc);
+            }
+            _ => panic!("both halves must be media-backed"),
+        }
+        assert!(!engine.project().timeline().carries_own_audio(video));
+        assert!(engine.project().timeline().carries_own_audio(audio));
+        assert!(engine.project().timeline().detached_to_audio_lane(video));
+        assert_eq!(
+            engine.project().media_count(),
+            1,
+            "extract must not create a new media pool entry"
+        );
+
+        // New audio lane sinks below the video lane (audio-floor invariant).
+        let order: Vec<_> = engine.project().timeline().order().to_vec();
+        let video_track = engine.project().timeline().track_of(video).unwrap();
+        let video_idx = order.iter().position(|t| *t == video_track).unwrap();
+        let audio_idx = order.iter().position(|t| *t == audio_track).unwrap();
+        assert!(
+            audio_idx < video_idx,
+            "audio lane must sit below video in stack order"
+        );
+    }
+
+    #[test]
+    fn extract_audio_is_idempotent_when_already_detached() {
+        let (mut engine, video, _) = extract_fixture(true, 0, 48);
+        extract_audio(&mut engine, video).expect("first extract");
+        assert_eq!(audio_clip_count(&engine), 1);
+
+        let err = extract_audio(&mut engine, video).expect_err("already detached");
+        assert!(err.starts_with("ignored:"));
+        assert_eq!(audio_clip_count(&engine), 1);
+        assert_eq!(audio_lane_count(&engine), 1);
+    }
+
+    #[test]
+    fn extract_audio_rejects_silent_video() {
+        let (mut engine, video, _) = extract_fixture(false, 0, 48);
+        let err = extract_audio(&mut engine, video).expect_err("no audio stream");
+        assert!(err.starts_with("ignored:"));
+        assert_eq!(audio_lane_count(&engine), 0);
+        assert!(engine.project().timeline().carries_own_audio(video));
+    }
+
+    #[test]
+    fn extract_audio_rejects_audio_lane_clip() {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("extract-audio-lane", r);
+        let media = project.add_media(cutlass_models::MediaSource::new(
+            "/tmp/extract-audio-lane.mp4",
+            1920,
+            1080,
+            r,
+            480,
+            true,
+        ));
+        let track = project.add_track(TrackKind::Audio, "A1");
+        let clip = project
+            .add_clip(
+                track,
+                media,
+                TimeRange::at_rate(0, 48, r),
+                RationalTime::new(0, r),
+            )
+            .expect("audio clip");
+        let mut engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+
+        let err = extract_audio(&mut engine, clip).expect_err("audio lane");
+        assert!(err.starts_with("ignored:"));
+        assert_eq!(audio_clip_count(&engine), 1);
+    }
+
+    #[test]
+    fn extract_audio_rejects_generated_clip() {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("extract-generated", r);
+        let track = project.add_track(TrackKind::Text, "T1");
+        let mut engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+        let clip = match engine
+            .apply(Command::Edit(EditCommand::AddGenerated {
+                track,
+                generator: Generator::text("Title"),
+                timeline: TimeRange::at_rate(0, 48, r),
+            }))
+            .expect("add generated")
+        {
+            ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let err = extract_audio(&mut engine, clip).expect_err("generated");
+        assert!(err.starts_with("ignored:"));
+        assert_eq!(audio_lane_count(&engine), 0);
+    }
+
+    #[test]
+    fn extract_audio_copies_speed_and_reverse() {
+        let (mut engine, video, _) = extract_fixture(true, 0, 96);
+        apply_edit(
+            &mut engine,
+            EditCommand::SetClipSpeed {
+                clip: video,
+                speed: Rational::new(2, 1),
+                reversed: true,
+            },
+        )
+        .expect("retime video");
+
+        let audio = extract_audio(&mut engine, video).expect("extract");
+        let audio_clip = engine.project().clip(audio).expect("audio");
+        assert_eq!(audio_clip.speed, Rational::new(2, 1));
+        assert!(audio_clip.reversed);
+        // Timeline duration follows the retimed video half.
+        let video_dur = engine.project().clip(video).unwrap().timeline.duration.value;
+        assert_eq!(audio_clip.timeline.duration.value, video_dur);
+    }
+
+    #[test]
+    fn extract_audio_reuses_free_audio_lane() {
+        let (mut engine, video, _) = extract_fixture(true, 0, 48);
+        // Pre-create an empty audio lane; extract should land there instead of
+        // spawning a second one.
+        let existing = match engine
+            .apply(Command::Edit(EditCommand::AddTrack {
+                kind: TrackKind::Audio,
+                name: "A1".into(),
+                index: None,
+                pinned: false,
+            }))
+            .expect("add audio lane")
+        {
+            ApplyOutcome::Edited(EditOutcome::CreatedTrack(id)) => id,
+            other => panic!("expected CreatedTrack, got {other:?}"),
+        };
+        assert_eq!(audio_lane_count(&engine), 1);
+
+        let audio = extract_audio(&mut engine, video).expect("extract");
+        assert_eq!(audio_lane_count(&engine), 1);
+        assert_eq!(
+            engine.project().timeline().track_of(audio),
+            Some(existing)
+        );
+    }
+
+    #[test]
+    fn extract_audio_creates_lane_when_existing_overlaps() {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("extract-overlap", r);
+        let media = project.add_media(cutlass_models::MediaSource::new(
+            "/tmp/extract-overlap.mp4",
+            1920,
+            1080,
+            r,
+            1000,
+            true,
+        ));
+        let video_track = project.add_track(TrackKind::Video, "V1");
+        let audio_track = project.add_track(TrackKind::Audio, "A1");
+        // Occupant covers [0, 96) on the only audio lane.
+        project
+            .add_clip(
+                audio_track,
+                media,
+                TimeRange::at_rate(0, 96, r),
+                RationalTime::new(0, r),
+            )
+            .expect("occupant");
+        let video = project
+            .add_clip(
+                video_track,
+                media,
+                TimeRange::at_rate(0, 48, r),
+                RationalTime::new(0, r),
+            )
+            .expect("video");
+        let mut engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+        assert_eq!(audio_lane_count(&engine), 1);
+
+        let audio = extract_audio(&mut engine, video).expect("extract");
+        assert_eq!(audio_lane_count(&engine), 2);
+        assert_ne!(
+            engine.project().timeline().track_of(audio),
+            Some(audio_track),
+            "extracted clip must not land on the occupied lane"
+        );
+    }
+
+    #[test]
+    fn extract_audio_undo_restores_pre_extract_state() {
+        let (mut engine, video, _) = extract_fixture(true, 12, 60);
+        assert!(engine.project().timeline().carries_own_audio(video));
+        assert_eq!(engine.project().timeline().clip_count(), 1);
+
+        extract_audio(&mut engine, video).expect("extract");
+        assert_eq!(engine.project().timeline().clip_count(), 2);
+        assert!(!engine.project().timeline().carries_own_audio(video));
+        assert_eq!(audio_lane_count(&engine), 1);
+
+        // One undo group → one undo clears the companion, link, role, and lane.
+        assert!(engine.undo());
+        assert_eq!(engine.project().timeline().clip_count(), 1);
+        assert!(engine.project().timeline().carries_own_audio(video));
+        assert!(!engine.project().timeline().detached_to_audio_lane(video));
+        // Empty non-main audio lane may remain or be gone depending on policy;
+        // the video half must be fully restored either way.
+        assert!(engine.project().clip(video).unwrap().link.is_none());
+
+        assert!(engine.redo());
+        assert_eq!(engine.project().timeline().clip_count(), 2);
+        assert!(!engine.project().timeline().carries_own_audio(video));
+        assert_eq!(audio_clip_count(&engine), 1);
     }
 }

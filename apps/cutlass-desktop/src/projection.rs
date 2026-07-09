@@ -264,7 +264,7 @@ fn clip_to_slint(
     let (animation_in_id, animation_in_label) = clip_animation(clip.animation_in.as_ref());
     let (animation_out_id, animation_out_label) = clip_animation(clip.animation_out.as_ref());
     let (animation_combo_id, animation_combo_label) = clip_animation(clip.animation_combo.as_ref());
-    let caps = clip_capabilities(clip, track_kind);
+    let caps = clip_capabilities(project, clip, track_kind);
 
     Clip {
         id: clip.id.raw().to_string().into(),
@@ -899,8 +899,12 @@ fn track_kind(kind: EngineKind) -> TrackKind {
     }
 }
 
-fn clip_capabilities(clip: &EngineClip, kind: EngineKind) -> ClipCapabilities {
-    let caps = EngineCaps::for_clip(clip, kind);
+fn clip_capabilities(
+    project: &EngineProject,
+    clip: &EngineClip,
+    kind: EngineKind,
+) -> ClipCapabilities {
+    let caps = EngineCaps::for_clip(project, clip, kind);
     ClipCapabilities {
         has_transform: caps.has_transform,
         has_crop: caps.has_crop,
@@ -913,6 +917,7 @@ fn clip_capabilities(clip: &EngineClip, kind: EngineKind) -> ClipCapabilities {
         can_split: caps.can_split,
         can_reverse: caps.can_reverse,
         can_ripple_delete: caps.can_ripple_delete,
+        can_extract_audio: caps.can_extract_audio,
     }
 }
 

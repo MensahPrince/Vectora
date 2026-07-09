@@ -147,6 +147,9 @@ export struct ClipCapabilities {
     can-split: bool,
     can-reverse: bool,
     can-ripple-delete: bool,
+    // CapCut "extract audio": video-lane media with an audio stream that is
+    // not already detached to a linked audio-lane companion.
+    can-extract-audio: bool,
 }
 
 @rust-attr(derive(serde::Serialize, serde::Deserialize))
