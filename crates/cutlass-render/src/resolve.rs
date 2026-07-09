@@ -522,6 +522,33 @@ pub(crate) fn resolve_generator(
         ),
         Generator::Effect => canvas_pass(effects, None, cw, ch),
         Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), color_grade, cw, ch),
+        Generator::Lottie {
+            path,
+            width,
+            height,
+        } => {
+            // Same placement convention as stickers: intrinsic pixels are
+            // reference pixels. The stored size drives placement so this
+            // stays pure — the renderer probes the file itself.
+            let px = ref_scale * scale;
+            Some(SceneLayer {
+                clip: None,
+                source: LayerSource::Lottie {
+                    path: path.clone(),
+                    local_time: local_seconds,
+                },
+                center,
+                anchor_point,
+                size: SizeSpec::Fixed([*width as f32 * px, *height as f32 * px]),
+                rotation,
+                opacity,
+                uv,
+                effects,
+                mask: None,
+                chroma_key: None,
+                color_grade,
+            })
+        }
         Generator::Sticker { asset } => {
             // Unknown/empty ids place nothing — the legacy payload-less
             // sticker behavior, never an error.

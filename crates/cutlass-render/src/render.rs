@@ -106,6 +106,16 @@ pub struct Renderer {
     /// Bounded by the catalog (small, embedded assets); frame lookup on the
     /// hot path is O(frames) over the delay table, no decode.
     stickers: HashMap<String, StickerSequence>,
+    /// File-backed Lottie animations, keyed by path: parsed composition +
+    /// LRU of rasterized frames (capped-fps sampling, per-asset byte budget
+    /// — never the pre-render-everything sticker strategy; see
+    /// `docs/lottie-design.md`). Failed loads are remembered so a missing
+    /// file logs once and draws nothing instead of re-probing every frame.
+    lottie: HashMap<String, LottieState>,
+    /// Monotonic per-scene stamp for the Lottie frame LRU: frames touched
+    /// by the scene currently being composed are never evicted, so two
+    /// clips of one asset can't alias mid-frame.
+    lottie_stamp: u64,
     /// Preferred decoder output mode. Apple and Windows start in
     /// [`OutputMode::Gpu`] so hardware-decoded surfaces (`CVPixelBuffer` /
     /// shared D3D11 NV12 textures) import into the compositor with no CPU
@@ -145,6 +155,8 @@ impl Renderer {
             decoders: HashMap::new(),
             stills: HashMap::new(),
             stickers: HashMap::new(),
+            lottie: HashMap::new(),
+            lottie_stamp: 0,
             decode_mode: default_decode_mode(),
             proxies: HashMap::new(),
             use_proxies: true,
@@ -434,6 +446,9 @@ impl Renderer {
         policy: SeekPolicy,
     ) -> Result<(), RenderError> {
         let realize_started = Instant::now();
+        // New scene, new LRU stamp: frames touched below are eviction-exempt
+        // until the next scene.
+        self.lottie_stamp += 1;
         // Decode time accumulated across media layers — on weak machines this
         // is where whole-frame seconds hide, so the stage log splits it out.
         let mut decode_ms = 0.0f64;
@@ -526,6 +541,23 @@ impl Renderer {
                     let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
                     realized.push(Realized::Still {
                         media: *media,
+                        placement: place(size),
+                        uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
+                        color_grade,
+                    });
+                }
+                LayerSource::Lottie { path, local_time } => {
+                    // A missing or unsupported file draws nothing (the media
+                    // offline story — projects move machines), never an error.
+                    let Some(frame_index) = self.ensure_lottie_frame(path, *local_time) else {
+                        continue;
+                    };
+                    let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                    realized.push(Realized::Lottie {
+                        path: path.clone(),
+                        frame_index,
                         placement: place(size),
                         uv: layer.uv,
                         effects: layer.effects.clone(),
@@ -671,6 +703,7 @@ impl Renderer {
                         outgoing.as_ref(),
                         &self.stills,
                         &self.stickers,
+                        &self.lottie,
                         out_effects,
                     ));
                     let out_idx = layer_storage.len() - 1;
@@ -687,6 +720,7 @@ impl Renderer {
                         incoming.as_ref(),
                         &self.stills,
                         &self.stickers,
+                        &self.lottie,
                         in_effects,
                     ));
                     let in_idx = layer_storage.len() - 1;
@@ -711,6 +745,7 @@ impl Renderer {
                         other,
                         &self.stills,
                         &self.stickers,
+                        &self.lottie,
                         effects,
                     ));
                     jobs.push(LayerJob::Plain {
@@ -857,6 +892,29 @@ impl Renderer {
                     effects: layer.effects.clone(),
                     fx,
                     color_grade,
+                }
+            }
+            LayerSource::Lottie { path, local_time } => {
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                match self.ensure_lottie_frame(path, *local_time) {
+                    Some(frame_index) => Realized::Lottie {
+                        path: path.clone(),
+                        frame_index,
+                        placement: place(size),
+                        uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
+                        color_grade,
+                    },
+                    // Missing file inside a transition: a transparent side,
+                    // matching the draw-nothing policy of the main path.
+                    None => Realized::Solid {
+                        rgba: [0, 0, 0, 0],
+                        placement: place(size),
+                        effects: layer.effects.clone(),
+                        fx,
+                        color_grade,
+                    },
                 }
             }
             LayerSource::Sticker { asset, local_time } => {
@@ -1071,6 +1129,80 @@ impl Renderer {
         );
         Ok(())
     }
+
+    /// Make the Lottie frame for `local_time` resident (parse the file on
+    /// first sight, rasterize the frame unless cached) and return its
+    /// sampled-frame index. `None` — draw nothing — for files that are
+    /// missing, unparseable, or fail to rasterize; the failure is
+    /// remembered and logged once, not re-probed per frame.
+    fn ensure_lottie_frame(&mut self, path: &str, local_time: f64) -> Option<usize> {
+        let stamp = self.lottie_stamp;
+        let state = self.lottie.entry(path.to_owned()).or_insert_with(|| {
+            match cutlass_decoder::LottieAnimation::load(std::path::Path::new(path)) {
+                Ok(animation) => LottieState::Loaded(LottiePlayer {
+                    animation,
+                    frames: HashMap::new(),
+                }),
+                Err(e) => {
+                    tracing::warn!("lottie '{path}' failed to load: {e}");
+                    LottieState::Failed
+                }
+            }
+        });
+        let LottieState::Loaded(player) = state else {
+            return None;
+        };
+
+        let index = player.animation.frame_index_at(local_time);
+        if let Some((_, used)) = player.frames.get_mut(&index) {
+            *used = stamp;
+            return Some(index);
+        }
+        let image = match player.animation.render_frame(index) {
+            Ok(image) => image,
+            Err(e) => {
+                tracing::warn!("lottie '{path}' frame {index} failed to render: {e}");
+                return None;
+            }
+        };
+        player.frames.insert(index, (image, stamp));
+
+        // Enforce the per-asset byte budget, oldest-stamp first. Frames
+        // stamped by the current scene are exempt (still borrowed below).
+        let mut total: usize = player.frames.values().map(|(f, _)| f.pixels.len()).sum();
+        while total > LOTTIE_CACHE_BYTES {
+            let Some((&victim, _)) = player
+                .frames
+                .iter()
+                .filter(|(_, (_, used))| *used != stamp)
+                .min_by_key(|(_, (_, used))| *used)
+            else {
+                break;
+            };
+            let (evicted, _) = player.frames.remove(&victim).expect("victim exists");
+            total -= evicted.pixels.len();
+        }
+        Some(index)
+    }
+}
+
+/// Per-asset Lottie frame-cache budget. At the 512 px render cap
+/// (~1 MB/frame) this holds ~32 frames — a full loop of a typical short
+/// sticker, so steady-state playback rasterizes nothing.
+const LOTTIE_CACHE_BYTES: usize = 32 << 20;
+
+/// A Lottie path the renderer has seen: parsed and playable, or failed
+/// (missing/unsupported file — draws nothing, logged once at load).
+enum LottieState {
+    Loaded(LottiePlayer),
+    Failed,
+}
+
+struct LottiePlayer {
+    animation: cutlass_decoder::LottieAnimation,
+    /// Rasterized frames keyed by sampled-frame index, stamped with the
+    /// scene counter of their last use (the LRU key).
+    frames: HashMap<usize, (RgbaImage, u64)>,
 }
 
 /// A decoded sticker asset: every frame up front plus per-frame delays, so
@@ -1140,6 +1272,7 @@ fn composite_from_realized<'a>(
     r: &'a Realized,
     stills: &'a HashMap<MediaId, RgbaImage>,
     stickers: &'a HashMap<String, StickerSequence>,
+    lottie: &'a HashMap<String, LottieState>,
     effects: &'a [PassInstance<'a>],
 ) -> CompositeLayer<'a> {
     match r {
@@ -1202,6 +1335,27 @@ fn composite_from_realized<'a>(
             .with_fx(*fx)
             .with_effects(effects)
             .with_color_grade(*color_grade),
+        Realized::Lottie {
+            path,
+            frame_index,
+            placement,
+            uv,
+            fx,
+            color_grade,
+            ..
+        } => {
+            // Realize only emits `Realized::Lottie` after `ensure_lottie_frame`
+            // cached this exact frame, and the LRU never evicts frames stamped
+            // by the scene being composed.
+            let LottieState::Loaded(player) = &lottie[path] else {
+                unreachable!("realized lottie layer without a loaded player")
+            };
+            CompositeLayer::rgba(&player.frames[frame_index].0, *placement)
+                .with_uv(*uv)
+                .with_fx(*fx)
+                .with_effects(effects)
+                .with_color_grade(*color_grade)
+        }
         Realized::Sdf {
             shape,
             placement,
@@ -1255,6 +1409,15 @@ enum Realized {
         fx: LayerEffects,
         color_grade: Option<ColorGrade>,
     },
+    Lottie {
+        path: String,
+        frame_index: usize,
+        placement: LayerPlacement,
+        uv: [f32; 4],
+        effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
+        color_grade: Option<ColorGrade>,
+    },
     Bitmap {
         image: RgbaImage,
         placement: LayerPlacement,
@@ -1287,6 +1450,7 @@ impl Realized {
             Realized::Frame { effects, .. }
             | Realized::Still { effects, .. }
             | Realized::Sticker { effects, .. }
+            | Realized::Lottie { effects, .. }
             | Realized::Bitmap { effects, .. }
             | Realized::Solid { effects, .. }
             | Realized::Sdf { effects, .. } => Some(effects),

@@ -73,6 +73,22 @@ pub enum Generator {
     /// empty string — what payload-less pre-catalog projects deserialize to —
     /// is valid and renders nothing, exactly like the old unit variant.
     Sticker { asset: String },
+    /// A Lottie vector animation, file-backed: `path` points at a `.json`
+    /// on disk (downloaded from the asset catalog or user-imported),
+    /// path-referenced like media rather than embedded like [`Sticker`].
+    ///
+    /// `width`/`height` are the composition's intrinsic size, captured when
+    /// the generator is created so the resolver can place the layer without
+    /// touching the filesystem (they are *reference pixels* on a 1080p
+    /// canvas, the sticker convention). A missing or unreadable file renders
+    /// nothing — the media offline story, never an error.
+    ///
+    /// [`Sticker`]: Generator::Sticker
+    Lottie {
+        path: String,
+        width: u32,
+        height: u32,
+    },
     /// Motion / composited VFX layer (implementation TBD).
     Effect,
     /// Blur, mask, and similar pixel filters (implementation TBD).
@@ -125,6 +141,11 @@ impl<'de> Deserialize<'de> for Generator {
                 #[serde(default)]
                 asset: String,
             },
+            Lottie {
+                path: String,
+                width: u32,
+                height: u32,
+            },
             Effect,
             Filter,
             Adjustment,
@@ -151,6 +172,15 @@ impl<'de> Deserialize<'de> for Generator {
                         stroke,
                     },
                     Tagged::Sticker { asset } => Generator::Sticker { asset },
+                    Tagged::Lottie {
+                        path,
+                        width,
+                        height,
+                    } => Generator::Lottie {
+                        path,
+                        width,
+                        height,
+                    },
                     Tagged::Effect => Generator::Effect,
                     Tagged::Filter => Generator::Filter,
                     Tagged::Adjustment => Generator::Adjustment,
@@ -163,6 +193,7 @@ impl<'de> Deserialize<'de> for Generator {
             "SolidColor",
             "Shape",
             "Sticker",
+            "Lottie",
             "Effect",
             "Filter",
             "Adjustment",
@@ -353,6 +384,16 @@ impl Generator {
         }
     }
 
+    /// A file-backed Lottie generator. `width`/`height` are the
+    /// composition's intrinsic size (probe the file before calling).
+    pub fn lottie(path: impl Into<String>, width: u32, height: u32) -> Self {
+        Generator::Lottie {
+            path: path.into(),
+            width,
+            height,
+        }
+    }
+
     /// A shape generator with the default drop size and fill color.
     pub fn shape(shape: Shape, rgba: [u8; 4]) -> Self {
         Generator::Shape {
@@ -399,6 +440,24 @@ impl Generator {
                 return Err(ModelError::InvalidParam(format!(
                     "unknown sticker '{asset}'"
                 )));
+            }
+            return Ok(());
+        }
+        if let Generator::Lottie {
+            path,
+            width,
+            height,
+        } = self
+        {
+            // Path validity (file exists, parses) is a render-time concern —
+            // projects move machines. Structural soundness is not.
+            if path.trim().is_empty() {
+                return Err(ModelError::InvalidParam("empty lottie path".into()));
+            }
+            if *width == 0 || *height == 0 {
+                return Err(ModelError::InvalidParam(
+                    "lottie intrinsic size must be non-zero".into(),
+                ));
             }
             return Ok(());
         }
@@ -2382,6 +2441,7 @@ mod tests {
             Generator::SolidColor { rgba: [1, 2, 3, 4] },
             Generator::shape(Shape::Ellipse, [9, 8, 7, 6]),
             Generator::sticker("heart"),
+            Generator::lottie("/tmp/confetti.json", 256, 256),
             Generator::Effect,
             Generator::Filter,
             Generator::Adjustment,

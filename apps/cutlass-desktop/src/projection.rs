@@ -691,6 +691,13 @@ fn clip_labels(project: &EngineProject, clip: &EngineClip) -> (String, String) {
                     .map_or_else(|| "Sticker".to_owned(), |s| s.label.to_owned()),
                 String::new(),
             ),
+            Generator::Lottie { path, .. } => (
+                std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map_or_else(|| "Animation".to_owned(), str::to_owned),
+                String::new(),
+            ),
             Generator::Effect => ("Effect".to_owned(), String::new()),
             Generator::Filter => ("Filter".to_owned(), String::new()),
             Generator::Adjustment => ("Adjustment".to_owned(), String::new()),
@@ -733,6 +740,8 @@ fn clip_generator_visual(clip: &EngineClip) -> (&'static str, Color) {
         {
             ("sticker", transparent)
         }
+        // File-backed Lotties composite like stickers (preview hit-testing).
+        ClipSource::Generated(Generator::Lottie { .. }) => ("sticker", transparent),
         _ => ("", transparent),
     }
 }

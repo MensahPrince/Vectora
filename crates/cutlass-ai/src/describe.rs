@@ -274,6 +274,15 @@ fn clip_content(project: &Project, content: &ClipSource) -> ClipContent {
                     format!("sticker:{asset}")
                 },
             },
+            Generator::Lottie { path, .. } => ClipContent::Other {
+                kind: format!(
+                    "lottie:{}",
+                    std::path::Path::new(path)
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("animation")
+                ),
+            },
             Generator::Effect => ClipContent::Other {
                 kind: "effect".to_string(),
             },

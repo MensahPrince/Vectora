@@ -83,6 +83,7 @@ impl Scene {
                 | LayerSource::Media { .. }
                 | LayerSource::Still { .. }
                 | LayerSource::Sticker { .. }
+                | LayerSource::Lottie { .. }
                 | LayerSource::Text { .. }
                 | LayerSource::Solid(_)
                 | LayerSource::Transition { .. } => {}
@@ -219,6 +220,15 @@ pub enum LayerSource {
     Sticker {
         /// Catalog id (see [`cutlass_models::sticker_catalog`]).
         asset: String,
+        /// Seconds since the clip's timeline start.
+        local_time: f64,
+    },
+    /// A file-backed Lottie animation: the renderer parses `path` once and
+    /// rasterizes the capped-fps frame at `local_time` on demand (LRU-cached,
+    /// looping). A missing/unparseable file draws nothing.
+    Lottie {
+        /// Absolute path to the `.json` on disk.
+        path: String,
         /// Seconds since the clip's timeline start.
         local_time: f64,
     },

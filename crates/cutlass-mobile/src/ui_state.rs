@@ -408,6 +408,9 @@ fn describe_content(
                     .map_or_else(|| "Sticker".into(), |s| s.label.to_owned());
                 ("sticker", label, None, None, None)
             }
+            Generator::Lottie { path, .. } => {
+                ("sticker", lottie_label(path), None, None, None)
+            }
             Generator::Effect => ("effect", "Effect".into(), None, None, None),
             Generator::Filter => ("filter", "Filter".into(), None, None, None),
             Generator::Adjustment => ("adjustment", "Adjustment".into(), None, None, None),
@@ -416,6 +419,15 @@ fn describe_content(
 }
 
 /// Merged, sorted clip-relative transform keyframe times in seconds.
+/// Display label for a file-backed Lottie: the file stem, or a generic
+/// fallback for degenerate paths.
+fn lottie_label(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .map_or_else(|| "Animation".to_owned(), str::to_owned)
+}
+
 fn transform_keyframe_seconds(clip: &Clip, rate: Rational) -> Vec<f64> {
     let mut ticks: Vec<i64> = Vec::new();
     fn collect<T>(param: &Param<T>, into: &mut Vec<i64>) {
