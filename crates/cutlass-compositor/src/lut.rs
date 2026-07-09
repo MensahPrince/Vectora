@@ -59,13 +59,14 @@ impl CubeLut {
             match head {
                 "TITLE" => {}
                 "LUT_3D_SIZE" => {
-                    let n: u32 = tokens
-                        .next()
-                        .and_then(|t| t.parse().ok())
-                        .ok_or(LutError::Malformed {
-                            line: line_no,
-                            message: "unreadable LUT_3D_SIZE".into(),
-                        })?;
+                    let n: u32 =
+                        tokens
+                            .next()
+                            .and_then(|t| t.parse().ok())
+                            .ok_or(LutError::Malformed {
+                                line: line_no,
+                                message: "unreadable LUT_3D_SIZE".into(),
+                            })?;
                     if !(2..=MAX_CUBE_SIZE).contains(&n) {
                         return Err(LutError::InvalidSize(n));
                     }

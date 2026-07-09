@@ -13,9 +13,8 @@ use cutlass_commands::{
     AnimationRef, AnimationSlot, AudioRole, CanvasAspect, ChromaKey, ClipId, ClipParam,
     ClipTransform, ColorAdjustments, Command, CropRect, Easing, EditCommand, EditOutcome, Filter,
     Generator, Lut, MarkerColor, MarkerId, Mask, MaskKind, MediaId, Param, ParamValue,
-    ProjectCommand,
-    Rational, RationalTime, Replaceable, StabilizeLevel, TemplateMeta, TemplatePick, TimeRange,
-    TrackId, TrackKind,
+    ProjectCommand, Rational, RationalTime, Replaceable, StabilizeLevel, TemplateMeta,
+    TemplatePick, TimeRange, TrackId, TrackKind,
 };
 use serde_json::{Value, json};
 

@@ -4,9 +4,7 @@
 //! cleanly when no adapter is available (CI).
 
 use cutlass_core::{Rational, RationalTime};
-use cutlass_models::{
-    CanvasAspect, CanvasSettings, Generator, Lut, Project, TimeRange, TrackKind,
-};
+use cutlass_models::{CanvasAspect, CanvasSettings, Generator, Lut, Project, TimeRange, TrackKind};
 use cutlass_render::Renderer;
 
 const FPS_24: Rational = Rational::FPS_24;

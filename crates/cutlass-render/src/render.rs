@@ -1234,10 +1234,8 @@ impl Renderer {
     /// offline story, never an error.
     fn resolve_scene_lut(&mut self, lut: &Option<SceneLut>) -> Option<SceneLut> {
         let lut = lut.as_ref()?;
-        let state = self
-            .luts
-            .entry(lut.path.clone())
-            .or_insert_with(|| match std::fs::read_to_string(&lut.path) {
+        let state = self.luts.entry(lut.path.clone()).or_insert_with(|| {
+            match std::fs::read_to_string(&lut.path) {
                 Ok(text) => match CubeLut::parse(&text) {
                     Ok(cube) => CubeLutState::Loaded(Box::new(cube)),
                     Err(e) => {
@@ -1249,7 +1247,8 @@ impl Renderer {
                     tracing::warn!("LUT '{}' failed to read: {e}", lut.path);
                     CubeLutState::Failed
                 }
-            });
+            }
+        });
         matches!(state, CubeLutState::Loaded(_)).then(|| lut.clone())
     }
 }

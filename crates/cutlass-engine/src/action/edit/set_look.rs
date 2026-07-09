@@ -7,8 +7,8 @@
 //! (persisted + surfaced in `ui_state`, drawn later).
 
 use cutlass_models::{
-    AnimationRef, AnimationSlot, AudioRole, ChromaKey, Clip, ClipId, ColorAdjustments, Filter,
-    Lut, Mask, ModelError, Project, StabilizeLevel,
+    AnimationRef, AnimationSlot, AudioRole, ChromaKey, Clip, ClipId, ColorAdjustments, Filter, Lut,
+    Mask, ModelError, Project, StabilizeLevel,
 };
 
 use crate::action::edit::restore_clip::RestoreClipAction;
