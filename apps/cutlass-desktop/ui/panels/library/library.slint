@@ -14,8 +14,8 @@ import {
 } from "../../components/index.slint";
 import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
 import { Media, TrackKind, CatalogEntry } from "../../models/index.slint";
-import { EffectsBackend, CloudBackend, TextPresetsBackend, AiBackend, LottieBackend } from "../../lib/index.slint";
-import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile, StockMediaTile, TextPresetLibraryTile, AiMediaTile } from "tiles.slint";
+import { EffectsBackend, CloudBackend, TextPresetsBackend, AiBackend, LottieBackend, SfxBackend } from "../../lib/index.slint";
+import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile, StockMediaTile, TextPresetLibraryTile, AiMediaTile, SfxAudioTile } from "tiles.slint";
 import { SectionPlaceholder } from "placeholder.slint";
 import { CutlassScrollView } from "../../components/scroll-view.slint";
 
@@ -420,6 +420,9 @@ export component LibraryPanel inherits PanelBase {
                     active: LibraryState.audio-section;
                     select(id) => {
                         LibraryState.audio-section = id;
+                        if id == "sfx" && SfxBackend.status == "idle" {
+                            SfxBackend.refresh();
+                        }
                     }
                 }
 
@@ -765,13 +768,87 @@ export component LibraryPanel inherits PanelBase {
                     }
                 }
 
-                // ---- Audio > SFX / Stock / AI -------------------------------
-                if LibraryState.active-tab == "audio" && LibraryState.audio-section == "sfx": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/sfx.svg");
-                    title: "Sound effects";
-                    message: "A built-in pack of whooshes, dings, and ambience. Coming soon.";
+                // ---- Audio > Sound effects ----------------------------------
+                // CC0-curated catalog (src/sfx.rs): metadata lists instantly,
+                // files download on click-to-import and land in the pool under
+                // Audio > Local like any other media.
+                if LibraryState.active-tab == "audio" && LibraryState.audio-section == "sfx": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    if SfxBackend.status == "loading": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+
+                        CutlassText {
+                            text: "Loading sound effects…";
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    if SfxBackend.status == "empty" || SfxBackend.status == "idle": SectionPlaceholder {
+                        vertical-stretch: 1;
+                        icon: @image-url("../../../../../assets/icon/library/sfx.svg");
+                        title: "Sound effects";
+                        message: "A CC0 pack of whooshes, dings, and ambience. Click a sound to add it to your media.";
+                    }
+
+                    if SfxBackend.status == "error": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        padding: AppStore.theme.metrics.spacing.xl;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        CutlassText {
+                            text: "Couldn't load sound effects";
+                            style: AppStore.theme.typography.heading-sm;
+                            horizontal-alignment: center;
+                        }
+
+                        CutlassText {
+                            text: SfxBackend.error;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            SubtleButton {
+                                label: "Retry";
+                                clicked => {
+                                    SfxBackend.refresh();
+                                }
+                            }
+                        }
+                    }
+
+                    if SfxBackend.status == "results": sfx-grid := CutlassGridView {
+                        show-horizontal-scrollbar: false;
+                        show-vertical-scrollbar: false;
+                        interactive: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
+                            / (100px + AppStore.theme.metrics.spacing.md)));
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: SfxBackend.items.length;
+
+                        for tile[i] in SfxBackend.items: SfxAudioTile {
+                            x: sfx-grid.cell-x(i);
+                            y: sfx-grid.cell-y(i);
+                            width: sfx-grid.cell-width;
+                            height: sfx-grid.cell-height;
+                            tile: tile;
+                            index: i;
+                        }
+                    }
                 }
 
                 if LibraryState.active-tab == "audio" && LibraryState.audio-section == "stock": SectionPlaceholder {

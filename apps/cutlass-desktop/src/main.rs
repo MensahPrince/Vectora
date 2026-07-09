@@ -20,6 +20,7 @@ mod projection;
 mod proxy;
 mod ruler;
 mod selection;
+mod sfx;
 mod snap;
 mod strips;
 mod templates;
@@ -746,6 +747,21 @@ fn main() -> Result<(), slint::PlatformError> {
         let refresh_handle = lottie_worker.handle();
         app.global::<LottieBackend>()
             .on_refresh(move || refresh_handle.refresh());
+    }
+
+    // Sound effects (Library > Audio > Sound effects): catalog fetch on its
+    // own thread, lazy download + normal media import on click (src/sfx.rs).
+    let sfx_worker = sfx::SfxWorker::spawn(app.as_weak(), preview_worker.handle())
+        .map_err(slint::PlatformError::Other)?;
+    {
+        let refresh_handle = sfx_worker.handle();
+        app.global::<SfxBackend>()
+            .on_refresh(move || refresh_handle.refresh());
+    }
+    {
+        let import_handle = sfx_worker.handle();
+        app.global::<SfxBackend>()
+            .on_import(move |index| import_handle.import(index.max(0) as usize));
     }
 
     // Cloud LUTs (look inspector > LUT): catalog fetch + `.cube` downloads
