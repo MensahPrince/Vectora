@@ -7796,7 +7796,13 @@ mod tests {
         assert_eq!(audio_clip.speed, Rational::new(2, 1));
         assert!(audio_clip.reversed);
         // Timeline duration follows the retimed video half.
-        let video_dur = engine.project().clip(video).unwrap().timeline.duration.value;
+        let video_dur = engine
+            .project()
+            .clip(video)
+            .unwrap()
+            .timeline
+            .duration
+            .value;
         assert_eq!(audio_clip.timeline.duration.value, video_dur);
     }
 
@@ -7821,10 +7827,7 @@ mod tests {
 
         let audio = extract_audio(&mut engine, video).expect("extract");
         assert_eq!(audio_lane_count(&engine), 1);
-        assert_eq!(
-            engine.project().timeline().track_of(audio),
-            Some(existing)
-        );
+        assert_eq!(engine.project().timeline().track_of(audio), Some(existing));
     }
 
     #[test]
