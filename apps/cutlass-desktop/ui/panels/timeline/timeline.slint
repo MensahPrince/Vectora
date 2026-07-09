@@ -2,7 +2,7 @@ import {
     CutlassText,
     HorizontalDivider,
     PanelBase,
-    CutlassScrollView,
+    CutlassScrollBar,
     VerticalDivider,
 } from "../../components/index.slint";
 import { AppStore, EditorStore, TimelineStore, TimelineActions } from "../../store/index.slint";
@@ -493,17 +493,10 @@ export component TimelinePanel inherits PanelBase {
     private property <float> timeline-pinch-base-zoom: TimelineStore.zoom;
 
     // Horizontal scrollbar: visible when content is wider than the viewport.
+    // Thumb geometry and drag math live in the shared `CutlassScrollBar`
+    // (see the instance at the bottom of `lane-host`); the timeline only
+    // owns the reveal/fade logic below.
     private property <bool> h-scroll-needed: content-width > lanes-width + 1px;
-    private property <float> h-scroll-fraction:
-        h-scroll-needed && min-scroll-x < 0px
-            ? TimelineViewState.scroll-x / min-scroll-x
-            : 0;
-    private property <length> h-thumb-width:
-        h-scroll-needed
-            ? max(32px, lanes-width * lanes-width / content-width)
-            : 0px;
-    private property <length> h-thumb-travel: max(0px, lanes-width - h-thumb-width);
-    private property <length> h-thumb-x: h-thumb-travel * h-scroll-fraction;
 
     // Fade the scrollbar in while scrolling, out after idle.
     private property <int> scrollbar-activity: TimelineViewState.scrollbar-activity-nonce;
@@ -512,6 +505,15 @@ export component TimelinePanel inherits PanelBase {
     changed scrollbar-activity => {
         h-scrollbar-opacity = 0.85;
         scrollbar-fade.restart();
+    }
+
+    // Reveal on any horizontal scroll, whatever drove it (wheel, thumb
+    // drag, zoom clamp, programmatic) — the explicit nonce bumps in the
+    // wheel/zoom handlers predate this and remain harmless.
+    private property <length> h-scroll-pos: TimelineViewState.scroll-x;
+
+    changed h-scroll-pos => {
+        TimelineViewState.scrollbar-activity-nonce += 1;
     }
 
     scrollbar-fade := Timer {
@@ -1190,60 +1192,24 @@ export component TimelinePanel inherits PanelBase {
             }
 
             // Slim horizontal scrollbar overlay (auto-fades when idle).
-            if root.h-scroll-needed: Rectangle {
-                y: parent.height - 10px;
+            // Shared thumb geometry / drag / track-click math from
+            // `CutlassScrollBar`; the timeline drives reveal via
+            // `scrollbar-activity-nonce` and keeps the bar awake while
+            // the pointer is on it. Fully hidden (opacity 0) the bar is
+            // click-through; wheel events over it fall through to
+            // `wheel-area` like everywhere else on the lanes.
+            if root.h-scroll-needed: CutlassScrollBar {
+                horizontal: true;
+                x: 0;
+                y: parent.height - AppStore.theme.scrollbar.size;
                 width: parent.width;
-                height: 8px;
-                opacity: root.h-scrollbar-opacity;
+                height: AppStore.theme.scrollbar.size;
+                opacity: (self.dragging || self.hovered) ? 0.85 : root.h-scrollbar-opacity;
+                bar-interactive: root.h-scrollbar-opacity > 0.001 || self.dragging || self.hovered;
 
-                Rectangle {
-                    x: root.h-thumb-x;
-                    y: 0;
-                    width: root.h-thumb-width;
-                    height: parent.height;
-                    background: #ffffff66;
-                    border-radius: 4px;
-
-                    TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        moved => {
-                            if (!self.pressed) {
-                                return;
-                            }
-                            TimelineViewState.scroll-x = clamp(
-                                root.min-scroll-x
-                                    * (self.mouse-x - self.width / 2)
-                                    / max(1px, root.h-thumb-travel),
-                                root.min-scroll-x,
-                                0px);
-                            TimelineViewState.scrollbar-activity-nonce += 1;
-                        }
-                        scroll-event(e) => {
-                            TimelineViewState.scroll-x = clamp(
-                                TimelineViewState.scroll-x + e.delta-x,
-                                root.min-scroll-x,
-                                0px);
-                            TimelineViewState.scrollbar-activity-nonce += 1;
-                            return accept;
-                        }
-                    }
-                }
-
-                // Click the track to jump scroll position.
-                TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    clicked => {
-                        TimelineViewState.scroll-x = clamp(
-                            root.min-scroll-x
-                                * (self.mouse-x - root.h-thumb-width / 2)
-                                / max(1px, root.h-thumb-travel),
-                            root.min-scroll-x,
-                            0px);
-                        TimelineViewState.scrollbar-activity-nonce += 1;
-                    }
-                }
+                visible-extent: lanes.width;
+                content-extent: root.content-width;
+                offset <=> TimelineViewState.scroll-x;
             }
             }
         }

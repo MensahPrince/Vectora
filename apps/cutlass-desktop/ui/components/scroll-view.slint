@@ -29,7 +29,7 @@
 //   thumb-size = track * visible-extent / viewport-extent  (proportional)
 //   thumb-pos  = (track - thumb-size) * (-viewport) / overflow
 // Thumb-size is clamped to a sensible minimum so it stays grabbable on
-// very tall content. Both bars are instances of the one `ScrollBar`
+// very tall content. Both bars are instances of the one `CutlassScrollBar`
 // component below — `horizontal` selects which window axis maps to the
 // bar's main axis — so the math exists exactly once.
 //
@@ -75,8 +75,16 @@ import { AppStore } from "../store/index.slint";
 // One overlay scrollbar (track + draggable thumb) for either axis.
 // Geometry is expressed along the bar's main axis; `horizontal` selects
 // which window coordinate maps to it. The parent provides position,
-// size, and `background` (track color) like any Rectangle.
-component ScrollBar inherits Rectangle {
+// size, and `background` (track color; default transparent) like any
+// Rectangle.
+//
+// Exported so surfaces with bespoke scroll plumbing (e.g. the timeline,
+// which syncs two Flickables and owns its own wheel/zoom handling) can
+// reuse the thumb math instead of re-deriving it. Such callers bind
+// `visible-extent` / `content-extent` / `offset` and drive `opacity` +
+// `bar-interactive` from their own reveal logic; `CutlassScrollView`
+// below packages all of that for the common case.
+export component CutlassScrollBar inherits Rectangle {
     // Main-axis extent of the visible area (flick.width / flick.height).
     in property <length> visible-extent;
     // Main-axis extent of the content (flick.viewport-width / -height).
@@ -97,12 +105,12 @@ component ScrollBar inherits Rectangle {
     // meant for content under its footprint.
     in property <bool> bar-interactive: true;
 
-    in property <color> thumb-color;
-    in property <color> thumb-hover-color;
-    in property <color> thumb-active-color;
-    in property <length> thumb-inset;
-    in property <length> thumb-min;
-    in property <length> thumb-radius;
+    in property <color> thumb-color: AppStore.theme.scrollbar.thumb;
+    in property <color> thumb-hover-color: AppStore.theme.scrollbar.thumb-hover;
+    in property <color> thumb-active-color: AppStore.theme.scrollbar.thumb-active;
+    in property <length> thumb-inset: AppStore.theme.scrollbar.thumb-inset;
+    in property <length> thumb-min: AppStore.theme.scrollbar.thumb-min;
+    in property <length> thumb-radius: AppStore.theme.scrollbar.thumb-radius;
 
     // ---- Derived metrics --------------------------------------------------
 
@@ -343,7 +351,7 @@ export component CutlassScrollView inherits Rectangle {
 
     // ---- Scrollbars ----------------------------------------------------------
 
-    if v-bar-shown: ScrollBar {
+    if v-bar-shown: CutlassScrollBar {
         horizontal: false;
         x: root.width - scrollbar-size;
         y: 0;
@@ -367,7 +375,7 @@ export component CutlassScrollView inherits Rectangle {
         thumb-radius: scrollbar-thumb-radius;
     }
 
-    if h-bar-shown: ScrollBar {
+    if h-bar-shown: CutlassScrollBar {
         horizontal: true;
         x: 0;
         y: root.height - scrollbar-size;
