@@ -7,7 +7,7 @@ use cutlass_models::{ColorAdjustments, Filter};
 ///
 /// Returns `None` for unknown ids so unknown presets behave as identity while
 /// manual adjustments still apply.
-fn preset_recipe(id: &str) -> Option<ColorGrade> {
+pub(crate) fn preset_recipe(id: &str) -> Option<ColorGrade> {
     Some(match id {
         "vivid" => ColorGrade {
             saturation: 0.45,

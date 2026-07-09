@@ -20,6 +20,7 @@ mod error;
 mod export;
 mod export_audio;
 mod grade;
+mod lut_pack;
 mod render;
 mod resolve;
 mod scene;
@@ -32,6 +33,7 @@ pub use export::{
     export_observed, export_to_file, export_to_file_observed,
 };
 pub use export_audio::{EXPORT_AUDIO_CHANNELS, EXPORT_AUDIO_RATE, ExportAudioMixer};
+pub use lut_pack::{STARTER_LUT_SIZE, StarterLut, starter_lut_pack};
 pub use render::{FrameStats, GestureFrames, Renderer, SeekPolicy};
 pub use resolve::{
     GESTURE_IDENTITY_TRANSFORM, GestureScenePartition, ResolveOverrides, canvas_size, resolve,
