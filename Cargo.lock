@@ -1256,7 +1256,6 @@ dependencies = [
 name = "cutlass-cloud"
 version = "0.5.3-alpha.0"
 dependencies = [
- "getrandom 0.2.17",
  "keyring",
  "serde",
  "serde_json",

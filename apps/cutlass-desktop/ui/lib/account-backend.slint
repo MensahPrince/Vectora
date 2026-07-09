@@ -2,48 +2,44 @@
 // worker thread; sign-in, balance, and update checks never touch the UI
 // thread).
 //
-// Sign-in is OAuth-only through the system browser (PKCE + loopback
-// redirect, see cutlass-cloud); the session token lives in the OS
-// keychain, never in a file. Credits are prepaid packs bought through
-// Polar checkout — also in the system browser; the app never handles
-// card data.
-
-// One purchasable credit pack (settings > Account > Buy credits).
-export struct CreditPackRow {
-    id: string,
-    // "Starter — 500 credits · $5".
-    label: string,
-}
+// Sign-in is the device-authorization flow through the system browser:
+// the app shows a short code, the browser opens the website's approval
+// page (provider choice happens there), and the app polls until the user
+// approves. Tokens live in the OS keychain, never in a file. Credits are
+// bought on the website's account page — the app never handles card data.
 
 export global AccountBackend {
     // "signed-out" | "signing-in" | "signed-in".
     in-out property <string> status: "signed-out";
     in-out property <string> email: "";
-    // OAuth provider of the session ("github" | "google").
+    // OAuth provider of the account ("github" | "google").
     in-out property <string> provider: "";
     in-out property <string> error: "";
+
+    // The short device-flow code to confirm in the browser; non-empty
+    // only while status == "signing-in".
+    in-out property <string> user-code: "";
 
     // Credit balance (managed path). `balance-known` gates the display so
     // a fetch failure shows "—" rather than a lying zero.
     in-out property <int> credits: 0;
     in-out property <bool> balance-known: false;
 
-    in-out property <[CreditPackRow]> packs: [];
-
     // --- update nudge (launch screen) -----------------------------------
     in-out property <bool> update-available: false;
     in-out property <string> update-version: "";
     in-out property <string> update-url: "";
 
-    // Open the provider consent page in the system browser and wait for
-    // the redirect. `provider` is "github" or "google".
-    callback sign-in(provider: string);
+    // Start the device flow: opens the website's approval page in the
+    // system browser and publishes `user-code` while polling.
+    callback sign-in();
     // Revoke the session (server best-effort, keychain always).
     callback sign-out();
-    // Re-fetch balance + packs.
+    // Re-fetch balance.
     callback refresh-balance();
-    // Open Polar checkout for `packs[index]` in the system browser.
-    callback buy-pack(index: int);
+    // Open the website's account page (balance, credit packs, receipts)
+    // in the system browser.
+    callback buy-credits();
     // Open the download page for an available update.
     callback open-update();
 }

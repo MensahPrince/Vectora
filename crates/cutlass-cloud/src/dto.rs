@@ -260,50 +260,18 @@ pub struct TextPreset {
 // Auth + credits (the account half; used from Workstream 6 on)
 // ---------------------------------------------------------------------------
 
-/// `POST /v1/auth/oauth/start` request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OauthStartRequest {
-    /// `github` or `google`.
-    pub provider: String,
-    /// PKCE code challenge (S256), generated client-side.
-    pub code_challenge: String,
-    /// Loopback redirect the desktop app listens on.
-    pub redirect_uri: String,
-}
-
-/// `POST /v1/auth/oauth/start` response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OauthStartResponse {
-    /// Provider authorize URL to open in the system browser.
-    pub authorize_url: String,
-    /// Opaque state to present at callback.
-    pub state: String,
-}
-
-/// `POST /v1/auth/oauth/callback` request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OauthCallbackRequest {
-    pub state: String,
-    pub code: String,
-    /// PKCE verifier matching the start challenge.
-    pub code_verifier: String,
-}
-
-/// Tokens issued at sign-in and refresh. Access is a short-lived JWT;
-/// refresh is opaque, stored hashed server-side, rotated on use. The app
-/// keeps both in the OS keychain, never in files.
+/// The client-side token bundle. `access_token` is a short-lived EdDSA
+/// JWT minted by the website (better-auth), verified by the backend via
+/// JWKS; `refresh_token` holds the long-lived better-auth **session
+/// token** from the device flow, used to fetch fresh JWTs from
+/// `/api/auth/token`. The app keeps both in the OS keychain, never in
+/// files. (Not a backend DTO — assembled client-side in [`crate::auth`].)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenPair {
     pub access_token: String,
     pub refresh_token: String,
     /// Access-token lifetime in seconds.
     pub expires_in: u64,
-}
-
-/// `POST /v1/auth/refresh` request.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RefreshRequest {
-    pub refresh_token: String,
 }
 
 /// `GET /v1/me` response — the signed-in identity shown in the account UI.
@@ -348,37 +316,6 @@ pub struct LedgerEntry {
     pub description: String,
     /// RFC 3339.
     pub created_at: String,
-}
-
-/// `POST /v1/credits/checkout` request: which pack to buy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckoutRequest {
-    /// Pack product id from `GET /v1/credits/packs`.
-    pub pack_id: String,
-}
-
-/// `POST /v1/credits/checkout` response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CheckoutResponse {
-    /// Polar checkout URL to open in the system browser.
-    pub checkout_url: String,
-}
-
-/// `GET /v1/credits/packs` response — the purchasable credit packs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PacksResponse {
-    pub packs: Vec<CreditPack>,
-}
-
-/// One purchasable one-time credit pack (a Polar product with a
-/// meter-credit benefit).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CreditPack {
-    pub id: String,
-    pub name: String,
-    pub credits: i64,
-    /// Display price ("$5"), formatted server-side (Polar owns currency).
-    pub price_display: String,
 }
 
 // ---------------------------------------------------------------------------

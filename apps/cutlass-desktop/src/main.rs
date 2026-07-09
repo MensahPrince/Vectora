@@ -695,25 +695,22 @@ fn main() -> Result<(), slint::PlatformError> {
         ai_backend.on_refresh_route(move || route_handle.refresh_route());
     }
 
-    // Cutlass account (Settings > Account + launch update nudge): sign-in,
-    // balance, checkout, and the update check on their own thread
-    // (src/account.rs); the session token lives in the OS keychain.
+    // Cutlass account (Settings > Account + launch update nudge): device-
+    // flow sign-in, balance, the website hand-off for credits, and the
+    // update check on their own thread (src/account.rs); tokens live in
+    // the OS keychain.
     let account_worker =
         account::AccountWorker::spawn(app.as_weak()).map_err(slint::PlatformError::Other)?;
     {
         let account_backend = app.global::<AccountBackend>();
         let sign_in_handle = account_worker.handle();
-        account_backend.on_sign_in(move |provider| sign_in_handle.sign_in(provider.to_string()));
+        account_backend.on_sign_in(move || sign_in_handle.sign_in());
         let sign_out_handle = account_worker.handle();
         account_backend.on_sign_out(move || sign_out_handle.sign_out());
         let balance_handle = account_worker.handle();
         account_backend.on_refresh_balance(move || balance_handle.refresh_balance());
         let buy_handle = account_worker.handle();
-        account_backend.on_buy_pack(move |index| {
-            if index >= 0 {
-                buy_handle.buy_pack(index as usize);
-            }
-        });
+        account_backend.on_buy_credits(move || buy_handle.buy_credits());
         let update_handle = account_worker.handle();
         account_backend.on_open_update(move || update_handle.open_update());
         // Restore any keychain session and run the update check now, in the

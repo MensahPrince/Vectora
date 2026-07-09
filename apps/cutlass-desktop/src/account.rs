@@ -1,10 +1,11 @@
 //! Cutlass account: the Rust half of `AccountBackend`.
 //!
 //! One worker thread owns everything network-flavored about the account —
-//! OAuth sign-in (system browser + loopback redirect), token refresh,
-//! balance/pack fetches, Polar checkout hand-off, and the startup update
-//! check. The session token lives in the OS keychain
-//! (`cutlass_cloud::token_store`); nothing here writes secrets to disk.
+//! device-authorization sign-in (system browser against the website's
+//! better-auth), JWT refresh, balance fetches, the "Buy credits" hand-off
+//! to the website's account page, and the startup update check. Tokens
+//! live in the OS keychain (`cutlass_cloud::token_store`); nothing here
+//! writes secrets to disk.
 //!
 //! Threading mirrors `cloud.rs`: commands in over a channel, results
 //! hopped to the UI thread with `invoke_from_event_loop`.
@@ -13,30 +14,25 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::dto::CreditPack;
 use cutlass_cloud::token_store::{self, StoredSession};
 use cutlass_cloud::{CloudClient, auth};
-use slint::{ComponentHandle, ModelRc, VecModel};
+use slint::ComponentHandle;
 use tracing::{info, warn};
 
-use crate::{AccountBackend, CreditPackRow};
+use crate::AccountBackend;
 
-/// How long the loopback listener waits for the browser redirect before
-/// giving up (the user may need to complete 2FA at the provider).
+/// How long the device-token poll waits for browser approval before
+/// giving up (the user may need to sign in at the provider first).
 const SIGN_IN_TIMEOUT: Duration = Duration::from_secs(300);
 
 enum Command {
     /// Startup: restore the keychain session (refreshing if stale) and run
     /// the update check.
     Init,
-    SignIn {
-        provider: String,
-    },
+    SignIn,
     SignOut,
     RefreshBalance,
-    BuyPack {
-        index: usize,
-    },
+    BuyCredits,
     OpenUpdate,
 }
 
@@ -50,8 +46,8 @@ impl AccountHandle {
         let _ = self.tx.send(Command::Init);
     }
 
-    pub fn sign_in(&self, provider: String) {
-        let _ = self.tx.send(Command::SignIn { provider });
+    pub fn sign_in(&self) {
+        let _ = self.tx.send(Command::SignIn);
     }
 
     pub fn sign_out(&self) {
@@ -62,8 +58,8 @@ impl AccountHandle {
         let _ = self.tx.send(Command::RefreshBalance);
     }
 
-    pub fn buy_pack(&self, index: usize) {
-        let _ = self.tx.send(Command::BuyPack { index });
+    pub fn buy_credits(&self) {
+        let _ = self.tx.send(Command::BuyCredits);
     }
 
     pub fn open_update(&self) {
@@ -99,7 +95,7 @@ impl AccountWorker {
     }
 }
 
-/// Backend base URL: `[account] base_url` in config.toml, then the
+/// Backend (API) base URL: `[account] base_url` in config.toml, then the
 /// `CUTLASS_API_BASE` env override, then production.
 pub fn base_url() -> String {
     let from_settings = cutlass_settings::load(&cutlass_settings::default_config_path())
@@ -114,7 +110,23 @@ pub fn base_url() -> String {
         .unwrap_or_else(|| cutlass_cloud::DEFAULT_BASE_URL.to_string())
 }
 
-/// A fresh access token from the keychain session, refreshing (and
+/// Auth base URL (the website hosting better-auth): `[account]
+/// auth_base_url` in config.toml, then the `CUTLASS_AUTH_BASE` env
+/// override, then production.
+pub fn auth_base_url() -> String {
+    let from_settings = cutlass_settings::load(&cutlass_settings::default_config_path())
+        .map(|s| s.account.auth_base_url)
+        .unwrap_or_default();
+    if !from_settings.is_empty() {
+        return from_settings;
+    }
+    std::env::var("CUTLASS_AUTH_BASE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| cutlass_cloud::DEFAULT_AUTH_BASE_URL.to_string())
+}
+
+/// A fresh access JWT from the keychain session, refreshing (and
 /// re-storing) when stale. The shared entry point for every surface that
 /// talks to the backend as the signed-in user from its own thread (the
 /// managed chat provider, generation fallbacks).
@@ -122,7 +134,7 @@ pub fn managed_access_token() -> Result<String, String> {
     let mut session =
         token_store::load().ok_or("Not signed in — sign in under Settings > Account.")?;
     if session.needs_refresh() {
-        let pair = auth::refresh(&base_url(), &session.refresh_token)
+        let pair = auth::refresh(&auth_base_url(), &session.refresh_token)
             .map_err(|e| format!("Session expired — sign in again. ({e})"))?;
         session = StoredSession::from_pair(&pair);
         if let Err(e) = token_store::store(&session) {
@@ -135,8 +147,8 @@ pub fn managed_access_token() -> Result<String, String> {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     base_url: String,
+    auth_base_url: String,
     session: Option<StoredSession>,
-    packs: Vec<CreditPack>,
     update_url: String,
 }
 
@@ -145,8 +157,8 @@ impl Worker {
         Self {
             backend_weak,
             base_url: base_url(),
+            auth_base_url: auth_base_url(),
             session: None,
-            packs: Vec::new(),
             update_url: String::new(),
         }
     }
@@ -157,10 +169,14 @@ impl Worker {
                 self.restore_session();
                 self.check_for_update();
             }
-            Command::SignIn { provider } => self.sign_in(&provider),
+            Command::SignIn => self.sign_in(),
             Command::SignOut => self.sign_out(),
             Command::RefreshBalance => self.fetch_account_state(),
-            Command::BuyPack { index } => self.buy_pack(index),
+            Command::BuyCredits => {
+                // The device-flow approval already left a browser session
+                // on the website, so /account lands signed-in.
+                open_in_browser(&format!("{}/account", self.auth_base_url));
+            }
             Command::OpenUpdate => {
                 if !self.update_url.is_empty() {
                     open_in_browser(&self.update_url);
@@ -176,7 +192,7 @@ impl Worker {
             return;
         };
         if session.needs_refresh() {
-            match auth::refresh(&self.base_url, &session.refresh_token) {
+            match auth::refresh(&self.auth_base_url, &session.refresh_token) {
                 Ok(pair) => {
                     session = StoredSession::from_pair(&pair);
                     if let Err(e) = token_store::store(&session) {
@@ -202,24 +218,28 @@ impl Worker {
         self.fetch_account_state();
     }
 
-    fn sign_in(&mut self, provider: &str) {
+    fn sign_in(&mut self) {
         self.publish(|b| {
             b.set_status("signing-in".into());
+            b.set_user_code("".into());
             b.set_error("".into());
         });
-        let result = auth::start_sign_in(&self.base_url, provider)
-            .and_then(|(authorize_url, pending)| {
-                open_in_browser(&authorize_url);
-                pending.wait(SIGN_IN_TIMEOUT)
-            })
-            .map(|pair| StoredSession::from_pair(&pair));
-        match result {
+        // Device flow: show the short code, open the website's approval
+        // page (code pre-filled), poll until the user approves there.
+        let result = auth::start_device_sign_in(&self.auth_base_url).and_then(|pending| {
+            let user_code = pending.user_code().to_string();
+            self.publish(move |b| b.set_user_code(user_code.as_str().into()));
+            open_in_browser(pending.verification_url());
+            pending.wait(SIGN_IN_TIMEOUT)
+        });
+        match result.map(|pair| StoredSession::from_pair(&pair)) {
             Ok(session) => {
                 if let Err(e) = token_store::store(&session) {
                     warn!("keychain store failed (session won't survive restart): {e}");
                 }
                 self.session = Some(session);
-                info!("signed in via {provider}");
+                info!("signed in via the browser device flow");
+                self.publish(|b| b.set_user_code("".into()));
                 self.fetch_account_state();
             }
             Err(e) => {
@@ -227,6 +247,7 @@ impl Worker {
                 let message = sign_in_error_message(&e);
                 self.publish(move |b| {
                     b.set_status("signed-out".into());
+                    b.set_user_code("".into());
                     b.set_error(message.as_str().into());
                 });
             }
@@ -237,29 +258,28 @@ impl Worker {
         if let Some(session) = self.session.take() {
             // Server revocation is best-effort; the keychain wipe is what
             // actually signs out.
-            if let Err(e) = auth::sign_out(&self.base_url, &session.refresh_token) {
+            if let Err(e) = auth::sign_out(&self.auth_base_url, &session.refresh_token) {
                 warn!("server sign-out failed (token revoked locally anyway): {e}");
             }
         }
         token_store::clear();
-        self.packs.clear();
         self.publish(|b| {
             b.set_status("signed-out".into());
             b.set_email("".into());
             b.set_provider("".into());
+            b.set_user_code("".into());
             b.set_credits(0);
             b.set_balance_known(false);
-            b.set_packs(ModelRc::default());
             b.set_error("".into());
         });
     }
 
-    /// Refresh the access token if stale, then return a client for the
+    /// Refresh the access JWT if stale, then return a client for the
     /// account routes. `None` means signed out.
     fn authed_client(&mut self) -> Option<auth::AuthedClient> {
         let session = self.session.as_mut()?;
         if session.needs_refresh() {
-            match auth::refresh(&self.base_url, &session.refresh_token) {
+            match auth::refresh(&self.auth_base_url, &session.refresh_token) {
                 Ok(pair) => {
                     *session = StoredSession::from_pair(&pair);
                     if let Err(e) = token_store::store(session) {
@@ -278,7 +298,7 @@ impl Worker {
         ))
     }
 
-    // --- account state (identity + balance + packs) ------------------------
+    // --- account state (identity + balance) ---------------------------------
 
     fn fetch_account_state(&mut self) {
         let Some(client) = self.authed_client() else {
@@ -294,8 +314,6 @@ impl Worker {
             }
         };
         let balance = client.balance();
-        let packs = client.packs().map(|p| p.packs).unwrap_or_default();
-        self.packs = packs.clone();
 
         let email = if me.email.is_empty() {
             me.display_name.clone()
@@ -315,37 +333,7 @@ impl Worker {
                 }
                 Err(_) => b.set_balance_known(false),
             }
-            let rows: Vec<CreditPackRow> = packs
-                .iter()
-                .map(|p| CreditPackRow {
-                    id: p.id.as_str().into(),
-                    label: format!("{} — {} credits · {}", p.name, p.credits, p.price_display)
-                        .as_str()
-                        .into(),
-                })
-                .collect();
-            b.set_packs(ModelRc::new(VecModel::from(rows)));
         });
-    }
-
-    fn buy_pack(&mut self, index: usize) {
-        let Some(pack) = self.packs.get(index).cloned() else {
-            return;
-        };
-        let Some(client) = self.authed_client() else {
-            return;
-        };
-        match client.checkout(&pack.id) {
-            Ok(response) => {
-                info!("opening Polar checkout for pack {}", pack.id);
-                open_in_browser(&response.checkout_url);
-            }
-            Err(e) => {
-                warn!("checkout failed: {e}");
-                let message = format!("Couldn't start checkout: {e}");
-                self.publish(move |b| b.set_error(message.as_str().into()));
-            }
-        }
     }
 
     // --- update nudge -------------------------------------------------------
@@ -399,6 +387,10 @@ fn sign_in_error_message(e: &cutlass_cloud::CloudError) -> String {
             "Couldn't reach the Cutlass service — check your connection.".into()
         }
         CloudError::Status { status, .. } => format!("Sign-in was rejected ({status})."),
+        // Device-flow outcomes arrive as protocol errors with readable
+        // messages ("sign-in was denied in the browser", "the sign-in
+        // code expired — try again").
+        CloudError::Protocol(message) => format!("Sign-in failed: {message}."),
         _ => "Sign-in failed — try again.".into(),
     }
 }

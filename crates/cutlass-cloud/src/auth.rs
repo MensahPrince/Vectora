@@ -1,259 +1,280 @@
-//! The authed half of the cloud client: OAuth sign-in (PKCE + loopback
-//! redirect), token refresh, and the account routes (identity, balance,
-//! ledger, credit packs, Polar checkout).
+//! The authed half of the cloud client: device-authorization sign-in
+//! (RFC 8628 against the website's better-auth), JWT refresh, and the
+//! backend's account routes (identity, balance, ledger).
 //!
-//! Sign-in shape (the OAuth-only decision): the app never sees provider
-//! passwords. It generates a PKCE verifier, asks the backend for the
-//! provider authorize URL, opens it in the **system browser**, and catches
-//! the redirect on a localhost listener; the backend swaps the code for a
-//! [`TokenPair`] (short-lived access JWT + rotating refresh token) which
-//! the desktop stores in the OS keychain ([`crate::token_store`]) — never
-//! in a file.
+//! Sign-in shape: identity lives in `cutlass-website` (better-auth), so
+//! the app never sees provider passwords **or** provider choice — it asks
+//! the website for a device code, opens the verification page in the
+//! system browser, shows the short user code, and polls until the user
+//! approves there. The poll yields a long-lived **session token**; a
+//! short-lived **JWT** (verified by `cutlass-backend` via JWKS) is then
+//! fetched from `/api/auth/token`. In [`TokenPair`] terms the session
+//! token sits in the `refresh_token` seat and the JWT in `access_token`;
+//! [`refresh`] re-fetches the JWT with the session token. The desktop
+//! stores the pair in the OS keychain ([`crate::token_store`]) — never in
+//! a file.
 //!
-//! Everything here blocks and belongs on a worker thread, like the rest of
-//! the crate.
+//! Everything here blocks and belongs on a worker thread, like the rest
+//! of the crate.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
 use std::time::Duration;
 
-use crate::dto::{
-    Balance, CheckoutRequest, CheckoutResponse, LedgerPage, Me, OauthCallbackRequest,
-    OauthStartRequest, OauthStartResponse, PacksResponse, RefreshRequest, TokenPair,
-};
+use serde::Deserialize;
+
+use crate::dto::{Balance, LedgerPage, Me, TokenPair};
 use crate::error::CloudError;
 
-/// URL-safe base64 without padding (RFC 4648 §5) — PKCE's encoding.
-fn base64url(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b = [
-            chunk[0],
-            chunk.get(1).copied().unwrap_or(0),
-            chunk.get(2).copied().unwrap_or(0),
-        ];
-        let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
-        out.push(ALPHABET[(n >> 18) as usize & 63] as char);
-        out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        if chunk.len() > 1 {
-            out.push(ALPHABET[(n >> 6) as usize & 63] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(ALPHABET[n as usize & 63] as char);
-        }
-    }
-    out
-}
+/// The OAuth client id the website's device-authorization plugin accepts.
+pub const DESKTOP_CLIENT_ID: &str = "cutlass-desktop";
 
-/// A fresh PKCE pair: `(verifier, S256 challenge)`.
-fn pkce_pair() -> Result<(String, String), CloudError> {
-    let mut seed = [0u8; 32];
-    getrandom::getrandom(&mut seed)
-        .map_err(|e| CloudError::Protocol(format!("PKCE entropy unavailable: {e}")))?;
-    let verifier = base64url(&seed);
-    let challenge = base64url(&crate::download::sha256(verifier.as_bytes()));
-    Ok((verifier, challenge))
-}
+/// Fallback JWT lifetime when the token carries no readable `exp`
+/// (better-auth's default is 15 minutes; refreshing early is harmless).
+const DEFAULT_JWT_TTL_SECONDS: u64 = 15 * 60;
 
-/// A sign-in in flight: the browser is open on the provider's consent page
-/// and the loopback listener is waiting for the redirect.
-pub struct PendingSignIn {
-    listener: TcpListener,
-    verifier: String,
-    state: String,
-    base_url: String,
-    agent: ureq::Agent,
-}
-
-/// Start an OAuth sign-in: binds the loopback listener, asks the backend
-/// for the provider authorize URL, and returns it with the pending flow.
-/// The caller opens the URL in the system browser, then calls
-/// [`PendingSignIn::wait`] (on a worker thread — it blocks).
-pub fn start_sign_in(
-    base_url: &str,
-    provider: &str,
-) -> Result<(String, PendingSignIn), CloudError> {
-    let base_url = base_url.trim_end_matches('/').to_string();
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .map_err(|e| CloudError::Io(std::io::Error::other(format!("loopback listener: {e}"))))?;
-    let port = listener
-        .local_addr()
-        .map_err(|e| CloudError::Io(std::io::Error::other(format!("loopback listener: {e}"))))?
-        .port();
-    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-    let (verifier, challenge) = pkce_pair()?;
-
-    let agent = ureq::AgentBuilder::new()
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout(Duration::from_secs(30))
-        .build();
-    let url = format!("{base_url}/v1/auth/oauth/start");
-    let response = agent
-        .post(&url)
-        .send_json(
-            serde_json::to_value(OauthStartRequest {
-                provider: provider.to_string(),
-                code_challenge: challenge,
-                redirect_uri,
-            })
-            .expect("start request serializes"),
-        )
-        .map_err(|e| CloudError::from_ureq(&url, e))?;
-    let start: OauthStartResponse = response
-        .into_json()
-        .map_err(|e| CloudError::Protocol(format!("{url}: {e}")))?;
-
-    Ok((
-        start.authorize_url,
-        PendingSignIn {
-            listener,
-            verifier,
-            state: start.state,
-            base_url,
-            agent,
-        },
-    ))
+        .build()
 }
 
-impl PendingSignIn {
-    /// Block until the provider redirects back (or `timeout` elapses), then
-    /// swap the code for tokens at the backend. The browser tab gets a tiny
-    /// "return to Cutlass" page either way.
+/// `POST /api/auth/device/code` response (RFC 8628 §3.2).
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceCodeResponse {
+    device_code: String,
+    user_code: String,
+    #[serde(default)]
+    verification_uri: String,
+    #[serde(default)]
+    verification_uri_complete: String,
+    /// Seconds until the codes expire.
+    #[serde(default)]
+    expires_in: u64,
+    /// Minimum polling interval in seconds.
+    #[serde(default)]
+    interval: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceTokenSuccess {
+    /// better-auth's device flow hands back a **session token** here
+    /// (bearer-usable against `/api/auth/*`), not a JWT.
+    access_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeviceTokenError {
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    error_description: Option<String>,
+}
+
+/// A device sign-in in flight: the code request succeeded and the user is
+/// (about to be) looking at the website's approval page.
+pub struct PendingDeviceSignIn {
+    auth_base: String,
+    agent: ureq::Agent,
+    response: DeviceCodeResponse,
+}
+
+/// Start a device-authorization sign-in against the website. The caller
+/// shows [`PendingDeviceSignIn::user_code`], opens
+/// [`PendingDeviceSignIn::verification_url`] in the system browser, then
+/// calls [`PendingDeviceSignIn::wait`] (on a worker thread — it blocks).
+pub fn start_device_sign_in(auth_base: &str) -> Result<PendingDeviceSignIn, CloudError> {
+    let auth_base = auth_base.trim_end_matches('/').to_string();
+    let agent = agent();
+    let url = format!("{auth_base}/api/auth/device/code");
+    let response = agent
+        .post(&url)
+        .send_json(serde_json::json!({ "client_id": DESKTOP_CLIENT_ID }))
+        .map_err(|e| CloudError::from_ureq(&url, e))?;
+    let response: DeviceCodeResponse = response
+        .into_json()
+        .map_err(|e| CloudError::Protocol(format!("{url}: {e}")))?;
+    Ok(PendingDeviceSignIn {
+        auth_base,
+        agent,
+        response,
+    })
+}
+
+impl PendingDeviceSignIn {
+    /// The short code the user confirms on the website ("ABCD-1234"
+    /// style, shown verbatim in the UI).
+    pub fn user_code(&self) -> &str {
+        &self.response.user_code
+    }
+
+    /// The page to open in the system browser — the complete URI (code
+    /// pre-filled) when the server offers one.
+    pub fn verification_url(&self) -> &str {
+        if self.response.verification_uri_complete.is_empty() {
+            &self.response.verification_uri
+        } else {
+            &self.response.verification_uri_complete
+        }
+    }
+
+    /// Block until the user approves in the browser (or `timeout` / the
+    /// code's own expiry elapses), then exchange the session token for a
+    /// JWT. Polls at the server-mandated interval, honoring `slow_down`.
     pub fn wait(self, timeout: Duration) -> Result<TokenPair, CloudError> {
-        self.listener.set_nonblocking(false).map_err(|e| {
-            CloudError::Io(std::io::Error::other(format!("loopback listener: {e}")))
-        })?;
-        // A deadline via read timeout on accept isn't portable; poll accept
-        // in nonblocking mode instead so a user who closes the browser tab
-        // doesn't hang the worker forever.
-        self.listener.set_nonblocking(true).map_err(|e| {
-            CloudError::Io(std::io::Error::other(format!("loopback listener: {e}")))
-        })?;
+        let timeout = match self.response.expires_in {
+            0 => timeout,
+            s => timeout.min(Duration::from_secs(s)),
+        };
         let deadline = std::time::Instant::now() + timeout;
-        let (mut stream, code, returned_state) = loop {
-            match self.listener.accept() {
-                Ok((stream, _)) => {
-                    let mut stream = stream;
-                    stream.set_nonblocking(false).map_err(|e| {
-                        CloudError::Io(std::io::Error::other(format!("callback stream: {e}")))
-                    })?;
-                    let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
-                    match read_callback_params(&mut stream) {
-                        Some((code, state)) => break (stream, code, state),
-                        // A stray request (favicon probe); answer and keep
-                        // waiting for the real callback.
-                        None => {
-                            let _ = respond_html(&mut stream, "Waiting for sign-in…");
+        let mut interval = Duration::from_secs(self.response.interval.max(1));
+        let url = format!("{}/api/auth/device/token", self.auth_base);
+
+        loop {
+            if std::time::Instant::now() + interval > deadline {
+                return Err(CloudError::Cancelled);
+            }
+            std::thread::sleep(interval);
+
+            let result = self.agent.post(&url).send_json(serde_json::json!({
+                "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+                "device_code": self.response.device_code,
+                "client_id": DESKTOP_CLIENT_ID,
+            }));
+            match result {
+                Ok(response) => {
+                    let token: DeviceTokenSuccess = response
+                        .into_json()
+                        .map_err(|e| CloudError::Protocol(format!("{url}: {e}")))?;
+                    return session_to_pair(&self.agent, &self.auth_base, &token.access_token);
+                }
+                // RFC 8628 signals "keep going" through error responses.
+                Err(ureq::Error::Status(_, response)) => {
+                    let error: DeviceTokenError = response
+                        .into_json()
+                        .map_err(|e| CloudError::Protocol(format!("{url}: {e}")))?;
+                    match error.error.as_str() {
+                        "authorization_pending" => {}
+                        "slow_down" => interval += Duration::from_secs(5),
+                        "access_denied" => {
+                            return Err(CloudError::Protocol(
+                                "sign-in was denied in the browser".into(),
+                            ));
+                        }
+                        "expired_token" => {
+                            return Err(CloudError::Protocol(
+                                "the sign-in code expired — try again".into(),
+                            ));
+                        }
+                        other => {
+                            let detail = error.error_description.unwrap_or_default();
+                            return Err(CloudError::Protocol(format!(
+                                "device sign-in failed: {other} {detail}"
+                            )));
                         }
                     }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if std::time::Instant::now() >= deadline {
-                        return Err(CloudError::Cancelled);
-                    }
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                Err(e) => {
-                    return Err(CloudError::Io(std::io::Error::other(format!(
-                        "callback accept: {e}"
-                    ))));
-                }
+                Err(e) => return Err(CloudError::from_ureq(&url, e)),
             }
-        };
-
-        if returned_state != self.state {
-            let _ = respond_html(&mut stream, "Sign-in failed — please try again.");
-            return Err(CloudError::Protocol("OAuth state mismatch".into()));
         }
-        let _ = respond_html(
-            &mut stream,
-            "You're signed in — you can close this tab and return to Cutlass.",
-        );
-
-        let url = format!("{}/v1/auth/oauth/callback", self.base_url);
-        let response = self
-            .agent
-            .post(&url)
-            .send_json(
-                serde_json::to_value(OauthCallbackRequest {
-                    state: self.state,
-                    code,
-                    code_verifier: self.verifier,
-                })
-                .expect("callback request serializes"),
-            )
-            .map_err(|e| CloudError::from_ureq(&url, e))?;
-        response
-            .into_json()
-            .map_err(|e| CloudError::Protocol(format!("{url}: {e}")))
     }
 }
 
-/// Parse `GET /callback?code=…&state=…` off the socket; `None` when the
-/// request isn't the callback (wrong path or missing params).
-fn read_callback_params(stream: &mut std::net::TcpStream) -> Option<(String, String)> {
-    let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).ok()?;
-    // "GET /callback?code=x&state=y HTTP/1.1"
-    let path = request_line.split_whitespace().nth(1)?;
-    let query = path.strip_prefix("/callback?")?;
-    let mut code = None;
-    let mut state = None;
-    for pair in query.split('&') {
-        let (k, v) = pair.split_once('=')?;
-        match k {
-            "code" => code = Some(percent_decode(v)),
-            "state" => state = Some(percent_decode(v)),
-            _ => {}
-        }
-    }
-    Some((code?, state?))
+/// Exchange a better-auth **session token** for a fresh short-lived JWT:
+/// `GET /api/auth/token` with the session token as bearer (the website
+/// runs better-auth's `bearer` plugin). This is the "refresh" of the new
+/// world — the session token itself only changes by signing in again.
+pub fn refresh(auth_base: &str, session_token: &str) -> Result<TokenPair, CloudError> {
+    session_to_pair(&agent(), auth_base.trim_end_matches('/'), session_token)
 }
 
-fn percent_decode(s: &str) -> String {
+fn session_to_pair(
+    agent: &ureq::Agent,
+    auth_base: &str,
+    session_token: &str,
+) -> Result<TokenPair, CloudError> {
+    #[derive(Deserialize)]
+    struct TokenResponse {
+        token: String,
+    }
+    let url = format!("{auth_base}/api/auth/token");
+    let response = agent
+        .get(&url)
+        .set("Authorization", &format!("Bearer {session_token}"))
+        .call()
+        .map_err(|e| CloudError::from_ureq(&url, e))?;
+    let token: TokenResponse = response
+        .into_json()
+        .map_err(|e| CloudError::Protocol(format!("{url}: {e}")))?;
+    let expires_in = jwt_ttl_seconds(&token.token).unwrap_or(DEFAULT_JWT_TTL_SECONDS);
+    Ok(TokenPair {
+        access_token: token.token,
+        refresh_token: session_token.to_string(),
+        expires_in,
+    })
+}
+
+/// `POST /api/auth/sign-out` — revoke the session server-side.
+/// Best-effort: the local keychain wipe is what actually signs out.
+pub fn sign_out(auth_base: &str, session_token: &str) -> Result<(), CloudError> {
+    let auth_base = auth_base.trim_end_matches('/');
+    let url = format!("{auth_base}/api/auth/sign-out");
+    agent()
+        .post(&url)
+        .set("Authorization", &format!("Bearer {session_token}"))
+        .send_json(serde_json::json!({}))
+        .map_err(|e| CloudError::from_ureq(&url, e))?;
+    Ok(())
+}
+
+/// Seconds until the JWT's `exp`, read without verifying (the backend
+/// verifies; the client only schedules its own refresh).
+fn jwt_ttl_seconds(token: &str) -> Option<u64> {
+    #[derive(Deserialize)]
+    struct Claims {
+        exp: u64,
+    }
+    let payload = token.split('.').nth(1)?;
+    let claims: Claims = serde_json::from_slice(&base64url_decode(payload)?).ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(claims.exp.saturating_sub(now))
+}
+
+/// URL-safe base64 without padding (RFC 4648 §5) — the JWT segment
+/// encoding.
+fn base64url_decode(s: &str) -> Option<Vec<u8>> {
+    fn value(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a') as u32 + 26),
+            b'0'..=b'9' => Some((c - b'0') as u32 + 52),
+            b'-' => Some(62),
+            b'_' => Some(63),
+            _ => None,
+        }
+    }
     let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'%' if i + 2 < bytes.len() => {
-                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
-                if let Some(v) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
-                    out.push(v);
-                    i += 3;
-                    continue;
-                }
-                out.push(b'%');
-                i += 1;
-            }
-            b'+' => {
-                out.push(b' ');
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        if chunk.len() == 1 {
+            return None;
+        }
+        let mut n: u32 = 0;
+        for &c in chunk {
+            n = (n << 6) | value(c)?;
+        }
+        n <<= 6 * (4 - chunk.len()) as u32;
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
-}
-
-fn respond_html(stream: &mut std::net::TcpStream, message: &str) -> std::io::Result<()> {
-    let body = format!(
-        "<!doctype html><meta charset=\"utf-8\"><title>Cutlass</title>\
-         <body style=\"font-family:system-ui;background:#141414;color:#eee;\
-         display:grid;place-items:center;height:100vh;margin:0\">\
-         <p>{message}</p></body>"
-    );
-    write!(
-        stream,
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
-    )
+    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +282,7 @@ fn respond_html(stream: &mut std::net::TcpStream, message: &str) -> std::io::Res
 // ---------------------------------------------------------------------------
 
 /// Blocking client over the backend's account routes; every request sends
-/// the bearer access token.
+/// the bearer JWT.
 pub struct AuthedClient {
     base_url: String,
     agent: ureq::Agent,
@@ -272,10 +293,7 @@ impl AuthedClient {
     pub fn new(base_url: &str, access_token: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            agent: ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(10))
-                .timeout(Duration::from_secs(30))
-                .build(),
+            agent: agent(),
             access_token: access_token.to_string(),
         }
     }
@@ -320,23 +338,6 @@ impl AuthedClient {
         self.get("/v1/credits/balance")
     }
 
-    /// `GET /v1/credits/packs` — the purchasable credit packs.
-    pub fn packs(&self) -> Result<PacksResponse, CloudError> {
-        self.get("/v1/credits/packs")
-    }
-
-    /// `POST /v1/credits/checkout` — a Polar checkout URL for `pack_id`,
-    /// to open in the system browser.
-    pub fn checkout(&self, pack_id: &str) -> Result<CheckoutResponse, CloudError> {
-        self.post(
-            "/v1/credits/checkout",
-            serde_json::to_value(CheckoutRequest {
-                pack_id: pack_id.to_string(),
-            })
-            .expect("checkout request serializes"),
-        )
-    }
-
     /// `GET /v1/credits/history`.
     pub fn history(&self, cursor: Option<&str>) -> Result<LedgerPage, CloudError> {
         match cursor {
@@ -370,109 +371,65 @@ impl AuthedClient {
     }
 }
 
-/// `POST /v1/auth/refresh` — swap a refresh token for a fresh pair (the
-/// old refresh token is invalidated server-side).
-pub fn refresh(base_url: &str, refresh_token: &str) -> Result<TokenPair, CloudError> {
-    let base_url = base_url.trim_end_matches('/');
-    let url = format!("{base_url}/v1/auth/refresh");
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(30))
-        .build();
-    let response = agent
-        .post(&url)
-        .send_json(
-            serde_json::to_value(RefreshRequest {
-                refresh_token: refresh_token.to_string(),
-            })
-            .expect("refresh request serializes"),
-        )
-        .map_err(|e| CloudError::from_ureq(&url, e))?;
-    response
-        .into_json()
-        .map_err(|e| CloudError::Protocol(format!("{url}: {e}")))
-}
-
-/// `POST /v1/auth/signout` — revoke the refresh token server-side.
-/// Best-effort: the local keychain wipe is what actually signs out.
-pub fn sign_out(base_url: &str, refresh_token: &str) -> Result<(), CloudError> {
-    let base_url = base_url.trim_end_matches('/');
-    let url = format!("{base_url}/v1/auth/signout");
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(Duration::from_secs(10))
-        .timeout(Duration::from_secs(15))
-        .build();
-    agent
-        .post(&url)
-        .send_json(
-            serde_json::to_value(RefreshRequest {
-                refresh_token: refresh_token.to_string(),
-            })
-            .expect("signout request serializes"),
-        )
-        .map_err(|e| CloudError::from_ureq(&url, e))?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn base64url_matches_rfc_vectors() {
-        // RFC 4648 §10 vectors, translated to the URL-safe alphabet.
-        assert_eq!(base64url(b""), "");
-        assert_eq!(base64url(b"f"), "Zg");
-        assert_eq!(base64url(b"fo"), "Zm8");
-        assert_eq!(base64url(b"foo"), "Zm9v");
-        assert_eq!(base64url(b"foobar"), "Zm9vYmFy");
-        // URL-safe characters, no padding.
-        assert_eq!(base64url(&[0xfb, 0xff]), "-_8");
+    fn base64url_decoding_round_trips() {
+        assert_eq!(base64url_decode(""), Some(vec![]));
+        assert_eq!(base64url_decode("Zg"), Some(b"f".to_vec()));
+        assert_eq!(base64url_decode("Zm8"), Some(b"fo".to_vec()));
+        assert_eq!(base64url_decode("Zm9v"), Some(b"foo".to_vec()));
+        assert_eq!(base64url_decode("Zm9vYmFy"), Some(b"foobar".to_vec()));
+        assert_eq!(base64url_decode("-_8"), Some(vec![0xfb, 0xff]));
+        assert_eq!(base64url_decode("a"), None, "lone symbol is malformed");
+        assert_eq!(base64url_decode("Zg=="), None, "padding is not accepted");
     }
 
     #[test]
-    fn pkce_challenge_matches_rfc_7636_appendix_b() {
-        // Appendix B fixes the verifier and expected S256 challenge.
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        let challenge = base64url(&crate::download::sha256(verifier.as_bytes()));
-        assert_eq!(challenge, "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+    fn jwt_ttl_reads_exp() {
+        // {"alg":"EdDSA"} . {"sub":"u","exp":<far future>} . (unverified)
+        let far = 4_000_000_000u64;
+        let header = "eyJhbGciOiJFZERTQSJ9";
+        let payload_json = format!(r#"{{"sub":"u","exp":{far}}}"#);
+        // Encode via the decoder's inverse using std — quick local encode.
+        let encode = |data: &[u8]| {
+            const ALPHABET: &[u8] =
+                b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+            let mut out = String::new();
+            for chunk in data.chunks(3) {
+                let b = [
+                    chunk[0],
+                    chunk.get(1).copied().unwrap_or(0),
+                    chunk.get(2).copied().unwrap_or(0),
+                ];
+                let n = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
+                out.push(ALPHABET[(n >> 18) as usize & 63] as char);
+                out.push(ALPHABET[(n >> 12) as usize & 63] as char);
+                if chunk.len() > 1 {
+                    out.push(ALPHABET[(n >> 6) as usize & 63] as char);
+                }
+                if chunk.len() > 2 {
+                    out.push(ALPHABET[n as usize & 63] as char);
+                }
+            }
+            out
+        };
+        let token = format!("{header}.{}.sig", encode(payload_json.as_bytes()));
+        let ttl = jwt_ttl_seconds(&token).expect("ttl readable");
+        assert!(ttl > 1_000_000, "far-future exp yields a large ttl");
+
+        assert_eq!(jwt_ttl_seconds("garbage"), None);
+        assert_eq!(jwt_ttl_seconds("a.b.c"), None);
     }
 
     #[test]
-    fn pkce_pairs_are_unique() {
-        let (v1, c1) = pkce_pair().unwrap();
-        let (v2, c2) = pkce_pair().unwrap();
-        assert_ne!(v1, v2);
-        assert_ne!(c1, c2);
-        assert_eq!(v1.len(), 43, "32 bytes base64url = 43 chars");
-    }
-
-    #[test]
-    fn percent_decoding() {
-        assert_eq!(percent_decode("a%2Fb+c"), "a/b c");
-        assert_eq!(percent_decode("plain"), "plain");
-        // Malformed escapes pass through rather than panicking.
-        assert_eq!(percent_decode("bad%zz"), "bad%zz");
-        assert_eq!(percent_decode("tail%2"), "tail%2");
-    }
-
-    #[test]
-    fn callback_parser_extracts_code_and_state() {
-        // Simulate the request line off a socketless reader by testing the
-        // pure parts: path parsing via a real loopback pair.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let join = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            read_callback_params(&mut stream)
-        });
-        let mut client = std::net::TcpStream::connect(addr).unwrap();
-        write!(
-            client,
-            "GET /callback?code=abc%2F1&state=xyz HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        )
-        .unwrap();
-        let parsed = join.join().unwrap();
-        assert_eq!(parsed, Some(("abc/1".to_string(), "xyz".to_string())));
+    fn expired_jwt_ttl_is_zero() {
+        let header = "eyJhbGciOiJFZERTQSJ9";
+        // exp: 1 (1970) — saturates to 0, never underflows.
+        let payload = "eyJzdWIiOiJ1IiwiZXhwIjoxfQ";
+        let token = format!("{header}.{payload}.sig");
+        assert_eq!(jwt_ttl_seconds(&token), Some(0));
     }
 }

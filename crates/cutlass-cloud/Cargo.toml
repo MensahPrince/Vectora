@@ -1,6 +1,6 @@
 [package]
 name = "cutlass-cloud"
-description = "Cutlass cloud client: shared API DTOs, anonymous asset/stock access, and the BYOK-vs-managed routing seam"
+description = "Cutlass cloud client: shared API DTOs, anonymous asset/stock access, and BYOK-vs-managed routing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,7 +13,6 @@ serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 ureq = { version = "2", features = ["json"] }
-getrandom = "0.2"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
 
 [dev-dependencies]

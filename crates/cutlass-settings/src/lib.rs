@@ -41,7 +41,8 @@
 //! # Cutlass account plumbing. The session token itself is NEVER here —
 //! # it lives in the OS keychain (see cutlass-cloud's token store).
 //! [account]
-//! base_url = "https://api.cutlass.app"   # override; empty = default
+//! base_url = "https://api.cutlass.app"    # API override; empty = default
+//! auth_base_url = "https://cutlass.app"   # website/auth override; empty = default
 //! ```
 
 use std::collections::BTreeMap;
@@ -186,13 +187,17 @@ impl ProviderSettings {
     }
 }
 
-/// The `[account]` table. Deliberately tiny: the base-URL override is the
-/// only account state that belongs in a plain file — the session token
-/// lives in the OS keychain, never here.
+/// The `[account]` table. Deliberately tiny: the base-URL overrides are
+/// the only account state that belongs in a plain file — the session
+/// token lives in the OS keychain, never here.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AccountSettings {
-    /// Backend base URL override; empty = the shipped default.
+    /// Backend (API) base URL override; empty = the shipped default.
     pub base_url: String,
+    /// Auth base URL override — the website hosting better-auth
+    /// (`/api/auth/*`, `/device`, `/account`); empty = the shipped
+    /// default.
+    pub auth_base_url: String,
 }
 
 /// The whole user config, one struct per table. [`Settings::default`] is the
@@ -327,6 +332,9 @@ impl Settings {
             if let Some(v) = string_at(t, "base_url") {
                 s.account.base_url = v;
             }
+            if let Some(v) = string_at(t, "auth_base_url") {
+                s.account.auth_base_url = v;
+            }
         }
 
         s
@@ -383,18 +391,25 @@ impl Settings {
             }
         }
         {
-            // An empty override removes the key (and a now-empty table), so
-            // a fresh config stays minimal.
-            if self.account.base_url.is_empty() {
-                if let Some(t) = doc.get_mut("account").and_then(Item::as_table_mut) {
-                    t.remove("base_url");
-                    if t.is_empty() {
-                        doc.remove("account");
+            // Empty overrides remove their keys (and a now-empty table),
+            // so a fresh config stays minimal.
+            for (key, value) in [
+                ("base_url", &self.account.base_url),
+                ("auth_base_url", &self.account.auth_base_url),
+            ] {
+                if value.is_empty() {
+                    if let Some(t) = doc.get_mut("account").and_then(Item::as_table_mut) {
+                        t.remove(key);
                     }
+                } else {
+                    let t = ensure_table(doc, "account");
+                    set_str(t, key, value);
                 }
-            } else {
-                let t = ensure_table(doc, "account");
-                set_str(t, "base_url", &self.account.base_url);
+            }
+            if let Some(t) = doc.get_mut("account").and_then(Item::as_table_mut) {
+                if t.is_empty() {
+                    doc.remove("account");
+                }
             }
         }
     }

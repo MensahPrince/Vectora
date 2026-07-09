@@ -18,10 +18,10 @@
 //!   client downloads **directly from provider CDNs** into a quota-managed
 //!   cache (LRU eviction, clear-cache action) with atomic tmp-then-rename
 //!   writes, progress callbacks, and cancellation.
-//! - [`auth`] / [`token_store`]: the account half — OAuth sign-in (PKCE +
-//!   loopback redirect through the system browser), refresh, balance,
-//!   ledger, Polar checkout; the session token lives in the OS keychain,
-//!   never in a file.
+//! - [`auth`] / [`token_store`]: the account half — device-authorization
+//!   sign-in (RFC 8628 through the system browser against the website's
+//!   better-auth), JWT refresh, balance, ledger; tokens live in the OS
+//!   keychain, never in a file. Billing UI lives on the website.
 //!
 //! **The routing rule** (BYOK-first): a user-configured provider key routes
 //! the call direct to the provider; else a signed-in session takes the
@@ -51,3 +51,8 @@ pub use stock::{DirectStockProvider, StockProvider};
 /// table in `~/.cutlass/config.toml` (points at staging or a self-hosted
 /// instance).
 pub const DEFAULT_BASE_URL: &str = "https://api.cutlass.app";
+
+/// Default production auth base URL — the website, where better-auth
+/// lives (`/api/auth/*`, the `/device` approval page, `/account`
+/// billing). Overridable via `[account] auth_base_url`.
+pub const DEFAULT_AUTH_BASE_URL: &str = "https://cutlass.app";

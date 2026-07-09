@@ -400,33 +400,43 @@ export component SettingsDialog inherits Rectangle {
                                 text: "Account";
                             }
                             Hint {
-                                text: "Optional. Everything with your own API keys works signed-out; a Cutlass account adds prepaid credits for managed cloud generation. Sign-in and checkout open in your browser — no passwords, no card data in the app.";
+                                text: "Optional. Everything with your own API keys works signed-out; a Cutlass account adds prepaid credits for managed cloud generation. Sign-in and purchases happen on the website in your browser — no passwords, no card data in the app.";
                             }
 
-                            // Signed out: provider buttons.
-                            if AccountBackend.status != "signed-in": HorizontalLayout {
+                            // Signed out: one button — provider choice
+                            // happens on the website.
+                            if AccountBackend.status != "signed-in": VerticalLayout {
                                 spacing: AppStore.theme.metrics.spacing.md;
-                                alignment: start;
 
-                                AccentButton {
-                                    label: AccountBackend.status == "signing-in"
-                                        ? "Waiting for browser…"
-                                        : "Sign in with GitHub";
-                                    enabled: AccountBackend.status != "signing-in";
-                                    clicked => {
-                                        AccountBackend.sign-in("github");
+                                HorizontalLayout {
+                                    alignment: start;
+                                    AccentButton {
+                                        label: AccountBackend.status == "signing-in"
+                                            ? "Waiting for approval…"
+                                            : "Sign in with browser";
+                                        enabled: AccountBackend.status != "signing-in";
+                                        clicked => {
+                                            AccountBackend.sign-in();
+                                        }
                                     }
                                 }
-                                SubtleButton {
-                                    label: "Sign in with Google";
-                                    enabled: AccountBackend.status != "signing-in";
-                                    clicked => {
-                                        AccountBackend.sign-in("google");
+
+                                // The device-flow code the user confirms on
+                                // the approval page (pre-filled there; shown
+                                // here to verify it matches).
+                                if AccountBackend.status == "signing-in" && AccountBackend.user-code != "": VerticalLayout {
+                                    spacing: AppStore.theme.metrics.spacing.xs;
+                                    Hint {
+                                        text: "Check that the code in your browser matches:";
+                                    }
+                                    CutlassText {
+                                        text: AccountBackend.user-code;
+                                        style: AppStore.theme.typography.heading-md;
                                     }
                                 }
                             }
 
-                            // Signed in: identity + balance + packs.
+                            // Signed in: identity + balance.
                             if AccountBackend.status == "signed-in": VerticalLayout {
                                 spacing: AppStore.theme.metrics.spacing.md;
 
@@ -458,25 +468,15 @@ export component SettingsDialog inherits Rectangle {
                                     }
                                 }
 
-                                if AccountBackend.packs.length > 0: VerticalLayout {
-                                    spacing: AppStore.theme.metrics.spacing.xs;
-
-                                    Hint {
-                                        text: "Buy credits (opens Polar checkout in your browser):";
-                                    }
-                                    for pack[i] in AccountBackend.packs: HorizontalLayout {
-                                        alignment: start;
-                                        SubtleButton {
-                                            label: pack.label;
-                                            clicked => {
-                                                AccountBackend.buy-pack(i);
-                                            }
-                                        }
-                                    }
-                                }
-
                                 HorizontalLayout {
                                     alignment: start;
+                                    spacing: AppStore.theme.metrics.spacing.md;
+                                    SubtleButton {
+                                        label: "Buy credits";
+                                        clicked => {
+                                            AccountBackend.buy-credits();
+                                        }
+                                    }
                                     SubtleButton {
                                         label: "Sign out";
                                         clicked => {
