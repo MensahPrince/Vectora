@@ -70,9 +70,7 @@ impl ClipCapabilities {
         };
 
         let media_has_audio = match &clip.content {
-            ClipSource::Media { media, .. } => {
-                project.media(*media).is_some_and(|m| m.has_audio)
-            }
+            ClipSource::Media { media, .. } => project.media(*media).is_some_and(|m| m.has_audio),
             ClipSource::Generated(_) => false,
         };
         let can_extract_audio = kind == TrackKind::Video
@@ -314,11 +312,7 @@ mod tests {
         let audio_track = project
             .timeline_mut()
             .add_track(Track::new(TrackKind::Audio, "A1"));
-        let companion = Clip::from_media(
-            media,
-            video.source_range().unwrap(),
-            video.timeline,
-        );
+        let companion = Clip::from_media(media, video.source_range().unwrap(), video.timeline);
         let audio_id = project
             .timeline_mut()
             .add_clip(audio_track, companion)
