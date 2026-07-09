@@ -18,8 +18,9 @@ use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand, Templa
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, SeekPolicy};
 use cutlass_models::{
     AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
-    Easing, Filter, Generator, LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param,
-    ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
+    Easing, Filter, Generator, LinkId, Lut, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId,
+    Param, ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind,
+    resample,
 };
 use cutlass_render::{ExportSettings, RenderError, Renderer};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -273,6 +274,13 @@ enum WorkerMsg {
     SetClipFilter {
         clip: String,
         filter_id: String,
+        intensity: f32,
+    },
+    /// Set (or clear) a visual clip's `.cube` LUT. `path == ""` clears;
+    /// intensity is normalized 0..=1. One undoable history entry.
+    SetClipLut {
+        clip: String,
+        path: String,
         intensity: f32,
     },
     /// Set all five manual color adjustments in one undoable history entry.
@@ -958,6 +966,14 @@ impl WorkerHandle {
         });
     }
 
+    pub fn set_clip_lut(&self, clip: String, path: String, intensity: f32) {
+        let _ = self.tx.send(WorkerMsg::SetClipLut {
+            clip,
+            path,
+            intensity,
+        });
+    }
+
     pub fn set_clip_adjust(&self, clip: String, adjust: ColorAdjustments) {
         let _ = self.tx.send(WorkerMsg::SetClipAdjust { clip, adjust });
     }
@@ -1473,6 +1489,11 @@ fn worker_loop(
                 filter_id,
                 intensity,
             } => set_clip_filter_and_publish(engine, &clip, &filter_id, intensity, &ui),
+            WorkerMsg::SetClipLut {
+                clip,
+                path,
+                intensity,
+            } => set_clip_lut_and_publish(engine, &clip, &path, intensity, &ui),
             WorkerMsg::SetClipAdjust { clip, adjust } => {
                 set_clip_adjust_and_publish(engine, &clip, adjust, &ui)
             }
@@ -3929,6 +3950,34 @@ fn set_clip_filter_and_publish(
         return;
     }
     info!(%clip_id, ?filter, "set clip filter");
+    publish_projection(engine, ui);
+}
+
+/// Set or clear a visual clip's `.cube` LUT (empty path clears). Intensity
+/// blends the looked-up color over the original in the LUT pass itself.
+fn set_clip_lut_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    path: &str,
+    intensity: f32,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-lut ignored: unparsable clip id");
+        return;
+    };
+    let lut = (!path.is_empty()).then(|| Lut {
+        path: path.to_string(),
+        intensity: intensity.clamp(0.0, 1.0),
+    });
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipLut {
+        clip: clip_id,
+        lut: lut.clone(),
+    })) {
+        error!(%clip_id, path, intensity, "set clip LUT failed: {e}");
+        return;
+    }
+    info!(%clip_id, ?lut, "set clip LUT");
     publish_projection(engine, ui);
 }
 

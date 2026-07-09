@@ -259,6 +259,7 @@ fn clip_to_slint(
     let clip_start = clip.timeline.start.value;
     let (shape_width, shape_height) = clip_shape_size(clip);
     let (filter_id, filter_label, filter_intensity) = clip_filter(clip);
+    let (lut_id, lut_label, lut_intensity) = clip_lut(clip);
     let (animation_in_id, animation_in_label) = clip_animation(clip.animation_in.as_ref());
     let (animation_out_id, animation_out_label) = clip_animation(clip.animation_out.as_ref());
     let (animation_combo_id, animation_combo_label) = clip_animation(clip.animation_combo.as_ref());
@@ -324,6 +325,9 @@ fn clip_to_slint(
         adjust_saturation: clip.adjust.saturation,
         adjust_exposure: clip.adjust.exposure,
         adjust_temperature: clip.adjust.temperature,
+        lut_id: lut_id.into(),
+        lut_label: lut_label.into(),
+        lut_intensity,
         animation_in_id: animation_in_id.into(),
         animation_in_label: animation_in_label.into(),
         animation_out_id: animation_out_id.into(),
@@ -367,6 +371,38 @@ fn clip_filter(clip: &EngineClip) -> (String, String, f32) {
         .unwrap_or(filter.id.as_str())
         .to_string();
     (filter.id.clone(), label, filter.intensity)
+}
+
+/// Project a clip's `.cube` LUT as (id, label, intensity). The id is the
+/// file's stem — for catalog downloads that IS the catalog id (the LUT
+/// worker names files `<id>.cube`) — and the label prettifies it
+/// (`cutlass-vivid` → "Vivid").
+fn clip_lut(clip: &EngineClip) -> (String, String, f32) {
+    let Some(lut) = &clip.lut else {
+        return (String::new(), String::new(), 0.0);
+    };
+    let id = std::path::Path::new(&lut.path)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| lut.path.clone());
+    (id.clone(), lut_label(&id), lut.intensity)
+}
+
+/// Human label for a LUT id/stem: strip the first-party prefix, split on
+/// separators, capitalize words (`cutlass-teal_orange` → "Teal Orange").
+pub(crate) fn lut_label(id: &str) -> String {
+    let base = id.strip_prefix("cutlass-").unwrap_or(id);
+    base.split(['-', '_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn clip_animation(animation: Option<&cutlass_models::AnimationRef>) -> (String, String) {

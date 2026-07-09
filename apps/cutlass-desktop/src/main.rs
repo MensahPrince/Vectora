@@ -7,6 +7,7 @@ mod drafts;
 mod inspector;
 mod interaction;
 mod lottie_stickers;
+mod lut_catalog;
 mod os_drop;
 mod params;
 mod paths;
@@ -745,6 +746,41 @@ fn main() -> Result<(), slint::PlatformError> {
         let refresh_handle = lottie_worker.handle();
         app.global::<LottieBackend>()
             .on_refresh(move || refresh_handle.refresh());
+    }
+
+    // Cloud LUTs (look inspector > LUT): catalog fetch + `.cube` downloads
+    // on their own thread (src/lut_catalog.rs); the registry resolves
+    // catalog ids to downloaded files for `set-clip-lut`.
+    let lut_registry: lut_catalog::LutRegistry =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let lut_worker = lut_catalog::LutWorker::spawn(app.as_weak(), lut_registry.clone())
+        .map_err(slint::PlatformError::Other)?;
+    {
+        let refresh_handle = lut_worker.handle();
+        app.global::<InspectorBackend>()
+            .on_refresh_luts(move || refresh_handle.refresh());
+    }
+    {
+        let set_lut_handle = preview_worker.handle();
+        let registry = lut_registry.clone();
+        app.global::<InspectorBackend>()
+            .on_set_clip_lut(move |clip_id, lut_id, intensity| {
+                let path = if lut_id.is_empty() {
+                    String::new()
+                } else {
+                    let Some(path) = registry
+                        .lock()
+                        .expect("LUT registry poisoned")
+                        .get(lut_id.as_str())
+                        .map(|p| p.to_string_lossy().into_owned())
+                    else {
+                        tracing::warn!(lut = %lut_id, "set-clip-lut ignored: unknown catalog id");
+                        return;
+                    };
+                    path
+                };
+                set_lut_handle.set_clip_lut(clip_id.to_string(), path, intensity);
+            });
     }
 
     let agent_worker = agent::AgentWorker::spawn(preview_worker.handle(), agent_store.as_weak())
