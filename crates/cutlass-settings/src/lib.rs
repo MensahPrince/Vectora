@@ -284,7 +284,10 @@ impl Settings {
             }
             s.ai.api_key = string_at(t, "api_key");
             s.ai.api_key_env = string_at(t, "api_key_env");
-            s.ai.use_account = t.get("use_account").and_then(Item::as_bool).unwrap_or(false);
+            s.ai.use_account = t
+                .get("use_account")
+                .and_then(Item::as_bool)
+                .unwrap_or(false);
         }
 
         if let Some(t) = section(doc, "appearance") {

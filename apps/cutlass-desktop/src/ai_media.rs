@@ -155,8 +155,14 @@ impl Worker {
 
     fn publish_route(&self) {
         let (label, available) = match self.route() {
-            Route::Byok(_) => ("Runs on your fal.ai key — the Cutlass backend is not involved.", true),
-            Route::Managed(_) => ("Runs on Cutlass credits (Settings > Account shows your balance).", true),
+            Route::Byok(_) => (
+                "Runs on your fal.ai key — the Cutlass backend is not involved.",
+                true,
+            ),
+            Route::Managed(_) => (
+                "Runs on Cutlass credits (Settings > Account shows your balance).",
+                true,
+            ),
             Route::None => ("Generation is off: sign in or add a fal.ai key.", false),
         };
         self.on_ui(move |b| {
@@ -304,9 +310,7 @@ impl Worker {
                         .ok_or_else(|| "The provider returned no media.".into());
                 }
                 JobStatus::Failed => {
-                    return Err(current
-                        .error
-                        .unwrap_or_else(|| "Generation failed.".into()));
+                    return Err(current.error.unwrap_or_else(|| "Generation failed.".into()));
                 }
                 _ => {}
             }
@@ -475,7 +479,10 @@ mod tests {
 
     #[test]
     fn extensions_fall_back_per_kind() {
-        assert_eq!(extension_of(GenerationKind::Image, "https://c/x.PNG?sig=1"), "png");
+        assert_eq!(
+            extension_of(GenerationKind::Image, "https://c/x.PNG?sig=1"),
+            "png"
+        );
         assert_eq!(extension_of(GenerationKind::Video, "https://c/x"), "mp4");
         assert_eq!(extension_of(GenerationKind::Tts, "https://c/x"), "wav");
     }

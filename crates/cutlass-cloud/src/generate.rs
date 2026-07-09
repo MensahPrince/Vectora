@@ -160,10 +160,7 @@ impl GenerationProvider for FalGenerationProvider {
         let (model, request_id) = job_id
             .split_once('#')
             .ok_or_else(|| CloudError::Protocol(format!("malformed fal job id: {job_id}")))?;
-        let status_url = format!(
-            "{}/{model}/requests/{request_id}/status",
-            self.queue_base
-        );
+        let status_url = format!("{}/{model}/requests/{request_id}/status", self.queue_base);
         let status = self.get_json(&status_url)?;
         let running = Job {
             id: job_id.to_string(),
@@ -225,7 +222,10 @@ mod tests {
     #[test]
     fn fal_media_url_probe() {
         let audio = serde_json::json!({"audio": {"url": "https://cdn/a.wav"}});
-        assert_eq!(extract_media_url(&audio).as_deref(), Some("https://cdn/a.wav"));
+        assert_eq!(
+            extract_media_url(&audio).as_deref(),
+            Some("https://cdn/a.wav")
+        );
         assert_eq!(extract_media_url(&serde_json::json!({})), None);
     }
 }
