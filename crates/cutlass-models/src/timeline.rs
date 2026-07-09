@@ -521,7 +521,7 @@ impl Timeline {
 
     /// Whether `clip_id` shares a link group with a clip on an audio lane — the
     /// CapCut "separate audio" companion that took over its sound.
-    fn detached_to_audio_lane(&self, clip_id: ClipId) -> bool {
+    pub fn detached_to_audio_lane(&self, clip_id: ClipId) -> bool {
         let Some(link) = self.clip(clip_id).and_then(|c| c.link) else {
             return false;
         };
