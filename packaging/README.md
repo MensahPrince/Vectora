@@ -4,11 +4,10 @@ Cutlass alpha builds ship as prebuilt binaries. The desktop editor is
 `cutlass-desktop`; the iOS/macOS SwiftUI app ships through Xcode/TestFlight
 and is not covered here.
 
-macOS is the only desktop platform with a working media stack today
-(AVFoundation/VideoToolbox). Windows and Linux packages are **dormant**: the
-app compiles and the UI runs there, but imported media cannot decode until
-their native backends land. The scripts are kept working so packaging is
-ready the day that happens.
+macOS (AVFoundation/VideoToolbox) and Windows (Media Foundation) have working
+media stacks. Linux packages are **dormant**: the app compiles and the UI
+runs there, but imported media cannot decode until the Linux backend lands.
+The Linux script is kept working so packaging is ready the day that happens.
 
 ## Versioning
 
@@ -20,7 +19,7 @@ ready the day that happens.
 ## Local builds
 
 ```bash
-# macOS .app — no bundled media libraries; AVFoundation is part of the OS
+# macOS .app: no bundled media libraries; AVFoundation is part of the OS
 cargo build --release -p cutlass-desktop
 ./scripts/package-macos.sh
 # → dist/Cutlass-0.5.3-alpha.0-macos-arm64.zip
@@ -30,7 +29,7 @@ cargo build --release -p cutlass-desktop
 ./scripts/package-linux.sh
 # → dist/Cutlass-0.5.3-alpha.0-linux-x86_64.tar.gz
 
-# Windows zip (dormant preview: UI only, no media decode yet)
+# Windows zip: no bundled media libraries; Media Foundation is part of the OS
 cargo build --release -p cutlass-desktop
 .\scripts\package-windows.ps1
 # → dist/Cutlass-0.5.3-alpha.0-windows-x86_64.zip
@@ -56,7 +55,7 @@ choco install innosetup
 
 The Inno Setup script lives at `packaging/windows/cutlass.iss`; the PowerShell
 wrapper passes the version, staged source dir, and output path as `/D` defines.
-The installer is unsigned for now — Windows SmartScreen will warn on first run
+The installer is unsigned for now. Windows SmartScreen will warn on first run
 until the `Setup.exe` is Authenticode-signed.
 
 `dist/` is gitignored.
@@ -71,5 +70,5 @@ Developer ID signing + notarization in CI.
 ## Licensing
 
 Bundles carry no third-party media libraries: decode/encode goes through the
-operating system's frameworks (AVFoundation/VideoToolbox on Apple platforms).
-Cutlass itself is MIT OR Apache-2.0.
+operating system's frameworks (AVFoundation/VideoToolbox on Apple platforms,
+Media Foundation on Windows). Cutlass itself is MIT OR Apache-2.0.

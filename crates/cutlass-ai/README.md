@@ -32,11 +32,11 @@ The crate does not mutate projects directly. It describes project state for the 
 
 Users can extend the assistant through `~/.cutlass/agent/` (reloaded before every prompt, no restart needed):
 
-- `rules/*.md` — always-on rules injected into the system prompt, capped at `MAX_RULES_BYTES` (over-budget rules truncate with a visible warning in the agent panel).
-- `skills/<id>/SKILL.md` — on-demand procedural workflows with YAML frontmatter (`name`, `description`). Only the name/description index enters the system prompt; the model fetches a body through the read-only `read_skill` tool.
-- `commands/*.md` — slash-command prompt templates: typing `/name args` in the chat panel expands the template client-side (`$ARGUMENTS` substitution).
+- `rules/*.md`: always-on rules injected into the system prompt, capped at `MAX_RULES_BYTES` (over-budget rules truncate with a visible warning in the agent panel).
+- `skills/<id>/SKILL.md`: on-demand procedural workflows with YAML frontmatter (`name`, `description`). Only the name/description index enters the system prompt; the model fetches a body through the read-only `read_skill` tool.
+- `commands/*.md`: slash-command prompt templates. Typing `/name args` in the chat panel expands the template client-side (`$ARGUMENTS` substitution).
 
-Per-project rules live in `ProjectMetadata.agent_rules`, edited from the agent panel, and travel with the project file — the panel shows them (never silently applies them) when a project arrives from elsewhere. Three first-party skills ship embedded from `assets/skills/`; user skills with the same id win.
+Per-project rules live in `ProjectMetadata.agent_rules`, edited from the agent panel, and travel with the project file. The panel shows them (never silently applies them) when a project arrives from elsewhere. Three first-party skills ship embedded from `assets/skills/`; user skills with the same id win.
 
 All of this is prompt-level only: the closed command vocabulary, validation, dry-run, and one-undo-group invariants are untouched, so a bad rule or skill can at worst propose bad edits.
 
@@ -53,7 +53,7 @@ model = "qwen3:14b"
 
 Secrets should stay in user config or environment variables. They should not be stored in project files or committed to the repository.
 
-## Adding Agent Capabilities
+## Adding agent capabilities
 
 When the assistant should learn a new edit operation, update the wire type, validation, tool schema snapshot, action description, and end-to-end agent tests together. The agent surface is deliberately closed so model-visible behavior changes are reviewed as code.
 

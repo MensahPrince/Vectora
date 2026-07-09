@@ -5,7 +5,7 @@ description: Turn the current edit into a short vertical 9:16 cut with a hook, c
 
 # Social media cut
 
-Goal: a short (15–60 s) vertical clip that works muted and hooks in the
+Goal: a short (15 to 60 s) vertical clip that works muted and hooks in the
 first 2 seconds.
 
 1. Call `describe_project` and note the main-track clips, total duration,
@@ -19,15 +19,16 @@ first 2 seconds.
    shaving every clip.
 4. Reframe for vertical: for each kept main-track clip, `set_clip_transform`
    with a scale that fills the 9:16 frame (media is usually 16:9, so scale
-   up ~1.8–2.4 and keep position centered unless the subject is off-center).
+   up about 1.8 to 2.4 and keep position centered unless the subject is
+   off-center).
 5. Add a hook title in the first 2 seconds: `add_generated` with a short,
    punchy text (ask the user if no obvious hook exists) on a text track,
-   duration ~2.5 s, then `set_clip_animation` with a pop or bounce `in`
+   duration about 2.5 s, then `set_clip_animation` with a pop or bounce `in`
    animation.
-6. Tighten the pacing: if any kept clip runs longer than ~6 s without a
+6. Tighten the pacing: if any kept clip runs longer than about 6 s without a
    cut, split it and either remove the slack or speed the middle up with
-   `set_clip_speed` (1.5–2x).
+   `set_clip_speed` (1.5 to 2x).
 7. If there is music, keep it under speech: `set_clip_audio` with volume
-   ~0.4 on the music clip, fades of 0.3 s in and out.
+   about 0.4 on the music clip, fades of 0.3 s in and out.
 8. Finish with `describe_project` and report the final duration and what
    was cut.

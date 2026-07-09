@@ -12,7 +12,7 @@ The crate describes what can be requested. `cutlass-engine` decides whether a co
 - Define `EditOutcome` values returned by successful edit commands.
 - Re-export common model IDs and time types used by command callers.
 
-## Design Notes
+## Design notes
 
 Commands are explicit Rust values rather than loosely typed callbacks or UI events. This keeps editing behavior auditable and makes it possible for several frontends to share one execution path.
 
@@ -23,7 +23,7 @@ The command layer should stay small and deterministic:
 - Pure data types shared by commands should live in `cutlass-models`.
 - AI-specific request shapes should live in `cutlass-ai` and lower into these commands only after validation.
 
-## Common Entry Points
+## Common entry points
 
 - `Command`: wrapper over project-level and timeline-level actions.
 - `ProjectCommand`: import, save, open, load, relink, and export.

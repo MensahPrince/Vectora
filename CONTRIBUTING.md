@@ -7,25 +7,25 @@ docs, sharpening the AI assistant, or just reporting what breaks.
 This guide explains how the repository is organized, how to build and test it,
 and what we expect from a change before it lands.
 
-## Human and AI Contributions Both Welcome
+## Human and AI contributions both welcome
 
 We judge a contribution by what it does, not by how it was made. Whether you
 wrote it by hand, with an AI assistant, or it was largely AI-generated, we
-accept it as long as it adds something useful — a bug fix, a new feature, a
-performance win, tests, or docs — and meets the bar in this guide.
+accept it as long as it adds something useful (a bug fix, a new feature, a
+performance win, tests, or docs) and meets the bar in this guide.
 
 That bar is the same for everyone: the change has to build, pass the checks
 below, be reasonably scoped and reviewable, and actually improve the project.
 You are responsible for any code you submit, so understand it, test it, and be
 ready to explain and revise it in review. Don't open low-effort or untested
-PRs (AI-generated or otherwise) just to make noise — those waste reviewer time
+PRs (AI-generated or otherwise) just to make noise. Those waste reviewer time
 and will be closed.
 
 It's nice (and appreciated) to mention in the PR description when a change was
-AI-generated or AI-assisted. It's not required and won't count against you — it
+AI-generated or AI-assisted. It's not required and won't count against you. It
 just gives reviewers helpful context.
 
-## Before You Start
+## Before you start
 
 - Read the [README](README.md) to understand what Cutlass is and how to run it.
 - Check [ROADMAP.md](ROADMAP.md) to see what is planned, in progress, or
@@ -36,7 +36,7 @@ just gives reviewers helpful context.
 - For anything larger than a small fix, open an issue first to discuss the
   approach. It saves everyone a wasted PR.
 
-## Ways to Contribute
+## Ways to contribute
 
 - **Report bugs** using the [bug report template](.github/ISSUE_TEMPLATE/bug_report.md).
   Include your OS, how you built or installed Cutlass, exact steps to reproduce,
@@ -47,14 +47,14 @@ just gives reviewers helpful context.
 - **Send code** for bug fixes, editing features, performance work, tests, or
   docs. See the workflow below.
 
-## Development Setup
+## Development setup
 
 Cutlass is a Rust workspace. You need a recent stable Rust toolchain (the repo
 pins `stable` via `rust-toolchain.toml`, edition 2024, MSRV 1.85). Media
-decode/encode is platform-native — AVFoundation/VideoToolbox on Apple
-platforms — so there are no third-party media libraries to install on macOS.
-The desktop app compiles on Windows and Linux, but their media backends
-aren't implemented yet (the UI runs; media won't decode).
+decode/encode is platform-native (AVFoundation/VideoToolbox on Apple
+platforms, Media Foundation on Windows), so there are no third-party media
+libraries to install. The desktop app compiles on Linux, but its media
+backend isn't implemented yet (the UI runs; media won't decode).
 
 Build and test the whole workspace:
 
@@ -74,36 +74,36 @@ The iOS/macOS SwiftUI app (`apps/cutlass-ios-macos`) builds with Xcode on top
 of the engine's C ABI; `./scripts/build-ios-xcframework.sh` produces the
 XCFramework it links.
 
-## Project Layout
+## Project layout
 
 The workspace is split into focused crates, layered from data up to the apps:
 
-- `cutlass-core` — shared primitives: rational time, colorimetry, pixel
-  formats, the GPU/CPU frame handoff, and the decode/encode contracts.
-- `cutlass-models` — project/timeline data model, media pool, templates, and
+- `cutlass-core`: shared primitives (rational time, colorimetry, pixel
+  formats, the GPU/CPU frame handoff, and the decode/encode contracts).
+- `cutlass-models`: project/timeline data model, media pool, templates, and
   the `.cutlass` file schema. UI-, decode-, and render-agnostic.
-- `cutlass-commands` — the structured command vocabulary every edit goes through.
-- `cutlass-decoder` — platform-native video/image decode behind the core
+- `cutlass-commands`: the structured command vocabulary every edit goes through.
+- `cutlass-decoder`: platform-native video/image decode behind the core
   `VideoDecoder` trait (AVFoundation/VideoToolbox on Apple), plus audio peaks.
-- `cutlass-encoder` — platform-native H.264/mp4 encode behind the core
+- `cutlass-encoder`: platform-native H.264/mp4 encode behind the core
   `VideoEncoder` trait (VideoToolbox on Apple).
-- `cutlass-compositor` — WGPU GPU compositor that combines layers into RGBA
+- `cutlass-compositor`: WGPU GPU compositor that combines layers into RGBA
   frames.
-- `cutlass-text` / `cutlass-shapes` — text and vector-shape generators the
+- `cutlass-text` / `cutlass-shapes`: text and vector-shape generators the
   compositor places as layers.
-- `cutlass-render` — resolves a project at an instant into a scene, renders
+- `cutlass-render`: resolves a project at an instant into a scene, renders
   frames, mixes audio, and exports timelines to video.
-- `cutlass-engine` — the headless editing engine: applies commands, records
+- `cutlass-engine`: the headless editing engine. Applies commands, records
   undo/redo, produces preview frames. Main integration point for non-UI
   callers.
-- `cutlass-mobile` — C ABI + JNI bridge the iOS/Android apps link.
-- `cutlass-settings` — desktop user settings (`~/.cutlass/config.toml`).
-- `cutlass-cli` — command-line compositor demos (headless GPU → image file).
-- `cutlass-py` — MoviePy-style Python bindings (excluded from the default
+- `cutlass-mobile`: C ABI + JNI bridge the iOS/Android apps link.
+- `cutlass-settings`: desktop user settings (`~/.cutlass/config.toml`).
+- `cutlass-cli`: command-line compositor demos (headless GPU to image file).
+- `cutlass-py`: MoviePy-style Python bindings (excluded from the default
   workspace build; built with maturin).
-- `apps/cutlass-desktop` — the Slint desktop editor (timeline, preview,
+- `apps/cutlass-desktop`: the Slint desktop editor (timeline, preview,
   inspector, library, export dialog).
-- `apps/cutlass-ios-macos`, `apps/cutlass-android` — the mobile apps.
+- `apps/cutlass-ios-macos`, `apps/cutlass-android`: the mobile apps.
 
 Each crate has its own `README.md` describing its responsibilities and what
 does and does not belong there. Read the relevant one before adding code.
@@ -113,9 +113,9 @@ Two boundaries matter:
 - **Keep the engine UI-agnostic.** Slint models, widgets, file dialogs, and
   interaction state belong in `apps/cutlass-desktop`, not `cutlass-engine`.
 - **Keep `cutlass-models` pure data.** No file I/O, GPU work, Slint bindings,
-  or undo/redo dispatch — those live in higher crates.
+  or undo/redo dispatch. Those live in higher crates.
 
-## Coding Conventions
+## Coding conventions
 
 - **Performance is a correctness concern** on interactive paths (timeline
   scrubbing, preview, per-frame and per-sample work, export). Know the
@@ -148,7 +148,7 @@ one giant change.
 - Use an author identity that matches your GitHub account so your contributions
   are attributed correctly.
 
-## Submitting a Pull Request
+## Submitting a pull request
 
 1. Fork the repo and create a topic branch from `main`.
 2. Make your change as a clean series of commits (see above).
@@ -175,7 +175,7 @@ one giant change.
 A maintainer will review and may ask for changes. Address feedback as new
 commits rather than rewriting published history.
 
-## Code of Conduct
+## Code of conduct
 
 Be respectful and constructive. Assume good faith, keep discussion focused on
 the work, and help make this a welcoming project to contribute to.

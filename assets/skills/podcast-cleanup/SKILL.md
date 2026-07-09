@@ -1,6 +1,6 @@
 ---
 name: Podcast cleanup
-description: Clean up a recorded conversation - denoise voices, level volumes, duck music, and add gentle fades.
+description: Clean up a recorded conversation: denoise voices, level volumes, duck music, and add gentle fades.
 ---
 
 # Podcast cleanup
@@ -14,9 +14,9 @@ content.
    `set_audio_role` with `voiceover` on each voice clip and `music` on
    music clips.
 3. Denoise every voice clip: `set_denoise` with `denoise: true`. Do not
-   denoise music — it smears.
+   denoise music; it smears.
 4. Level the conversation: voice clips should sit at volume 1.0; if one
-   speaker's clip is noticeably hot or quiet the user will say so — adjust
+   speaker's clip is noticeably hot or quiet the user will say so. Adjust
    only named clips with `set_clip_audio` (e.g. volume 0.8), never guess.
 5. Duck music under speech: on each music clip that overlaps voice, set
    `set_clip_audio` volume to ~0.25 and add 0.5 s fades in and out.

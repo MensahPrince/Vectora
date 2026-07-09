@@ -3,7 +3,7 @@ name = "cutlass-commands"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Cutlass structured editor commands (import, trim, split, …)"
+description = "Cutlass structured editor commands (import, trim, split, and related edits)"
 
 [dependencies]
 cutlass-models = { path = "../cutlass-models" }

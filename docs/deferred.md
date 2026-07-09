@@ -17,8 +17,8 @@ README / overview claims that still oversell it.
   time.
 - **Where:** `crates/cutlass-render/src/export_audio.rs`,
   `crates/cutlass-render/src/audio_dsp.rs`, `apps/cutlass-desktop/src/audio.rs`.
-- **Also:** README currently claims pitch stays put; that claim is ahead of
-  the mixer.
+- **Also:** README states pitch follows rate for now; keep it that way until
+  this lands.
 
 ### Reversed-clip audio
 
@@ -55,10 +55,10 @@ README / overview claims that still oversell it.
 
 - **Wanted:** Real H.264/AAC export and media decode on Linux (and solid
   Windows packaging if that matters).
-- **Today:** Apple VideoToolbox path is the supported export story on this
-  line. Linux encoder/decoder return `Unsupported`. Windows/Linux desktop
-  builds are preview-only in the README (UI runs; media may not play).
-  Packaging for Windows/Linux is marked dormant.
+- **Today:** Apple (VideoToolbox) and Windows (Media Foundation) decode and
+  export work. Linux encoder/decoder return `Unsupported`; Linux desktop
+  builds are preview-only in the README (UI runs; media won't play) and Linux
+  packaging is marked dormant.
 - **Where:** `crates/cutlass-encoder`, `crates/cutlass-decoder`,
   [ROADMAP.md](../ROADMAP.md) item 9, `packaging/README.md`.
 
@@ -113,10 +113,6 @@ README / overview claims that still oversell it.
 
 ## Docs / marketing honesty (when revisiting)
 
-Until the audio items above land, these README bullets oversell reality:
-
-- “Change speed without the chipmunk effect — pitch stays put”
-- “Auto-duck music under a voice track”
-- “Beat detection you can snap your cuts to”
-
-Either implement the feature or soften the README when editing that section.
+The README no longer claims pitch preservation, auto-duck, or beat detection
+(fixed Jul 2026). When one of those audio items ships, add it back to the
+README's feature list.

@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Cutlass desktop editor (Slint) — a native Rust frontend that links the platform-independent engine directly."
+description = "Cutlass desktop editor (Slint): a native Rust frontend that links the platform-independent engine directly."
 
 [dependencies]
 # Slint pinned to the 1.16 line: 1.17 moved the unstable wgpu interop to

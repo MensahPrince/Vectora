@@ -34,3 +34,4 @@ trailer.cutlass
 # Agent task scaffolding (local only; do not commit).
 AGENT_TASK.md
 .cursor/plans/
+.cursor/skills/
