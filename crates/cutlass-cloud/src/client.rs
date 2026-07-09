@@ -88,6 +88,11 @@ impl CloudClient {
         self.catalog("/v1/assets/luts", "luts.json")
     }
 
+    /// `GET /v1/assets/lottie` — file-backed Lottie animations.
+    pub fn lottie(&self) -> Result<CatalogResponse, CloudError> {
+        self.catalog("/v1/assets/lottie", "lottie.json")
+    }
+
     /// `GET /v1/assets/skills` — agent skill packs.
     pub fn skills(&self) -> Result<CatalogResponse, CloudError> {
         self.catalog("/v1/assets/skills", "skills.json")

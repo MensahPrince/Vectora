@@ -6,6 +6,7 @@ mod cloud;
 mod drafts;
 mod inspector;
 mod interaction;
+mod lottie_stickers;
 mod os_drop;
 mod params;
 mod paths;
@@ -732,6 +733,20 @@ fn main() -> Result<(), slint::PlatformError> {
             .on_refresh(move || refresh_handle.refresh());
     }
 
+    // Lottie stickers (Library > Stickers > Lottie): catalog fetch, file
+    // downloads, and frame-0 thumbnails on their own thread
+    // (src/lottie_stickers.rs); the registry feeds the drop resolver below.
+    let lottie_registry: lottie_stickers::LottieRegistry =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let lottie_worker =
+        lottie_stickers::LottieWorker::spawn(app.as_weak(), lottie_registry.clone())
+            .map_err(slint::PlatformError::Other)?;
+    {
+        let refresh_handle = lottie_worker.handle();
+        app.global::<LottieBackend>()
+            .on_refresh(move || refresh_handle.refresh());
+    }
+
     let agent_worker = agent::AgentWorker::spawn(preview_worker.handle(), agent_store.as_weak())
         .map_err(slint::PlatformError::from)?;
 
@@ -845,6 +860,7 @@ fn main() -> Result<(), slint::PlatformError> {
 
     let generated_drop_handle = preview_worker.handle();
     let drop_preset_registry = text_preset_registry.clone();
+    let drop_lottie_registry = lottie_registry.clone();
     editor.on_on_generated_dropped(
         move |generator, track_id, start_tick, duration_ticks, drop_row| {
             // "effect:<id>" drops a standalone effect-lane segment: a bare
@@ -866,6 +882,24 @@ fn main() -> Result<(), slint::PlatformError> {
                     (
                         text_presets::generator_for(preset),
                         text_presets::animations_for(preset),
+                    )
+                // "lottie:<id>" drops a file-backed Lottie animation from the
+                // asset catalog (src/lottie_stickers.rs fills the registry).
+                } else if let Some(lottie_id) = generator.as_str().strip_prefix("lottie:") {
+                    let registry = drop_lottie_registry
+                        .lock()
+                        .expect("lottie registry poisoned");
+                    let Some(asset) = registry.get(lottie_id) else {
+                        tracing::warn!(lottie_id, "ignoring drop of unknown lottie asset");
+                        return;
+                    };
+                    (
+                        cutlass_models::Generator::lottie(
+                            asset.path.to_string_lossy(),
+                            asset.width,
+                            asset.height,
+                        ),
+                        Vec::new(),
                     )
                 } else {
                     let Some(generator) = generator_from_key(generator.as_str()) else {

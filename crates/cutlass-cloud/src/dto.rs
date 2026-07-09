@@ -162,6 +162,7 @@ pub enum AssetKind {
     TextPreset,
     Sfx,
     Lut,
+    Lottie,
     Skill,
     #[serde(other)]
     Other,
