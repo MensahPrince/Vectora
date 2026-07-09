@@ -209,6 +209,11 @@ export component TransitionCatalogTile inherits Rectangle {
 export component MediaTile inherits Rectangle {
     in property <Media> media;
 
+    // Lazy-content gate, bound by grid call sites to the grid's
+    // visible-index range so offscreen tiles skip the thumbnail
+    // element (and its texture) entirely. Chrome stays unconditional.
+    in property <bool> thumbnail-visible: true;
+
     // Audio tiles show the waveform card color while the waveform image is
     // still rendering; video tiles stay dark until the poster frame lands.
     background: media.is-audio ? #2A46C8 : AppStore.theme.surface.content-background;
@@ -222,7 +227,7 @@ export component MediaTile inherits Rectangle {
 
     // Poster frame (video) or waveform card (audio), generated off-thread
     // after import — empty until ready (see src/thumbnails.rs).
-    if media.thumbnail.width > 0: Image {
+    if thumbnail-visible && media.thumbnail.width > 0: Image {
         width: parent.width;
         height: parent.height;
         source: media.thumbnail;
@@ -511,11 +516,16 @@ export component StockMediaTile inherits Rectangle {
     in property <StockTile> tile;
     in property <int> index;
 
+    // Lazy-content gate, bound by grid call sites to the grid's
+    // visible-index range so offscreen tiles skip the thumbnail
+    // element (and its texture) entirely. Chrome stays unconditional.
+    in property <bool> thumbnail-visible: true;
+
     background: AppStore.theme.surface.content-background;
     border-radius: 4px;
     clip: true;
 
-    if tile.has-thumbnail: Image {
+    if thumbnail-visible && tile.has-thumbnail: Image {
         width: parent.width;
         height: parent.height;
         source: tile.thumbnail;

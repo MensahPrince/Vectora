@@ -499,6 +499,9 @@ export component LibraryPanel inherits PanelBase {
                             width: media-grid.cell-width;
                             height: media-grid.cell-height;
                             media: m;
+                            // Offscreen tiles skip their poster-frame texture.
+                            thumbnail-visible: i >= media-grid.first-visible-index
+                                && i <= media-grid.last-visible-index;
                         }
                     }
                 }
@@ -615,6 +618,9 @@ export component LibraryPanel inherits PanelBase {
                                 height: stock-grid.cell-height;
                                 tile: tile;
                                 index: i;
+                                // Offscreen tiles skip their thumbnail texture.
+                                thumbnail-visible: i >= stock-grid.first-visible-index
+                                    && i <= stock-grid.last-visible-index;
                             }
                         }
 

@@ -129,6 +129,31 @@ export component CutlassGridView inherits Rectangle {
     out property <length> content-height:
         row-count <= 0 ? 0px : row-count * cell-height + (row-count - 1) * spacing + 2 * inset;
 
+    // ---- Visible range ------------------------------------------------------
+    //
+    // Index range of items whose row intersects the viewport, padded by
+    // one row of overscan on each side so wheel scrolling doesn't pop
+    // content in at the edge. Tiles gate their expensive content
+    // (thumbnail decodes, previews) on this to keep large catalogs
+    // cheap without a virtualization rewrite:
+    //
+    //     if i >= grid.first-visible-index && i <= grid.last-visible-index:
+    //         Image { ... }
+    //
+    // Keep the tile chrome unconditional — only the heavy parts should
+    // come and go, so scroll extents and hit-testing stay stable.
+
+    property <length> row-pitch: max(1px, cell-height + spacing);
+    property <int> first-visible-row:
+        max(0, floor((-viewport-y - inset) / row-pitch) - 1);
+    property <int> last-visible-row:
+        max(0, floor((-viewport-y - inset + self.height) / row-pitch) + 1);
+
+    out property <int> first-visible-index:
+        min(first-visible-row * max(effective-columns, 1), max(item-count - 1, 0));
+    out property <int> last-visible-index:
+        min((last-visible-row + 1) * max(effective-columns, 1) - 1, max(item-count - 1, 0));
+
     // ---- Public placement helpers ------------------------------------------
     //
     // Pure, so Slint can inline them at every for-loop instantiation
