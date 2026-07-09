@@ -493,4 +493,7 @@ export struct Project {
     // Audio-only subset of `media`, projected separately because Slint's
     // `for` can't filter a model — feeds the Audio tab's Local section.
     media-audio: [Media],
+    // Per-project AI agent rules (ProjectMetadata.agent_rules). Shown and
+    // edited in the agent panel; travels with the saved project.
+    agent-rules: string,
 }

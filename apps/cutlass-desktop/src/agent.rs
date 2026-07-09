@@ -22,8 +22,9 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use cutlass_ai::providers::openai_compat::OpenAiCompatProvider;
 use cutlass_ai::{
-    AgentConfig, AgentEvent, EditorContext, EngineBridge, Message, ProjectSummary, PromptStatus,
-    WireCommand, run_prompt, summarize, validate,
+    AgentConfig, AgentEvent, AgentExtensions, EditorContext, EngineBridge, Message,
+    ProjectSummary, PromptStatus, WireCommand, compose_rules, expand_slash_command,
+    load_agent_dir, merge_skills, run_prompt, summarize, validate,
 };
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
@@ -300,14 +301,33 @@ fn agent_main(
                 });
                 push_entry(&store, "user", prompt.clone());
 
+                // Reload ~/.cutlass/agent every prompt (tiny files) so
+                // rule/skill/command edits apply without a restart.
+                let agent_dir = load_agent_dir(&cutlass_settings::agent_dir());
+                for warning in &agent_dir.warnings {
+                    warn!(warning, "agent extension file skipped");
+                    push_entry(&store, "status", warning.clone());
+                }
+                // Slash commands expand client-side; the transcript keeps
+                // what was typed, the model sees the template.
+                let sent = match expand_slash_command(&prompt, &agent_dir.commands) {
+                    Some(expanded) => {
+                        let name = prompt[1..].split_whitespace().next().unwrap_or("");
+                        push_entry(&store, "status", format!("Expanded /{name}."));
+                        expanded
+                    }
+                    None => prompt.clone(),
+                };
+
                 run_one_prompt(
                     &worker,
                     &store,
                     &mut sandbox,
                     &mut preview,
                     &mut history,
-                    &prompt,
+                    &sent,
                     context,
+                    agent_dir,
                     dry_run,
                     &cancel,
                 );
@@ -354,6 +374,7 @@ fn run_one_prompt(
     history: &mut Vec<Message>,
     prompt: &str,
     context: EditorContext,
+    agent_dir: cutlass_ai::AgentDir,
     dry_run: bool,
     cancel: &AtomicBool,
 ) {
@@ -437,6 +458,32 @@ fn run_one_prompt(
         preview.descriptions.clear();
     }
 
+    // Compose rules after the snapshot reset so per-project rules read
+    // from the project this prompt actually edits (imported projects
+    // included — the panel shows them via EditorStore.project.agent-rules).
+    let mut sections: Vec<(String, String)> = agent_dir
+        .rules
+        .into_iter()
+        .map(|(stem, text)| (format!("user rule: {stem}"), text))
+        .collect();
+    let project_rules = engine.project().metadata().agent_rules.clone();
+    if !project_rules.trim().is_empty() {
+        sections.push(("project rules".into(), project_rules));
+    }
+    let (rules, truncated) = compose_rules(&sections);
+    with_store(store, move |s| s.set_rules_truncated(truncated));
+    if truncated {
+        push_entry(
+            store,
+            "status",
+            "Rules exceed the size cap and were truncated.".into(),
+        );
+    }
+    let extensions = AgentExtensions {
+        rules,
+        skills: merge_skills(agent_dir.skills),
+    };
+
     let mut plan: Vec<AgentPlanStep> = preview.plan.clone();
     let mut bridge = SandboxBridge {
         engine,
@@ -453,6 +500,7 @@ fn run_one_prompt(
         &provider,
         &mut bridge,
         &context,
+        &extensions,
         history,
         prompt,
         &AgentConfig::default(),

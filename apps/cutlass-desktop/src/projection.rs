@@ -95,6 +95,7 @@ pub fn project_to_slint(
         },
         media: model(pool),
         media_audio: model(audio_pool),
+        agent_rules: project.metadata().agent_rules.clone().into(),
     }
 }
 

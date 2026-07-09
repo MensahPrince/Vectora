@@ -103,6 +103,7 @@ fn main() {
         &provider,
         &mut host,
         &context,
+        &cutlass_ai::AgentExtensions::default(),
         &[],
         &prompt,
         &AgentConfig::default(),

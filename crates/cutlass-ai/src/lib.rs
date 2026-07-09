@@ -18,6 +18,10 @@
 //!   the deterministic `ScriptedProvider` test double.
 //! - [`config`]: API-key resolution (`api_key_env` indirection). The config
 //!   *file* is owned by `cutlass-settings`; keys never live in project files.
+//! - [`extend`]: prompt-level extensibility — user/project rules, skills
+//!   behind the read-only `read_skill` tool, and slash-command templates.
+//!   Rules and skills shape *how* the closed vocabulary is used; they can
+//!   never add mutation surface.
 //!
 //! Invariant: **AI proposes, the engine disposes.** Nothing in this crate
 //! mutates a project; output is validated commands for the caller to apply
@@ -54,6 +58,7 @@
 pub mod agent;
 pub mod config;
 pub mod describe;
+pub mod extend;
 pub mod provider;
 pub mod providers;
 pub mod validate;
@@ -63,6 +68,10 @@ pub use agent::{
     ActionLogEntry, AgentConfig, AgentEvent, EngineBridge, PromptOutcome, PromptStatus, run_prompt,
 };
 pub use describe::{EditorContext, ProjectSummary, summarize};
+pub use extend::{
+    AgentDir, AgentExtensions, MAX_RULES_BYTES, Skill, SlashCommand, bundled_skills,
+    compose_rules, expand_slash_command, load_agent_dir, merge_skills,
+};
 pub use provider::Message;
 pub use validate::{Rejection, validate};
 pub use wire::{TOOL_SCHEMA_VERSION, ToolSpec, WireCommand, tool_specs};

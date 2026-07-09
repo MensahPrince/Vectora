@@ -229,6 +229,16 @@ pub fn default_config_path() -> PathBuf {
         .join("config.toml")
 }
 
+/// `~/.cutlass/agent/` — the user's AI-assistant extension dir
+/// (`rules/*.md`, `skills/<id>/SKILL.md`, `commands/*.md`), reloaded by
+/// the desktop before every prompt so edits apply without a restart.
+pub fn agent_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(".cutlass")
+        .join("agent")
+}
+
 /// Load settings from `path`. A missing file yields [`Settings::default`]
 /// (not an error); a malformed file is an `Err` naming the problem so the
 /// caller can surface it. Unknown keys/tables are ignored, and any key we

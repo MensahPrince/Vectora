@@ -26,6 +26,19 @@ The crate does not mutate projects directly. It describes project state for the 
 - `validate`: lower wire commands into engine commands or return rejections.
 - `tool_specs` and `TOOL_SCHEMA_VERSION`: tool schema surface exposed to providers.
 - `WireCommand`: model-facing edit request type.
+- `AgentExtensions`, `load_agent_dir`, `bundled_skills`, `merge_skills`: prompt extensibility (rules, skills, slash commands).
+
+## Rules, skills, and slash commands
+
+Users can extend the assistant through `~/.cutlass/agent/` (reloaded before every prompt, no restart needed):
+
+- `rules/*.md` — always-on rules injected into the system prompt, capped at `MAX_RULES_BYTES` (over-budget rules truncate with a visible warning in the agent panel).
+- `skills/<id>/SKILL.md` — on-demand procedural workflows with YAML frontmatter (`name`, `description`). Only the name/description index enters the system prompt; the model fetches a body through the read-only `read_skill` tool.
+- `commands/*.md` — slash-command prompt templates: typing `/name args` in the chat panel expands the template client-side (`$ARGUMENTS` substitution).
+
+Per-project rules live in `ProjectMetadata.agent_rules`, edited from the agent panel, and travel with the project file — the panel shows them (never silently applies them) when a project arrives from elsewhere. Three first-party skills ship embedded from `assets/skills/`; user skills with the same id win.
+
+All of this is prompt-level only: the closed command vocabulary, validation, dry-run, and one-undo-group invariants are untouched, so a bad rule or skill can at worst propose bad edits.
 
 ## Configuration
 

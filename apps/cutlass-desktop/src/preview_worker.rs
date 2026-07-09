@@ -288,6 +288,10 @@ enum WorkerMsg {
         clip: String,
         adjust: ColorAdjustments,
     },
+    /// Save edited per-project agent rules into `ProjectMetadata`.
+    /// Metadata, not a timeline command: dirties the session (rules save
+    /// with the project) but is not undoable, like relink.
+    SetAgentRules { rules: String },
     /// Set (or clear) one look-animation slot on a visual clip.
     SetClipAnimation {
         clip: String,
@@ -978,6 +982,10 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::SetClipAdjust { clip, adjust });
     }
 
+    pub fn set_agent_rules(&self, rules: String) {
+        let _ = self.tx.send(WorkerMsg::SetAgentRules { rules });
+    }
+
     pub fn set_clip_animation(&self, clip: String, slot: String, animation_id: String) {
         let _ = self.tx.send(WorkerMsg::SetClipAnimation {
             clip,
@@ -1496,6 +1504,10 @@ fn worker_loop(
             } => set_clip_lut_and_publish(engine, &clip, &path, intensity, &ui),
             WorkerMsg::SetClipAdjust { clip, adjust } => {
                 set_clip_adjust_and_publish(engine, &clip, adjust, &ui)
+            }
+            WorkerMsg::SetAgentRules { rules } => {
+                engine.set_agent_rules(rules);
+                publish_projection(engine, &ui);
             }
             WorkerMsg::SetClipAnimation {
                 clip,

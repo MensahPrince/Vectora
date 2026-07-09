@@ -848,6 +848,14 @@ fn main() -> Result<(), slint::PlatformError> {
         agent_session.reset_history();
     });
 
+    // Per-project agent rules editor (agent panel) → ProjectMetadata via
+    // the engine worker; the projection publishes the saved value back to
+    // EditorStore.project.agent-rules.
+    let rules_handle = preview_worker.handle();
+    agent_store.on_set_project_rules(move |rules| {
+        rules_handle.set_agent_rules(rules.to_string());
+    });
+
     // Playhead moves (ruler scrub, frame-step keys, Home/End) become preview
     // frame requests; the worker coalesces a burst to the newest tick.
     let frame_handle = preview_worker.handle();

@@ -96,6 +96,18 @@ impl Engine {
         self.project_path.as_ref()
     }
 
+    /// Set the project's per-project AI agent rules (`ProjectMetadata`).
+    /// Metadata, not timeline state: it bypasses the command layer and is
+    /// not undoable by design (like `RelinkMedia`), but it does dirty the
+    /// session so the rules save with the project.
+    pub fn set_agent_rules(&mut self, rules: String) {
+        if self.project.metadata().agent_rules == rules {
+            return;
+        }
+        self.project.metadata_mut().agent_rules = rules;
+        self.revision += 1;
+    }
+
     /// Monotonic session revision, bumped by every successful mutation.
     pub fn revision(&self) -> u64 {
         self.revision

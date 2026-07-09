@@ -129,6 +129,7 @@ fn run_with(
         provider,
         host,
         context,
+        &cutlass_ai::AgentExtensions::default(),
         &[],
         prompt,
         config,
@@ -1383,6 +1384,7 @@ fn session_history_threads_prior_turns_into_the_next_prompt() {
         &first,
         &mut host,
         &ctx,
+        &cutlass_ai::AgentExtensions::default(),
         &[],
         "split the selected clip in half",
         &AgentConfig::default(),
@@ -1401,6 +1403,7 @@ fn session_history_threads_prior_turns_into_the_next_prompt() {
         &second,
         &mut host,
         &ctx,
+        &cutlass_ai::AgentExtensions::default(),
         &outcome1.turn_messages,
         "what did you just do?",
         &AgentConfig::default(),
@@ -1431,6 +1434,80 @@ fn session_history_threads_prior_turns_into_the_next_prompt() {
     );
 }
 
+/// Skill retrieval-and-follow: with skills loaded, the index (names +
+/// descriptions only) enters the system prompt, `read_skill` returns the
+/// body without counting as an edit, and the model then edits per the
+/// procedure — the whole prompt still one undo group.
+#[test]
+fn read_skill_feeds_the_procedure_then_edits_follow() {
+    let (mut host, _media, _track, clip) = fixture();
+    let cancel = AtomicBool::new(false);
+    let extensions = cutlass_ai::AgentExtensions {
+        rules: "[user]\nprefer tight cuts".into(),
+        skills: vec![cutlass_ai::Skill {
+            id: "tight-open".into(),
+            name: "Tight opening".into(),
+            description: "Trim the first seconds off the opening clip.".into(),
+            body: "Step 1: trim_clip the first clip, raising start by 3.".into(),
+        }],
+    };
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "read_skill",
+            serde_json::json!({ "id": "tight-open" }),
+        )]),
+        tool_turn(vec![(
+            "call_2",
+            "trim_clip",
+            serde_json::json!({ "clip": clip, "start": 3.0, "duration": 7.0 }),
+        )]),
+        text_turn("Tightened the opening per the skill."),
+    ]);
+
+    let cfg = AgentConfig {
+        max_tool_calls: 1, // read_skill must not consume the only edit slot
+        ..AgentConfig::default()
+    };
+    let mut events = Vec::new();
+    let outcome = run_prompt(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        &extensions,
+        &[],
+        "tighten the opening",
+        &cfg,
+        &cancel,
+        &mut |e| events.push(e),
+    );
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 1);
+    assert!(outcome.actions[0].description.starts_with("trimmed clip"));
+
+    // The system prompt carried the rules and the index, not the body.
+    let sent = provider.requests();
+    let Message::System { content } = &sent[0][0] else {
+        panic!("first message is the system prompt");
+    };
+    assert!(content.contains("prefer tight cuts"));
+    assert!(content.contains("tight-open (Tight opening)"));
+    assert!(!content.contains("Step 1: trim_clip"));
+
+    // The read_skill tool result delivered the body verbatim.
+    let body_result = sent[1].iter().find_map(|m| match m {
+        Message::ToolResult { content, .. } => Some(content.clone()),
+        _ => None,
+    });
+    assert!(
+        body_result
+            .expect("read_skill result in the second request")
+            .contains("Step 1: trim_clip"),
+    );
+
+    assert!(host.engine.undo(), "one undo entry for the whole prompt");
+}
+
 /// `describe_project` results are large and the fresh system snapshot
 /// supersedes them, so history keeps only a placeholder — never a full
 /// stale project blob.
@@ -1446,6 +1523,7 @@ fn describe_project_results_are_collapsed_in_history() {
         &provider,
         &mut host,
         &EditorContext::default(),
+        &cutlass_ai::AgentExtensions::default(),
         &[],
         "what's on the timeline?",
         &AgentConfig::default(),

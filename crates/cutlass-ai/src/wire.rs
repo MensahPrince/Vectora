@@ -41,7 +41,7 @@ use serde::{Deserialize, Serialize};
 ///     tool descriptions drop the "linked audio companion" steering.
 /// 20: look tools (mask/chroma/stabilize/filter/adjust/animation/audio_role);
 ///     removed unsupported `duck` and `detect_beats`.
-pub const TOOL_SCHEMA_VERSION: u32 = 20;
+pub const TOOL_SCHEMA_VERSION: u32 = 21;
 
 /// Track lane categories the agent may create or target.
 ///

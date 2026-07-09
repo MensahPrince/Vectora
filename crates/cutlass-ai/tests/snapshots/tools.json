@@ -1870,7 +1870,23 @@
         "properties": {},
         "type": "object"
       }
+    },
+    {
+      "description": "Fetch the full step-by-step procedure of a skill by id. The available skills (id, name, and what they're for) are listed in the system prompt. Call this before starting a task a skill covers, then follow the returned procedure.",
+      "name": "read_skill",
+      "parameters": {
+        "properties": {
+          "id": {
+            "description": "The skill id, exactly as listed in the system prompt.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      }
     }
   ],
-  "version": 20
+  "version": 21
 }
