@@ -662,8 +662,8 @@ export component LaunchScreen inherits Rectangle {
                         vertical-stretch: 1;
                     }
 
-                    // Update nudge: a quiet chip above the footer when the
-                    // backend reports a newer release. Click opens the
+                    // Update nudge: a quiet chip at the bottom of the rail when
+                    // the backend reports a newer release. Click opens the
                     // download page in the browser; never blocks anything.
                     if AccountBackend.update-available: Rectangle {
                         height: 30px;
@@ -687,47 +687,6 @@ export component LaunchScreen inherits Rectangle {
                             mouse-cursor: pointer;
                             clicked => {
                                 AccountBackend.open-update();
-                            }
-                        }
-                    }
-
-                    // Footer: honest local-workspace status.
-                    VerticalLayout {
-                        spacing: AppStore.theme.metrics.spacing.sm;
-
-                        Rectangle {
-                            height: AppStore.theme.metrics.stroke.hairline;
-                            background: #ffffff12;
-                        }
-
-                        HorizontalLayout {
-                            spacing: AppStore.theme.metrics.spacing.sm;
-
-                            VerticalLayout {
-                                alignment: center;
-
-                                Rectangle {
-                                    width: 7px;
-                                    height: 7px;
-                                    border-radius: 3.5px;
-                                    background: AppStore.theme.accent.primary;
-                                }
-                            }
-
-                            VerticalLayout {
-                                alignment: center;
-                                spacing: 1px;
-
-                                CutlassText {
-                                    text: "Local workspace";
-                                    style: AppStore.theme.typography.label;
-                                }
-
-                                CutlassText {
-                                    text: "Runs on-device · open source";
-                                    style: AppStore.theme.typography.caption;
-                                    foreground: AppStore.theme.text.muted;
-                                }
                             }
                         }
                     }
