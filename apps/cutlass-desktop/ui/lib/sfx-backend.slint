@@ -1,0 +1,36 @@
+// Sound effects for Library > Audio > Sound effects, implemented in Rust
+// (src/sfx.rs owns a worker thread; catalog fetches and file downloads
+// never touch the UI thread).
+//
+// The worker fetches the anonymous catalog (/v1/assets/sfx) and publishes
+// metadata tiles immediately; files download lazily on click-to-import
+// (stock pattern — an imported SFX is ordinary pool media under Audio >
+// Local, draggable to audio lanes like any MediaTile).
+
+// One catalog sound effect.
+export struct SfxTile {
+    // Catalog id ("sfx-whoosh-01").
+    key: string,
+    name: string,
+    // "0:03" corner chip.
+    duration-label: string,
+    // Provenance credit ("CC0 · freesound.org / author"), hover-revealed.
+    attribution: string,
+    // "" | "downloading" | "imported" | "failed"
+    state: string,
+    // Download progress 0..1 while `state == "downloading"`.
+    progress: float,
+}
+
+export global SfxBackend {
+    in-out property <[SfxTile]> items: [];
+    // "idle" (never fetched) | "loading" | "results" | "empty" | "error".
+    in-out property <string> status: "idle";
+    in-out property <string> error: "";
+
+    // (Re)fetch the catalog.
+    callback refresh();
+
+    // Download (if needed) and import `items[index]` into the media pool.
+    callback import(index: int);
+}

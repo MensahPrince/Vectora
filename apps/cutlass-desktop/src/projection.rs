@@ -95,6 +95,7 @@ pub fn project_to_slint(
         },
         media: model(pool),
         media_audio: model(audio_pool),
+        agent_rules: project.metadata().agent_rules.clone().into(),
     }
 }
 
@@ -259,10 +260,11 @@ fn clip_to_slint(
     let clip_start = clip.timeline.start.value;
     let (shape_width, shape_height) = clip_shape_size(clip);
     let (filter_id, filter_label, filter_intensity) = clip_filter(clip);
+    let (lut_id, lut_label, lut_intensity) = clip_lut(clip);
     let (animation_in_id, animation_in_label) = clip_animation(clip.animation_in.as_ref());
     let (animation_out_id, animation_out_label) = clip_animation(clip.animation_out.as_ref());
     let (animation_combo_id, animation_combo_label) = clip_animation(clip.animation_combo.as_ref());
-    let caps = clip_capabilities(clip, track_kind);
+    let caps = clip_capabilities(project, clip, track_kind);
 
     Clip {
         id: clip.id.raw().to_string().into(),
@@ -324,6 +326,9 @@ fn clip_to_slint(
         adjust_saturation: clip.adjust.saturation,
         adjust_exposure: clip.adjust.exposure,
         adjust_temperature: clip.adjust.temperature,
+        lut_id: lut_id.into(),
+        lut_label: lut_label.into(),
+        lut_intensity,
         animation_in_id: animation_in_id.into(),
         animation_in_label: animation_in_label.into(),
         animation_out_id: animation_out_id.into(),
@@ -367,6 +372,38 @@ fn clip_filter(clip: &EngineClip) -> (String, String, f32) {
         .unwrap_or(filter.id.as_str())
         .to_string();
     (filter.id.clone(), label, filter.intensity)
+}
+
+/// Project a clip's `.cube` LUT as (id, label, intensity). The id is the
+/// file's stem — for catalog downloads that IS the catalog id (the LUT
+/// worker names files `<id>.cube`) — and the label prettifies it
+/// (`cutlass-vivid` → "Vivid").
+fn clip_lut(clip: &EngineClip) -> (String, String, f32) {
+    let Some(lut) = &clip.lut else {
+        return (String::new(), String::new(), 0.0);
+    };
+    let id = std::path::Path::new(&lut.path)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| lut.path.clone());
+    (id.clone(), lut_label(&id), lut.intensity)
+}
+
+/// Human label for a LUT id/stem: strip the first-party prefix, split on
+/// separators, capitalize words (`cutlass-teal_orange` → "Teal Orange").
+pub(crate) fn lut_label(id: &str) -> String {
+    let base = id.strip_prefix("cutlass-").unwrap_or(id);
+    base.split(['-', '_', ' '])
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn clip_animation(animation: Option<&cutlass_models::AnimationRef>) -> (String, String) {
@@ -691,6 +728,13 @@ fn clip_labels(project: &EngineProject, clip: &EngineClip) -> (String, String) {
                     .map_or_else(|| "Sticker".to_owned(), |s| s.label.to_owned()),
                 String::new(),
             ),
+            Generator::Lottie { path, .. } => (
+                std::path::Path::new(path)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map_or_else(|| "Animation".to_owned(), str::to_owned),
+                String::new(),
+            ),
             Generator::Effect => ("Effect".to_owned(), String::new()),
             Generator::Filter => ("Filter".to_owned(), String::new()),
             Generator::Adjustment => ("Adjustment".to_owned(), String::new()),
@@ -733,6 +777,8 @@ fn clip_generator_visual(clip: &EngineClip) -> (&'static str, Color) {
         {
             ("sticker", transparent)
         }
+        // File-backed Lotties composite like stickers (preview hit-testing).
+        ClipSource::Generated(Generator::Lottie { .. }) => ("sticker", transparent),
         _ => ("", transparent),
     }
 }
@@ -853,8 +899,12 @@ fn track_kind(kind: EngineKind) -> TrackKind {
     }
 }
 
-fn clip_capabilities(clip: &EngineClip, kind: EngineKind) -> ClipCapabilities {
-    let caps = EngineCaps::for_clip(clip, kind);
+fn clip_capabilities(
+    project: &EngineProject,
+    clip: &EngineClip,
+    kind: EngineKind,
+) -> ClipCapabilities {
+    let caps = EngineCaps::for_clip(project, clip, kind);
     ClipCapabilities {
         has_transform: caps.has_transform,
         has_crop: caps.has_crop,
@@ -867,6 +917,7 @@ fn clip_capabilities(clip: &EngineClip, kind: EngineKind) -> ClipCapabilities {
         can_split: caps.can_split,
         can_reverse: caps.can_reverse,
         can_ripple_delete: caps.can_ripple_delete,
+        can_extract_audio: caps.can_extract_audio,
     }
 }
 

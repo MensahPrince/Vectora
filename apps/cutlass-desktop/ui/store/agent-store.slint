@@ -39,6 +39,12 @@ export global AgentStore {
     // while the agent's group is the newest entry.
     in-out property <bool> undo-offered: false;
 
+    // The composed rules (user ~/.cutlass/agent/rules + project rules)
+    // overflowed the size cap on the last prompt and were truncated — the
+    // cap exists for small local models, and truncation must be visible,
+    // never silent.
+    in-out property <bool> rules-truncated: false;
+
     // → main.rs → agent worker.
     callback send(prompt: string);
     callback cancel();
@@ -48,4 +54,10 @@ export global AgentStore {
     // running prompt and drop a parked plan — both rehearsed against the
     // old project. Fired from app.slint's session-epoch watcher.
     callback session-changed();
+
+    // Save edited per-project agent rules (→ main.rs → engine worker →
+    // ProjectMetadata). The current value reads from
+    // EditorStore.project.agent-rules, so imported-project rules are
+    // always visible here before they shape a prompt.
+    callback set-project-rules(rules: string);
 }

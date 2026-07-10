@@ -26,7 +26,7 @@ This crate is the main integration point for non-UI callers. The desktop editor,
 - `export_project`, `export_timeline`, and related helpers: direct export entry points.
 - `RgbaFrame`: preview frame returned by the engine.
 
-## How It Fits
+## How it fits
 
 `cutlass-engine` depends on most lower-level crates:
 
@@ -39,7 +39,7 @@ This crate is the main integration point for non-UI callers. The desktop editor,
 
 The engine should stay UI-agnostic. Slint models, widgets, file dialogs, and interaction state belong in `cutlass-ui`.
 
-## Testing And Benchmarks
+## Testing and benchmarks
 
 Run the engine tests with:
 

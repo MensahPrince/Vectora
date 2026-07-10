@@ -1,6 +1,6 @@
 [package]
 name = "cutlass-ai"
-description = "AI agent foundation: LLM-facing wire commands, validation, and project summaries"
+description = "Prompt-to-edit layer: LLM-facing wire commands, validation, and project summaries"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -18,3 +18,4 @@ ureq = "2"
 [dev-dependencies]
 cutlass-engine = { path = "../cutlass-engine" }
 cutlass-settings = { path = "../cutlass-settings" }
+tempfile = "3"

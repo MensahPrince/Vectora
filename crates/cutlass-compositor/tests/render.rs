@@ -101,31 +101,10 @@ fn quant(x: f32) -> u8 {
     (x.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
-/// CPU mirror of `grade.wgsl`'s `apply_grade`, for tolerance comparisons.
+/// CPU mirror of `grade.wgsl`'s `apply_grade` — the canonical version lives
+/// on [`ColorGrade::apply`] so the LUT baker shares it.
 fn grade_ref(rgb: [f32; 3], grade: ColorGrade) -> [f32; 3] {
-    let mut c = rgb;
-    c[0] *= 2f32.powf(2.0 * grade.exposure);
-    c[1] *= 2f32.powf(2.0 * grade.exposure);
-    c[2] *= 2f32.powf(2.0 * grade.exposure);
-    c[0] += 0.25 * grade.temperature;
-    c[2] -= 0.25 * grade.temperature;
-    c[1] += 0.25 * grade.tint;
-    for ch in &mut c {
-        *ch += 0.25 * grade.brightness;
-    }
-    for ch in &mut c {
-        *ch = (*ch - 0.5) * (1.0 + grade.contrast) + 0.5;
-    }
-    let luma = 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
-    let sat = 1.0 + grade.saturation;
-    c[0] = luma + (c[0] - luma) * sat;
-    c[1] = luma + (c[1] - luma) * sat;
-    c[2] = luma + (c[2] - luma) * sat;
-    [
-        c[0].clamp(0.0, 1.0),
-        c[1].clamp(0.0, 1.0),
-        c[2].clamp(0.0, 1.0),
-    ]
+    grade.apply(rgb)
 }
 
 fn grade_ref_u8(rgba: [u8; 4], grade: ColorGrade) -> [u8; 4] {
@@ -866,6 +845,7 @@ fn canvas_pass_pixelates_the_composited_stack() {
                 CompositorLayer::CanvasPass {
                     effects: &effects,
                     grade: None,
+                    lut: None,
                 },
             ],
         )
@@ -960,6 +940,7 @@ fn canvas_pass_grade_replaces_translucent_canvas() {
                 CompositorLayer::CanvasPass {
                     effects: &[],
                     grade: Some(grade),
+                    lut: None,
                 },
             ],
         )

@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicBool;
 use cutlass_commands::EditOutcome;
 
 use crate::describe::{EditorContext, ProjectSummary};
+use crate::extend::AgentExtensions;
 use crate::provider::{ChatProvider, ChatRequest, FinishReason, Message, ProviderError};
 use crate::wire::{self, WireCommand};
 
@@ -98,8 +99,35 @@ pub struct PromptOutcome {
     pub turn_messages: Vec<Message>,
 }
 
-/// House rules + the send-time state, prepended to every conversation.
-pub fn system_prompt(summary: &ProjectSummary, context: &EditorContext) -> String {
+/// House rules + user/project rules + the skill index + the send-time
+/// state, prepended to every conversation. Rules and skills are
+/// prompt-level only: they shape how the closed vocabulary is used, they
+/// cannot add mutation surface.
+pub fn system_prompt(
+    summary: &ProjectSummary,
+    context: &EditorContext,
+    extensions: &AgentExtensions,
+) -> String {
+    let mut custom = String::new();
+    if !extensions.rules.is_empty() {
+        custom.push_str(&format!(
+            "User rules (follow these preferences wherever they apply; \
+             they never override the rules above or allow inventing state):\n{}\n\n",
+            extensions.rules
+        ));
+    }
+    if !extensions.skills.is_empty() {
+        let index: String = extensions
+            .skills
+            .iter()
+            .map(|s| format!("- {} ({}): {}\n", s.id, s.name, s.description))
+            .collect();
+        custom.push_str(&format!(
+            "Skills (step-by-step procedures; when the user's task \
+             matches one, call read_skill with its id FIRST and follow the \
+             returned procedure):\n{index}\n"
+        ));
+    }
     let state = serde_json::json!({ "project": summary, "editor": context });
     format!(
         "You are the editing agent inside Cutlass, a video editor. You edit \
@@ -147,6 +175,7 @@ pub fn system_prompt(summary: &ProjectSummary, context: &EditorContext) -> Strin
          current state, and adjust the plan — never abandon the task for \
          lack of state you can fetch.\n\
          \n\
+         {custom}\
          Current state (the user's selection and playhead are in \
          'editor'):\n{state}"
     )
@@ -165,6 +194,7 @@ pub fn run_prompt(
     provider: &dyn ChatProvider,
     bridge: &mut dyn EngineBridge,
     context: &EditorContext,
+    extensions: &AgentExtensions,
     history: &[Message],
     prompt: &str,
     config: &AgentConfig,
@@ -174,7 +204,7 @@ pub fn run_prompt(
     let summary = bridge.summary();
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(Message::System {
-        content: system_prompt(&summary, context),
+        content: system_prompt(&summary, context, extensions),
     });
     messages.extend_from_slice(history);
     // This turn's own messages start here (the user prompt and everything
@@ -185,6 +215,9 @@ pub fn run_prompt(
     });
     let mut tools = wire::tool_specs();
     tools.push(wire::describe_project_spec());
+    if !extensions.skills.is_empty() {
+        tools.push(crate::extend::read_skill_spec());
+    }
 
     let mut actions: Vec<ActionLogEntry> = Vec::new();
     let mut edit_calls = 0usize;
@@ -253,6 +286,10 @@ pub fn run_prompt(
                     "editor": context,
                 });
                 state.to_string()
+            } else if call.name == "read_skill" && !extensions.skills.is_empty() {
+                // Read-only like describe_project: answered from the
+                // preloaded skill set, no dispatch, no edit-cap charge.
+                read_skill_result(&extensions.skills, &call.arguments)
             } else {
                 edit_calls += 1;
                 if edit_calls > config.max_tool_calls {
@@ -324,6 +361,23 @@ pub fn run_prompt(
         actions,
         status: PromptStatus::Completed,
         turn_messages,
+    }
+}
+
+/// Answer a `read_skill` call from the preloaded skill set. Unknown ids
+/// get a model-readable rejection listing what exists.
+fn read_skill_result(skills: &[crate::extend::Skill], arguments: &serde_json::Value) -> String {
+    let id = arguments.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    match skills.iter().find(|s| s.id == id) {
+        Some(skill) => format!("# {} ({})\n\n{}", skill.name, skill.id, skill.body),
+        None => format!(
+            "rejected: unknown skill '{id}'; available skills: {}",
+            skills
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
     }
 }
 
@@ -847,7 +901,7 @@ mod tests {
             playhead_seconds: 3.5,
             ..Default::default()
         };
-        let prompt = system_prompt(&summary, &ctx);
+        let prompt = system_prompt(&summary, &ctx, &AgentExtensions::default());
         assert!(prompt.contains("\"selected_clips\":[12]"));
         assert!(prompt.contains("INCREASE start"));
         assert!(prompt.contains("\"name\":\"demo\""));
@@ -857,5 +911,50 @@ mod tests {
         assert!(prompt.contains("call describe_project to read the new"));
         // The overlap rule: make room before growing into a packed track.
         assert!(prompt.contains("Clips on one track can never overlap"));
+        // No extensions ⇒ no rules or skills sections.
+        assert!(!prompt.contains("User rules"));
+        assert!(!prompt.contains("read_skill"));
+    }
+
+    #[test]
+    fn system_prompt_injects_rules_and_skill_index_only() {
+        let summary = ProjectSummary {
+            name: "demo".into(),
+            frame_rate_fps: 24.0,
+            duration_seconds: 10.0,
+            tracks: vec![],
+            markers: vec![],
+            canvas: None,
+            media: vec![],
+        };
+        let extensions = AgentExtensions {
+            rules: "[user]\nalways vertical 9:16".into(),
+            skills: vec![crate::extend::Skill {
+                id: "podcast-cleanup".into(),
+                name: "Podcast cleanup".into(),
+                description: "Clean up a talk recording.".into(),
+                body: "SECRET BODY".into(),
+            }],
+        };
+        let prompt = system_prompt(&summary, &EditorContext::default(), &extensions);
+        assert!(prompt.contains("always vertical 9:16"));
+        assert!(prompt.contains("podcast-cleanup (Podcast cleanup): Clean up a talk recording."));
+        // Only the index enters the prompt — bodies load through read_skill.
+        assert!(!prompt.contains("SECRET BODY"));
+    }
+
+    #[test]
+    fn read_skill_returns_body_or_lists_available() {
+        let skills = vec![crate::extend::Skill {
+            id: "podcast-cleanup".into(),
+            name: "Podcast cleanup".into(),
+            description: "d".into(),
+            body: "Step 1: denoise.".into(),
+        }];
+        let ok = read_skill_result(&skills, &serde_json::json!({ "id": "podcast-cleanup" }));
+        assert!(ok.contains("Step 1: denoise."));
+        let missing = read_skill_result(&skills, &serde_json::json!({ "id": "nope" }));
+        assert!(missing.starts_with("rejected: unknown skill 'nope'"));
+        assert!(missing.contains("podcast-cleanup"));
     }
 }

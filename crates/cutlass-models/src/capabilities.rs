@@ -2,11 +2,13 @@
 //! actions apply to a clip on a given lane.
 //!
 //! This is **not** persisted — it is computed from [`Clip`] + [`TrackKind`]
-//! and mirrors the engine's edit-command rejection rules. The desktop UI
-//! projects these flags onto the Slint clip model; the AI agent can use the
-//! same descriptor to pre-validate commands before dispatching them.
+//! (+ project context for extract-audio) and mirrors the engine's edit-command
+//! rejection rules. The desktop UI projects these flags onto the Slint clip
+//! model; the AI agent can use the same descriptor to pre-validate commands
+//! before dispatching them.
 
 use crate::clip::{Clip, ClipSource, Generator};
+use crate::project::Project;
 use crate::track::TrackKind;
 
 /// What a clip supports for inspector panels and context-menu actions.
@@ -37,6 +39,9 @@ pub struct ClipCapabilities {
     pub can_reverse: bool,
     /// Delete and close the gap on the clip's lane (`RippleDelete`).
     pub can_ripple_delete: bool,
+    /// CapCut "extract audio": detach the video clip's sound onto a linked
+    /// audio-lane companion (same media, no new library asset).
+    pub can_extract_audio: bool,
 }
 
 /// A timeline edit the UI or agent may offer for a selected clip.
@@ -48,11 +53,13 @@ pub enum ClipAction {
     Delete,
     RippleDelete,
     Reverse,
+    ExtractAudio,
 }
 
 impl ClipCapabilities {
-    /// Derive capabilities from the clip's content and the lane it sits on.
-    pub fn for_clip(clip: &Clip, kind: TrackKind) -> Self {
+    /// Derive capabilities from the clip's content, the lane it sits on, and
+    /// project context (media `has_audio`, already-detached link state).
+    pub fn for_clip(project: &Project, clip: &Clip, kind: TrackKind) -> Self {
         let is_visual = kind.is_visual();
         let is_media = clip.source_range().is_some();
 
@@ -61,6 +68,14 @@ impl ClipCapabilities {
             ClipSource::Generated(Generator::Shape { .. }) => (false, true),
             _ => (false, false),
         };
+
+        let media_has_audio = match &clip.content {
+            ClipSource::Media { media, .. } => project.media(*media).is_some_and(|m| m.has_audio),
+            ClipSource::Generated(_) => false,
+        };
+        let can_extract_audio = kind == TrackKind::Video
+            && media_has_audio
+            && !project.timeline().detached_to_audio_lane(clip.id);
 
         Self {
             has_transform: is_visual,
@@ -74,6 +89,7 @@ impl ClipCapabilities {
             can_split: true,
             can_reverse: is_media,
             can_ripple_delete: true,
+            can_extract_audio,
         }
     }
 
@@ -85,6 +101,7 @@ impl ClipCapabilities {
             ClipAction::Split => self.can_split,
             ClipAction::Reverse => self.can_reverse,
             ClipAction::RippleDelete => self.can_ripple_delete,
+            ClipAction::ExtractAudio => self.can_extract_audio,
             ClipAction::Copy | ClipAction::Duplicate | ClipAction::Delete => true,
         }
     }
@@ -94,8 +111,11 @@ impl ClipCapabilities {
 mod tests {
     use super::*;
     use crate::clip::{Clip, Generator, Shape};
-    use crate::ids::MediaId;
+    use crate::ids::{LinkId, MediaId};
+    use crate::media::MediaSource;
+    use crate::project::Project;
     use crate::time::{Rational, TimeRange};
+    use crate::track::Track;
 
     const R24: Rational = Rational::FPS_24;
 
@@ -103,18 +123,41 @@ mod tests {
         TimeRange::at_rate(start, duration, R24)
     }
 
-    fn media_clip() -> Clip {
-        Clip::from_media(MediaId::from_raw(1), tr(0, 48), tr(0, 48))
+    fn project_with_media(has_audio: bool) -> (Project, MediaId) {
+        let mut project = Project::new("caps", R24);
+        let media = project.add_media(MediaSource::new(
+            "/tmp/caps.mp4",
+            1920,
+            1080,
+            R24,
+            480,
+            has_audio,
+        ));
+        (project, media)
     }
 
-    fn assert_caps(clip: &Clip, kind: TrackKind, expect: ClipCapabilities) {
-        assert_eq!(ClipCapabilities::for_clip(clip, kind), expect);
+    fn place_media(project: &mut Project, media: MediaId, kind: TrackKind) -> Clip {
+        let track = project
+            .timeline_mut()
+            .add_track(Track::new(kind, format!("{kind:?}")));
+        let clip = Clip::from_media(media, tr(0, 48), tr(0, 48));
+        let id = project
+            .timeline_mut()
+            .add_clip(track, clip)
+            .expect("place clip");
+        project.clip(id).expect("clip").clone()
+    }
+
+    fn assert_caps(project: &Project, clip: &Clip, kind: TrackKind, expect: ClipCapabilities) {
+        assert_eq!(ClipCapabilities::for_clip(project, clip, kind), expect);
     }
 
     #[test]
     fn media_video_clip_caps() {
-        let clip = media_clip();
+        let (mut project, media) = project_with_media(true);
+        let clip = place_media(&mut project, media, TrackKind::Video);
         assert_caps(
+            &project,
             &clip,
             TrackKind::Video,
             ClipCapabilities {
@@ -129,14 +172,25 @@ mod tests {
                 can_split: true,
                 can_reverse: true,
                 can_ripple_delete: true,
+                can_extract_audio: true,
             },
         );
     }
 
     #[test]
+    fn media_video_without_audio_cannot_extract() {
+        let (mut project, media) = project_with_media(false);
+        let clip = place_media(&mut project, media, TrackKind::Video);
+        let caps = ClipCapabilities::for_clip(&project, &clip, TrackKind::Video);
+        assert!(!caps.can_extract_audio);
+    }
+
+    #[test]
     fn media_audio_clip_caps() {
-        let clip = media_clip();
+        let (mut project, media) = project_with_media(true);
+        let clip = place_media(&mut project, media, TrackKind::Audio);
         assert_caps(
+            &project,
             &clip,
             TrackKind::Audio,
             ClipCapabilities {
@@ -151,14 +205,17 @@ mod tests {
                 can_split: true,
                 can_reverse: true,
                 can_ripple_delete: true,
+                can_extract_audio: false,
             },
         );
     }
 
     #[test]
     fn text_clip_caps() {
+        let project = Project::new("text", R24);
         let clip = Clip::generated(Generator::text("Hello"), tr(0, 48));
         assert_caps(
+            &project,
             &clip,
             TrackKind::Text,
             ClipCapabilities {
@@ -173,17 +230,20 @@ mod tests {
                 can_split: true,
                 can_reverse: false,
                 can_ripple_delete: true,
+                can_extract_audio: false,
             },
         );
     }
 
     #[test]
     fn shape_clip_caps() {
+        let project = Project::new("shape", R24);
         let clip = Clip::generated(
             Generator::shape(Shape::Rectangle, [255, 0, 0, 255]),
             tr(0, 48),
         );
         assert_caps(
+            &project,
             &clip,
             TrackKind::Sticker,
             ClipCapabilities {
@@ -198,12 +258,14 @@ mod tests {
                 can_split: true,
                 can_reverse: false,
                 can_ripple_delete: true,
+                can_extract_audio: false,
             },
         );
     }
 
     #[test]
     fn solid_and_adjustment_caps() {
+        let project = Project::new("gen", R24);
         let solid = Clip::generated(
             Generator::SolidColor {
                 rgba: [0, 0, 0, 255],
@@ -211,6 +273,7 @@ mod tests {
             tr(0, 24),
         );
         assert_caps(
+            &project,
             &solid,
             TrackKind::Sticker,
             ClipCapabilities {
@@ -226,6 +289,7 @@ mod tests {
 
         let adj = Clip::generated(Generator::Adjustment, tr(0, 24));
         assert_caps(
+            &project,
             &adj,
             TrackKind::Adjustment,
             ClipCapabilities {
@@ -242,16 +306,44 @@ mod tests {
     }
 
     #[test]
+    fn extract_audio_disabled_once_detached() {
+        let (mut project, media) = project_with_media(true);
+        let video = place_media(&mut project, media, TrackKind::Video);
+        let audio_track = project
+            .timeline_mut()
+            .add_track(Track::new(TrackKind::Audio, "A1"));
+        let companion = Clip::from_media(media, video.source_range().unwrap(), video.timeline);
+        let audio_id = project
+            .timeline_mut()
+            .add_clip(audio_track, companion)
+            .expect("audio companion");
+        let link = LinkId::next();
+        project.timeline_mut().clip_mut(video.id).unwrap().link = Some(link);
+        project.timeline_mut().clip_mut(audio_id).unwrap().link = Some(link);
+
+        let caps =
+            ClipCapabilities::for_clip(&project, project.clip(video.id).unwrap(), TrackKind::Video);
+        assert!(!caps.can_extract_audio);
+        assert!(!project.timeline().carries_own_audio(video.id));
+    }
+
+    #[test]
     fn allows_action_matches_flags() {
-        let video = ClipCapabilities::for_clip(&media_clip(), TrackKind::Video);
+        let (mut project, media) = project_with_media(true);
+        let clip = place_media(&mut project, media, TrackKind::Video);
+        let video = ClipCapabilities::for_clip(&project, &clip, TrackKind::Video);
         assert!(video.allows(ClipAction::Reverse));
         assert!(video.allows(ClipAction::Split));
+        assert!(video.allows(ClipAction::ExtractAudio));
 
+        let text_project = Project::new("text", R24);
         let text = ClipCapabilities::for_clip(
+            &text_project,
             &Clip::generated(Generator::text("Hi"), tr(0, 24)),
             TrackKind::Text,
         );
         assert!(!text.allows(ClipAction::Reverse));
+        assert!(!text.allows(ClipAction::ExtractAudio));
         assert!(text.allows(ClipAction::Copy));
     }
 }

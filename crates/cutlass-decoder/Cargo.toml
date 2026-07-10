@@ -19,6 +19,14 @@ png = "0.17"
 zune-jpeg = "0.5"
 # Portable animated-sticker decode: GIF frames (APNG rides on `png` above).
 gif = "0.14"
+# Lottie vector animation: velato parses + replays draw calls; vello_cpu
+# rasterizes them (pure Rust, SIMD — the GPU stays with the compositor).
+# velato's optional `vello` feature would drag in wgpu; off. kurbo/peniko
+# pinned to the lines both crates share so sink types unify.
+velato = { version = "0.10", default-features = false }
+vello_cpu = "0.0.9"
+kurbo = "0.13"
+peniko = "0.6"
 
 # Apple backend: AVFoundation reader (demux + VideoToolbox decode) producing
 # IOSurface-backed CVPixelBuffers. objc2 framework crates are pinned to the same

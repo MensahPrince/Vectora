@@ -58,7 +58,7 @@
 use core::cmp::Ordering;
 use std::time::Instant;
 
-use cutlass_core::{DecodeError, Rational, RationalTime, VideoDecoder, VideoFrame};
+use cutlass_core::{DecodeError, Rational, RationalTime, VideoDecoder, VideoFrame, resample};
 
 /// Upper bound on the roll window: a pathological cost estimate (huge seek
 /// EMA, tiny frame EMA) must never make the decoder crawl forever instead of
@@ -274,6 +274,13 @@ pub(crate) fn frame_at_rolling<D: VideoDecoder + ?Sized>(
 /// Every other target seeks and decodes a single frame, snapping to the
 /// sync point at or before `target`.
 ///
+/// A target at or past end of stream would otherwise miss (`Ok(None)`),
+/// but "nearest" callers expect the tail frame there — containers
+/// routinely over-report their frame count by one, so end-of-media
+/// targets overshoot EOF in ordinary editing (transition tail frames,
+/// the final tick of a clip). Such targets fall back to
+/// [`seek_back_to_tail`].
+///
 /// The snap path deliberately does **not** feed `stats`: its cost (one
 /// decode) says nothing about a full exact `frame_at`, and folding it into
 /// the seek EMA would shrink the roll window that exact calls rely on.
@@ -290,10 +297,52 @@ pub(crate) fn frame_at_nearest_rolling<D: VideoDecoder + ?Sized>(
         frame_rate,
         stats.roll_window_us(frame_rate),
     ) {
-        return frame_at_rolling(decoder, last_pts, stats, target);
+        if let Some(frame) = frame_at_rolling(decoder, last_pts, stats, target)? {
+            return Ok(Some(frame));
+        }
+        // Rolled off the end of the stream: the target lies past EOF.
+    } else {
+        decoder.seek(target)?;
+        if let Some(frame) = decoder.next_frame()? {
+            return Ok(Some(frame));
+        }
+        // The seek landed at/past the last sample: no frame to emit.
     }
-    decoder.seek(target)?;
-    decoder.next_frame()
+    seek_back_to_tail(decoder, target, frame_rate)
+}
+
+/// Bounded number of one-frame step-backs when a nearest-seek target lies
+/// past EOF. One covers the routine over-report-by-one; a few more absorb
+/// sloppier containers. Past that the stream is either empty or the target
+/// is nowhere near the tail, and a miss is the honest answer.
+const MAX_EOF_BACKSTEPS: i64 = 8;
+
+/// Recover the last decodable frame for a target at/past end of stream:
+/// step the target back one frame period at a time and re-seek, returning
+/// the first frame that decodes. Bounded by [`MAX_EOF_BACKSTEPS`] so an
+/// empty or unreadable stream can't loop.
+fn seek_back_to_tail<D: VideoDecoder + ?Sized>(
+    decoder: &mut D,
+    target: RationalTime,
+    frame_rate: Rational,
+) -> Result<Option<VideoFrame>, DecodeError> {
+    let rate = if frame_rate.is_valid() {
+        frame_rate
+    } else {
+        Rational::new(30, 1)
+    };
+    let start = resample(target, rate).value;
+    for step in 1..=MAX_EOF_BACKSTEPS {
+        let tick = start - step;
+        if tick < 0 {
+            break;
+        }
+        decoder.seek(RationalTime::new(tick, rate))?;
+        if let Some(frame) = decoder.next_frame()? {
+            return Ok(Some(frame));
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -609,5 +658,91 @@ mod tests {
         let f = dec.frame_at_nearest(rt(12, R30)).unwrap().unwrap();
         assert_eq!(f.pts.value, 12, "roll-window targets land exactly");
         assert_eq!(dec.seeks, 1, "the nearest roll path must not seek");
+    }
+
+    /// All-keyframe mock whose `seek` lands exactly on the target frame —
+    /// including *past* EOF, where `next_frame` then yields nothing. That's
+    /// the AVFoundation shape for a seek beyond the last sample, which the
+    /// tail-recovery path must step back from.
+    struct TailMockDecoder {
+        inner: MockDecoder,
+    }
+
+    impl TailMockDecoder {
+        fn new(count: i64) -> Self {
+            Self {
+                inner: MockDecoder::new(count),
+            }
+        }
+    }
+
+    impl VideoDecoder for TailMockDecoder {
+        fn info(&self) -> &SourceInfo {
+            &self.inner.info
+        }
+
+        fn seek(&mut self, target: RationalTime) -> Result<(), DecodeError> {
+            self.inner.cursor = resample(target, R30).value.max(0);
+            self.inner.last_pts = None;
+            self.inner.seeks += 1;
+            Ok(())
+        }
+
+        fn next_frame(&mut self) -> Result<Option<VideoFrame>, DecodeError> {
+            self.inner.next_frame()
+        }
+
+        fn frame_at(&mut self, target: RationalTime) -> Result<Option<VideoFrame>, DecodeError> {
+            let last = self.inner.last_pts;
+            let mut stats = self.inner.stats;
+            let result = frame_at_rolling(self, last, &mut stats, target);
+            self.inner.stats = stats;
+            result
+        }
+
+        fn frame_at_nearest(
+            &mut self,
+            target: RationalTime,
+        ) -> Result<Option<VideoFrame>, DecodeError> {
+            let last = self.inner.last_pts;
+            let mut stats = self.inner.stats;
+            let result = frame_at_nearest_rolling(self, last, &mut stats, target);
+            self.inner.stats = stats;
+            result
+        }
+    }
+
+    /// The over-report-by-one case: a stream of frames 0..29 asked for
+    /// frame 30 (what a pool that trusts the container's count requests at
+    /// the media tail) must hand back the last real frame, not miss.
+    #[test]
+    fn nearest_past_eof_target_steps_back_to_tail_frame() {
+        let mut dec = TailMockDecoder::new(30);
+        let f = dec.frame_at_nearest(rt(30, R30)).unwrap().unwrap();
+        assert_eq!(f.pts.value, 29, "past-EOF nearest lands on the tail");
+    }
+
+    /// Rolling into EOF (target within the roll window but past the last
+    /// frame) recovers the tail frame too, not just the cold-seek path.
+    #[test]
+    fn nearest_roll_into_eof_recovers_tail_frame() {
+        let mut dec = TailMockDecoder::new(10);
+        dec.frame_at(rt(9, R30)).unwrap().unwrap();
+        let f = dec.frame_at_nearest(rt(11, R30)).unwrap().unwrap();
+        assert_eq!(f.pts.value, 9);
+    }
+
+    /// A target nowhere near the tail (beyond the bounded back-steps) is an
+    /// honest miss, and an empty stream can't loop.
+    #[test]
+    fn nearest_far_past_eof_and_empty_streams_still_miss() {
+        let mut dec = TailMockDecoder::new(30);
+        assert!(
+            dec.frame_at_nearest(rt(30 + MAX_EOF_BACKSTEPS + 1, R30))
+                .unwrap()
+                .is_none()
+        );
+        let mut empty = TailMockDecoder::new(0);
+        assert!(empty.frame_at_nearest(rt(5, R30)).unwrap().is_none());
     }
 }

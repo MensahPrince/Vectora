@@ -119,8 +119,11 @@ fn audio_only_probe(path: &Path) -> Option<MediaProbe> {
 
 #[cfg(target_vendor = "apple")]
 fn open(path: &Path) -> Result<(Box<dyn VideoDecoder>, bool), DecodeError> {
+    // The audio-track check reads the decoder's already-parsed asset — no
+    // second open of the file.
     let decoder = crate::AvfDecoder::open(path, OutputMode::Cpu)?;
-    Ok((Box::new(decoder), crate::apple::has_audio_track(path)))
+    let has_audio = decoder.has_audio_track();
+    Ok((Box::new(decoder), has_audio))
 }
 
 #[cfg(target_os = "windows")]

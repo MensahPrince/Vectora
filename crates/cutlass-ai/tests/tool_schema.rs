@@ -14,6 +14,7 @@ fn snapshot_path() -> PathBuf {
 fn current_schema() -> serde_json::Value {
     let mut tools = cutlass_ai::tool_specs();
     tools.push(cutlass_ai::wire::describe_project_spec());
+    tools.push(cutlass_ai::extend::read_skill_spec());
     serde_json::json!({
         "version": cutlass_ai::TOOL_SCHEMA_VERSION,
         "tools": tools

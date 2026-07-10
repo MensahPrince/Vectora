@@ -14,12 +14,13 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
-use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand};
+use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand, TemplatePick};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, SeekPolicy};
 use cutlass_models::{
-    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
-    Easing, Filter, Generator, LinkId, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId, Param,
-    ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind, resample,
+    AnimatedTransform, AudioRole, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments,
+    CropRect, Easing, Filter, Generator, LinkId, Lut, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId,
+    MediaId, Param, ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId,
+    TrackKind, resample,
 };
 use cutlass_render::{ExportSettings, RenderError, Renderer};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -69,6 +70,18 @@ enum WorkerMsg {
         height: u32,
     },
     Import(PathBuf),
+    /// OS files dropped on the window (Finder / Explorer). With `target`
+    /// — the drop landed on the timeline: (lane-list row, sequence tick)
+    /// under the cursor — every file is imported and placed end-to-end from
+    /// the drop point in one undo group: videos/images on a video lane
+    /// (falling back to the empty main track, CapCut-style), audio-only
+    /// files on an audio lane (the model's lane zones keep audio at the
+    /// bottom). Without `target` the drop is a plain pool import, the same
+    /// as [`WorkerMsg::Import`] per file.
+    DropFiles {
+        paths: Vec<PathBuf>,
+        target: Option<(i64, i64)>,
+    },
     /// A preview proxy for pool media `media_id` is ready at `proxy`
     /// (from the proxy worker thread). `source` is the file the job was
     /// keyed to; the handler binds the proxy only while the pool entry
@@ -98,7 +111,9 @@ enum WorkerMsg {
     /// Generated lanes are never the main track, so there's no ripple-insert
     /// path. `effect` seeds the new clip's effect chain — a standalone
     /// effect-lane segment dropped from the Effects catalog (CapCut's
-    /// effect-as-track-clip).
+    /// effect-as-track-clip). `animations` are `(slot, catalog id)` pairs a
+    /// text-preset drop attaches to the fresh clip (unknown ids are skipped,
+    /// never errors — a served preset must not brick the drop).
     AddGenerated {
         generator: Generator,
         track: String,
@@ -106,6 +121,7 @@ enum WorkerMsg {
         duration_ticks: i64,
         drop_row: i64,
         effect: Option<String>,
+        animations: Vec<(String, String)>,
     },
     /// Move `clip` (raw id) to `track` at `start_tick`, or — when `track` is
     /// empty — to a new lane of the clip's kind inserted at `insert_row`.
@@ -147,6 +163,12 @@ enum WorkerMsg {
     /// Toggle reverse playback on a media clip: reads the clip's current
     /// speed and flips `reversed`. One undoable history entry.
     ReverseClip {
+        clip: String,
+    },
+    /// CapCut "extract audio": place the video clip's sound on an audio lane
+    /// (same media, no new library asset), link the pair, and tag the audio
+    /// half as `Extracted`. The video goes silent via `carries_own_audio`.
+    ExtractAudio {
         clip: String,
     },
     /// Replace a generated clip's content (raw id) — e.g. an inspector title
@@ -260,10 +282,23 @@ enum WorkerMsg {
         filter_id: String,
         intensity: f32,
     },
+    /// Set (or clear) a visual clip's `.cube` LUT. `path == ""` clears;
+    /// intensity is normalized 0..=1. One undoable history entry.
+    SetClipLut {
+        clip: String,
+        path: String,
+        intensity: f32,
+    },
     /// Set all five manual color adjustments in one undoable history entry.
     SetClipAdjust {
         clip: String,
         adjust: ColorAdjustments,
+    },
+    /// Save edited per-project agent rules into `ProjectMetadata`.
+    /// Metadata, not a timeline command: dirties the session (rules save
+    /// with the project) but is not undoable, like relink.
+    SetAgentRules {
+        rules: String,
     },
     /// Set (or clear) one look-animation slot on a visual clip.
     SetClipAnimation {
@@ -535,6 +570,17 @@ enum WorkerMsg {
     /// `project.cutlass` is written by the `SaveProject` that follows).
     /// Same epoch bump as `OpenProject`.
     NewProject,
+    /// Replace the session with an installed `.cutlasst` template filled by
+    /// `picks` (CapCut "use template"). On success a fresh draft directory
+    /// is created and the filled project saved into it (the engine resets
+    /// the project path, so the bind happens here, not via a queued
+    /// `SaveProject` that would also run after a failure). Same epoch bump
+    /// as `OpenProject`; failure publishes `session-error` and leaves the
+    /// current session untouched.
+    ApplyTemplate {
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+    },
     /// Rename the current draft (its display name). Applied as one undoable
     /// edit; the projection republish updates the title bar and the next
     /// auto-save writes the name into the draft's project file and meta.
@@ -631,6 +677,12 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::Import(path));
     }
 
+    /// OS file drop: import `paths` and, when `target` names a timeline
+    /// landing spot (lane row, tick), place them end-to-end from there.
+    pub fn drop_files(&self, paths: Vec<PathBuf>, target: Option<(i64, i64)>) {
+        let _ = self.tx.send(WorkerMsg::DropFiles { paths, target });
+    }
+
     /// A preview proxy landed for pool media `media_id` (raw id), generated
     /// from the source file at `source`. Called from the proxy worker thread.
     pub fn proxy_ready(&self, media_id: u64, source: PathBuf, proxy: PathBuf) {
@@ -647,6 +699,10 @@ impl WorkerHandle {
 
     pub fn open_project(&self, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::OpenProject { path });
+    }
+
+    pub fn apply_template(&self, path: PathBuf, picks: Vec<TemplatePick>) {
+        let _ = self.tx.send(WorkerMsg::ApplyTemplate { path, picks });
     }
 
     pub fn new_project(&self) {
@@ -712,6 +768,7 @@ impl WorkerHandle {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn add_generated(
         &self,
         generator: Generator,
@@ -720,6 +777,7 @@ impl WorkerHandle {
         duration_ticks: i64,
         drop_row: i64,
         effect: Option<String>,
+        animations: Vec<(String, String)>,
     ) {
         let _ = self.tx.send(WorkerMsg::AddGenerated {
             generator,
@@ -728,6 +786,7 @@ impl WorkerHandle {
             duration_ticks,
             drop_row,
             effect,
+            animations,
         });
     }
 
@@ -770,6 +829,10 @@ impl WorkerHandle {
 
     pub fn reverse_clip(&self, clip: String) {
         let _ = self.tx.send(WorkerMsg::ReverseClip { clip });
+    }
+
+    pub fn extract_audio(&self, clip: String) {
+        let _ = self.tx.send(WorkerMsg::ExtractAudio { clip });
     }
 
     pub fn split_clip(&self, clip: String, at_tick: i64) {
@@ -919,8 +982,20 @@ impl WorkerHandle {
         });
     }
 
+    pub fn set_clip_lut(&self, clip: String, path: String, intensity: f32) {
+        let _ = self.tx.send(WorkerMsg::SetClipLut {
+            clip,
+            path,
+            intensity,
+        });
+    }
+
     pub fn set_clip_adjust(&self, clip: String, adjust: ColorAdjustments) {
         let _ = self.tx.send(WorkerMsg::SetClipAdjust { clip, adjust });
+    }
+
+    pub fn set_agent_rules(&self, rules: String) {
+        let _ = self.tx.send(WorkerMsg::SetAgentRules { rules });
     }
 
     pub fn set_clip_animation(&self, clip: String, slot: String, animation_id: String) {
@@ -1289,6 +1364,9 @@ fn worker_loop(
                 fit.set_viewport(width, height);
             }
             WorkerMsg::Import(path) => import_and_publish(engine, &path, &ui),
+            WorkerMsg::DropFiles { paths, target } => {
+                drop_files_and_publish(engine, &paths, target, *main_magnet, &ui);
+            }
             WorkerMsg::ProxyReady {
                 media_id,
                 source,
@@ -1308,6 +1386,7 @@ fn worker_loop(
                 duration_ticks,
                 drop_row,
                 effect,
+                animations,
             } => add_generated_and_publish(
                 engine,
                 generator,
@@ -1316,6 +1395,7 @@ fn worker_loop(
                 duration_ticks,
                 drop_row,
                 effect.as_deref(),
+                &animations,
                 &ui,
             ),
             WorkerMsg::MoveClip {
@@ -1357,6 +1437,7 @@ fn worker_loop(
             WorkerMsg::ReverseClip { clip } => {
                 reverse_clip_and_publish(engine, &clip, *linkage, &ui)
             }
+            WorkerMsg::ExtractAudio { clip } => extract_audio_and_publish(engine, &clip, &ui),
             WorkerMsg::SetGenerator { clip, generator } => {
                 set_generator_and_publish(engine, &clip, generator, &ui)
             }
@@ -1429,8 +1510,17 @@ fn worker_loop(
                 filter_id,
                 intensity,
             } => set_clip_filter_and_publish(engine, &clip, &filter_id, intensity, &ui),
+            WorkerMsg::SetClipLut {
+                clip,
+                path,
+                intensity,
+            } => set_clip_lut_and_publish(engine, &clip, &path, intensity, &ui),
             WorkerMsg::SetClipAdjust { clip, adjust } => {
                 set_clip_adjust_and_publish(engine, &clip, adjust, &ui)
+            }
+            WorkerMsg::SetAgentRules { rules } => {
+                engine.set_agent_rules(rules);
+                publish_projection(engine, &ui);
             }
             WorkerMsg::SetClipAnimation {
                 clip,
@@ -1651,6 +1741,9 @@ fn worker_loop(
                 remove_media_and_publish(engine, &media, force, &ui)
             }
             WorkerMsg::NewProject => new_project_and_publish(engine, &ui),
+            WorkerMsg::ApplyTemplate { path, picks } => {
+                apply_template_and_publish(engine, path, picks, &ui)
+            }
             WorkerMsg::RenameProject { name } => rename_project_and_publish(engine, name, &ui),
             WorkerMsg::SnapshotProject { reply } => {
                 let _ = reply.send(engine.project().clone());
@@ -2217,6 +2310,8 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::SetTrackFlag { .. }
             | WorkerMsg::OpenProject { .. }
             | WorkerMsg::NewProject
+            // A filled template is a whole new composite.
+            | WorkerMsg::ApplyTemplate { .. }
             // Relinked media decodes again — refresh the stale composite.
             | WorkerMsg::RelinkMedia { .. }
             | WorkerMsg::RelinkFolder { .. }
@@ -2640,6 +2735,211 @@ fn import_and_publish(engine: &mut Engine, path: &Path, ui: &UiSink) {
     }
 }
 
+/// One pool entry imported by an OS drop, ready to place: id, full source
+/// range, and that range resampled to timeline ticks (what the clip will
+/// occupy).
+struct DroppedMedia {
+    media: MediaId,
+    source: TimeRange,
+    duration_ticks: i64,
+}
+
+/// OS files dropped on the timeline (Finder / Explorer): import every path
+/// and place the results end-to-end from the drop point — videos and images
+/// on a video lane, audio-only files on an audio lane (the model's lane
+/// zones keep audio at the bottom) — as **one undo group**, mobile
+/// `append_main`-style. Without `target` the drop missed the timeline and
+/// each path takes the plain pool-import path (today's behavior).
+///
+/// A file whose import/probe fails is skipped without aborting the rest;
+/// the group commits with whatever landed.
+fn drop_files_and_publish(
+    engine: &mut Engine,
+    paths: &[PathBuf],
+    target: Option<(i64, i64)>,
+    main_magnet: bool,
+    ui: &UiSink,
+) {
+    let Some((drop_row, drop_tick)) = target else {
+        for path in paths {
+            import_and_publish(engine, path, ui);
+        }
+        return;
+    };
+    let tl_rate = engine.project().timeline().frame_rate;
+
+    engine.begin_group();
+    // Import first (inside the group, so one undo also clears the pool
+    // entries this gesture added), classifying per landing lane kind. Order
+    // within each kind is the order the OS delivered the files.
+    let mut imported: Vec<MediaId> = Vec::new();
+    let mut visual: Vec<DroppedMedia> = Vec::new();
+    let mut audio: Vec<DroppedMedia> = Vec::new();
+    for path in paths {
+        match engine.apply(Command::Project(ProjectCommand::Import {
+            path: path.clone(),
+        })) {
+            Ok(ApplyOutcome::Imported { media }) => {
+                let Some(entry) = engine.project().media(media) else {
+                    continue;
+                };
+                let source = entry.full_range();
+                let dropped = DroppedMedia {
+                    media,
+                    source,
+                    // Mirror Project::add_clip's source→timeline resampling
+                    // so the plan sees the same extent the engine validates.
+                    duration_ticks: resample(source.duration, tl_rate).value.max(1),
+                };
+                if entry.is_audio_only() {
+                    audio.push(dropped);
+                } else {
+                    visual.push(dropped);
+                }
+                imported.push(media);
+            }
+            Ok(other) => {
+                error!(path = %path.display(), "unexpected drop-import outcome: {other:?}");
+            }
+            Err(e) => error!(path = %path.display(), "drop import failed, file skipped: {e}"),
+        }
+    }
+
+    place_drop_group(
+        engine,
+        &visual,
+        TrackKind::Video,
+        drop_row,
+        drop_tick,
+        main_magnet,
+    );
+    place_drop_group(engine, &audio, TrackKind::Audio, drop_row, drop_tick, false);
+
+    // Commit whatever landed (an empty group is a no-op); pool bookkeeping
+    // and the projection republish mirror import_and_publish.
+    engine.commit_group();
+    info!(
+        files = paths.len(),
+        placed = visual.len() + audio.len(),
+        drop_row,
+        drop_tick,
+        "placed OS file drop on the timeline"
+    );
+    for media in imported {
+        if let Some(source) = engine.project().media(media) {
+            register_media_with_workers(source, ui);
+        }
+    }
+    publish_projection(engine, ui);
+}
+
+/// Place one kind-group of an OS drop end-to-end. The landing lane mirrors
+/// the library-drop policy (`add_clip_and_publish`): the lane of `kind` at
+/// the drop row, else — for video — the *empty* main track (CapCut: video
+/// dropped anywhere lands on the empty main lane), else a fresh lane
+/// inserted at the drop row (lane zones then clamp it: audio sinks below the
+/// main track). On the main lane with the magnet on, files ripple-insert at
+/// the caret boundary; otherwise the chain first-fit slides past existing
+/// clips. Failures skip the file, never the group.
+fn place_drop_group(
+    engine: &mut Engine,
+    items: &[DroppedMedia],
+    kind: TrackKind,
+    drop_row: i64,
+    drop_tick: i64,
+    main_magnet: bool,
+) {
+    if items.is_empty() {
+        return;
+    }
+    let tl_rate = engine.project().timeline().frame_rate;
+    let lane = track_at_row(engine, drop_row)
+        .filter(|t| t.kind == kind && !t.locked)
+        .map(|t| t.id)
+        .or_else(|| empty_main_lane(engine, kind));
+    let lane = match lane {
+        Some(id) => id,
+        None => match create_track(engine, kind, drop_row) {
+            Ok(id) => id,
+            Err(e) => {
+                error!("drop failed creating {kind:?} track: {e}");
+                return;
+            }
+        },
+    };
+
+    let timeline = engine.project().timeline();
+    let spans = timeline.track(lane).map(occupied_spans).unwrap_or_default();
+    let insert = main_magnet && kind == TrackKind::Video && timeline.main_track() == Some(lane);
+    let durations: Vec<i64> = items.iter().map(|m| m.duration_ticks).collect();
+    let starts: Vec<i64> = if insert {
+        // Magnet insert: chain from the caret boundary; every RippleInsert
+        // shifts later clips right, so each next file lands at the previous
+        // one's end.
+        let boundary = crate::os_drop::insertion_boundary(&spans, drop_tick);
+        durations
+            .iter()
+            .scan(boundary, |at, d| {
+                let start = *at;
+                *at += d;
+                Some(start)
+            })
+            .collect()
+    } else {
+        crate::os_drop::plan_sequential_starts(&spans, drop_tick, &durations)
+    };
+
+    for (item, start) in items.iter().zip(starts) {
+        let command = if insert {
+            EditCommand::RippleInsert {
+                track: lane,
+                media: item.media,
+                source: item.source,
+                at: RationalTime::new(start, tl_rate),
+            }
+        } else {
+            EditCommand::AddClip {
+                track: lane,
+                media: item.media,
+                source: item.source,
+                start: RationalTime::new(start, tl_rate),
+            }
+        };
+        match engine.apply(Command::Edit(command)) {
+            Ok(ApplyOutcome::Edited(EditOutcome::Created(clip))) => {
+                info!(%clip, %lane, media = %item.media, start, insert, "placed dropped file");
+            }
+            Ok(other) => {
+                error!(media = %item.media, "unexpected drop placement outcome: {other:?}");
+            }
+            Err(e) => error!(media = %item.media, %lane, start, "drop placement failed: {e}"),
+        }
+    }
+}
+
+/// The track at UI lane-list row `row` (top-first), if any. The engine
+/// stacks bottom→top while the lane list renders top-first (projection.rs),
+/// so row r ↔ stack index (count − 1 − r).
+fn track_at_row(engine: &Engine, row: i64) -> Option<&Track> {
+    let timeline = engine.project().timeline();
+    let count = timeline.order().len() as i64;
+    if !(0..count).contains(&row) {
+        return None;
+    }
+    let id = timeline.order()[(count - 1 - row) as usize];
+    timeline.track(id)
+}
+
+/// Sorted, non-overlapping `[start, end)` tick spans of every clip on
+/// `track` — the occupancy input to the OS-drop placement planner.
+fn occupied_spans(track: &Track) -> Vec<(i64, i64)> {
+    track
+        .clips_ordered()
+        .iter()
+        .map(|c| (c.timeline.start.value, c.timeline.end_tick()))
+        .collect()
+}
+
 /// Persist the session to its draft file. `path` is the draft's
 /// `project.cutlass` (binding a freshly created draft); `None` reuses the
 /// engine's current path — the debounced auto-save and the flush before a
@@ -2702,6 +3002,60 @@ fn open_project_and_publish(engine: &mut Engine, path: PathBuf, ui: &UiSink) {
         Err(e) => {
             error!(path = %path.display(), "open failed: {e}");
             publish_session_error(ui, format!("Couldn't open {}: {e}", path.display()));
+        }
+    }
+}
+
+/// Replace the session with an installed template filled by the user's
+/// picks (the launch gallery's "Use template"). `ApplyTemplate` is atomic
+/// engine-side — a failed pick probe or fill leaves the current session
+/// untouched, surfaced through `session-error`. Success yields a *new
+/// unsaved* project, so a fresh draft directory is created here and the
+/// filled project saved into it (the same bind `New` performs via its
+/// queued save — done inline so a failure never litters an empty draft).
+/// Media registration, projection republish, and the session-epoch bump
+/// mirror `open_project_and_publish`; the epoch bump also dismisses the
+/// launch screen.
+fn apply_template_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    picks: Vec<TemplatePick>,
+    ui: &UiSink,
+) {
+    match engine.apply(Command::Project(ProjectCommand::ApplyTemplate {
+        path: path.clone(),
+        picks,
+    })) {
+        Ok(ApplyOutcome::AppliedTemplate) => {
+            info!(
+                template = %path.display(),
+                pool = engine.project().media_count(),
+                "applied template"
+            );
+            match crate::drafts::create() {
+                Ok(draft) => save_project_and_publish(engine, Some(draft), ui),
+                Err(e) => {
+                    error!("couldn't create a draft for the filled template: {e}");
+                    publish_session_error(
+                        ui,
+                        format!(
+                            "The template was applied but a project draft couldn't be created: {e}"
+                        ),
+                    );
+                }
+            }
+            for media in engine.project().media_iter() {
+                if media.path().exists() {
+                    register_media_with_workers(media, ui);
+                }
+            }
+            publish_projection(engine, ui);
+            bump_session_epoch(ui);
+        }
+        Ok(other) => error!(template = %path.display(), "unexpected apply outcome: {other:?}"),
+        Err(e) => {
+            error!(template = %path.display(), "apply template failed: {e}");
+            publish_session_error(ui, format!("Couldn't use the template: {e}"));
         }
     }
 }
@@ -3001,8 +3355,8 @@ fn add_clip_and_publish(
 
     // CapCut keeps a video's sound on the video clip itself — a drop lands one
     // clip and the audio mixers read its audio from that lane (see
-    // `audio_snapshot`). No companion lane is spawned; "Separate audio" is a
-    // later, explicit gesture.
+    // `audio_snapshot`). No companion lane is spawned; use Extract audio
+    // (`extract_audio_and_publish`) for the explicit detach gesture.
 
     // The main-track magnet only applies to the main *video* lane.
     if insert
@@ -3096,7 +3450,10 @@ fn add_clip_and_publish(
 /// Place a generated clip (text/solid/shape/effect) from a library-tile
 /// drop. One history entry, even when it creates the landing lane; rolled
 /// back on a rejected placement so a lane made for the drop doesn't linger.
-/// `effect` seeds the new clip's chain (standalone effect-lane segments).
+/// `effect` seeds the new clip's chain (standalone effect-lane segments);
+/// `animations` attaches a text preset's look animations (unknown slots or
+/// catalog ids are skipped with a warning — a served preset must not brick
+/// the drop).
 #[allow(clippy::too_many_arguments)]
 fn add_generated_and_publish(
     engine: &mut Engine,
@@ -3106,6 +3463,7 @@ fn add_generated_and_publish(
     duration_ticks: i64,
     drop_row: i64,
     effect: Option<&str>,
+    animations: &[(String, String)],
     ui: &UiSink,
 ) {
     let Some(lane_kind) = TrackKind::for_generator(&generator) else {
@@ -3158,6 +3516,26 @@ fn add_generated_and_publish(
                 engine.rollback_group();
                 publish_projection(engine, ui);
                 return;
+            }
+            // Text-preset animations ride the same history group. Skips
+            // (unknown slot/id) and failures degrade to an unanimated title
+            // rather than rejecting the drop.
+            for (slot, animation_id) in animations {
+                let Some(animation_slot) = parse_animation_slot(slot) else {
+                    warn!(slot, "preset animation skipped: unknown slot");
+                    continue;
+                };
+                if cutlass_models::animation_spec(animation_id).is_none() {
+                    warn!(animation_id, "preset animation skipped: unknown catalog id");
+                    continue;
+                }
+                if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipAnimation {
+                    clip,
+                    slot: animation_slot,
+                    animation: Some(cutlass_models::AnimationRef::new(animation_id)),
+                })) {
+                    warn!(%clip, animation_id, "preset animation skipped: {e}");
+                }
             }
             engine.commit_group();
             info!(%clip, %track_id, start_tick = start_value, "added generated clip from drop");
@@ -3597,6 +3975,34 @@ fn set_clip_filter_and_publish(
         return;
     }
     info!(%clip_id, ?filter, "set clip filter");
+    publish_projection(engine, ui);
+}
+
+/// Set or clear a visual clip's `.cube` LUT (empty path clears). Intensity
+/// blends the looked-up color over the original in the LUT pass itself.
+fn set_clip_lut_and_publish(
+    engine: &mut Engine,
+    clip: &str,
+    path: &str,
+    intensity: f32,
+    ui: &UiSink,
+) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "set-clip-lut ignored: unparsable clip id");
+        return;
+    };
+    let lut = (!path.is_empty()).then(|| Lut {
+        path: path.to_string(),
+        intensity: intensity.clamp(0.0, 1.0),
+    });
+    if let Err(e) = engine.apply(Command::Edit(EditCommand::SetClipLut {
+        clip: clip_id,
+        lut: lut.clone(),
+    })) {
+        error!(%clip_id, path, intensity, "set clip LUT failed: {e}");
+        return;
+    }
+    info!(%clip_id, ?lut, "set clip LUT");
     publish_projection(engine, ui);
 }
 
@@ -4860,6 +5266,178 @@ fn reverse_clip_and_publish(engine: &mut Engine, clip: &str, linkage: bool, ui: 
         linkage,
         ui,
     );
+}
+
+/// CapCut "extract audio": place a linked audio-lane companion that reuses the
+/// video clip's media (no new library asset). The video half goes silent via
+/// [`Timeline::carries_own_audio`] once linked to the audio partner.
+fn extract_audio_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
+    let Some(clip_id) = parse_raw_id(clip).map(ClipId::from_raw) else {
+        error!(clip, "extract audio ignored: unparsable clip id");
+        return;
+    };
+    match extract_audio(engine, clip_id) {
+        Ok(audio_clip) => {
+            info!(%clip_id, %audio_clip, "extracted audio onto audio lane");
+            publish_projection(engine, ui);
+        }
+        Err(e) => {
+            // Soft ignore for already-detached / wrong target; hard failures
+            // still republish so the UI stays consistent after a rolled-back
+            // group (extract_audio rolls back before returning Err).
+            if e.starts_with("ignored:") {
+                info!(%clip_id, "{e}");
+            } else {
+                error!(%clip_id, "extract audio failed: {e}");
+                publish_projection(engine, ui);
+            }
+        }
+    }
+}
+
+/// Core CapCut extract-audio sequence. Returns the new audio-lane clip id.
+fn extract_audio(engine: &mut Engine, clip_id: ClipId) -> Result<ClipId, String> {
+    let (track_kind, already_detached, snapshot) = {
+        let project = engine.project();
+        let timeline = project.timeline();
+        let track_id = timeline
+            .track_of(clip_id)
+            .ok_or_else(|| format!("ignored: clip {clip_id} not on the timeline"))?;
+        let track = timeline
+            .track(track_id)
+            .ok_or_else(|| format!("ignored: unknown track for {clip_id}"))?;
+        let kind = track.kind;
+        let detached = timeline.detached_to_audio_lane(clip_id);
+        let snapshot = project
+            .clip(clip_id)
+            .cloned()
+            .ok_or_else(|| format!("ignored: clip {clip_id} missing"))?;
+        (kind, detached, snapshot)
+    };
+    if track_kind != TrackKind::Video {
+        return Err(format!("ignored: {clip_id} is not a video-lane clip"));
+    }
+    if already_detached {
+        return Err(format!("ignored: {clip_id} already detached"));
+    }
+    let ClipSource::Media { media, source } = snapshot.content else {
+        return Err(format!("ignored: {clip_id} is not a media clip"));
+    };
+    if !engine.project().media(media).is_some_and(|m| m.has_audio) {
+        return Err(format!("ignored: {clip_id} media has no audio stream"));
+    }
+
+    let rate = engine.project().timeline().frame_rate;
+    let s = snapshot.timeline.start.value;
+    let d = snapshot.timeline.duration.value;
+    let placed_len = resample(source.duration, rate).value.max(1);
+    let reserve = placed_len.max(d);
+    let range = TimeRange::at_rate(s, reserve, rate);
+
+    engine.begin_group();
+
+    let lane = match ensure_audio_host_lane(engine, range) {
+        Ok(id) => id,
+        Err(e) => {
+            engine.rollback_group();
+            return Err(format!("finding audio lane: {e}"));
+        }
+    };
+
+    let audio_clip = match engine.apply(Command::Edit(EditCommand::AddClip {
+        track: lane,
+        media,
+        source,
+        start: RationalTime::new(s, rate),
+    })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::Created(id))) => id,
+        Ok(other) => {
+            engine.rollback_group();
+            return Err(format!("unexpected AddClip outcome: {other:?}"));
+        }
+        Err(e) => {
+            engine.rollback_group();
+            return Err(format!("AddClip failed: {e}"));
+        }
+    };
+
+    if snapshot.speed != Rational::new(1, 1) || snapshot.reversed {
+        if let Err(e) = apply_edit(
+            engine,
+            EditCommand::SetClipSpeed {
+                clip: audio_clip,
+                speed: snapshot.speed,
+                reversed: snapshot.reversed,
+            },
+        ) {
+            engine.rollback_group();
+            return Err(format!("SetClipSpeed failed: {e}"));
+        }
+    }
+
+    if let Err(e) = apply_edit(
+        engine,
+        EditCommand::LinkClips {
+            clips: vec![clip_id, audio_clip],
+        },
+    ) {
+        engine.rollback_group();
+        return Err(format!("LinkClips failed: {e}"));
+    }
+
+    if let Err(e) = apply_edit(
+        engine,
+        EditCommand::SetAudioRole {
+            clip: audio_clip,
+            role: Some(AudioRole::Extracted),
+        },
+    ) {
+        engine.rollback_group();
+        return Err(format!("SetAudioRole failed: {e}"));
+    }
+
+    engine.commit_group();
+    Ok(audio_clip)
+}
+
+/// First unlocked audio lane that can host `range` without overlap, or a new
+/// audio lane appended at the stack floor (`index: None`).
+fn ensure_audio_host_lane(engine: &mut Engine, range: TimeRange) -> Result<TrackId, String> {
+    let (existing, count) = {
+        let timeline = engine.project().timeline();
+        let mut existing = None;
+        for track in timeline.tracks_ordered() {
+            if track.kind != TrackKind::Audio || track.locked {
+                continue;
+            }
+            match track.has_overlap(range, None) {
+                Ok(false) => {
+                    existing = Some(track.id);
+                    break;
+                }
+                Ok(true) => continue,
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        let count = timeline
+            .tracks_ordered()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .count();
+        (existing, count)
+    };
+    if let Some(id) = existing {
+        return Ok(id);
+    }
+    match engine.apply(Command::Edit(EditCommand::AddTrack {
+        kind: TrackKind::Audio,
+        name: format!("{}{}", kind_prefix(TrackKind::Audio), count + 1),
+        index: None,
+        pinned: false,
+    })) {
+        Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(id))) => Ok(id),
+        Ok(other) => Err(format!("unexpected add-track outcome: {other:?}")),
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 /// Split a clip into two abutting clips at `at_tick`. The UI only offers the
@@ -6856,5 +7434,468 @@ mod tests {
         // Downstream on both lanes shifted left by 20, staying aligned.
         assert_eq!(extent(&engine, c), (180, 100));
         assert_eq!(extent(&engine, q), (180, 100));
+    }
+
+    // --- OS file drop → timeline placement -----------------------------------
+
+    /// A pool entry wrapped the way `drop_files_and_publish` hands it to the
+    /// placement: full source range + duration resampled to timeline ticks.
+    fn dropped(engine: &Engine, media: MediaId) -> DroppedMedia {
+        let entry = engine.project().media(media).expect("pool entry");
+        let source = entry.full_range();
+        let tl_rate = engine.project().timeline().frame_rate;
+        DroppedMedia {
+            media,
+            source,
+            duration_ticks: resample(source.duration, tl_rate).value.max(1),
+        }
+    }
+
+    /// Engine over an empty timeline whose pool holds a 1000-tick base video
+    /// (for pre-placed clips), dropped videos of `video_ticks`, and dropped
+    /// audio-only entries of `audio_ms` — no real files, nothing decodes.
+    fn drop_fixture(
+        video_ticks: &[i64],
+        audio_ms: &[i64],
+    ) -> (Engine, MediaId, Vec<MediaId>, Vec<MediaId>) {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("drop-fixture", r);
+        let base = project.add_media(cutlass_models::MediaSource::new(
+            "/tmp/base.mp4",
+            1920,
+            1080,
+            r,
+            1000,
+            false,
+        ));
+        let videos = video_ticks
+            .iter()
+            .enumerate()
+            .map(|(i, &ticks)| {
+                project.add_media(cutlass_models::MediaSource::new(
+                    format!("/tmp/drop-v{i}.mp4"),
+                    1920,
+                    1080,
+                    r,
+                    ticks,
+                    false,
+                ))
+            })
+            .collect();
+        let audios = audio_ms
+            .iter()
+            .enumerate()
+            .map(|(i, &ms)| {
+                project.add_media(cutlass_models::MediaSource::new(
+                    format!("/tmp/drop-a{i}.wav"),
+                    0,
+                    0,
+                    Rational::new(1000, 1),
+                    ms,
+                    true,
+                ))
+            })
+            .collect();
+        let engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+        (engine, base, videos, audios)
+    }
+
+    fn lane_clip_extents(engine: &Engine, track: TrackId) -> Vec<(i64, i64)> {
+        occupied_spans(engine.project().timeline().track(track).expect("track"))
+    }
+
+    /// Dropped videos land on the targeted video lane end-to-end from the
+    /// drop tick, first-fit sliding past a clip that blocks the anchor.
+    #[test]
+    fn os_drop_places_videos_end_to_end_on_the_target_lane() {
+        let (mut engine, base, videos, _) = drop_fixture(&[50, 30], &[]);
+        let track = add_video_track(&mut engine, "V1");
+        add_media_clip(&mut engine, track, base, 80, 100); // occupies [80, 180)
+        let items = [dropped(&engine, videos[0]), dropped(&engine, videos[1])];
+
+        // Row 0 is the only lane (single track). Anchor 100 is inside the
+        // existing clip → slide to 180, then chain: 180+50 = 230.
+        place_drop_group(&mut engine, &items, TrackKind::Video, 0, 100, false);
+
+        assert_eq!(
+            lane_clip_extents(&engine, track),
+            vec![(80, 180), (180, 230), (230, 260)]
+        );
+    }
+
+    /// Audio-only files never land on a video lane: a drop anywhere creates
+    /// (or reuses) an audio lane, and the model's lane zones keep it below
+    /// the main track.
+    #[test]
+    fn os_drop_routes_audio_to_an_audio_lane_below_main() {
+        // 4000 ms of audio ≙ 96 ticks at the FPS_24 timeline rate.
+        let (mut engine, base, _, audios) = drop_fixture(&[], &[4000]);
+        let track = add_video_track(&mut engine, "V1");
+        add_media_clip(&mut engine, track, base, 0, 100);
+        let items = [dropped(&engine, audios[0])];
+
+        // Dropped on the main video row: wrong kind → new audio lane.
+        place_drop_group(&mut engine, &items, TrackKind::Audio, 0, 240, false);
+
+        let timeline = engine.project().timeline();
+        let bottom = timeline.order()[0];
+        let lane = timeline.track(bottom).expect("bottom lane");
+        assert_eq!(lane.kind, TrackKind::Audio, "audio sits at the stack floor");
+        assert_eq!(lane_clip_extents(&engine, bottom), vec![(240, 336)]);
+        assert_eq!(
+            timeline.main_track(),
+            Some(track),
+            "main track unchanged above the audio floor"
+        );
+    }
+
+    /// Videos dropped on empty space (no video lane at the row) fall back to
+    /// the *empty* main track instead of spawning an overlay lane.
+    #[test]
+    fn os_drop_falls_back_to_the_empty_main_lane() {
+        let (mut engine, _, videos, _) = drop_fixture(&[50, 40], &[]);
+        let main = add_video_track(&mut engine, "V1"); // empty main lane
+        let items = [dropped(&engine, videos[0]), dropped(&engine, videos[1])];
+
+        // Row 7 hits no lane at all; the empty main catches the drop.
+        place_drop_group(&mut engine, &items, TrackKind::Video, 7, 60, false);
+
+        assert_eq!(
+            lane_clip_extents(&engine, main),
+            vec![(60, 110), (110, 150)]
+        );
+        assert_eq!(
+            engine.project().timeline().order().len(),
+            1,
+            "no overlay lane spawned"
+        );
+    }
+
+    /// With the magnet on, a drop on the main lane ripple-inserts the whole
+    /// set at the caret boundary: existing downstream clips shift right by
+    /// the sum of the inserted durations.
+    #[test]
+    fn os_drop_magnet_inserts_ripple_on_the_main_lane() {
+        let (mut engine, base, videos, _) = drop_fixture(&[60, 40], &[]);
+        let track = add_video_track(&mut engine, "V1");
+        add_media_clip(&mut engine, track, base, 0, 100); // A [0, 100)
+        add_media_clip(&mut engine, track, base, 100, 100); // B [100, 200)
+        let items = [dropped(&engine, videos[0]), dropped(&engine, videos[1])];
+
+        // Tick 120: past A's midpoint, before B's → boundary at B's start.
+        place_drop_group(&mut engine, &items, TrackKind::Video, 0, 120, true);
+
+        assert_eq!(
+            lane_clip_extents(&engine, track),
+            vec![(0, 100), (100, 160), (160, 200), (200, 300)],
+            "inserted end-to-end at the boundary, B shifted right by 100"
+        );
+    }
+
+    // --- extract audio -------------------------------------------------------
+
+    /// Video-with-audio on a video lane at timeline start `start`, duration
+    /// `duration` (source window starts at 0).
+    fn extract_fixture(has_audio: bool, start: i64, duration: i64) -> (Engine, ClipId, MediaId) {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("extract-audio", r);
+        let media = project.add_media(cutlass_models::MediaSource::new(
+            "/tmp/extract-audio.mp4",
+            1920,
+            1080,
+            r,
+            1000,
+            has_audio,
+        ));
+        let track = project.add_track(TrackKind::Video, "V1");
+        let video = project
+            .add_clip(
+                track,
+                media,
+                TimeRange::at_rate(0, duration, r),
+                RationalTime::new(start, r),
+            )
+            .expect("video clip");
+        let engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+        (engine, video, media)
+    }
+
+    fn audio_lane_count(engine: &Engine) -> usize {
+        engine
+            .project()
+            .timeline()
+            .tracks_ordered()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .count()
+    }
+
+    fn audio_clip_count(engine: &Engine) -> usize {
+        engine
+            .project()
+            .timeline()
+            .tracks_ordered()
+            .filter(|t| t.kind == TrackKind::Audio)
+            .map(|t| t.clips_ordered().len())
+            .sum()
+    }
+
+    #[test]
+    fn extract_audio_lands_linked_extracted_companion() {
+        let (mut engine, video, media) = extract_fixture(true, 24, 96);
+        assert!(engine.project().timeline().carries_own_audio(video));
+        assert_eq!(audio_lane_count(&engine), 0);
+
+        let audio = extract_audio(&mut engine, video).expect("extract");
+        let audio_track = engine
+            .project()
+            .timeline()
+            .track_of(audio)
+            .expect("audio track");
+        assert_eq!(
+            engine
+                .project()
+                .timeline()
+                .track(audio_track)
+                .expect("track")
+                .kind,
+            TrackKind::Audio
+        );
+        assert_eq!(audio_lane_count(&engine), 1);
+
+        let video_clip = engine.project().clip(video).expect("video").clone();
+        let audio_clip = engine.project().clip(audio).expect("audio").clone();
+        assert_eq!(video_clip.link, audio_clip.link);
+        assert!(video_clip.link.is_some());
+        assert_eq!(audio_clip.audio_role, Some(AudioRole::Extracted));
+        assert_eq!(audio_clip.timeline.start.value, 24);
+        assert_eq!(audio_clip.timeline.duration.value, 96);
+        match (&video_clip.content, &audio_clip.content) {
+            (
+                ClipSource::Media {
+                    media: vm,
+                    source: vs,
+                },
+                ClipSource::Media {
+                    media: am,
+                    source: asrc,
+                },
+            ) => {
+                assert_eq!(*vm, media);
+                assert_eq!(vm, am);
+                assert_eq!(vs, asrc);
+            }
+            _ => panic!("both halves must be media-backed"),
+        }
+        assert!(!engine.project().timeline().carries_own_audio(video));
+        assert!(engine.project().timeline().carries_own_audio(audio));
+        assert!(engine.project().timeline().detached_to_audio_lane(video));
+        assert_eq!(
+            engine.project().media_count(),
+            1,
+            "extract must not create a new media pool entry"
+        );
+
+        // New audio lane sinks below the video lane (audio-floor invariant).
+        let order: Vec<_> = engine.project().timeline().order().to_vec();
+        let video_track = engine.project().timeline().track_of(video).unwrap();
+        let video_idx = order.iter().position(|t| *t == video_track).unwrap();
+        let audio_idx = order.iter().position(|t| *t == audio_track).unwrap();
+        assert!(
+            audio_idx < video_idx,
+            "audio lane must sit below video in stack order"
+        );
+    }
+
+    #[test]
+    fn extract_audio_is_idempotent_when_already_detached() {
+        let (mut engine, video, _) = extract_fixture(true, 0, 48);
+        extract_audio(&mut engine, video).expect("first extract");
+        assert_eq!(audio_clip_count(&engine), 1);
+
+        let err = extract_audio(&mut engine, video).expect_err("already detached");
+        assert!(err.starts_with("ignored:"));
+        assert_eq!(audio_clip_count(&engine), 1);
+        assert_eq!(audio_lane_count(&engine), 1);
+    }
+
+    #[test]
+    fn extract_audio_rejects_silent_video() {
+        let (mut engine, video, _) = extract_fixture(false, 0, 48);
+        let err = extract_audio(&mut engine, video).expect_err("no audio stream");
+        assert!(err.starts_with("ignored:"));
+        assert_eq!(audio_lane_count(&engine), 0);
+        assert!(engine.project().timeline().carries_own_audio(video));
+    }
+
+    #[test]
+    fn extract_audio_rejects_audio_lane_clip() {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("extract-audio-lane", r);
+        let media = project.add_media(cutlass_models::MediaSource::new(
+            "/tmp/extract-audio-lane.mp4",
+            1920,
+            1080,
+            r,
+            480,
+            true,
+        ));
+        let track = project.add_track(TrackKind::Audio, "A1");
+        let clip = project
+            .add_clip(
+                track,
+                media,
+                TimeRange::at_rate(0, 48, r),
+                RationalTime::new(0, r),
+            )
+            .expect("audio clip");
+        let mut engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+
+        let err = extract_audio(&mut engine, clip).expect_err("audio lane");
+        assert!(err.starts_with("ignored:"));
+        assert_eq!(audio_clip_count(&engine), 1);
+    }
+
+    #[test]
+    fn extract_audio_rejects_generated_clip() {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("extract-generated", r);
+        let track = project.add_track(TrackKind::Text, "T1");
+        let mut engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+        let clip = match engine
+            .apply(Command::Edit(EditCommand::AddGenerated {
+                track,
+                generator: Generator::text("Title"),
+                timeline: TimeRange::at_rate(0, 48, r),
+            }))
+            .expect("add generated")
+        {
+            ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
+            other => panic!("expected Created, got {other:?}"),
+        };
+
+        let err = extract_audio(&mut engine, clip).expect_err("generated");
+        assert!(err.starts_with("ignored:"));
+        assert_eq!(audio_lane_count(&engine), 0);
+    }
+
+    #[test]
+    fn extract_audio_copies_speed_and_reverse() {
+        let (mut engine, video, _) = extract_fixture(true, 0, 96);
+        apply_edit(
+            &mut engine,
+            EditCommand::SetClipSpeed {
+                clip: video,
+                speed: Rational::new(2, 1),
+                reversed: true,
+            },
+        )
+        .expect("retime video");
+
+        let audio = extract_audio(&mut engine, video).expect("extract");
+        let audio_clip = engine.project().clip(audio).expect("audio");
+        assert_eq!(audio_clip.speed, Rational::new(2, 1));
+        assert!(audio_clip.reversed);
+        // Timeline duration follows the retimed video half.
+        let video_dur = engine
+            .project()
+            .clip(video)
+            .unwrap()
+            .timeline
+            .duration
+            .value;
+        assert_eq!(audio_clip.timeline.duration.value, video_dur);
+    }
+
+    #[test]
+    fn extract_audio_reuses_free_audio_lane() {
+        let (mut engine, video, _) = extract_fixture(true, 0, 48);
+        // Pre-create an empty audio lane; extract should land there instead of
+        // spawning a second one.
+        let existing = match engine
+            .apply(Command::Edit(EditCommand::AddTrack {
+                kind: TrackKind::Audio,
+                name: "A1".into(),
+                index: None,
+                pinned: false,
+            }))
+            .expect("add audio lane")
+        {
+            ApplyOutcome::Edited(EditOutcome::CreatedTrack(id)) => id,
+            other => panic!("expected CreatedTrack, got {other:?}"),
+        };
+        assert_eq!(audio_lane_count(&engine), 1);
+
+        let audio = extract_audio(&mut engine, video).expect("extract");
+        assert_eq!(audio_lane_count(&engine), 1);
+        assert_eq!(engine.project().timeline().track_of(audio), Some(existing));
+    }
+
+    #[test]
+    fn extract_audio_creates_lane_when_existing_overlaps() {
+        let r = Rational::FPS_24;
+        let mut project = Project::new("extract-overlap", r);
+        let media = project.add_media(cutlass_models::MediaSource::new(
+            "/tmp/extract-overlap.mp4",
+            1920,
+            1080,
+            r,
+            1000,
+            true,
+        ));
+        let video_track = project.add_track(TrackKind::Video, "V1");
+        let audio_track = project.add_track(TrackKind::Audio, "A1");
+        // Occupant covers [0, 96) on the only audio lane.
+        project
+            .add_clip(
+                audio_track,
+                media,
+                TimeRange::at_rate(0, 96, r),
+                RationalTime::new(0, r),
+            )
+            .expect("occupant");
+        let video = project
+            .add_clip(
+                video_track,
+                media,
+                TimeRange::at_rate(0, 48, r),
+                RationalTime::new(0, r),
+            )
+            .expect("video");
+        let mut engine = Engine::with_project(EngineConfig::default(), project).expect("engine");
+        assert_eq!(audio_lane_count(&engine), 1);
+
+        let audio = extract_audio(&mut engine, video).expect("extract");
+        assert_eq!(audio_lane_count(&engine), 2);
+        assert_ne!(
+            engine.project().timeline().track_of(audio),
+            Some(audio_track),
+            "extracted clip must not land on the occupied lane"
+        );
+    }
+
+    #[test]
+    fn extract_audio_undo_restores_pre_extract_state() {
+        let (mut engine, video, _) = extract_fixture(true, 12, 60);
+        assert!(engine.project().timeline().carries_own_audio(video));
+        assert_eq!(engine.project().timeline().clip_count(), 1);
+
+        extract_audio(&mut engine, video).expect("extract");
+        assert_eq!(engine.project().timeline().clip_count(), 2);
+        assert!(!engine.project().timeline().carries_own_audio(video));
+        assert_eq!(audio_lane_count(&engine), 1);
+
+        // One undo group → one undo clears the companion, link, role, and lane.
+        assert!(engine.undo());
+        assert_eq!(engine.project().timeline().clip_count(), 1);
+        assert!(engine.project().timeline().carries_own_audio(video));
+        assert!(!engine.project().timeline().detached_to_audio_lane(video));
+        // Empty non-main audio lane may remain or be gone depending on policy;
+        // the video half must be fully restored either way.
+        assert!(engine.project().clip(video).unwrap().link.is_none());
+
+        assert!(engine.redo());
+        assert_eq!(engine.project().timeline().clip_count(), 2);
+        assert!(!engine.project().timeline().carries_own_audio(video));
+        assert_eq!(audio_clip_count(&engine), 1);
     }
 }

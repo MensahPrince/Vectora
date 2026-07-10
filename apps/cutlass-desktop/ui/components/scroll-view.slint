@@ -29,7 +29,7 @@
 //   thumb-size = track * visible-extent / viewport-extent  (proportional)
 //   thumb-pos  = (track - thumb-size) * (-viewport) / overflow
 // Thumb-size is clamped to a sensible minimum so it stays grabbable on
-// very tall content. Both bars are instances of the one `ScrollBar`
+// very tall content. Both bars are instances of the one `CutlassScrollBar`
 // component below — `horizontal` selects which window axis maps to the
 // bar's main axis — so the math exists exactly once.
 //
@@ -38,15 +38,18 @@
 // The bars overlay the content and the Flickable clamps scrolling at
 // the content edge, so a permanently visible bar would permanently
 // occlude the last `scrollbar-size` of content along its axis. Instead
-// the bars fade in on scrolling, on content-extent changes, and on
-// pointer-over, then fade out shortly after the last activity — the
-// occlusion is transient.
+// the bars fade in on scrolling and on content-extent changes, then
+// fade out shortly after the last activity — the occlusion is
+// transient.
 //
-// The bars' input areas stay live while faded so that moving the
-// pointer over a bar reveals it before any click lands. The flip side
-// is that the bar footprint swallows clicks even while invisible; that
-// matches the previous always-visible behavior, and the hover-reveal
-// keeps it visually coherent.
+// The bars' input areas are only live while the bars are visible
+// (poked awake, hovered, or mid-drag). A fully hidden bar is
+// click-through, so content under the bar footprint stays clickable —
+// matching native macOS overlay scrollbars, which appear on scroll
+// activity and only become interactive once revealed. Hovering a bar
+// while it is visible (including mid-fade) keeps it awake and
+// interactive; hovering the footprint of a fully hidden bar does
+// nothing.
 //
 // Usage
 // -----
@@ -66,14 +69,24 @@
 // Accessibility: Slint 1.16 has no `scrollbar` accessible role
 // (`AccessibleRole` offers `slider` at closest, which would misreport
 // the widget), so the bars carry no accessibility annotations yet.
+// Keyboard access is available instead via the opt-in
+// `enable-key-scroll` (arrows / Page Up / Page Down / Home / End).
 
 import { AppStore } from "../store/index.slint";
 
 // One overlay scrollbar (track + draggable thumb) for either axis.
 // Geometry is expressed along the bar's main axis; `horizontal` selects
 // which window coordinate maps to it. The parent provides position,
-// size, and `background` (track color) like any Rectangle.
-component ScrollBar inherits Rectangle {
+// size, and `background` (track color; default transparent) like any
+// Rectangle.
+//
+// Exported so surfaces with bespoke scroll plumbing (e.g. the timeline,
+// which syncs two Flickables and owns its own wheel/zoom handling) can
+// reuse the thumb math instead of re-deriving it. Such callers bind
+// `visible-extent` / `content-extent` / `offset` and drive `opacity` +
+// `bar-interactive` from their own reveal logic; `CutlassScrollView`
+// below packages all of that for the common case.
+export component CutlassScrollBar inherits Rectangle {
     // Main-axis extent of the visible area (flick.width / flick.height).
     in property <length> visible-extent;
     // Main-axis extent of the content (flick.viewport-width / -height).
@@ -89,12 +102,17 @@ component ScrollBar inherits Rectangle {
     in-out property <bool> dragging;
     in-out property <bool> hovered;
 
-    in property <color> thumb-color;
-    in property <color> thumb-hover-color;
-    in property <color> thumb-active-color;
-    in property <length> thumb-inset;
-    in property <length> thumb-min;
-    in property <length> thumb-radius;
+    // Hit-testing gate, driven by the parent's auto-hide state: a fully
+    // hidden bar must be click-through so it doesn't swallow clicks
+    // meant for content under its footprint.
+    in property <bool> bar-interactive: true;
+
+    in property <color> thumb-color: AppStore.theme.scrollbar.thumb;
+    in property <color> thumb-hover-color: AppStore.theme.scrollbar.thumb-hover;
+    in property <color> thumb-active-color: AppStore.theme.scrollbar.thumb-active;
+    in property <length> thumb-inset: AppStore.theme.scrollbar.thumb-inset;
+    in property <length> thumb-min: AppStore.theme.scrollbar.thumb-min;
+    in property <length> thumb-radius: AppStore.theme.scrollbar.thumb-radius;
 
     // ---- Derived metrics --------------------------------------------------
 
@@ -153,6 +171,7 @@ component ScrollBar inherits Rectangle {
 
         width: 100%;
         height: 100%;
+        enabled: root.bar-interactive;
 
         changed pressed => { root.dragging = self.pressed; }
         changed has-hover => { root.hovered = self.has-hover; }
@@ -212,6 +231,14 @@ export component CutlassScrollView inherits Rectangle {
     // gate).
     in property <bool> interactive: true;
 
+    // Keyboard scrolling (opt-in). When set, a FocusScope around the
+    // viewport takes focus on click and drives `viewport-y`: arrows
+    // step, Page Up/Down page, Home/End jump. Opt-in rather than
+    // default because the scope competes for click-focus with
+    // focusable content (text inputs) and with window-level shortcut
+    // scopes.
+    in property <bool> enable-key-scroll: false;
+
     // ---- Scrollbar configuration --------------------------------------------
 
     // Auto-instantiate by default: only create a bar when content
@@ -238,15 +265,50 @@ export component CutlassScrollView inherits Rectangle {
     // ---- Derived metrics ----------------------------------------------------
 
     // Bar existence latches on `dragging || hovered` so the `if` below
-    // can't destroy a bar mid-drag (or mid-hover, which would cut the
-    // auto-hide fade short) when content shrinks under it.
-    property <bool> v-bar-shown: show-vertical-scrollbar || v-bar-dragging || v-bar-hovered;
-    property <bool> h-bar-shown: show-horizontal-scrollbar || h-bar-dragging || h-bar-hovered;
+    // can't destroy a bar mid-drag when content shrinks under it, and
+    // on `*-bar-linger` so a bar whose overflow just disappeared stays
+    // alive until the fade-out animation completes instead of being
+    // torn down mid-fade.
+    property <bool> v-bar-alive: show-vertical-scrollbar || v-bar-dragging || v-bar-hovered;
+    property <bool> h-bar-alive: show-horizontal-scrollbar || h-bar-dragging || h-bar-hovered;
+    property <bool> v-bar-shown: v-bar-alive || v-bar-linger;
+    property <bool> h-bar-shown: h-bar-alive || h-bar-linger;
+
+    // Set while a bar is painted so it can outlive its `alive`
+    // condition through the fade-out; cleared once the fade lands at
+    // zero opacity.
+    //
+    // Latched from the opacity change stream rather than
+    // `changed v-bar-alive`: change trackers evaluate their watched
+    // expression eagerly at component init, and the alive conditions
+    // read `self.width` / `self.height`. When the scroll view sits
+    // inside a conditional (`if`) element, init runs while the parent
+    // layout cache is mid-evaluation, and that eager layout read
+    // re-enters it — Slint panics with "Recursion detected".
+    // `bars-opacity` only depends on plain interaction state, so
+    // watching it is safe; the alive flags are read in the handler
+    // body, which runs from the event loop, outside any binding
+    // evaluation.
+    property <bool> v-bar-linger;
+    property <bool> h-bar-linger;
+
+    changed bars-opacity => {
+        if (bars-opacity <= 0.001) {
+            v-bar-linger = false;
+            h-bar-linger = false;
+        } else {
+            if (v-bar-alive) { v-bar-linger = true; }
+            if (h-bar-alive) { h-bar-linger = true; }
+        }
+    }
 
     // Reserve the opposite bar's footprint so the two tracks meet at a
-    // square corner instead of painting over each other.
+    // square corner instead of painting over each other. Animated so
+    // the perpendicular thumb's track length eases instead of jumping
+    // when the other bar latches into or out of existence.
     property <length> reserve-bottom: h-bar-shown ? scrollbar-size : 0px;
     property <length> reserve-right: v-bar-shown ? scrollbar-size : 0px;
+    animate reserve-bottom, reserve-right { duration: 120ms; easing: ease-out; }
 
     // ---- Auto-hide ----------------------------------------------------------
 
@@ -263,6 +325,12 @@ export component CutlassScrollView inherits Rectangle {
     property <float> bars-opacity: (bars-poked || bars-engaged) ? 1.0 : 0.0;
     animate bars-opacity { duration: 200ms; easing: ease-out; }
 
+    // Bars accept pointer input only while at least partially painted
+    // (awake, engaged, or mid-fade); fully hidden bars are
+    // click-through. Hovering a visible bar re-engages it via the
+    // bar's own hover tracking.
+    property <bool> bars-interactive: bars-poked || bars-engaged || bars-opacity > 0.001;
+
     function poke-bars() {
         self.bars-poked = true;
         hide-delay.restart();
@@ -272,9 +340,16 @@ export component CutlassScrollView inherits Rectangle {
     changed viewport-y => { poke-bars(); }
     // Also reveal when the scrollable extent changes (content added or
     // removed, including the initial layout) so overflow is
-    // discoverable without scrolling.
-    changed viewport-width => { poke-bars(); }
-    changed viewport-height => { poke-bars(); }
+    // discoverable without scrolling — but only when that axis
+    // actually overflows, so fit-content views bound to their own
+    // width/height don't flash the bars on every window resize or
+    // splitter drag.
+    changed viewport-width => {
+        if (viewport-width > self.width) { poke-bars(); }
+    }
+    changed viewport-height => {
+        if (viewport-height > self.height) { poke-bars(); }
+    }
 
     hide-delay := Timer {
         interval: 1100ms;
@@ -290,23 +365,66 @@ export component CutlassScrollView inherits Rectangle {
     // sub-pixel rounding leaking content past the scrollbar tracks.
     clip: true;
 
-    flick := Flickable {
+    function scroll-to-y(target: length) {
+        self.viewport-y = clamp(target, min(0px, self.height - self.viewport-height), 0px);
+    }
+
+    // Wraps the viewport so a click inside (that no focusable child
+    // claims) focuses the scope and keys scroll. Disabled scopes never
+    // take focus, so the default is behaviorally inert.
+    key-scope := FocusScope {
         x: 0;
         y: 0;
         width: root.width;
         height: root.height;
-        interactive: root.interactive;
-        viewport-width: root.viewport-width;
-        viewport-height: root.viewport-height;
-        viewport-x <=> root.viewport-x;
-        viewport-y <=> root.viewport-y;
+        enabled: root.enable-key-scroll;
 
-        @children
+        key-pressed(event) => {
+            if (event.text == Key.UpArrow) {
+                root.scroll-to-y(root.viewport-y + 40px);
+                return accept;
+            }
+            if (event.text == Key.DownArrow) {
+                root.scroll-to-y(root.viewport-y - 40px);
+                return accept;
+            }
+            if (event.text == Key.PageUp) {
+                root.scroll-to-y(root.viewport-y + root.height);
+                return accept;
+            }
+            if (event.text == Key.PageDown) {
+                root.scroll-to-y(root.viewport-y - root.height);
+                return accept;
+            }
+            if (event.text == Key.Home) {
+                root.scroll-to-y(0px);
+                return accept;
+            }
+            if (event.text == Key.End) {
+                root.scroll-to-y(-root.viewport-height);
+                return accept;
+            }
+            reject
+        }
+
+        flick := Flickable {
+            x: 0;
+            y: 0;
+            width: root.width;
+            height: root.height;
+            interactive: root.interactive;
+            viewport-width: root.viewport-width;
+            viewport-height: root.viewport-height;
+            viewport-x <=> root.viewport-x;
+            viewport-y <=> root.viewport-y;
+
+            @children
+        }
     }
 
     // ---- Scrollbars ----------------------------------------------------------
 
-    if v-bar-shown: ScrollBar {
+    if v-bar-shown: CutlassScrollBar {
         horizontal: false;
         x: root.width - scrollbar-size;
         y: 0;
@@ -320,6 +438,7 @@ export component CutlassScrollView inherits Rectangle {
         offset <=> flick.viewport-y;
         dragging <=> root.v-bar-dragging;
         hovered <=> root.v-bar-hovered;
+        bar-interactive: root.bars-interactive;
 
         thumb-color: scrollbar-thumb-color;
         thumb-hover-color: scrollbar-thumb-hover-color;
@@ -329,7 +448,7 @@ export component CutlassScrollView inherits Rectangle {
         thumb-radius: scrollbar-thumb-radius;
     }
 
-    if h-bar-shown: ScrollBar {
+    if h-bar-shown: CutlassScrollBar {
         horizontal: true;
         x: 0;
         y: root.height - scrollbar-size;
@@ -343,6 +462,7 @@ export component CutlassScrollView inherits Rectangle {
         offset <=> flick.viewport-x;
         dragging <=> root.h-bar-dragging;
         hovered <=> root.h-bar-hovered;
+        bar-interactive: root.bars-interactive;
 
         thumb-color: scrollbar-thumb-color;
         thumb-hover-color: scrollbar-thumb-hover-color;
@@ -366,7 +486,11 @@ export component CutlassScrollView inherits Rectangle {
 
         // Rectangles don't participate in hit-testing; without this,
         // clicks on the corner would fall through to the (visually
-        // hidden) content beneath and activate it.
-        TouchArea { }
+        // hidden) content beneath and activate it while the bars are
+        // painted. Disabled when the bars are hidden so the corner is
+        // click-through like the bars themselves.
+        TouchArea {
+            enabled: root.bars-interactive;
+        }
     }
 }

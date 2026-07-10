@@ -83,6 +83,7 @@ impl Scene {
                 | LayerSource::Media { .. }
                 | LayerSource::Still { .. }
                 | LayerSource::Sticker { .. }
+                | LayerSource::Lottie { .. }
                 | LayerSource::Text { .. }
                 | LayerSource::Solid(_)
                 | LayerSource::Transition { .. } => {}
@@ -167,6 +168,19 @@ pub struct SceneLayer {
     /// Resolved color grade (filter preset + manual adjustments); `None` when
     /// the clip's look is identity.
     pub color_grade: Option<ColorGrade>,
+    /// `.cube` 3D LUT applied after the grade; `None` when the clip has none.
+    /// File-backed: the renderer parses and uploads the table on first use
+    /// and skips missing/unparseable files gracefully.
+    pub lut: Option<SceneLut>,
+}
+
+/// A file-backed `.cube` LUT reference on a [`SceneLayer`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct SceneLut {
+    /// Absolute path to the `.cube` file.
+    pub path: String,
+    /// Blend of the looked-up result over the original, `0` … `1`.
+    pub intensity: f32,
 }
 
 impl SceneLayer {
@@ -219,6 +233,15 @@ pub enum LayerSource {
     Sticker {
         /// Catalog id (see [`cutlass_models::sticker_catalog`]).
         asset: String,
+        /// Seconds since the clip's timeline start.
+        local_time: f64,
+    },
+    /// A file-backed Lottie animation: the renderer parses `path` once and
+    /// rasterizes the capped-fps frame at `local_time` on demand (LRU-cached,
+    /// looping). A missing/unparseable file draws nothing.
+    Lottie {
+        /// Absolute path to the `.json` on disk.
+        path: String,
         /// Seconds since the clip's timeline start.
         local_time: f64,
     },
@@ -291,6 +314,7 @@ mod tests {
             mask: None,
             chroma_key: None,
             color_grade: None,
+            lut: None,
         }
     }
 
@@ -316,6 +340,7 @@ mod tests {
             mask: None,
             chroma_key: None,
             color_grade: None,
+            lut: None,
         }
     }
 
@@ -336,6 +361,7 @@ mod tests {
             mask: None,
             chroma_key: None,
             color_grade: None,
+            lut: None,
         }
     }
 

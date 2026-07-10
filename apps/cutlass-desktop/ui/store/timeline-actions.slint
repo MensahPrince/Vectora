@@ -10,6 +10,7 @@
 import { EditorStore } from "editor-store.slint";
 import { TimelineStore } from "timeline-store.slint";
 import { AppStore } from "app-store.slint";
+import { TrackKind } from "../models/index.slint";
 import { TimelineViewState } from "../panels/timeline/state.slint";
 import { InspectorBackend, SelectedClipInfo } from "../lib/inspector-backend.slint";
 import { SelectionBackend, SelectionUpdate } from "../lib/selection-backend.slint";
@@ -190,6 +191,21 @@ export global TimelineActions {
             return;
         }
         EditorStore.on-clip-reversed(TimelineStore.selected-clip-id);
+    }
+
+    // CapCut extract audio: video-lane media with sound that is not already
+    // detached. Gated by the projected capability on the primary selection.
+    public pure function can-extract-audio() -> bool {
+        return self.selected-clip().found
+            && self.selected-clip().track-kind == TrackKind.video
+            && self.selected-clip().clip.caps.can-extract-audio;
+    }
+
+    public function extract-audio-selected() {
+        if (!self.can-extract-audio()) {
+            return;
+        }
+        EditorStore.on-clip-audio-extracted(TimelineStore.selected-clip-id);
     }
 
     // Whether the selection touches any link group — gates the toolbar's

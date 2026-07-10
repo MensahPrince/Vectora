@@ -1,0 +1,29 @@
+// Lottie stickers for Library > Stickers > Lottie, implemented in Rust
+// (src/lottie_stickers.rs owns a worker thread; catalog fetches, file
+// downloads, and thumbnail rasterization never touch the UI thread).
+//
+// The worker fetches the anonymous catalog (/v1/assets/lottie), downloads
+// the small .json files into the asset cache, probes each composition, and
+// rasterizes frame 0 as the tile thumbnail. Tiles drag onto the timeline
+// with the generator key "lottie:<id>"; the drop resolver looks the id up
+// in the registry the worker filled and places a file-backed
+// Generator::Lottie clip.
+
+// One downloaded, droppable Lottie animation.
+export struct LottieTile {
+    // Catalog id ("lot-confetti"); becomes "lottie:<id>" on drag.
+    key: string,
+    name: string,
+    // Frame 0, rasterized by the worker.
+    thumbnail: image,
+}
+
+export global LottieBackend {
+    in-out property <[LottieTile]> items: [];
+    // "idle" (never fetched) | "loading" | "results" | "empty" | "error".
+    in-out property <string> status: "idle";
+    in-out property <string> error: "";
+
+    // (Re)fetch the catalog and download any missing files.
+    callback refresh();
+}

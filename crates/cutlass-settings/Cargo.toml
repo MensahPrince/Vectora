@@ -1,6 +1,6 @@
 [package]
 name = "cutlass-settings"
-description = "User settings model + format-preserving IO for ~/.cutlass/config.toml"
+description = "User settings model and format-preserving IO for ~/.cutlass/config.toml"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -674,14 +674,30 @@ mod tests {
     fn add_transition_inverse_oscillates() {
         use crate::action::edit::set_transition;
         let mut project = setup();
-        let track = project.add_track(TrackKind::Adjustment, "FX");
+        let track = project.add_track(TrackKind::Sticker, "S1");
         let left = project
             .timeline_mut()
-            .add_clip(track, Clip::generated(Generator::Adjustment, tr(0, 24)))
+            .add_clip(
+                track,
+                Clip::generated(
+                    Generator::SolidColor {
+                        rgba: [255, 0, 0, 255],
+                    },
+                    tr(0, 24),
+                ),
+            )
             .unwrap();
         let _right = project
             .timeline_mut()
-            .add_clip(track, Clip::generated(Generator::Adjustment, tr(24, 24)))
+            .add_clip(
+                track,
+                Clip::generated(
+                    Generator::SolidColor {
+                        rgba: [0, 0, 255, 255],
+                    },
+                    tr(24, 24),
+                ),
+            )
             .unwrap();
 
         let mut project_path = None;
@@ -725,14 +741,30 @@ mod tests {
         use crate::action::dispatch;
         use cutlass_commands::{Command, EditCommand};
         let mut project = setup();
-        let track = project.add_track(TrackKind::Adjustment, "FX");
+        let track = project.add_track(TrackKind::Sticker, "S1");
         let left = project
             .timeline_mut()
-            .add_clip(track, Clip::generated(Generator::Adjustment, tr(0, 24)))
+            .add_clip(
+                track,
+                Clip::generated(
+                    Generator::SolidColor {
+                        rgba: [255, 0, 0, 255],
+                    },
+                    tr(0, 24),
+                ),
+            )
             .unwrap();
         let _right = project
             .timeline_mut()
-            .add_clip(track, Clip::generated(Generator::Adjustment, tr(24, 24)))
+            .add_clip(
+                track,
+                Clip::generated(
+                    Generator::SolidColor {
+                        rgba: [0, 0, 255, 255],
+                    },
+                    tr(24, 24),
+                ),
+            )
             .unwrap();
         project.add_transition(left, "crossfade").unwrap();
 

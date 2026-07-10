@@ -19,6 +19,8 @@ thiserror.workspace = true
 tracing.workspace = true
 png = "0.17"
 nnnoiseless = "0.5"
+# The `lut-pack` baker bin writes the starter-pack `luts.json` catalog.
+serde_json.workspace = true
 
 [dev-dependencies]
 tempfile = "3"

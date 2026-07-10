@@ -16,9 +16,9 @@ use std::path::PathBuf;
 
 use cutlass_models::{
     AnimationRef, AnimationSlot, AudioRole, CanvasAspect, ChromaKey, ClipId, ClipParam,
-    ClipTransform, ColorAdjustments, CropRect, Easing, Filter, Generator, MarkerColor, MarkerId,
-    Mask, MediaId, Param, ParamValue, Rational, RationalTime, Replaceable, StabilizeLevel,
-    TemplateMeta, TimeRange, TrackId, TrackKind,
+    ClipTransform, ColorAdjustments, CropRect, Easing, Filter, Generator, Lut, MarkerColor,
+    MarkerId, Mask, MediaId, Param, ParamValue, Rational, RationalTime, Replaceable,
+    StabilizeLevel, TemplateMeta, TimeRange, TrackId, TrackKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -261,6 +261,10 @@ pub enum EditCommand {
         clip: ClipId,
         filter: Option<Filter>,
     },
+    /// Set (or clear) a `.cube` 3D LUT, applied after filter + adjust. Any
+    /// visual clip, including `Generator::Filter` lane bars (canvas-wide).
+    /// The inverse restores the previous clip state.
+    SetClipLut { clip: ClipId, lut: Option<Lut> },
     /// Set a clip's manual color grade (CapCut adjust, Phase I;
     /// render-neutral): all five sliders in one shot, neutral values clear.
     /// Any visual clip, including `Generator::Adjustment` lane bars. The

@@ -1,8 +1,14 @@
+mod account;
 mod agent;
+mod ai_media;
 mod audio;
+mod cloud;
 mod drafts;
 mod inspector;
 mod interaction;
+mod lottie_stickers;
+mod lut_catalog;
+mod os_drop;
 mod params;
 mod paths;
 mod placement;
@@ -14,13 +20,22 @@ mod projection;
 mod proxy;
 mod ruler;
 mod selection;
+mod sfx;
 mod snap;
 mod strips;
+mod templates;
+mod text_presets;
 mod thumbnails;
 mod timecode;
 mod timeline;
 mod transport;
 mod window;
+
+use std::cell::Cell;
+use std::cell::RefCell;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::time::Duration;
 
 use cutlass_engine::EngineConfig;
 use slint::BackendSelector;
@@ -30,7 +45,9 @@ use slint::ModelRc;
 use slint::SharedString;
 use slint::VecModel;
 use slint::wgpu_28::WGPUConfiguration;
+use slint::winit_030::EventResult;
 use slint::winit_030::WinitWindowAccessor;
+use slint::winit_030::winit::event::WindowEvent;
 use tracing_subscriber::EnvFilter;
 
 slint::include_modules!();
@@ -120,21 +137,82 @@ fn defer_main_thread(f: impl FnOnce() + Send + 'static) {
 // during which Slint's display-link tick re-enters timer processing and
 // aborts with "Recursion in timer code".
 
-async fn pick_import_path() -> Option<std::path::PathBuf> {
+// Extensions accepted by the import dialog and OS file-drop handler.
+const MEDIA_IMPORT_EXTENSIONS: &[&str] = &[
+    "mp4", "mov", "mkv", "webm", "m4v", "mp3", "wav", "m4a", "aac", "flac", "ogg", "png", "jpg",
+    "jpeg", "webp",
+];
+const VIDEO_IMPORT_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "m4v"];
+const AUDIO_IMPORT_EXTENSIONS: &[&str] = &["mp3", "wav", "m4a", "aac", "flac", "ogg"];
+const IMAGE_IMPORT_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
+
+fn media_extension_supported(path: &std::path::Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    MEDIA_IMPORT_EXTENSIONS
+        .iter()
+        .any(|&supported| supported == ext)
+}
+
+/// Extension-only audio check for files still owned by the OS drag (the
+/// probe runs after the drop): drives the hover preview's lane kind.
+fn audio_extension(path: &std::path::Path) -> bool {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return false;
+    };
+    let ext = ext.to_ascii_lowercase();
+    AUDIO_IMPORT_EXTENSIONS
+        .iter()
+        .any(|&supported| supported == ext)
+}
+
+/// Where an OS file drop at window-space `cursor` (logical points) lands on
+/// the timeline: `Some((lane row, sequence tick))` when the cursor is over
+/// the timeline panel, `None` anywhere else — the caller falls back to the
+/// pool-only import. Geometry comes from the AppState mirror TimelinePanel
+/// maintains (`sync-os-drop-geometry`); the launch-screen and maximized-
+/// preview guards cover the states where that mirror is stale because the
+/// panel is unmounted.
+fn os_drop_timeline_target(app: &AppWindow, cursor: (f32, f32)) -> Option<(i64, i64)> {
+    let state = app.global::<AppState>();
+    if state.get_launch_visible() || state.get_preview_maximized() {
+        return None;
+    }
+    let (cx, cy) = cursor;
+    let (px, py) = (state.get_timeline_panel_x(), state.get_timeline_panel_y());
+    let (pw, ph) = (state.get_timeline_panel_w(), state.get_timeline_panel_h());
+    if pw <= 0.0 || ph <= 0.0 || cx < px || cx >= px + pw || cy < py || cy >= py + ph {
+        return None;
+    }
+    let pitch = state.get_timeline_row_pitch();
+    let zoom = app.global::<TimelineStore>().get_zoom();
+    if pitch <= 0.0 || zoom <= 0.0 {
+        return None;
+    }
+    let view = app.global::<TimelineViewState>();
+    // Same math as the library drag targeting in timeline.slint: cursor →
+    // lane-content space → tick / row (row 0 is the head spacer, lanes
+    // start at row 1).
+    let tick = ((cx - state.get_timeline_lanes_x() - view.get_scroll_x()) / zoom)
+        .round()
+        .max(0.0) as i64;
+    let row =
+        ((cy - state.get_timeline_lanes_y() - view.get_scroll_y()) / pitch).floor() as i64 - 1;
+    Some((row, tick))
+}
+
+async fn pick_import_paths() -> Vec<std::path::PathBuf> {
     rfd::AsyncFileDialog::new()
-        .add_filter(
-            "Media",
-            &[
-                "mp4", "mov", "mkv", "webm", "m4v", "mp3", "wav", "m4a", "aac", "flac", "ogg",
-                "png", "jpg", "jpeg", "webp",
-            ],
-        )
-        .add_filter("Video", &["mp4", "mov", "mkv", "webm", "m4v"])
-        .add_filter("Audio", &["mp3", "wav", "m4a", "aac", "flac", "ogg"])
-        .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
-        .pick_file()
+        .add_filter("Media", MEDIA_IMPORT_EXTENSIONS)
+        .add_filter("Video", VIDEO_IMPORT_EXTENSIONS)
+        .add_filter("Audio", AUDIO_IMPORT_EXTENSIONS)
+        .add_filter("Images", IMAGE_IMPORT_EXTENSIONS)
+        .pick_files()
         .await
-        .map(|file| file.path().to_path_buf())
+        .map(|files| files.into_iter().map(|f| f.path().to_path_buf()).collect())
+        .unwrap_or_default()
 }
 
 /// File picker for Open file… — choose an external `.cutlass` to import into
@@ -549,6 +627,175 @@ fn main() -> Result<(), slint::PlatformError> {
         "engine session ready"
     );
 
+    // Library stock browsing: search + direct-CDN downloads on their own
+    // thread (src/cloud.rs); imports route through the preview worker like
+    // any local file.
+    let cloud_worker = cloud::CloudWorker::spawn(app.as_weak(), preview_worker.handle())
+        .map_err(slint::PlatformError::Other)?;
+    {
+        let cloud_backend = app.global::<CloudBackend>();
+        let search_handle = cloud_worker.handle();
+        let search_app = app.as_weak();
+        cloud_backend.on_stock_search(move || {
+            let Some(app) = search_app.upgrade() else {
+                return;
+            };
+            let backend = app.global::<CloudBackend>();
+            let query = backend.get_stock_query().trim().to_string();
+            if query.is_empty() {
+                return;
+            }
+            search_handle.search(query, backend.get_stock_kind().as_str());
+        });
+        let more_handle = cloud_worker.handle();
+        cloud_backend.on_stock_load_more(move || more_handle.load_more());
+        let import_handle = cloud_worker.handle();
+        cloud_backend.on_stock_import(move |index| {
+            if index >= 0 {
+                import_handle.import(index as usize);
+            }
+        });
+    }
+
+    // Launch-screen templates gallery: catalog fetches, bundle installs, and
+    // the pick flow on their own thread (src/templates.rs); the filled
+    // template swaps the session through the preview worker.
+    let templates_worker =
+        templates::TemplatesWorker::spawn(app.as_weak(), preview_worker.handle())
+            .map_err(slint::PlatformError::Other)?;
+    {
+        let templates_backend = app.global::<TemplatesBackend>();
+        let refresh_handle = templates_worker.handle();
+        templates_backend.on_refresh(move |category| refresh_handle.refresh(category.to_string()));
+        let use_handle = templates_worker.handle();
+        templates_backend.on_use_template(move |index| {
+            if index >= 0 {
+                use_handle.use_template(index as usize);
+            }
+        });
+    }
+
+    // AI generation (Library AI sections): prompt → job → poll → import on
+    // its own thread (src/ai_media.rs), routed BYOK-or-managed.
+    let ai_media_worker = ai_media::AiMediaWorker::spawn(app.as_weak(), preview_worker.handle())
+        .map_err(slint::PlatformError::Other)?;
+    {
+        let ai_backend = app.global::<AiBackend>();
+        let generate_handle = ai_media_worker.handle();
+        ai_backend.on_generate(move |kind, prompt| {
+            generate_handle.generate(kind.to_string(), prompt.trim().to_string());
+        });
+        let import_handle = ai_media_worker.handle();
+        ai_backend.on_import(move |kind, index| {
+            if index >= 0 {
+                import_handle.import(kind.to_string(), index as usize);
+            }
+        });
+        let route_handle = ai_media_worker.handle();
+        ai_backend.on_refresh_route(move || route_handle.refresh_route());
+    }
+
+    // Cutlass account (Settings > Account + launch update nudge): device-
+    // flow sign-in, balance, the website hand-off for credits, and the
+    // update check on their own thread (src/account.rs); tokens live in
+    // the OS keychain.
+    let account_worker =
+        account::AccountWorker::spawn(app.as_weak()).map_err(slint::PlatformError::Other)?;
+    {
+        let account_backend = app.global::<AccountBackend>();
+        let sign_in_handle = account_worker.handle();
+        account_backend.on_sign_in(move || sign_in_handle.sign_in());
+        let sign_out_handle = account_worker.handle();
+        account_backend.on_sign_out(move || sign_out_handle.sign_out());
+        let balance_handle = account_worker.handle();
+        account_backend.on_refresh_balance(move || balance_handle.refresh_balance());
+        let buy_handle = account_worker.handle();
+        account_backend.on_buy_credits(move || buy_handle.buy_credits());
+        let update_handle = account_worker.handle();
+        account_backend.on_open_update(move || update_handle.open_update());
+        // Restore any keychain session and run the update check now, in the
+        // background — the launch screen renders regardless.
+        account_worker.handle().init();
+    }
+
+    // Animated text presets (Library > Text > Presets): catalog fetches on
+    // their own thread (src/text_presets.rs); the registry feeds the
+    // generated-drop resolver below.
+    let text_preset_registry: text_presets::PresetRegistry =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let text_presets_worker =
+        text_presets::TextPresetsWorker::spawn(app.as_weak(), text_preset_registry.clone())
+            .map_err(slint::PlatformError::Other)?;
+    {
+        let refresh_handle = text_presets_worker.handle();
+        app.global::<TextPresetsBackend>()
+            .on_refresh(move || refresh_handle.refresh());
+    }
+
+    // Lottie stickers (Library > Stickers > Lottie): catalog fetch, file
+    // downloads, and frame-0 thumbnails on their own thread
+    // (src/lottie_stickers.rs); the registry feeds the drop resolver below.
+    let lottie_registry: lottie_stickers::LottieRegistry =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let lottie_worker =
+        lottie_stickers::LottieWorker::spawn(app.as_weak(), lottie_registry.clone())
+            .map_err(slint::PlatformError::Other)?;
+    {
+        let refresh_handle = lottie_worker.handle();
+        app.global::<LottieBackend>()
+            .on_refresh(move || refresh_handle.refresh());
+    }
+
+    // Sound effects (Library > Audio > Sound effects): catalog fetch on its
+    // own thread, lazy download + normal media import on click (src/sfx.rs).
+    let sfx_worker = sfx::SfxWorker::spawn(app.as_weak(), preview_worker.handle())
+        .map_err(slint::PlatformError::Other)?;
+    {
+        let refresh_handle = sfx_worker.handle();
+        app.global::<SfxBackend>()
+            .on_refresh(move || refresh_handle.refresh());
+    }
+    {
+        let import_handle = sfx_worker.handle();
+        app.global::<SfxBackend>()
+            .on_import(move |index| import_handle.import(index.max(0) as usize));
+    }
+
+    // Cloud LUTs (look inspector > LUT): catalog fetch + `.cube` downloads
+    // on their own thread (src/lut_catalog.rs); the registry resolves
+    // catalog ids to downloaded files for `set-clip-lut`.
+    let lut_registry: lut_catalog::LutRegistry =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let lut_worker = lut_catalog::LutWorker::spawn(app.as_weak(), lut_registry.clone())
+        .map_err(slint::PlatformError::Other)?;
+    {
+        let refresh_handle = lut_worker.handle();
+        app.global::<InspectorBackend>()
+            .on_refresh_luts(move || refresh_handle.refresh());
+    }
+    {
+        let set_lut_handle = preview_worker.handle();
+        let registry = lut_registry.clone();
+        app.global::<InspectorBackend>()
+            .on_set_clip_lut(move |clip_id, lut_id, intensity| {
+                let path = if lut_id.is_empty() {
+                    String::new()
+                } else {
+                    let Some(path) = registry
+                        .lock()
+                        .expect("LUT registry poisoned")
+                        .get(lut_id.as_str())
+                        .map(|p| p.to_string_lossy().into_owned())
+                    else {
+                        tracing::warn!(lut = %lut_id, "set-clip-lut ignored: unknown catalog id");
+                        return;
+                    };
+                    path
+                };
+                set_lut_handle.set_clip_lut(clip_id.to_string(), path, intensity);
+            });
+    }
+
     let agent_worker = agent::AgentWorker::spawn(preview_worker.handle(), agent_store.as_weak())
         .map_err(slint::PlatformError::from)?;
 
@@ -596,6 +843,14 @@ fn main() -> Result<(), slint::PlatformError> {
         agent_session.cancel();
         agent_session.discard_plan();
         agent_session.reset_history();
+    });
+
+    // Per-project agent rules editor (agent panel) → ProjectMetadata via
+    // the engine worker; the projection publishes the saved value back to
+    // EditorStore.project.agent-rules.
+    let rules_handle = preview_worker.handle();
+    agent_store.on_set_project_rules(move |rules| {
+        rules_handle.set_agent_rules(rules.to_string());
     });
 
     // Playhead moves (ruler scrub, frame-step keys, Home/End) become preview
@@ -661,6 +916,8 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     let generated_drop_handle = preview_worker.handle();
+    let drop_preset_registry = text_preset_registry.clone();
+    let drop_lottie_registry = lottie_registry.clone();
     editor.on_on_generated_dropped(
         move |generator, track_id, start_tick, duration_ticks, drop_row| {
             // "effect:<id>" drops a standalone effect-lane segment: a bare
@@ -668,10 +925,46 @@ fn main() -> Result<(), slint::PlatformError> {
             let effect = generator
                 .strip_prefix("effect:")
                 .map(std::string::ToString::to_string);
-            let Some(generator) = generator_from_key(generator.as_str()) else {
-                tracing::warn!(%generator, "ignoring drop of unknown generator key");
-                return;
-            };
+            // "text-preset:<id>" drops a styled, animated title from the
+            // served preset catalog (src/text_presets.rs fills the registry).
+            let (generator, animations) =
+                if let Some(preset_id) = generator.as_str().strip_prefix("text-preset:") {
+                    let registry = drop_preset_registry
+                        .lock()
+                        .expect("preset registry poisoned");
+                    let Some(preset) = registry.get(preset_id) else {
+                        tracing::warn!(preset_id, "ignoring drop of unknown text preset");
+                        return;
+                    };
+                    (
+                        text_presets::generator_for(preset),
+                        text_presets::animations_for(preset),
+                    )
+                // "lottie:<id>" drops a file-backed Lottie animation from the
+                // asset catalog (src/lottie_stickers.rs fills the registry).
+                } else if let Some(lottie_id) = generator.as_str().strip_prefix("lottie:") {
+                    let registry = drop_lottie_registry
+                        .lock()
+                        .expect("lottie registry poisoned");
+                    let Some(asset) = registry.get(lottie_id) else {
+                        tracing::warn!(lottie_id, "ignoring drop of unknown lottie asset");
+                        return;
+                    };
+                    (
+                        cutlass_models::Generator::lottie(
+                            asset.path.to_string_lossy(),
+                            asset.width,
+                            asset.height,
+                        ),
+                        Vec::new(),
+                    )
+                } else {
+                    let Some(generator) = generator_from_key(generator.as_str()) else {
+                        tracing::warn!(%generator, "ignoring drop of unknown generator key");
+                        return;
+                    };
+                    (generator, Vec::new())
+                };
             generated_drop_handle.add_generated(
                 generator,
                 track_id.to_string(),
@@ -679,6 +972,7 @@ fn main() -> Result<(), slint::PlatformError> {
                 i64::from(duration_ticks),
                 i64::from(drop_row),
                 effect,
+                animations,
             );
         },
     );
@@ -692,13 +986,134 @@ fn main() -> Result<(), slint::PlatformError> {
     editor.on_on_import_clicked(move || {
         let import_handle = import_handle.clone();
         let task = slint::spawn_local(async move {
-            if let Some(path) = pick_import_path().await {
+            for path in pick_import_paths().await {
                 import_handle.import(path);
             }
         });
         if let Err(e) = task {
             tracing::error!("failed to open import dialog: {e}");
         }
+    });
+
+    // OS file drag-and-drop (Finder / Explorer): winit 0.30 emits one event
+    // per file, with no pointer position (the position-carrying drag API is
+    // winit 0.31). A gesture's paths are batched and flushed on a short
+    // timer; the flush queries the OS cursor (src/os_drop.rs) snapshotted at
+    // the first DroppedFile and hit-tests it against the timeline panel: a
+    // drop over the timeline imports *and places* the files end-to-end at
+    // the cursor's lane row + tick (one undo group), anywhere else keeps the
+    // pool-only import. While files hover, a poll timer feeds the cursor to
+    // the timeline's landing preview — there are no hover-move events to
+    // react to.
+    let drop_import_handle = preview_worker.handle();
+    let drop_app_weak = app.as_weak();
+    // (visual, audio) counts of the hovered files, by extension — the
+    // preview targets a video lane unless the whole set is audio.
+    let hover_counts: Rc<Cell<(i32, i32)>> = Rc::new(Cell::new((0, 0)));
+    let hover_poll: Rc<slint::Timer> = Rc::new(slint::Timer::default());
+    let pending_drop: Rc<RefCell<Vec<PathBuf>>> = Rc::new(RefCell::new(Vec::new()));
+    let drop_cursor: Rc<Cell<Option<(f32, f32)>>> = Rc::new(Cell::new(None));
+    // Clear every hover-preview state the drag set (drop and cancel paths).
+    let end_hover = {
+        let hover_counts = hover_counts.clone();
+        let hover_poll = hover_poll.clone();
+        let app_weak = drop_app_weak.clone();
+        move || {
+            hover_poll.stop();
+            hover_counts.set((0, 0));
+            if let Some(app) = app_weak.upgrade() {
+                let state = app.global::<AppState>();
+                state.set_os_drop_hover(false);
+                state.set_os_drop_over_timeline(false);
+                state.set_os_drop_file_count(0);
+                state.set_os_drop_cursor_x(-1.0);
+                state.set_os_drop_cursor_y(-1.0);
+            }
+        }
+    };
+    app.window().on_winit_window_event(move |window, event| {
+        match event {
+            WindowEvent::HoveredFile(path) if media_extension_supported(path) => {
+                let (visual, audio) = hover_counts.get();
+                let counts = if audio_extension(path) {
+                    (visual, audio + 1)
+                } else {
+                    (visual + 1, audio)
+                };
+                hover_counts.set(counts);
+                if let Some(app) = drop_app_weak.upgrade() {
+                    let state = app.global::<AppState>();
+                    state.set_os_drop_hover(true);
+                    state.set_os_drop_file_count(counts.0 + counts.1);
+                    state.set_os_drop_lane_kind(if counts.0 == 0 {
+                        TrackKind::Audio
+                    } else {
+                        TrackKind::Video
+                    });
+                }
+                // ~30 Hz cursor poll for the landing preview, running for
+                // the hover's lifetime (restarting per file is harmless —
+                // HoveredFile only fires once per file, at drag entry).
+                let poll_weak = drop_app_weak.clone();
+                hover_poll.start(
+                    slint::TimerMode::Repeated,
+                    Duration::from_millis(33),
+                    move || {
+                        let Some(app) = poll_weak.upgrade() else {
+                            return;
+                        };
+                        if let Some((x, y)) = app
+                            .window()
+                            .with_winit_window(os_drop::cursor_in_window)
+                            .flatten()
+                        {
+                            let state = app.global::<AppState>();
+                            state.set_os_drop_cursor_x(x);
+                            state.set_os_drop_cursor_y(y);
+                        }
+                    },
+                );
+            }
+            WindowEvent::DroppedFile(path) => {
+                end_hover();
+                if !media_extension_supported(path) {
+                    tracing::warn!(path = %path.display(), "ignored unsupported dropped file");
+                } else {
+                    let mut pending = pending_drop.borrow_mut();
+                    if pending.is_empty() {
+                        // First file of the gesture: snapshot the cursor now
+                        // (the flush runs a beat later, when the pointer may
+                        // have moved on) and schedule one flush for the whole
+                        // batch — the backends deliver a multi-file drop
+                        // back-to-back from a single OS callback.
+                        drop_cursor.set(
+                            window
+                                .with_winit_window(os_drop::cursor_in_window)
+                                .flatten(),
+                        );
+                        let pending_drop = pending_drop.clone();
+                        let drop_cursor = drop_cursor.clone();
+                        let app_weak = drop_app_weak.clone();
+                        let handle = drop_import_handle.clone();
+                        slint::Timer::single_shot(Duration::from_millis(30), move || {
+                            let paths = std::mem::take(&mut *pending_drop.borrow_mut());
+                            if paths.is_empty() {
+                                return;
+                            }
+                            let target = app_weak.upgrade().and_then(|app| {
+                                let cursor = drop_cursor.take()?;
+                                os_drop_timeline_target(&app, cursor)
+                            });
+                            handle.drop_files(paths, target);
+                        });
+                    }
+                    pending.push(path.clone());
+                }
+            }
+            WindowEvent::HoveredFileCancelled => end_hover(),
+            _ => {}
+        }
+        EventResult::Propagate
     });
 
     // Library asset delete: right-click a media tile → Remove from project.
@@ -806,6 +1221,11 @@ fn main() -> Result<(), slint::PlatformError> {
     let reverse_handle = preview_worker.handle();
     editor.on_on_clip_reversed(move |clip_id| {
         reverse_handle.reverse_clip(clip_id.to_string());
+    });
+
+    let extract_audio_handle = preview_worker.handle();
+    editor.on_on_clip_audio_extracted(move |clip_id| {
+        extract_audio_handle.extract_audio(clip_id.to_string());
     });
 
     let split_handle = preview_worker.handle();
@@ -1032,6 +1452,7 @@ fn main() -> Result<(), slint::PlatformError> {
             .unwrap_or_default()
             .into(),
     );
+    settings_backend.set_ai_use_account(app_settings.ai.use_account);
     app.global::<AppStore>()
         .set_theme_id(app_settings.appearance.theme.index());
 
@@ -1051,6 +1472,7 @@ fn main() -> Result<(), slint::PlatformError> {
             s.ai.model = sb.get_ai_model().trim().to_string();
             s.ai.api_key = non_empty(&sb.get_ai_api_key());
             s.ai.api_key_env = non_empty(&sb.get_ai_api_key_env());
+            s.ai.use_account = sb.get_ai_use_account();
             s.appearance.theme =
                 cutlass_settings::ThemeChoice::from_index(app.global::<AppStore>().get_theme_id());
 

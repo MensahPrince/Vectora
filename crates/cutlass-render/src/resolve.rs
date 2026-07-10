@@ -32,7 +32,7 @@ use cutlass_text::{FontFamily, TextAlign, TextStyle};
 
 use crate::animation::apply_look_animations;
 use crate::grade::resolve_color_grade;
-use crate::scene::{LayerSource, ResolvedPass, Scene, SceneLayer, SizeSpec};
+use crate::scene::{LayerSource, ResolvedPass, Scene, SceneLayer, SceneLut, SizeSpec};
 
 /// Vertical reference height that a generator's reference-pixel sizes (text
 /// `size`, shape `width`/`height`) are authored against. Matches the model's
@@ -197,22 +197,40 @@ fn resolve_track_at(
         let window_end = window_start + transition.duration;
         if t.value >= window_start && t.value < window_end {
             let progress = (t.value - window_start) as f32 / transition.duration as f32;
-            let outgoing_t = RationalTime::new(left.timeline.end_tick() - 1, t.rate);
-            let incoming_t = RationalTime::new(right.timeline.start.value, t.rate);
-            let outgoing = resolve_clip(project, left, outgoing_t, cw, ch, overrides)?
-                .map(Box::new)
-                .ok_or_else(|| {
-                    cutlass_models::ModelError::InvalidParam(
-                        "transition outgoing clip produced no layer".into(),
-                    )
-                })?;
-            let incoming = resolve_clip(project, right, incoming_t, cw, ch, overrides)?
-                .map(Box::new)
-                .ok_or_else(|| {
-                    cutlass_models::ModelError::InvalidParam(
-                        "transition incoming clip produced no layer".into(),
-                    )
-                })?;
+            // Each side plays live wherever it has material and holds its
+            // boundary frame past it: the outgoing clip runs until the cut
+            // then freezes on its last frame, the incoming holds its first
+            // frame until the cut then runs — CapCut's motion, and the tail
+            // frame is only requested for the window's back half. Clamped
+            // into each clip's extent (not just at the cut) because the
+            // model doesn't bound the duration by the clips' lengths.
+            let outgoing_t = RationalTime::new(
+                t.value
+                    .clamp(left.timeline.start.value, left.timeline.end_tick() - 1),
+                t.rate,
+            );
+            let incoming_t = RationalTime::new(
+                t.value
+                    .clamp(right.timeline.start.value, right.timeline.end_tick() - 1),
+                t.rate,
+            );
+            // A side that produces no layer (e.g. empty text) or a canvas-wide
+            // pass (effect/filter/adjustment segments) can't be composited as
+            // a transition frame — the renderer rejects nested canvas passes.
+            // Skip the transition and resolve the track normally so the
+            // preview keeps updating instead of erroring every frame.
+            let outgoing = resolve_clip(project, left, outgoing_t, cw, ch, overrides)?;
+            let incoming = resolve_clip(project, right, incoming_t, cw, ch, overrides)?;
+            let (Some(outgoing), Some(incoming)) = (outgoing, incoming) else {
+                break;
+            };
+            if matches!(outgoing.source, LayerSource::CanvasPass)
+                || matches!(incoming.source, LayerSource::CanvasPass)
+            {
+                break;
+            }
+            let outgoing = Box::new(outgoing);
+            let incoming = Box::new(incoming);
             return Ok(Some(SceneLayer {
                 clip: None,
                 source: LayerSource::Transition {
@@ -231,6 +249,7 @@ fn resolve_track_at(
                 mask: None,
                 chroma_key: None,
                 color_grade: None,
+                lut: None,
             }));
         }
     }
@@ -328,6 +347,16 @@ fn resolve_clip(
         _ => (clip.filter.as_ref(), &clip.adjust),
     };
     let color_grade = resolve_color_grade(filter, adjust);
+    // File-backed `.cube` LUT (applied after the grade). Zero intensity is
+    // identity — drop it here so downstream stages keep their fast paths.
+    let lut = clip
+        .lut
+        .as_ref()
+        .filter(|l| l.intensity > 0.0)
+        .map(|l| SceneLut {
+            path: l.path.clone(),
+            intensity: l.intensity,
+        });
 
     match &clip.content {
         ClipSource::Media { media, .. } => {
@@ -369,6 +398,7 @@ fn resolve_clip(
                 mask: clip.mask,
                 chroma_key: clip.chroma_key,
                 color_grade,
+                lut,
             }))
         }
         ClipSource::Generated(generator) => {
@@ -385,6 +415,7 @@ fn resolve_clip(
                 opacity,
                 uv,
                 color_grade,
+                lut,
                 cw,
                 ch,
                 xf.scale,
@@ -431,6 +462,7 @@ pub(crate) fn resolve_generator(
     opacity: f32,
     uv: [f32; 4],
     color_grade: Option<ColorGrade>,
+    lut: Option<SceneLut>,
     cw: f32,
     ch: f32,
     scale: f32,
@@ -439,7 +471,8 @@ pub(crate) fn resolve_generator(
     effects: Vec<ResolvedPass>,
 ) -> Option<SceneLayer> {
     let ref_scale = ch / REFERENCE_HEIGHT;
-    match generator {
+    let has_lut = lut.is_some();
+    let mut layer = match generator {
         Generator::Text { content, style } => {
             let text = style.case.apply(content);
             if text.trim().is_empty() {
@@ -461,6 +494,7 @@ pub(crate) fn resolve_generator(
                 mask: None,
                 chroma_key: None,
                 color_grade,
+                lut: None,
             })
         }
         Generator::SolidColor { rgba } => Some(SceneLayer {
@@ -476,6 +510,7 @@ pub(crate) fn resolve_generator(
             mask: None,
             chroma_key: None,
             color_grade,
+            lut: None,
         }),
         Generator::Shape {
             shape,
@@ -502,8 +537,38 @@ pub(crate) fn resolve_generator(
             scale,
             effects,
         ),
-        Generator::Effect => canvas_pass(effects, None, cw, ch),
-        Generator::Filter | Generator::Adjustment => canvas_pass(Vec::new(), color_grade, cw, ch),
+        Generator::Effect => canvas_pass(effects, None, has_lut, cw, ch),
+        Generator::Filter | Generator::Adjustment => {
+            canvas_pass(Vec::new(), color_grade, has_lut, cw, ch)
+        }
+        Generator::Lottie {
+            path,
+            width,
+            height,
+        } => {
+            // Same placement convention as stickers: intrinsic pixels are
+            // reference pixels. The stored size drives placement so this
+            // stays pure — the renderer probes the file itself.
+            let px = ref_scale * scale;
+            Some(SceneLayer {
+                clip: None,
+                source: LayerSource::Lottie {
+                    path: path.clone(),
+                    local_time: local_seconds,
+                },
+                center,
+                anchor_point,
+                size: SizeSpec::Fixed([*width as f32 * px, *height as f32 * px]),
+                rotation,
+                opacity,
+                uv,
+                effects,
+                mask: None,
+                chroma_key: None,
+                color_grade,
+                lut: None,
+            })
+        }
         Generator::Sticker { asset } => {
             // Unknown/empty ids place nothing — the legacy payload-less
             // sticker behavior, never an error.
@@ -529,18 +594,22 @@ pub(crate) fn resolve_generator(
                 mask: None,
                 chroma_key: None,
                 color_grade,
+                lut: None,
             })
         }
-    }
+    }?;
+    layer.lut = lut;
+    Some(layer)
 }
 
 fn canvas_pass(
     effects: Vec<ResolvedPass>,
     color_grade: Option<ColorGrade>,
+    has_lut: bool,
     cw: f32,
     ch: f32,
 ) -> Option<SceneLayer> {
-    (!effects.is_empty() || color_grade.is_some()).then_some(SceneLayer {
+    (!effects.is_empty() || color_grade.is_some() || has_lut).then_some(SceneLayer {
         clip: None,
         source: LayerSource::CanvasPass,
         center: [cw * 0.5, ch * 0.5],
@@ -553,6 +622,7 @@ fn canvas_pass(
         mask: None,
         chroma_key: None,
         color_grade,
+        lut: None,
     })
 }
 
@@ -625,6 +695,7 @@ fn resolve_shape(
             mask: None,
             chroma_key: None,
             color_grade,
+            lut: None,
         });
     }
 
@@ -650,6 +721,7 @@ fn resolve_shape(
             mask: None,
             chroma_key: None,
             color_grade,
+            lut: None,
         });
     }
 
@@ -692,6 +764,7 @@ fn resolve_shape(
         mask: None,
         chroma_key: None,
         color_grade,
+        lut: None,
     })
 }
 
@@ -995,6 +1068,7 @@ mod tests {
             1.0,
             [0.0, 0.0, 1.0, 1.0],
             None,
+            None,
             1920.0,
             1080.0,
             1.0,
@@ -1228,6 +1302,7 @@ mod tests {
             mask: None,
             chroma_key: None,
             color_grade: None,
+            lut: None,
         };
         // to_center (960, 540) rotated 90° cw (+y down) → (-540, 960).
         approx2(layer.quad_center([1920.0, 1080.0]), [420.0, 1500.0]);
@@ -1962,6 +2037,49 @@ mod tests {
             }
             other => panic!("expected transition layer, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn transition_between_canvas_passes_falls_back_to_plain_clip() {
+        // Legacy project files may carry transitions on effect/filter/
+        // adjustment lanes (the model now rejects creating them). Both sides
+        // resolve to CanvasPass, which the renderer can't nest — the resolver
+        // must skip the transition and resolve the track normally, not error.
+        let mut project = Project::new("p", FPS_24);
+        let track = project.add_track(TrackKind::Adjustment, "A1");
+        let left = project
+            .add_generated(track, Generator::Adjustment, tr(0, 24))
+            .unwrap();
+        let right = project
+            .add_generated(track, Generator::Adjustment, tr(24, 24))
+            .unwrap();
+        for clip in [left, right] {
+            project
+                .set_clip_adjustments(
+                    clip,
+                    ColorAdjustments {
+                        exposure: 1.0,
+                        ..ColorAdjustments::default()
+                    },
+                )
+                .unwrap();
+        }
+        // Inject the transition through the persistence path, the way a
+        // project saved before the model-level guard would carry it.
+        let mut doc = serde_json::to_value(&project).unwrap();
+        doc["timeline"]["tracks"][0][1]["transitions"] = serde_json::json!([{
+            "left": left.raw(),
+            "right": right.raw(),
+            "transition_id": "crossfade",
+            "duration": 24,
+        }]);
+        let project: Project = serde_json::from_value(doc).unwrap();
+
+        // Midpoint of the window [12, 36): no Transition layer, just the
+        // plain canvas pass of the clip under the playhead.
+        let scene = resolve(&project, rt(24)).unwrap();
+        assert_eq!(scene.layers.len(), 1);
+        assert!(matches!(scene.layers[0].source, LayerSource::CanvasPass));
     }
 
     #[test]

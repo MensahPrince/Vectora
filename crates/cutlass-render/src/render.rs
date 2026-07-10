@@ -11,8 +11,8 @@ use std::time::Instant;
 
 use cutlass_compositor::{
     ColorGrade, CompositeLayer, Compositor, CompositorConfig, CompositorError, CompositorLayer,
-    FrameSink, GpuContext, ImageSink, LayerChromaKey, LayerEffects, LayerMask, LayerPlacement,
-    PassInstance, RgbaImage, SdfLayer, mask_kind,
+    CubeLut, FrameSink, GpuContext, ImageSink, LayerChromaKey, LayerEffects, LayerLut, LayerMask,
+    LayerPlacement, PassInstance, RgbaImage, SdfLayer, mask_kind,
 };
 use cutlass_core::{RationalTime, VideoDecoder, VideoFrame};
 use cutlass_decoder::OutputMode;
@@ -22,7 +22,7 @@ use cutlass_text::TextRenderer;
 
 use crate::error::RenderError;
 use crate::resolve::{ResolveOverrides, resolve, resolve_gesture_partitions, resolve_with};
-use crate::scene::{LayerSource, ResolvedPass, Scene, SizeSpec};
+use crate::scene::{LayerSource, ResolvedPass, Scene, SceneLut, SizeSpec};
 
 /// A composited frame slower than this logs its stage breakdown at `info`
 /// (default-visible): interactive preview budgets a few frames of latency,
@@ -106,6 +106,22 @@ pub struct Renderer {
     /// Bounded by the catalog (small, embedded assets); frame lookup on the
     /// hot path is O(frames) over the delay table, no decode.
     stickers: HashMap<String, StickerSequence>,
+    /// File-backed Lottie animations, keyed by path: parsed composition +
+    /// LRU of rasterized frames (capped-fps sampling, per-asset byte budget
+    /// — never the pre-render-everything sticker strategy; see
+    /// `docs/lottie-design.md`). Failed loads are remembered so a missing
+    /// file logs once and draws nothing instead of re-probing every frame.
+    lottie: HashMap<String, LottieState>,
+    /// Monotonic per-scene stamp for the Lottie frame LRU: frames touched
+    /// by the scene currently being composed are never evicted, so two
+    /// clips of one asset can't alias mid-frame.
+    lottie_stamp: u64,
+    /// Parsed `.cube` LUTs, keyed by path. The GPU texture lives in the
+    /// compositor's own cache (same key); this holds the CPU parse so a
+    /// re-render never re-reads the file. Failed loads are remembered so a
+    /// missing file logs once and grades nothing instead of re-probing
+    /// every frame.
+    luts: HashMap<String, CubeLutState>,
     /// Preferred decoder output mode. Apple and Windows start in
     /// [`OutputMode::Gpu`] so hardware-decoded surfaces (`CVPixelBuffer` /
     /// shared D3D11 NV12 textures) import into the compositor with no CPU
@@ -145,6 +161,9 @@ impl Renderer {
             decoders: HashMap::new(),
             stills: HashMap::new(),
             stickers: HashMap::new(),
+            lottie: HashMap::new(),
+            lottie_stamp: 0,
+            luts: HashMap::new(),
             decode_mode: default_decode_mode(),
             proxies: HashMap::new(),
             use_proxies: true,
@@ -434,6 +453,9 @@ impl Renderer {
         policy: SeekPolicy,
     ) -> Result<(), RenderError> {
         let realize_started = Instant::now();
+        // New scene, new LRU stamp: frames touched below are eviction-exempt
+        // until the next scene.
+        self.lottie_stamp += 1;
         // Decode time accumulated across media layers — on weak machines this
         // is where whole-frame seconds hide, so the stage log splits it out.
         let mut decode_ms = 0.0f64;
@@ -446,6 +468,9 @@ impl Renderer {
         for layer in &scene.layers {
             let fx = layer_effects(layer);
             let color_grade = layer.color_grade;
+            // Load (or recall) the layer's .cube table; unreadable files
+            // resolve to None and grade nothing.
+            let scene_lut = self.resolve_scene_lut(&layer.lut);
             // The layer carries the anchor position; the quad center falls out
             // of the final pixel size (bitmap sizes only exist after raster).
             let place = |size: [f32; 2]| LayerPlacement {
@@ -459,6 +484,7 @@ impl Renderer {
                     realized.push(Realized::CanvasPass {
                         effects: layer.effects.clone(),
                         grade: color_grade,
+                        lut: scene_lut,
                     });
                 }
                 LayerSource::Transition {
@@ -484,6 +510,7 @@ impl Renderer {
                         effects: layer.effects.clone(),
                         fx,
                         color_grade,
+                        lut: scene_lut,
                     });
                 }
                 LayerSource::Text { content, style } => {
@@ -503,6 +530,7 @@ impl Renderer {
                         effects: layer.effects.clone(),
                         fx,
                         color_grade,
+                        lut: scene_lut,
                     });
                 }
                 LayerSource::Media { media, source_time } => {
@@ -519,6 +547,7 @@ impl Renderer {
                         effects: layer.effects.clone(),
                         fx,
                         color_grade,
+                        lut: scene_lut,
                     });
                 }
                 LayerSource::Still { media } => {
@@ -531,6 +560,25 @@ impl Renderer {
                         effects: layer.effects.clone(),
                         fx,
                         color_grade,
+                        lut: scene_lut,
+                    });
+                }
+                LayerSource::Lottie { path, local_time } => {
+                    // A missing or unsupported file draws nothing (the media
+                    // offline story — projects move machines), never an error.
+                    let Some(frame_index) = self.ensure_lottie_frame(path, *local_time) else {
+                        continue;
+                    };
+                    let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                    realized.push(Realized::Lottie {
+                        path: path.clone(),
+                        frame_index,
+                        placement: place(size),
+                        uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
+                        color_grade,
+                        lut: scene_lut,
                     });
                 }
                 LayerSource::Sticker { asset, local_time } => {
@@ -550,6 +598,7 @@ impl Renderer {
                         effects: layer.effects.clone(),
                         fx,
                         color_grade,
+                        lut: scene_lut,
                     });
                 }
                 LayerSource::Shape {
@@ -575,6 +624,7 @@ impl Renderer {
                         effects: layer.effects.clone(),
                         fx,
                         color_grade,
+                        lut: scene_lut,
                     });
                 }
                 LayerSource::PathShape {
@@ -603,6 +653,7 @@ impl Renderer {
                         effects: layer.effects.clone(),
                         fx,
                         color_grade,
+                        lut: scene_lut,
                     });
                 }
             }
@@ -627,6 +678,7 @@ impl Renderer {
             CanvasPass {
                 effects: &'a [PassInstance<'a>],
                 grade: Option<ColorGrade>,
+                lut: &'a Option<SceneLut>,
             },
             Transition {
                 out_idx: usize,
@@ -639,7 +691,11 @@ impl Renderer {
 
         for r in &realized {
             match r {
-                Realized::CanvasPass { effects, grade } => {
+                Realized::CanvasPass {
+                    effects,
+                    grade,
+                    lut,
+                } => {
                     let effects = if effects.is_empty() {
                         &[]
                     } else {
@@ -650,6 +706,7 @@ impl Renderer {
                     jobs.push(LayerJob::CanvasPass {
                         effects,
                         grade: *grade,
+                        lut,
                     });
                 }
                 Realized::Transition {
@@ -671,6 +728,8 @@ impl Renderer {
                         outgoing.as_ref(),
                         &self.stills,
                         &self.stickers,
+                        &self.lottie,
+                        &self.luts,
                         out_effects,
                     ));
                     let out_idx = layer_storage.len() - 1;
@@ -687,6 +746,8 @@ impl Renderer {
                         incoming.as_ref(),
                         &self.stills,
                         &self.stickers,
+                        &self.lottie,
+                        &self.luts,
                         in_effects,
                     ));
                     let in_idx = layer_storage.len() - 1;
@@ -711,6 +772,8 @@ impl Renderer {
                         other,
                         &self.stills,
                         &self.stickers,
+                        &self.lottie,
+                        &self.luts,
                         effects,
                     ));
                     jobs.push(LayerJob::Plain {
@@ -727,9 +790,14 @@ impl Renderer {
                 LayerJob::Plain { storage_idx } => {
                     CompositorLayer::layer(&layer_storage[*storage_idx])
                 }
-                LayerJob::CanvasPass { effects, grade } => CompositorLayer::CanvasPass {
+                LayerJob::CanvasPass {
+                    effects,
+                    grade,
+                    lut,
+                } => CompositorLayer::CanvasPass {
                     effects,
                     grade: *grade,
+                    lut: layer_lut(lut, &self.luts),
                 },
                 LayerJob::Transition {
                     out_idx,
@@ -814,6 +882,7 @@ impl Renderer {
                     effects: layer.effects.clone(),
                     fx,
                     color_grade,
+                    lut: None,
                 }
             }
             LayerSource::Text { content, style } => {
@@ -833,6 +902,7 @@ impl Renderer {
                     effects: layer.effects.clone(),
                     fx,
                     color_grade,
+                    lut: None,
                 }
             }
             LayerSource::Media { media, source_time } => {
@@ -845,6 +915,7 @@ impl Renderer {
                     effects: layer.effects.clone(),
                     fx,
                     color_grade,
+                    lut: None,
                 }
             }
             LayerSource::Still { media } => {
@@ -857,6 +928,32 @@ impl Renderer {
                     effects: layer.effects.clone(),
                     fx,
                     color_grade,
+                    lut: None,
+                }
+            }
+            LayerSource::Lottie { path, local_time } => {
+                let size = fixed_size(layer.size, [scene.width as f32, scene.height as f32]);
+                match self.ensure_lottie_frame(path, *local_time) {
+                    Some(frame_index) => Realized::Lottie {
+                        path: path.clone(),
+                        frame_index,
+                        placement: place(size),
+                        uv: layer.uv,
+                        effects: layer.effects.clone(),
+                        fx,
+                        color_grade,
+                        lut: None,
+                    },
+                    // Missing file inside a transition: a transparent side,
+                    // matching the draw-nothing policy of the main path.
+                    None => Realized::Solid {
+                        rgba: [0, 0, 0, 0],
+                        placement: place(size),
+                        effects: layer.effects.clone(),
+                        fx,
+                        color_grade,
+                        lut: None,
+                    },
                 }
             }
             LayerSource::Sticker { asset, local_time } => {
@@ -873,6 +970,7 @@ impl Renderer {
                     effects: layer.effects.clone(),
                     fx,
                     color_grade,
+                    lut: None,
                 }
             }
             LayerSource::Shape {
@@ -896,6 +994,7 @@ impl Renderer {
                     effects: layer.effects.clone(),
                     fx,
                     color_grade,
+                    lut: None,
                 }
             }
             LayerSource::PathShape {
@@ -924,6 +1023,7 @@ impl Renderer {
                     effects: layer.effects.clone(),
                     fx,
                     color_grade,
+                    lut: None,
                 }
             }
             LayerSource::Transition { .. } => {
@@ -966,12 +1066,15 @@ impl Renderer {
             SeekPolicy::Exact => decoder.frame_at(source_time)?,
             SeekPolicy::NearestSync => decoder.frame_at_nearest(source_time)?,
         };
-        // Proxies run a frame short by construction (generation drops the
-        // container-reported tail, which routinely over-counts by one): an
-        // exact target at the media's very end can overshoot the proxy's
-        // EOF. Show the nearest decodable frame instead of failing the
-        // whole composite over the final tick.
-        if frame.is_none() && proxy.is_some() {
+        // An exact target at the media's very end can overshoot EOF: the
+        // pool trusts the container's frame count, which routinely
+        // over-reports by one, and proxies additionally run a frame short
+        // by construction (generation drops that untrustworthy tail). Show
+        // the nearest decodable frame instead of failing the whole
+        // composite — transitions pin the outgoing side at the final
+        // source frame, so a miss here would error every frame of the
+        // window.
+        if frame.is_none() {
             frame = decoder.frame_at_nearest(source_time)?;
         }
         frame.ok_or(RenderError::NoFrame {
@@ -1002,6 +1105,7 @@ impl Renderer {
             0.0,
             1.0,
             [0.0, 0.0, 1.0, 1.0],
+            None,
             None,
             canvas_w as f32,
             canvas_h as f32,
@@ -1068,6 +1172,129 @@ impl Renderer {
         );
         Ok(())
     }
+
+    /// Make the Lottie frame for `local_time` resident (parse the file on
+    /// first sight, rasterize the frame unless cached) and return its
+    /// sampled-frame index. `None` — draw nothing — for files that are
+    /// missing, unparseable, or fail to rasterize; the failure is
+    /// remembered and logged once, not re-probed per frame.
+    fn ensure_lottie_frame(&mut self, path: &str, local_time: f64) -> Option<usize> {
+        let stamp = self.lottie_stamp;
+        let state = self.lottie.entry(path.to_owned()).or_insert_with(|| {
+            match cutlass_decoder::LottieAnimation::load(std::path::Path::new(path)) {
+                Ok(animation) => LottieState::Loaded(Box::new(LottiePlayer {
+                    animation,
+                    frames: HashMap::new(),
+                })),
+                Err(e) => {
+                    tracing::warn!("lottie '{path}' failed to load: {e}");
+                    LottieState::Failed
+                }
+            }
+        });
+        let LottieState::Loaded(player) = state else {
+            return None;
+        };
+
+        let index = player.animation.frame_index_at(local_time);
+        if let Some((_, used)) = player.frames.get_mut(&index) {
+            *used = stamp;
+            return Some(index);
+        }
+        let image = match player.animation.render_frame(index) {
+            Ok(image) => image,
+            Err(e) => {
+                tracing::warn!("lottie '{path}' frame {index} failed to render: {e}");
+                return None;
+            }
+        };
+        player.frames.insert(index, (image, stamp));
+
+        // Enforce the per-asset byte budget, oldest-stamp first. Frames
+        // stamped by the current scene are exempt (still borrowed below).
+        let mut total: usize = player.frames.values().map(|(f, _)| f.pixels.len()).sum();
+        while total > LOTTIE_CACHE_BYTES {
+            let Some((&victim, _)) = player
+                .frames
+                .iter()
+                .filter(|(_, (_, used))| *used != stamp)
+                .min_by_key(|(_, (_, used))| *used)
+            else {
+                break;
+            };
+            let (evicted, _) = player.frames.remove(&victim).expect("victim exists");
+            total -= evicted.pixels.len();
+        }
+        Some(index)
+    }
+
+    /// Resolve a layer's `.cube` LUT reference: parse and cache the file on
+    /// first sight, and return the reference only when the table is loadable.
+    /// Missing/unparseable files log once and grade nothing — the media
+    /// offline story, never an error.
+    fn resolve_scene_lut(&mut self, lut: &Option<SceneLut>) -> Option<SceneLut> {
+        let lut = lut.as_ref()?;
+        let state = self.luts.entry(lut.path.clone()).or_insert_with(|| {
+            match std::fs::read_to_string(&lut.path) {
+                Ok(text) => match CubeLut::parse(&text) {
+                    Ok(cube) => CubeLutState::Loaded(Box::new(cube)),
+                    Err(e) => {
+                        tracing::warn!("LUT '{}' failed to parse: {e}", lut.path);
+                        CubeLutState::Failed
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!("LUT '{}' failed to read: {e}", lut.path);
+                    CubeLutState::Failed
+                }
+            }
+        });
+        matches!(state, CubeLutState::Loaded(_)).then(|| lut.clone())
+    }
+}
+
+/// A `.cube` path the renderer has seen: parsed, or failed (missing or
+/// malformed file — grades nothing, logged once at load).
+enum CubeLutState {
+    Loaded(Box<CubeLut>),
+    Failed,
+}
+
+/// Borrow the parsed table behind a realized LUT reference for the
+/// compositor's [`LayerLut`] (keyed uploads; see `cutlass-compositor`).
+/// Realize only emits references [`Renderer::resolve_scene_lut`] loaded.
+fn layer_lut<'a>(
+    lut: &'a Option<SceneLut>,
+    luts: &'a HashMap<String, CubeLutState>,
+) -> Option<LayerLut<'a>> {
+    let lut = lut.as_ref()?;
+    let CubeLutState::Loaded(cube) = &luts[&lut.path] else {
+        unreachable!("realized LUT reference without a loaded table")
+    };
+    Some(LayerLut {
+        key: &lut.path,
+        lut: cube,
+        intensity: lut.intensity,
+    })
+}
+
+/// Per-asset Lottie frame-cache budget. At the 512 px render cap
+/// (~1 MB/frame) this holds ~32 frames — a full loop of a typical short
+/// sticker, so steady-state playback rasterizes nothing.
+const LOTTIE_CACHE_BYTES: usize = 32 << 20;
+
+/// A Lottie path the renderer has seen: parsed and playable, or failed
+/// (missing/unsupported file — draws nothing, logged once at load).
+enum LottieState {
+    Loaded(Box<LottiePlayer>),
+    Failed,
+}
+
+struct LottiePlayer {
+    animation: cutlass_decoder::LottieAnimation,
+    /// Rasterized frames keyed by sampled-frame index, stamped with the
+    /// scene counter of their last use (the LRU key).
+    frames: HashMap<usize, (RgbaImage, u64)>,
 }
 
 /// A decoded sticker asset: every frame up front plus per-frame delays, so
@@ -1137,6 +1364,8 @@ fn composite_from_realized<'a>(
     r: &'a Realized,
     stills: &'a HashMap<MediaId, RgbaImage>,
     stickers: &'a HashMap<String, StickerSequence>,
+    lottie: &'a HashMap<String, LottieState>,
+    luts: &'a HashMap<String, CubeLutState>,
     effects: &'a [PassInstance<'a>],
 ) -> CompositeLayer<'a> {
     match r {
@@ -1145,47 +1374,55 @@ fn composite_from_realized<'a>(
             placement,
             fx,
             color_grade,
+            lut,
             ..
         } => CompositeLayer::solid(*rgba, *placement)
             .with_fx(*fx)
             .with_effects(effects)
-            .with_color_grade(*color_grade),
+            .with_color_grade(*color_grade)
+            .with_lut(layer_lut(lut, luts)),
         Realized::Bitmap {
             image,
             placement,
             uv,
             fx,
             color_grade,
+            lut,
             ..
         } => CompositeLayer::rgba(image, *placement)
             .with_uv(*uv)
             .with_fx(*fx)
             .with_effects(effects)
-            .with_color_grade(*color_grade),
+            .with_color_grade(*color_grade)
+            .with_lut(layer_lut(lut, luts)),
         Realized::Frame {
             frame,
             placement,
             uv,
             fx,
             color_grade,
+            lut,
             ..
         } => CompositeLayer::frame(frame, *placement)
             .with_uv(*uv)
             .with_fx(*fx)
             .with_effects(effects)
-            .with_color_grade(*color_grade),
+            .with_color_grade(*color_grade)
+            .with_lut(layer_lut(lut, luts)),
         Realized::Still {
             media,
             placement,
             uv,
             fx,
             color_grade,
+            lut,
             ..
         } => CompositeLayer::rgba(&stills[media], *placement)
             .with_uv(*uv)
             .with_fx(*fx)
             .with_effects(effects)
-            .with_color_grade(*color_grade),
+            .with_color_grade(*color_grade)
+            .with_lut(layer_lut(lut, luts)),
         Realized::Sticker {
             asset,
             frame_index,
@@ -1193,22 +1430,49 @@ fn composite_from_realized<'a>(
             uv,
             fx,
             color_grade,
+            lut,
             ..
         } => CompositeLayer::rgba(&stickers[asset].frames[*frame_index], *placement)
             .with_uv(*uv)
             .with_fx(*fx)
             .with_effects(effects)
-            .with_color_grade(*color_grade),
+            .with_color_grade(*color_grade)
+            .with_lut(layer_lut(lut, luts)),
+        Realized::Lottie {
+            path,
+            frame_index,
+            placement,
+            uv,
+            fx,
+            color_grade,
+            lut,
+            ..
+        } => {
+            // Realize only emits `Realized::Lottie` after `ensure_lottie_frame`
+            // cached this exact frame, and the LRU never evicts frames stamped
+            // by the scene being composed.
+            let LottieState::Loaded(player) = &lottie[path] else {
+                unreachable!("realized lottie layer without a loaded player")
+            };
+            CompositeLayer::rgba(&player.frames[frame_index].0, *placement)
+                .with_uv(*uv)
+                .with_fx(*fx)
+                .with_effects(effects)
+                .with_color_grade(*color_grade)
+                .with_lut(layer_lut(lut, luts))
+        }
         Realized::Sdf {
             shape,
             placement,
             fx,
             color_grade,
+            lut,
             ..
         } => CompositeLayer::sdf(*shape, *placement)
             .with_fx(*fx)
             .with_effects(effects)
-            .with_color_grade(*color_grade),
+            .with_color_grade(*color_grade)
+            .with_lut(layer_lut(lut, luts)),
         Realized::Transition { .. } | Realized::CanvasPass { .. } => {
             unreachable!("non-layer realized items handled separately")
         }
@@ -1226,6 +1490,7 @@ enum Realized {
     CanvasPass {
         effects: Vec<ResolvedPass>,
         grade: Option<ColorGrade>,
+        lut: Option<SceneLut>,
     },
     Frame {
         frame: VideoFrame,
@@ -1234,6 +1499,7 @@ enum Realized {
         effects: Vec<ResolvedPass>,
         fx: LayerEffects,
         color_grade: Option<ColorGrade>,
+        lut: Option<SceneLut>,
     },
     Still {
         media: MediaId,
@@ -1242,6 +1508,7 @@ enum Realized {
         effects: Vec<ResolvedPass>,
         fx: LayerEffects,
         color_grade: Option<ColorGrade>,
+        lut: Option<SceneLut>,
     },
     Sticker {
         asset: String,
@@ -1251,6 +1518,17 @@ enum Realized {
         effects: Vec<ResolvedPass>,
         fx: LayerEffects,
         color_grade: Option<ColorGrade>,
+        lut: Option<SceneLut>,
+    },
+    Lottie {
+        path: String,
+        frame_index: usize,
+        placement: LayerPlacement,
+        uv: [f32; 4],
+        effects: Vec<ResolvedPass>,
+        fx: LayerEffects,
+        color_grade: Option<ColorGrade>,
+        lut: Option<SceneLut>,
     },
     Bitmap {
         image: RgbaImage,
@@ -1259,6 +1537,7 @@ enum Realized {
         effects: Vec<ResolvedPass>,
         fx: LayerEffects,
         color_grade: Option<ColorGrade>,
+        lut: Option<SceneLut>,
     },
     Solid {
         rgba: [u8; 4],
@@ -1266,6 +1545,7 @@ enum Realized {
         effects: Vec<ResolvedPass>,
         fx: LayerEffects,
         color_grade: Option<ColorGrade>,
+        lut: Option<SceneLut>,
     },
     Sdf {
         shape: SdfLayer,
@@ -1273,6 +1553,7 @@ enum Realized {
         effects: Vec<ResolvedPass>,
         fx: LayerEffects,
         color_grade: Option<ColorGrade>,
+        lut: Option<SceneLut>,
     },
 }
 
@@ -1284,6 +1565,7 @@ impl Realized {
             Realized::Frame { effects, .. }
             | Realized::Still { effects, .. }
             | Realized::Sticker { effects, .. }
+            | Realized::Lottie { effects, .. }
             | Realized::Bitmap { effects, .. }
             | Realized::Solid { effects, .. }
             | Realized::Sdf { effects, .. } => Some(effects),

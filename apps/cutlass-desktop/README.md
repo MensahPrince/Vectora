@@ -1,7 +1,7 @@
 # cutlass-desktop
 
-The Cutlass desktop editor — a native Rust + [Slint](https://slint.dev)
-frontend combining the Slint interface with the engine, preview worker, audio
+The Cutlass desktop editor is a native Rust + [Slint](https://slint.dev)
+frontend. It combines the Slint interface with the engine, preview worker, audio
 playback, timeline gestures, inspector controls, media library, and export
 dialog. Unlike the mobile apps, it links `cutlass-engine` **directly** (no
 C-ABI/JNI bridge).
@@ -27,12 +27,12 @@ validation live in the shared engine and model crates.
 - Run the AI assistant panel: sandbox rehearsal, dry-run preview card, and
   one-undo plan replay via `cutlass-ai` and `src/agent.rs`.
 
-## Main Areas
+## Main areas
 
 - `src/main.rs`: application startup and high-level UI callbacks.
 - `src/agent.rs`: AI assistant worker (sandbox rehearsal, plan replay).
-- `src/preview_worker.rs`: background engine owner — edits, autosave, preview
-  pump, audio snapshots, export thread, live-gesture overrides.
+- `src/preview_worker.rs`: background engine owner (edits, autosave, preview
+  pump, audio snapshots, export thread, live-gesture overrides).
 - `src/preview_view.rs`, `src/preview_select.rs`, `src/preview_gesture.rs`,
   `src/placement.rs`: preview display, hit-testing, and canvas interaction.
 - `src/audio.rs`: cpal playback fed by `cutlass_render::ExportAudioMixer`.
@@ -53,12 +53,12 @@ cargo run -p cutlass-desktop
 cargo run -p cutlass-desktop -- path/to/video.mp4
 ```
 
-Media decode/encode is platform-native (AVFoundation/VideoToolbox), so macOS
-needs no third-party media libraries. The app compiles on Windows and Linux,
-but their media backends aren't implemented yet — the UI runs, media won't
-play.
+Media decode/encode is platform-native (AVFoundation/VideoToolbox on Apple
+platforms, Media Foundation on Windows), so there are no third-party media
+libraries to install. The app compiles on Linux, but its media backend isn't
+implemented yet. The UI runs; media won't play.
 
-## Development Notes
+## Development notes
 
 Keep UI-only state in this crate. If behavior affects project correctness,
 undo/redo, export, or preview output, it should usually be an engine command

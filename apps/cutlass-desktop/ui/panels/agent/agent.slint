@@ -15,6 +15,7 @@ import {
     AgentStore,
     AgentEntry,
     AppStore,
+    EditorStore,
     TimelineActions,
 } from "../../store/index.slint";
 
@@ -346,6 +347,7 @@ export component AgentPanel inherits PanelBase {
             viewport-width: self.width;
             viewport-height: transcript-content.preferred-height;
             show-horizontal-scrollbar: false;
+            enable-key-scroll: true;
 
             // Pin to the newest entry as text streams in. Assigning in a
             // change handler (not a binding) keeps wheel scrolling free
@@ -431,10 +433,106 @@ export component AgentPanel inherits PanelBase {
             }
         }
 
+        // Per-project agent rules (ProjectMetadata.agent_rules): always
+        // visible-on-demand so rules arriving with an imported project are
+        // shown before they shape a prompt, never silently applied.
+        if root.rules-open: Rectangle {
+            background: AppStore.theme.agent.plan-bg;
+            border-width: 1px;
+            border-color: AppStore.theme.agent.plan-border;
+            border-radius: AppStore.theme.metrics.radius.md;
+
+            VerticalLayout {
+                padding: AppStore.theme.metrics.spacing.md;
+                spacing: AppStore.theme.metrics.spacing.sm;
+
+                CutlassText {
+                    text: "Project rules";
+                    style: AppStore.theme.typography.label;
+                }
+
+                CutlassText {
+                    text: "Saved with this project and added to every prompt, alongside your rules in ~/.cutlass/agent/rules.";
+                    wrap: word-wrap;
+                    style: AppStore.theme.typography.caption;
+                    foreground: AppStore.theme.text.muted;
+                }
+
+                Rectangle {
+                    height: 90px;
+                    border-radius: AppStore.theme.metrics.radius.md;
+                    background: AppStore.theme.agent.input-bg;
+                    clip: true;
+
+                    TouchArea {
+                        mouse-cursor: MouseCursor.text;
+                        clicked => {
+                            rules-input.focus();
+                        }
+                    }
+
+                    rules-scroll := CutlassScrollView {
+                        x: AppStore.theme.metrics.spacing.md;
+                        y: AppStore.theme.metrics.spacing.sm;
+                        width: max(0px, parent.width - 2 * AppStore.theme.metrics.spacing.md);
+                        height: max(0px, parent.height - 2 * AppStore.theme.metrics.spacing.sm);
+                        viewport-width: self.width;
+                        viewport-height: max(self.height, rules-input.preferred-height);
+                        show-horizontal-scrollbar: false;
+                        show-vertical-scrollbar: false;
+
+                        rules-input := TextInput {
+                            width: rules-scroll.width;
+                            height: max(rules-scroll.height, self.preferred-height);
+                            single-line: false;
+                            wrap: word-wrap;
+                            text <=> root.rules-draft;
+                            color: AppStore.theme.text.primary;
+                            font-size: AppStore.theme.typography.body.size;
+                            font-weight: AppStore.theme.typography.body.weight;
+                            selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
+                            selection-foreground-color: AppStore.theme.text.primary;
+                            page-height: rules-scroll.height;
+                            accessible-role: none;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    spacing: AppStore.theme.metrics.spacing.sm;
+                    alignment: start;
+
+                    AccentButton {
+                        label: "Save";
+                        clicked => {
+                            AgentStore.set-project-rules(root.rules-draft);
+                            root.rules-open = false;
+                        }
+                    }
+
+                    SubtleButton {
+                        label: "Cancel";
+                        clicked => {
+                            root.rules-open = false;
+                        }
+                    }
+                }
+            }
+        }
+
         // Composer + the preview-before-apply toggle.
         VerticalLayout {
             padding: AppStore.theme.metrics.spacing.md;
             spacing: AppStore.theme.metrics.spacing.sm;
+
+            // The size cap protects small local models; over-budget rules
+            // truncate and must say so here, never silently.
+            if AgentStore.rules-truncated: CutlassText {
+                text: "Rules exceed the size cap — the assistant sees a truncated version.";
+                wrap: word-wrap;
+                style: AppStore.theme.typography.caption;
+                foreground: AppStore.theme.agent.error;
+            }
 
             prompt-input := PromptInput {
                 enabled: !AgentStore.running;
@@ -489,9 +587,36 @@ export component AgentPanel inherits PanelBase {
                         }
                     }
                 }
+
+                rules-button := TouchArea {
+                    width: rules-label.preferred-width;
+                    height: rules-label.preferred-height;
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        if (root.rules-open) {
+                            root.rules-open = false;
+                        } else {
+                            root.rules-draft = EditorStore.project.agent-rules;
+                            root.rules-open = true;
+                        }
+                    }
+
+                    rules-label := CutlassText {
+                        // The dot marks that this project carries rules —
+                        // worth a look when the project came from elsewhere.
+                        text: EditorStore.project.agent-rules == "" ? "Project rules" : "● Project rules";
+                        style: AppStore.theme.typography.caption;
+                        foreground: rules-button.has-hover ? AppStore.theme.text.primary : AppStore.theme.text.secondary;
+                    }
+                }
             }
         }
     }
+
+    // Inline project-rules editor state: draft decouples typing from the
+    // published projection until Save.
+    private property <bool> rules-open: false;
+    private property <string> rules-draft: "";
 
     function submit(text: string) {
         if (text == "" || AgentStore.running) {

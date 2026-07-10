@@ -2,7 +2,7 @@ import {
     CutlassText,
     HorizontalDivider,
     PanelBase,
-    CutlassScrollView,
+    CutlassScrollBar,
     VerticalDivider,
 } from "../../components/index.slint";
 import { AppStore, EditorStore, TimelineStore, TimelineActions } from "../../store/index.slint";
@@ -173,6 +173,70 @@ export component TimelinePanel inherits PanelBase {
             }
         }
     }
+
+    // --- OS file-drop targeting (Finder / Explorer) ---------------------
+    // Mirror the panel + lane-viewport geometry into AppState so the Rust
+    // drop handler (src/main.rs) can hit-test the OS drop cursor and convert
+    // it to a lane row + tick. winit's file-drop events carry no pointer
+    // position, so the handler works from a polled cursor (src/os_drop.rs)
+    // rather than a pointer event — the geometry has to be readable outside
+    // this component.
+    function sync-os-drop-geometry() {
+        AppState.timeline-panel-x = self.absolute-position.x;
+        AppState.timeline-panel-y = self.absolute-position.y;
+        AppState.timeline-panel-w = self.width;
+        AppState.timeline-panel-h = self.height;
+        AppState.timeline-lanes-x = lanes.absolute-position.x;
+        AppState.timeline-lanes-y = lanes.absolute-position.y;
+        AppState.timeline-row-pitch = root.row-pitch;
+    }
+    // A change to any mirrored value flips this sum; the handler re-syncs.
+    private property <length> os-drop-geometry-watch:
+        self.absolute-position.x + self.absolute-position.y + self.width + self.height
+        + lanes.absolute-position.x + lanes.absolute-position.y + root.row-pitch;
+    changed os-drop-geometry-watch => {
+        self.sync-os-drop-geometry();
+    }
+
+    // Landing preview while the OS drag hovers this panel (cursor fed by the
+    // Rust polling timer). Same coordinate math as the library drag above.
+    private property <bool> os-drop-cursor-inside:
+        AppState.os-drop-hover
+        && AppState.os-drop-cursor-x >= self.absolute-position.x
+        && AppState.os-drop-cursor-x < self.absolute-position.x + self.width
+        && AppState.os-drop-cursor-y >= self.absolute-position.y
+        && AppState.os-drop-cursor-y < self.absolute-position.y + self.height;
+
+    changed os-drop-cursor-inside => {
+        AppState.os-drop-over-timeline = self.os-drop-cursor-inside;
+    }
+
+    private property <int> os-drop-cursor-tick: max(0, round(
+        (AppState.os-drop-cursor-x - lanes.absolute-position.x - TimelineViewState.scroll-x)
+        / TimelineStore.zoom / 1px));
+
+    private property <int> os-drop-row: floor(
+        (AppState.os-drop-cursor-y - lanes.absolute-position.y - TimelineViewState.scroll-y)
+        / (root.track-height + root.track-spacing)) - 1;
+
+    // Placeholder span for the preview — real durations aren't known until
+    // the drop probes the files: 3 seconds at the sequence rate.
+    private property <int> os-drop-ghost-ticks:
+        max(1, 3 * root.sequence.fps.num / max(1, root.sequence.fps.den));
+
+    // Row + caret resolution through the library-drop resolver so the
+    // preview honors the same landing rules the worker applies (empty-main
+    // fallback, main-track magnet insertion). Snap threshold 0: the OS drop
+    // commit doesn't edge-snap, so the preview must not either.
+    private property <LibraryDropResolution> os-drop-res: DragBackend.resolve-library-drop(
+        root.sequence,
+        AppState.os-drop-lane-kind,
+        root.os-drop-ghost-ticks,
+        root.os-drop-cursor-tick,
+        root.os-drop-row,
+        TimelineStore.playhead-tick,
+        0,
+        TimelineStore.main-magnet-enabled);
 
     private property <length> track-spacing: AppStore.theme.metrics.spacing.sm;
     private property <length> track-height: TimelineActions.track-lane-height();
@@ -429,17 +493,10 @@ export component TimelinePanel inherits PanelBase {
     private property <float> timeline-pinch-base-zoom: TimelineStore.zoom;
 
     // Horizontal scrollbar: visible when content is wider than the viewport.
+    // Thumb geometry and drag math live in the shared `CutlassScrollBar`
+    // (see the instance at the bottom of `lane-host`); the timeline only
+    // owns the reveal/fade logic below.
     private property <bool> h-scroll-needed: content-width > lanes-width + 1px;
-    private property <float> h-scroll-fraction:
-        h-scroll-needed && min-scroll-x < 0px
-            ? TimelineViewState.scroll-x / min-scroll-x
-            : 0;
-    private property <length> h-thumb-width:
-        h-scroll-needed
-            ? max(32px, lanes-width * lanes-width / content-width)
-            : 0px;
-    private property <length> h-thumb-travel: max(0px, lanes-width - h-thumb-width);
-    private property <length> h-thumb-x: h-thumb-travel * h-scroll-fraction;
 
     // Fade the scrollbar in while scrolling, out after idle.
     private property <int> scrollbar-activity: TimelineViewState.scrollbar-activity-nonce;
@@ -448,6 +505,15 @@ export component TimelinePanel inherits PanelBase {
     changed scrollbar-activity => {
         h-scrollbar-opacity = 0.85;
         scrollbar-fade.restart();
+    }
+
+    // Reveal on any horizontal scroll, whatever drove it (wheel, thumb
+    // drag, zoom clamp, programmatic) — the explicit nonce bumps in the
+    // wheel/zoom handlers predate this and remain harmless.
+    private property <length> h-scroll-pos: TimelineViewState.scroll-x;
+
+    changed h-scroll-pos => {
+        TimelineViewState.scrollbar-activity-nonce += 1;
     }
 
     scrollbar-fade := Timer {
@@ -460,6 +526,7 @@ export component TimelinePanel inherits PanelBase {
 
     init => {
         TimelineViewState.viewport-w = lanes.width;
+        self.sync-os-drop-geometry();
     }
 
     // The playhead → preview-frame-request watcher lives at window scope
@@ -642,14 +709,21 @@ export component TimelinePanel inherits PanelBase {
                     viewport-y <=> TimelineViewState.scroll-y;
                     viewport-x <=> TimelineViewState.scroll-x;
 
-                    VerticalLayout {
-                    vertical-stretch: 1;
-                    horizontal-stretch: 1;
-                    spacing: track-spacing;
-
-                    ForceHeadSpace { }
-
+                    // Lane backdrops are absolutely positioned in content
+                    // space — deliberately NOT a layout. Width bindings on
+                    // layout children go stale when zoom grows content-width
+                    // without a scroll event: the layout solver owns child
+                    // geometry and its cached pass survives the binding change
+                    // (a5f43dd bound the enclosing VerticalLayout, then the
+                    // per-lane width — pinch out→in still glitched). The
+                    // overlay bands below use plain x/y/width bindings and
+                    // never go stale, so the lanes now use the same idiom;
+                    // the y math mirrors the head column's spacer + spacing.
                     for t[lane-idx] in sequence.tracks: TrackLane {
+                        x: 0;
+                        y: (lane-idx + 1) * row-pitch;
+                        width: max(content-width, lanes.width);
+                        height: track-height;
                         track-id: t.id;
                         kind: t.kind;
                         for c in t.clips: ClipView {
@@ -664,7 +738,6 @@ export component TimelinePanel inherits PanelBase {
                             zoom: TimelineStore.zoom;
                         }
                     }
-                }
 
                 // --- transition junction pills (M4, above the clips) ---------
                 // One overlay band per lane; each transition pill is centered
@@ -807,6 +880,61 @@ export component TimelinePanel inherits PanelBase {
                     width: 1px;
                     height: max(parent.height, content-height);
                     background: AppStore.theme.accent.primary;
+                }
+
+                // --- OS file-drop landing preview -----------------------------
+                // Same visuals as a library drag: caret + slot on the main lane
+                // (magnet insert), placeholder-length ghost elsewhere. Position
+                // is honest (the worker lands the first file exactly here);
+                // length is a stand-in until the drop probes the files.
+                if os-drop-cursor-inside && os-drop-res.is-insert: Rectangle {
+                    Rectangle {
+                        x: os-drop-res.caret-tick * TimelineStore.zoom * 1px;
+                        y: (os-drop-res.target-row + 1) * row-pitch;
+                        width: root.os-drop-ghost-ticks * TimelineStore.zoom * 1px;
+                        height: track-height - 5px;
+                        background: AppStore.theme.accent.primary.with-alpha(0.28);
+                        border-width: 1px;
+                        border-color: AppStore.theme.accent.primary;
+                        border-radius: AppStore.theme.track-lane.clip.radius;
+                    }
+                    Rectangle {
+                        x: os-drop-res.caret-tick * TimelineStore.zoom * 1px - self.width / 2;
+                        y: (os-drop-res.target-row + 1) * row-pitch - 2px;
+                        width: 9px;
+                        height: track-height - 1px;
+                        border-radius: 4.5px;
+                        background: AppStore.theme.accent.primary.with-alpha(0.35);
+                    }
+                    Rectangle {
+                        x: os-drop-res.caret-tick * TimelineStore.zoom * 1px - self.width / 2;
+                        y: (os-drop-res.target-row + 1) * row-pitch - 2px;
+                        width: 3px;
+                        height: track-height - 1px;
+                        background: AppStore.theme.accent.primary;
+                    }
+                }
+
+                if os-drop-cursor-inside && !os-drop-res.is-insert: Rectangle {
+                    x: os-drop-res.resolved-start * TimelineStore.zoom * 1px;
+                    y: (os-drop-res.target-row + 1) * row-pitch;
+                    width: root.os-drop-ghost-ticks * TimelineStore.zoom * 1px;
+                    height: track-height - 5px;
+                    background: AppStore.theme.accent.primary.with-alpha(0.3);
+                    border-width: 1px;
+                    border-color: AppStore.theme.accent.primary;
+                    border-radius: AppStore.theme.track-lane.clip.radius;
+                }
+
+                // File-count badge above the landing spot.
+                if os-drop-cursor-inside: DragTooltip {
+                    x: (os-drop-res.is-insert
+                            ? os-drop-res.caret-tick : os-drop-res.resolved-start)
+                        * TimelineStore.zoom * 1px;
+                    y: (os-drop-res.target-row + 1) * row-pitch - self.height - 4px;
+                    text: AppState.os-drop-file-count <= 1
+                        ? "Drop to add"
+                        : "Drop to add " + AppState.os-drop-file-count + " files";
                 }
 
                 // Vertical magnet guide at the snapped edge (CapCut-style).
@@ -954,8 +1082,20 @@ export component TimelinePanel inherits PanelBase {
                     border-color: #ffffff;
                     border-radius: AppStore.theme.track-lane.clip.radius;
 
-                    Text {
+                    // Same constraints as the in-place clip label: without an
+                    // explicit width Slint gives the Text its natural size and
+                    // centers it, painting the full name far outside a narrow
+                    // floater. No `clip: true` here — combined with the
+                    // border-radius it would allocate a floater-sized GPU
+                    // layer (the 16384px wgpu trap from clip.slint).
+                    if TimelineViewState.dragging-duration-ticks * TimelineStore.zoom * 1px > 40px: Text {
+                        x: 4px;
+                        width: min(self.preferred-width, parent.width - 8px);
+                        height: parent.height;
+                        vertical-alignment: center;
                         text: TimelineViewState.dragging-name;
+                        font-size: 9px;
+                        overflow: elide;
                     }
                 }
 
@@ -1052,60 +1192,24 @@ export component TimelinePanel inherits PanelBase {
             }
 
             // Slim horizontal scrollbar overlay (auto-fades when idle).
-            if root.h-scroll-needed: Rectangle {
-                y: parent.height - 10px;
+            // Shared thumb geometry / drag / track-click math from
+            // `CutlassScrollBar`; the timeline drives reveal via
+            // `scrollbar-activity-nonce` and keeps the bar awake while
+            // the pointer is on it. Fully hidden (opacity 0) the bar is
+            // click-through; wheel events over it fall through to
+            // `wheel-area` like everywhere else on the lanes.
+            if root.h-scroll-needed: CutlassScrollBar {
+                horizontal: true;
+                x: 0;
+                y: parent.height - AppStore.theme.scrollbar.size;
                 width: parent.width;
-                height: 8px;
-                opacity: root.h-scrollbar-opacity;
+                height: AppStore.theme.scrollbar.size;
+                opacity: (self.dragging || self.hovered) ? 0.85 : root.h-scrollbar-opacity;
+                bar-interactive: root.h-scrollbar-opacity > 0.001 || self.dragging || self.hovered;
 
-                Rectangle {
-                    x: root.h-thumb-x;
-                    y: 0;
-                    width: root.h-thumb-width;
-                    height: parent.height;
-                    background: #ffffff66;
-                    border-radius: 4px;
-
-                    TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        moved => {
-                            if (!self.pressed) {
-                                return;
-                            }
-                            TimelineViewState.scroll-x = clamp(
-                                root.min-scroll-x
-                                    * (self.mouse-x - self.width / 2)
-                                    / max(1px, root.h-thumb-travel),
-                                root.min-scroll-x,
-                                0px);
-                            TimelineViewState.scrollbar-activity-nonce += 1;
-                        }
-                        scroll-event(e) => {
-                            TimelineViewState.scroll-x = clamp(
-                                TimelineViewState.scroll-x + e.delta-x,
-                                root.min-scroll-x,
-                                0px);
-                            TimelineViewState.scrollbar-activity-nonce += 1;
-                            return accept;
-                        }
-                    }
-                }
-
-                // Click the track to jump scroll position.
-                TouchArea {
-                    width: 100%;
-                    height: 100%;
-                    clicked => {
-                        TimelineViewState.scroll-x = clamp(
-                            root.min-scroll-x
-                                * (self.mouse-x - root.h-thumb-width / 2)
-                                / max(1px, root.h-thumb-travel),
-                            root.min-scroll-x,
-                            0px);
-                        TimelineViewState.scrollbar-activity-nonce += 1;
-                    }
-                }
+                visible-extent: lanes.width;
+                content-extent: root.content-width;
+                offset <=> TimelineViewState.scroll-x;
             }
             }
         }

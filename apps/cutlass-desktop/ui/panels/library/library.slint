@@ -14,8 +14,8 @@ import {
 } from "../../components/index.slint";
 import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
 import { Media, TrackKind, CatalogEntry } from "../../models/index.slint";
-import { EffectsBackend } from "../../lib/index.slint";
-import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile } from "tiles.slint";
+import { EffectsBackend, CloudBackend, TextPresetsBackend, AiBackend, LottieBackend, SfxBackend } from "../../lib/index.slint";
+import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile, StockMediaTile, TextPresetLibraryTile, AiMediaTile, SfxAudioTile } from "tiles.slint";
 import { SectionPlaceholder } from "placeholder.slint";
 import { CutlassScrollView } from "../../components/scroll-view.slint";
 
@@ -26,6 +26,8 @@ global LibraryState {
     in-out property <string> active-tab: "media";
     in-out property <string> media-section: "local";
     in-out property <string> audio-section: "local";
+    in-out property <string> text-section: "titles";
+    in-out property <string> stickers-section: "shapes";
 }
 
 // Shared accent for active tab / section labels (same accent as AccentButton).
@@ -131,6 +133,175 @@ component SectionList inherits VerticalLayout {
         activate => {
             root.select(s.id);
         }
+    }
+}
+
+// Search field for the stock browser, styled like the settings text field.
+component StockSearchField inherits Rectangle {
+    height: 28px;
+    horizontal-stretch: 1;
+    border-radius: AppStore.theme.metrics.radius.sm;
+    background: #111111;
+    border-width: 1px;
+    border-color: input.has-focus ? AppStore.theme.accent.primary : #ffffff14;
+    clip: true;
+    forward-focus: input;
+
+    input := TextInput {
+        x: AppStore.theme.metrics.spacing.sm;
+        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
+        height: parent.height;
+        vertical-alignment: center;
+        single-line: true;
+        text <=> CloudBackend.stock-query;
+        color: AppStore.theme.text.primary;
+        font-size: AppStore.theme.typography.body.size;
+        selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
+        selection-foreground-color: AppStore.theme.text.primary;
+        accessible-role: none;
+        accepted => {
+            CloudBackend.stock-search();
+        }
+    }
+
+    if CloudBackend.stock-query == "" && !input.has-focus: CutlassText {
+        x: AppStore.theme.metrics.spacing.sm;
+        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
+        height: parent.height;
+        vertical-alignment: center;
+        text: "Search stock media…";
+        style: AppStore.theme.typography.body;
+        foreground: AppStore.theme.text.muted;
+        overflow: elide;
+    }
+}
+
+// Videos / Photos toggle chip for the stock browser.
+component StockKindChip inherits Rectangle {
+    in property <string> kind;
+    in property <string> label;
+
+    property <bool> active: CloudBackend.stock-kind == root.kind;
+
+    width: lbl.preferred-width + 16px;
+    height: 24px;
+    border-radius: 12px;
+    background: root.active ? AppStore.theme.accent.primary.with-alpha(0.22)
+        : ta.has-hover ? #ffffff0a
+        : transparent;
+    border-width: 1px;
+    border-color: root.active ? AppStore.theme.accent.primary : #ffffff14;
+
+    lbl := CutlassText {
+        text: root.label;
+        style: { size: 11px, weight: 600, italic: false };
+        foreground: root.active ? AppStore.theme.accent.primary : AppStore.theme.text.secondary;
+    }
+
+    ta := TouchArea {
+        clicked => {
+            if CloudBackend.stock-kind != root.kind {
+                CloudBackend.stock-kind = root.kind;
+                if CloudBackend.stock-query != "" {
+                    CloudBackend.stock-search();
+                }
+            }
+        }
+    }
+}
+
+// Prompt field for the AI generation sections.
+component AiPromptField inherits Rectangle {
+    in property <string> placeholder;
+    in-out property <string> value;
+    callback accepted();
+
+    height: 28px;
+    horizontal-stretch: 1;
+    border-radius: AppStore.theme.metrics.radius.sm;
+    background: #111111;
+    border-width: 1px;
+    border-color: input.has-focus ? AppStore.theme.accent.primary : #ffffff14;
+    clip: true;
+    forward-focus: input;
+
+    input := TextInput {
+        x: AppStore.theme.metrics.spacing.sm;
+        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
+        height: parent.height;
+        vertical-alignment: center;
+        single-line: true;
+        text <=> root.value;
+        color: AppStore.theme.text.primary;
+        font-size: AppStore.theme.typography.body.size;
+        selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
+        selection-foreground-color: AppStore.theme.text.primary;
+        accessible-role: none;
+        accepted => {
+            root.accepted();
+        }
+    }
+
+    if root.value == "" && !input.has-focus: CutlassText {
+        x: AppStore.theme.metrics.spacing.sm;
+        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
+        height: parent.height;
+        vertical-alignment: center;
+        text: root.placeholder;
+        style: AppStore.theme.typography.body;
+        foreground: AppStore.theme.text.muted;
+        overflow: elide;
+    }
+}
+
+// Image / Video toggle chip for the AI media section.
+component AiKindChip inherits Rectangle {
+    in property <string> kind;
+    in property <string> label;
+
+    property <bool> active: AiBackend.media-kind == root.kind;
+
+    width: lbl.preferred-width + 16px;
+    height: 24px;
+    border-radius: 12px;
+    background: root.active ? AppStore.theme.accent.primary.with-alpha(0.22)
+        : ta.has-hover ? #ffffff0a
+        : transparent;
+    border-width: 1px;
+    border-color: root.active ? AppStore.theme.accent.primary : #ffffff14;
+
+    lbl := CutlassText {
+        text: root.label;
+        style: { size: 11px, weight: 600, italic: false };
+        foreground: root.active ? AppStore.theme.accent.primary : AppStore.theme.text.secondary;
+    }
+
+    ta := TouchArea {
+        clicked => {
+            AiBackend.media-kind = root.kind;
+        }
+    }
+}
+
+// The "who pays" line under every generate button (the BYOK-first rule
+// made visible), plus the last error when one exists.
+component AiRouteLine inherits VerticalLayout {
+    padding-left: AppStore.theme.metrics.spacing.sm;
+    padding-right: AppStore.theme.metrics.spacing.sm;
+    spacing: 2px;
+
+    CutlassText {
+        text: AiBackend.route-label;
+        style: AppStore.theme.typography.caption;
+        foreground: AppStore.theme.text.muted;
+        wrap: word-wrap;
+    }
+
+    if AiBackend.error != "": CutlassText {
+        text: AiBackend.error;
+        style: AppStore.theme.typography.caption;
+        foreground: #FF6B6B;
+        wrap: word-wrap;
     }
 }
 
@@ -249,19 +420,40 @@ export component LibraryPanel inherits PanelBase {
                     active: LibraryState.audio-section;
                     select(id) => {
                         LibraryState.audio-section = id;
+                        if id == "sfx" && SfxBackend.status == "idle" {
+                            SfxBackend.refresh();
+                        }
                     }
                 }
 
                 if LibraryState.active-tab == "text": SectionList {
                     width: parent.width;
-                    sections: [{ id: "titles", label: "Add text" }];
-                    active: "titles";
+                    sections: [
+                        { id: "titles", label: "Add text" },
+                        { id: "presets", label: "Presets" },
+                    ];
+                    active: LibraryState.text-section;
+                    select(id) => {
+                        LibraryState.text-section = id;
+                        if id == "presets" && TextPresetsBackend.status == "idle" {
+                            TextPresetsBackend.refresh();
+                        }
+                    }
                 }
 
                 if LibraryState.active-tab == "stickers": SectionList {
                     width: parent.width;
-                    sections: [{ id: "shapes", label: "Shapes" }];
-                    active: "shapes";
+                    sections: [
+                        { id: "shapes", label: "Shapes" },
+                        { id: "lottie", label: "Lottie" },
+                    ];
+                    active: LibraryState.stickers-section;
+                    select(id) => {
+                        LibraryState.stickers-section = id;
+                        if id == "lottie" && LottieBackend.status == "idle" {
+                            LottieBackend.refresh();
+                        }
+                    }
                 }
 
                 if LibraryState.active-tab == "effects": SectionList {
@@ -289,14 +481,12 @@ export component LibraryPanel inherits PanelBase {
                     ImportToolbar { }
 
                     media-grid := CutlassGridView {
-                        show-horizontal-scrollbar: false;
-                        show-vertical-scrollbar: false;
+                        interactive: false;
                         vertical-stretch: 1;
                         horizontal-stretch: 1;
 
                         // As many 100px columns as the pane width allows.
-                        columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
-                            / (100px + AppStore.theme.metrics.spacing.md)));
+                        auto-columns: true;
                         cell-width: 100px;
                         cell-height: 100px;
                         spacing: AppStore.theme.metrics.spacing.md;
@@ -309,25 +499,218 @@ export component LibraryPanel inherits PanelBase {
                             width: media-grid.cell-width;
                             height: media-grid.cell-height;
                             media: m;
+                            // Offscreen tiles skip their poster-frame texture.
+                            thumbnail-visible: i >= media-grid.first-visible-index
+                                && i <= media-grid.last-visible-index;
                         }
                     }
                 }
 
-                // ---- Media > Stock / AI -------------------------------------
-                if LibraryState.active-tab == "media" && LibraryState.media-section == "stock": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/stock.svg");
-                    title: "Stock library";
-                    message: "Royalty-free clips and backgrounds, browsable without leaving the editor. Coming soon.";
+                // ---- Media > Stock ------------------------------------------
+                // Search metadata comes from the backend (or directly from the
+                // providers with BYOK stock keys); media files download straight
+                // from the provider CDNs. Importing a result lands it in the
+                // pool under Local like any other media (src/cloud.rs).
+                if LibraryState.active-tab == "media" && LibraryState.media-section == "stock": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    HorizontalLayout {
+                        padding: AppStore.theme.metrics.spacing.sm;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        StockSearchField { }
+
+                        StockKindChip {
+                            kind: "video";
+                            label: "Videos";
+                        }
+
+                        StockKindChip {
+                            kind: "photo";
+                            label: "Photos";
+                        }
+                    }
+
+                    if CloudBackend.stock-status == "idle": SectionPlaceholder {
+                        vertical-stretch: 1;
+                        icon: @image-url("../../../../../assets/icon/library/stock.svg");
+                        title: "Stock library";
+                        message: "Royalty-free clips and photos from Pexels and Pixabay. Type a search above to browse.";
+                    }
+
+                    if CloudBackend.stock-status == "searching": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+
+                        CutlassText {
+                            text: "Searching…";
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    if CloudBackend.stock-status == "empty": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        padding: AppStore.theme.metrics.spacing.xl;
+
+                        CutlassText {
+                            text: "No results — try a different search.";
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+
+                    if CloudBackend.stock-status == "error": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        padding: AppStore.theme.metrics.spacing.xl;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        CutlassText {
+                            text: "Search failed";
+                            style: AppStore.theme.typography.heading-sm;
+                            horizontal-alignment: center;
+                        }
+
+                        CutlassText {
+                            text: CloudBackend.stock-error;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            SubtleButton {
+                                label: "Retry";
+                                clicked => {
+                                    CloudBackend.stock-search();
+                                }
+                            }
+                        }
+                    }
+
+                    if CloudBackend.stock-status == "results": VerticalLayout {
+                        vertical-stretch: 1;
+                        spacing: AppStore.theme.metrics.spacing.none;
+
+                        stock-grid := CutlassGridView {
+                            interactive: false;
+                            vertical-stretch: 1;
+                            horizontal-stretch: 1;
+
+                            auto-columns: true;
+                            cell-width: 100px;
+                            cell-height: 100px;
+                            spacing: AppStore.theme.metrics.spacing.md;
+                            inset: AppStore.theme.metrics.spacing.md;
+                            item-count: CloudBackend.stock-items.length;
+
+                            for tile[i] in CloudBackend.stock-items: StockMediaTile {
+                                x: stock-grid.cell-x(i);
+                                y: stock-grid.cell-y(i);
+                                width: stock-grid.cell-width;
+                                height: stock-grid.cell-height;
+                                tile: tile;
+                                index: i;
+                                // Offscreen tiles skip their thumbnail texture.
+                                thumbnail-visible: i >= stock-grid.first-visible-index
+                                    && i <= stock-grid.last-visible-index;
+                            }
+                        }
+
+                        if CloudBackend.stock-has-more: HorizontalLayout {
+                            padding: AppStore.theme.metrics.spacing.sm;
+                            alignment: center;
+
+                            SubtleButton {
+                                label: CloudBackend.stock-loading-more ? "Loading…" : "Load more";
+                                clicked => {
+                                    if !CloudBackend.stock-loading-more {
+                                        CloudBackend.stock-load-more();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
 
-                if LibraryState.active-tab == "media" && LibraryState.media-section == "ai": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/ai.svg");
-                    title: "AI media";
-                    message: "Generate images and video clips from a prompt, straight into the library. Coming soon.";
+                // ---- Media > AI media ---------------------------------------
+                // Prompt → job → poll → direct-CDN download → normal import
+                // path (src/ai_media.rs). Routed BYOK-or-managed.
+                if LibraryState.active-tab == "media" && LibraryState.media-section == "ai": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    HorizontalLayout {
+                        padding: AppStore.theme.metrics.spacing.sm;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        AiPromptField {
+                            placeholder: "Describe an image or clip…";
+                            value <=> AiBackend.media-prompt;
+                            accepted => {
+                                if !AiBackend.busy && AiBackend.media-prompt != "" {
+                                    AiBackend.generate(AiBackend.media-kind, AiBackend.media-prompt);
+                                }
+                            }
+                        }
+
+                        AiKindChip {
+                            kind: "image";
+                            label: "Image";
+                        }
+
+                        AiKindChip {
+                            kind: "video";
+                            label: "Video";
+                        }
+
+                        SubtleButton {
+                            label: AiBackend.busy ? "Generating…" : "Generate";
+                            enabled: !AiBackend.busy && AiBackend.media-prompt != "";
+                            clicked => {
+                                AiBackend.generate(AiBackend.media-kind, AiBackend.media-prompt);
+                            }
+                        }
+                    }
+
+                    AiRouteLine { }
+
+                    if AiBackend.media-items.length == 0: SectionPlaceholder {
+                        vertical-stretch: 1;
+                        icon: @image-url("../../../../../assets/icon/library/ai.svg");
+                        title: "AI media";
+                        message: AiBackend.available
+                            ? "Generate images and video clips from a prompt; click a result to add it to the library."
+                            : "Sign in (Settings > Account) or add a fal.ai key under [providers.fal] to enable generation.";
+                    }
+
+                    if AiBackend.media-items.length > 0: ai-media-grid := CutlassGridView {
+                        interactive: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        auto-columns: true;
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: AiBackend.media-items.length;
+
+                        for tile[i] in AiBackend.media-items: AiMediaTile {
+                            x: ai-media-grid.cell-x(i);
+                            y: ai-media-grid.cell-y(i);
+                            width: ai-media-grid.cell-width;
+                            height: ai-media-grid.cell-height;
+                            tile: tile;
+                            index: i;
+                        }
+                    }
                 }
 
                 // ---- Audio > Local ------------------------------------------
@@ -358,13 +741,11 @@ export component LibraryPanel inherits PanelBase {
                     }
 
                     if root.audio-media.length > 0: audio-grid := CutlassGridView {
-                        show-horizontal-scrollbar: false;
-                        show-vertical-scrollbar: false;
+                        interactive: false;
                         vertical-stretch: 1;
                         horizontal-stretch: 1;
 
-                        columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
-                            / (100px + AppStore.theme.metrics.spacing.md)));
+                        auto-columns: true;
                         cell-width: 100px;
                         cell-height: 100px;
                         spacing: AppStore.theme.metrics.spacing.md;
@@ -381,13 +762,84 @@ export component LibraryPanel inherits PanelBase {
                     }
                 }
 
-                // ---- Audio > SFX / Stock / AI -------------------------------
-                if LibraryState.active-tab == "audio" && LibraryState.audio-section == "sfx": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/sfx.svg");
-                    title: "Sound effects";
-                    message: "A built-in pack of whooshes, dings, and ambience. Coming soon.";
+                // ---- Audio > Sound effects ----------------------------------
+                // CC0-curated catalog (src/sfx.rs): metadata lists instantly,
+                // files download on click-to-import and land in the pool under
+                // Audio > Local like any other media.
+                if LibraryState.active-tab == "audio" && LibraryState.audio-section == "sfx": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    if SfxBackend.status == "loading": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+
+                        CutlassText {
+                            text: "Loading sound effects…";
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                        }
+                    }
+
+                    if SfxBackend.status == "empty" || SfxBackend.status == "idle": SectionPlaceholder {
+                        vertical-stretch: 1;
+                        icon: @image-url("../../../../../assets/icon/library/sfx.svg");
+                        title: "Sound effects";
+                        message: "A CC0 pack of whooshes, dings, and ambience. Click a sound to add it to your media.";
+                    }
+
+                    if SfxBackend.status == "error": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        padding: AppStore.theme.metrics.spacing.xl;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        CutlassText {
+                            text: "Couldn't load sound effects";
+                            style: AppStore.theme.typography.heading-sm;
+                            horizontal-alignment: center;
+                        }
+
+                        CutlassText {
+                            text: SfxBackend.error;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            SubtleButton {
+                                label: "Retry";
+                                clicked => {
+                                    SfxBackend.refresh();
+                                }
+                            }
+                        }
+                    }
+
+                    if SfxBackend.status == "results": sfx-grid := CutlassGridView {
+                        interactive: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        auto-columns: true;
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: SfxBackend.items.length;
+
+                        for tile[i] in SfxBackend.items: SfxAudioTile {
+                            x: sfx-grid.cell-x(i);
+                            y: sfx-grid.cell-y(i);
+                            width: sfx-grid.cell-width;
+                            height: sfx-grid.cell-height;
+                            tile: tile;
+                            index: i;
+                        }
+                    }
                 }
 
                 if LibraryState.active-tab == "audio" && LibraryState.audio-section == "stock": SectionPlaceholder {
@@ -398,23 +850,74 @@ export component LibraryPanel inherits PanelBase {
                     message: "Royalty-free tracks to score your edit. Coming soon.";
                 }
 
-                if LibraryState.active-tab == "audio" && LibraryState.audio-section == "ai": SectionPlaceholder {
-                    width: parent.width;
-                    height: parent.height;
-                    icon: @image-url("../../../../../assets/icon/library/ai.svg");
-                    title: "AI generated";
-                    message: "Generate music and voice-overs from a prompt. Coming soon.";
+                // ---- Audio > AI generated (TTS voice-overs) -----------------
+                if LibraryState.active-tab == "audio" && LibraryState.audio-section == "ai": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    HorizontalLayout {
+                        padding: AppStore.theme.metrics.spacing.sm;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        AiPromptField {
+                            placeholder: "Text to speak…";
+                            value <=> AiBackend.tts-prompt;
+                            accepted => {
+                                if !AiBackend.busy && AiBackend.tts-prompt != "" {
+                                    AiBackend.generate("tts", AiBackend.tts-prompt);
+                                }
+                            }
+                        }
+
+                        SubtleButton {
+                            label: AiBackend.busy ? "Generating…" : "Generate";
+                            enabled: !AiBackend.busy && AiBackend.tts-prompt != "";
+                            clicked => {
+                                AiBackend.generate("tts", AiBackend.tts-prompt);
+                            }
+                        }
+                    }
+
+                    AiRouteLine { }
+
+                    if AiBackend.tts-items.length == 0: SectionPlaceholder {
+                        vertical-stretch: 1;
+                        icon: @image-url("../../../../../assets/icon/library/ai.svg");
+                        title: "AI voice-over";
+                        message: AiBackend.available
+                            ? "Type a line and generate a voice-over; click a result to add it as audio media."
+                            : "Sign in (Settings > Account) or add a fal.ai key under [providers.fal] to enable generation.";
+                    }
+
+                    if AiBackend.tts-items.length > 0: ai-tts-grid := CutlassGridView {
+                        interactive: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        auto-columns: true;
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: AiBackend.tts-items.length;
+
+                        for tile[i] in AiBackend.tts-items: AiMediaTile {
+                            x: ai-tts-grid.cell-x(i);
+                            y: ai-tts-grid.cell-y(i);
+                            width: ai-tts-grid.cell-width;
+                            height: ai-tts-grid.cell-height;
+                            tile: tile;
+                            index: i;
+                        }
+                    }
                 }
 
-                // ---- Text ---------------------------------------------------
-                if LibraryState.active-tab == "text": text-grid := CutlassGridView {
+                // ---- Text > Add text ----------------------------------------
+                if LibraryState.active-tab == "text" && LibraryState.text-section == "titles": text-grid := CutlassGridView {
                     width: parent.width;
                     height: parent.height;
-                    show-horizontal-scrollbar: false;
-                    show-vertical-scrollbar: false;
+                    interactive: false;
 
-                    columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
-                        / (100px + AppStore.theme.metrics.spacing.md)));
+                    auto-columns: true;
                     cell-width: 100px;
                     cell-height: 100px;
                     spacing: AppStore.theme.metrics.spacing.md;
@@ -434,15 +937,175 @@ export component LibraryPanel inherits PanelBase {
                     }
                 }
 
+                // ---- Text > Presets -----------------------------------------
+                // Served recipes (TextStyle + look-animation combos) rendered
+                // by the existing text pipeline; tiles drag onto the timeline
+                // like the default text tile (src/text_presets.rs).
+                if LibraryState.active-tab == "text" && LibraryState.text-section == "presets": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    if TextPresetsBackend.status == "idle" || TextPresetsBackend.status == "loading": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+
+                        CutlassText {
+                            text: "Loading presets…";
+                            horizontal-alignment: center;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+                    }
+
+                    if TextPresetsBackend.status == "empty": SectionPlaceholder {
+                        vertical-stretch: 1;
+                        icon: @image-url("../../../../../assets/icon/library/text.svg");
+                        title: "Text presets";
+                        message: "Styled, animated title recipes land here as the catalog grows.";
+                    }
+
+                    if TextPresetsBackend.status == "error": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        padding: AppStore.theme.metrics.spacing.xl;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        CutlassText {
+                            text: "Couldn't load presets";
+                            style: AppStore.theme.typography.heading-sm;
+                            horizontal-alignment: center;
+                        }
+
+                        CutlassText {
+                            text: TextPresetsBackend.error;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            SubtleButton {
+                                label: "Retry";
+                                clicked => {
+                                    TextPresetsBackend.refresh();
+                                }
+                            }
+                        }
+                    }
+
+                    if TextPresetsBackend.status == "results": preset-grid := CutlassGridView {
+                        interactive: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        auto-columns: true;
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: TextPresetsBackend.items.length;
+
+                        for tile[i] in TextPresetsBackend.items: TextPresetLibraryTile {
+                            x: preset-grid.cell-x(i);
+                            y: preset-grid.cell-y(i);
+                            width: preset-grid.cell-width;
+                            height: preset-grid.cell-height;
+                            tile: tile;
+                        }
+                    }
+                }
+
+                // ---- Stickers > Lottie (downloaded vector animations) -------
+                // File-backed animations from the anonymous asset catalog;
+                // the worker downloads the small .json files eagerly so every
+                // tile is immediately droppable (src/lottie_stickers.rs).
+                if LibraryState.active-tab == "stickers" && LibraryState.stickers-section == "lottie": VerticalLayout {
+                    spacing: AppStore.theme.metrics.spacing.none;
+
+                    if LottieBackend.status == "idle" || LottieBackend.status == "loading": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+
+                        CutlassText {
+                            text: "Loading animations…";
+                            horizontal-alignment: center;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+                    }
+
+                    if LottieBackend.status == "empty": SectionPlaceholder {
+                        vertical-stretch: 1;
+                        icon: @image-url("../../../../../assets/icon/library/stickers.svg");
+                        title: "Lottie stickers";
+                        message: "Vector animations land here as the catalog grows.";
+                    }
+
+                    if LottieBackend.status == "error": VerticalLayout {
+                        vertical-stretch: 1;
+                        alignment: center;
+                        padding: AppStore.theme.metrics.spacing.xl;
+                        spacing: AppStore.theme.metrics.spacing.sm;
+
+                        CutlassText {
+                            text: "Couldn't load animations";
+                            style: AppStore.theme.typography.heading-sm;
+                            horizontal-alignment: center;
+                        }
+
+                        CutlassText {
+                            text: LottieBackend.error;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                            horizontal-alignment: center;
+                            wrap: word-wrap;
+                        }
+
+                        HorizontalLayout {
+                            alignment: center;
+                            SubtleButton {
+                                label: "Retry";
+                                clicked => {
+                                    LottieBackend.refresh();
+                                }
+                            }
+                        }
+                    }
+
+                    if LottieBackend.status == "results": lottie-grid := CutlassGridView {
+                        interactive: false;
+                        vertical-stretch: 1;
+                        horizontal-stretch: 1;
+
+                        auto-columns: true;
+                        cell-width: 100px;
+                        cell-height: 100px;
+                        spacing: AppStore.theme.metrics.spacing.md;
+                        inset: AppStore.theme.metrics.spacing.md;
+                        item-count: LottieBackend.items.length;
+
+                        for tile[i] in LottieBackend.items: GeneratedTile {
+                            x: lottie-grid.cell-x(i);
+                            y: lottie-grid.cell-y(i);
+                            width: lottie-grid.cell-width;
+                            height: lottie-grid.cell-height;
+                            generator: "lottie:" + tile.key;
+                            label: tile.name;
+                            icon: tile.thumbnail;
+                            lane-kind: TrackKind.sticker;
+                            seconds: 5;
+                        }
+                    }
+                }
+
                 // ---- Stickers (bundled pack + shapes) -----------------------
-                if LibraryState.active-tab == "stickers": shape-grid := CutlassGridView {
+                if LibraryState.active-tab == "stickers" && LibraryState.stickers-section == "shapes": shape-grid := CutlassGridView {
                     width: parent.width;
                     height: parent.height;
-                    show-horizontal-scrollbar: false;
-                    show-vertical-scrollbar: false;
+                    interactive: false;
 
-                    columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
-                        / (100px + AppStore.theme.metrics.spacing.md)));
+                    auto-columns: true;
                     cell-width: 100px;
                     cell-height: 100px;
                     spacing: AppStore.theme.metrics.spacing.md;
@@ -524,13 +1187,11 @@ export component LibraryPanel inherits PanelBase {
                     }
 
                     effects-grid := CutlassGridView {
-                        show-horizontal-scrollbar: false;
-                        show-vertical-scrollbar: false;
+                        interactive: false;
                         vertical-stretch: 1;
                         horizontal-stretch: 1;
 
-                        columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
-                            / (100px + AppStore.theme.metrics.spacing.md)));
+                        auto-columns: true;
                         cell-width: 100px;
                         cell-height: 100px;
                         spacing: AppStore.theme.metrics.spacing.md;
@@ -577,13 +1238,11 @@ export component LibraryPanel inherits PanelBase {
                     }
 
                     transitions-grid := CutlassGridView {
-                        show-horizontal-scrollbar: false;
-                        show-vertical-scrollbar: false;
+                        interactive: false;
                         vertical-stretch: 1;
                         horizontal-stretch: 1;
 
-                        columns: max(1, floor((self.width - AppStore.theme.metrics.spacing.md)
-                            / (100px + AppStore.theme.metrics.spacing.md)));
+                        auto-columns: true;
                         cell-width: 100px;
                         cell-height: 100px;
                         spacing: AppStore.theme.metrics.spacing.md;

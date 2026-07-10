@@ -147,6 +147,9 @@ export struct ClipCapabilities {
     can-split: bool,
     can-reverse: bool,
     can-ripple-delete: bool,
+    // CapCut "extract audio": video-lane media with an audio stream that is
+    // not already detached to a linked audio-lane companion.
+    can-extract-audio: bool,
 }
 
 @rust-attr(derive(serde::Serialize, serde::Deserialize))
@@ -300,6 +303,11 @@ export struct Clip {
     adjust-saturation: float,
     adjust-exposure: float,
     adjust-temperature: float,
+    // Optional `.cube` LUT, projected read-only. `lut-id` is the catalog id
+    // (the file's stem); edits go through `InspectorBackend.set-clip-lut`.
+    lut-id: string,
+    lut-label: string,
+    lut-intensity: float,
     // Look animation presets (CapCut In / Out / Combo tabs). Projected
     // read-only — edits go through `InspectorBackend.set-clip-animation`.
     animation-in-id: string,
@@ -488,4 +496,7 @@ export struct Project {
     // Audio-only subset of `media`, projected separately because Slint's
     // `for` can't filter a model — feeds the Audio tab's Local section.
     media-audio: [Media],
+    // Per-project AI agent rules (ProjectMetadata.agent_rules). Shown and
+    // edited in the agent panel; travels with the saved project.
+    agent-rules: string,
 }

@@ -2,6 +2,7 @@ import {
     HSplitGripLead,
     HSplitGripTrail,
     VSplitGripTimeline,
+    CutlassText,
 } from "components/index.slint";
 import {
     AgentPanel,
@@ -80,6 +81,13 @@ export { ExportBackend }from "lib/export-backend.slint";
 export { CanvasBackend }from "lib/canvas-backend.slint";
 export { EffectsBackend }from "lib/effects-backend.slint";
 export { SettingsBackend }from "lib/settings-backend.slint";
+export { CloudBackend, StockTile }from "lib/cloud-backend.slint";
+export { TemplatesBackend, TemplateTile }from "lib/templates-backend.slint";
+export { TextPresetsBackend, TextPresetTile }from "lib/text-presets-backend.slint";
+export { LottieBackend, LottieTile }from "lib/lottie-backend.slint";
+export { SfxBackend, SfxTile }from "lib/sfx-backend.slint";
+export { AccountBackend }from "lib/account-backend.slint";
+export { AiBackend, AiItemTile }from "lib/ai-backend.slint";
 
 export component AppWindow inherits Window {
     title: "Cutlass";
@@ -355,7 +363,11 @@ export component AppWindow inherits Window {
                     TimelineActions.redo();
                     return accept;
                 }
-                if (event.text == "z") {
+                // "Z" too: with caps lock on, Cmd+Z delivers "Z" with no
+                // shift modifier — without this branch the keypress silently
+                // matched nothing and undo was dropped. Real Cmd+Shift+Z is
+                // already caught by the shift-gated redo branch above.
+                if (event.text == "z" || event.text == "Z") {
                     TimelineActions.undo();
                     return accept;
                 }
@@ -578,6 +590,26 @@ export component AppWindow inherits Window {
         y: AppState.transition-drag-cursor-y - AppState.transition-drag-tile-anchor-y;
         background: #C84A8F;
         border-radius: AppStore.theme.track-lane.clip.radius;
+    }
+
+    // OS file-drop target — accent border + hint while Finder/Explorer hovers
+    // supported files over the window. Hidden while the cursor is over the
+    // timeline: the panel shows a landing preview there instead (dropping on
+    // the timeline places clips rather than just importing).
+    if AppState.os-drop-hover && !AppState.os-drop-over-timeline: Rectangle {
+        width: root.width;
+        height: root.height;
+        background: #ffffff08;
+        border-width: 2px;
+        border-color: AppStore.theme.accent.primary;
+
+        CutlassText {
+            text: "Drop to import";
+            style: AppStore.theme.typography.heading-sm;
+            foreground: AppStore.theme.accent.primary;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
     }
 
     // Export settings dialog — declared last so the modal paints above

@@ -7,7 +7,7 @@
 //! (persisted + surfaced in `ui_state`, drawn later).
 
 use cutlass_models::{
-    AnimationRef, AnimationSlot, AudioRole, ChromaKey, Clip, ClipId, ColorAdjustments, Filter,
+    AnimationRef, AnimationSlot, AudioRole, ChromaKey, Clip, ClipId, ColorAdjustments, Filter, Lut,
     Mask, ModelError, Project, StabilizeLevel,
 };
 
@@ -61,6 +61,14 @@ pub fn set_filter(
     filter: Option<Filter>,
 ) -> Result<Box<dyn EditAction>, EngineError> {
     with_restore(ctx, clip, |p| p.set_clip_filter(clip, filter))
+}
+
+pub fn set_lut(
+    ctx: &mut ApplyContext<'_>,
+    clip: ClipId,
+    lut: Option<Lut>,
+) -> Result<Box<dyn EditAction>, EngineError> {
+    with_restore(ctx, clip, |p| p.set_clip_lut(clip, lut))
 }
 
 pub fn set_adjustments(

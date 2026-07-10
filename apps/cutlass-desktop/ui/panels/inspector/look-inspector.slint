@@ -6,7 +6,7 @@ import { CutlassText, CutlassScrollView } from "../../components/index.slint";
 import { AppState } from "../../state.slint";
 import { AppStore, TimelineStore } from "../../store/index.slint";
 import { InspectorBackend } from "../../lib/inspector-backend.slint";
-import { Clip } from "../../models/index.slint";
+import { CatalogEntry, Clip } from "../../models/index.slint";
 import { LabelCell, SectionHeader, SliderRow } from "inspector-widgets.slint";
 
 component FilterRow inherits Rectangle {
@@ -41,6 +41,7 @@ component FilterRow inherits Rectangle {
 }
 
 component FilterDropdown inherits Rectangle {
+    in property <[CatalogEntry]> entries: InspectorBackend.filter-catalog;
     in property <string> current-id;
     in property <string> current-label;
 
@@ -123,7 +124,7 @@ component FilterDropdown inherits Rectangle {
                             }
                         }
 
-                        for entry in InspectorBackend.filter-catalog: FilterRow {
+                        for entry in root.entries: FilterRow {
                             label: entry.label;
                             id: entry.id;
                             selected: entry.id == root.current-id;
@@ -144,6 +145,14 @@ export component LookInspector inherits VerticalLayout {
 
     spacing: AppStore.theme.metrics.spacing.lg;
     alignment: LayoutAlignment.start;
+
+    init => {
+        // First open fetches the LUT catalog; later opens reuse the result
+        // (the worker also serves cached catalogs offline).
+        if (InspectorBackend.lut-status == "idle") {
+            InspectorBackend.refresh-luts();
+        }
+    }
 
     function preview-look(
         filter-id: string,
@@ -227,6 +236,62 @@ export component LookInspector inherits VerticalLayout {
             InspectorBackend.set-clip-filter(
                 root.model.id,
                 root.model.filter-id,
+                clamp(v, 0, 100) / 100);
+        }
+    }
+
+    SectionHeader {
+        title: "LUT";
+    }
+
+    HorizontalLayout {
+        spacing: AppStore.theme.metrics.spacing.md;
+        height: 28px;
+        vertical-stretch: 0;
+
+        LabelCell {
+            label: "Preset";
+        }
+
+        FilterDropdown {
+            entries: InspectorBackend.lut-catalog;
+            current-id: root.model.lut-id;
+            current-label: root.model.lut-label;
+            selected(id) => {
+                InspectorBackend.set-clip-lut(root.model.id, id, id == "" ? 0 : 0.8);
+            }
+        }
+    }
+
+    if InspectorBackend.lut-status == "loading": CutlassText {
+        text: "Loading LUT catalog…";
+        style: AppStore.theme.typography.caption;
+        foreground: AppStore.theme.text.muted;
+    }
+
+    if InspectorBackend.lut-status == "error": CutlassText {
+        text: InspectorBackend.lut-error;
+        style: AppStore.theme.typography.caption;
+        foreground: AppStore.theme.text.muted;
+        wrap: word-wrap;
+    }
+
+    if root.model.lut-id != "": SliderRow {
+        label: "Intensity";
+        suffix: "%";
+        value: root.model.lut-intensity * 100;
+        minimum: 0;
+        maximum: 100;
+        step: 1;
+        decimals: 0;
+        reset-value: 80;
+        // No live preview: LUT application has no session override yet,
+        // so the slider commits on release only.
+        preview(v) => { }
+        commit(v) => {
+            InspectorBackend.set-clip-lut(
+                root.model.id,
+                root.model.lut-id,
                 clamp(v, 0, 100) / 100);
         }
     }

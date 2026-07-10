@@ -58,6 +58,12 @@ export struct AudioSample {
 export global InspectorBackend {
     // Clip-level filter preset catalog, populated once at startup.
     in-out property <[CatalogEntry]> filter-catalog: [];
+    // Cloud LUT catalog (downloaded `.cube` starter pack). Populated by the
+    // LUT worker after `refresh-luts`; ids map to local files Rust-side.
+    in-out property <[CatalogEntry]> lut-catalog: [];
+    // "idle" | "loading" | "results" | "empty" | "error"
+    in-out property <string> lut-status: "idle";
+    in-out property <string> lut-error: "";
     // Look animation preset catalogs, populated once at startup.
     in-out property <[CatalogEntry]> animation-in-catalog: [];
     in-out property <[CatalogEntry]> animation-out-catalog: [];
@@ -208,6 +214,15 @@ export global InspectorBackend {
     // Set (or clear with an empty id) a visual clip's filter preset. Intensity
     // is normalized 0..=1; the inspector displays it as 0..=100%.
     callback set-clip-filter(clip-id: string, filter-id: string, intensity: float);
+
+    // Fetch the LUT catalog and download its `.cube` files (idempotent; the
+    // look inspector fires it on first open).
+    callback refresh-luts();
+
+    // Set (or clear with an empty id) a visual clip's `.cube` LUT. `lut-id`
+    // is a `lut-catalog` entry id; Rust resolves it to the downloaded file.
+    // Intensity is normalized 0..=1. One undoable edit.
+    callback set-clip-lut(clip-id: string, lut-id: string, intensity: float);
 
     // Set (or clear with an empty id) one look-animation slot: "in", "out",
     // or "combo". One undoable edit; combo exclusivity is enforced by the model.

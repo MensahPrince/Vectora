@@ -1,69 +1,75 @@
 # Cutlass
 
 Cutlass is a free, open-source video editor with an AI assistant built in.
-Edit the normal way on a timeline — cut, trim, arrange, add effects and audio —
-or just tell the assistant what you want and watch it do the edit for you.
+Edit on the timeline the normal way, or describe the edit in plain language
+and the assistant runs it as regular timeline commands you can review and
+undo.
 
-It's still alpha and moving fast, but it's a real editor now, not a toy.
+It's early alpha. The core editing loop works, but expect rough edges and a
+project format that hasn't settled yet.
 
-## What you can do
+## What works today
 
-**Edit a timeline**
+**Timeline editing**
 
 - Import video, audio, and images onto a multi-lane timeline.
 - Cut, trim, split, move, duplicate, link/unlink, ripple-delete, multi-select.
-- Change speed and reverse, crop and flip, move/scale/rotate, set opacity.
-- Add styled text, solid colors, shapes, and bundled stickers (static or
-  animated).
-- Apply entrance/exit/combo look animations from the catalog.
-- Pick a canvas shape (16:9, 9:16, 1:1, 4:5, 21:9) and a background color.
-- Keyframe almost anything — animate transforms and effect settings over time.
+- Speed changes (flat or ramped), reverse, crop, flip, move/scale/rotate,
+  opacity.
+- Styled text, solid colors, shapes, and bundled stickers, static and animated.
+- Entrance/exit/combo animations from a catalog.
+- Keyframes on transforms and effect settings.
+- Canvas presets (16:9, 9:16, 1:1, 4:5, 21:9) and a background color.
 
-**Effects & transitions**
+**Effects and color**
 
-- A GPU effect engine with a starter pack: blur, vignette, sharpen, pixelate,
-  glitch, chromatic aberration, grain, glow, zoom-blur, mirror.
-- Transitions between clips: crossfade, dip to black/white, wipes, slide, zoom,
-  blur.
-- Adjustment layers that affect everything beneath them.
+- GPU effect passes: gaussian blur, vignette, pixelate. The rest of the
+  catalog (sharpen, glitch, grain, glow, and so on) is selectable but renders
+  as a no-op until its shader lands.
+- Per-clip masks (linear, mirror, circle, rectangle, heart, star) and chroma
+  key.
+- Filter presets and color adjustments per clip, plus lane-wide adjustment
+  layers that grade everything beneath them.
+- Transitions: crossfade and wipe-left are implemented; the other catalog
+  entries currently play as a crossfade.
 
-**Audio that doesn't need a separate app**
+**Audio**
 
 - Volume envelopes and draggable fade handles.
-- Change speed without the chipmunk effect — pitch stays put, ramps included.
-- Auto-duck music under a voice track.
-- One-click noise reduction.
-- Beat detection you can snap your cuts to.
+- Speed changes resample the audio, ramps included. Pitch follows the rate
+  for now; pitch-preserving stretch is planned but not built.
+- Noise reduction per clip (RNNoise).
 
-**Preview & export**
+**Preview and export**
 
-- Live GPU preview with scrubbing and real-time playback.
+- Live GPU preview with scrubbing and playback.
 - Export to H.264/AAC MP4.
 
 **The AI assistant**
 
-Describe an edit in plain language and the assistant makes it on your timeline.
-It uses the same actions you would, so every change stays visible, undoable, and
-reviewable — nothing happens behind your back. It's optional; the editor works
-fine without it. Configure an OpenAI-compatible endpoint in
-`~/.cutlass/config.toml` (see below); dry-run preview is on by default.
+Describe an edit and the assistant applies it through the same commands the
+UI uses, so its work shows up on the timeline like yours would and undoes in
+one step. Dry-run preview is on by default: you see the plan before anything
+changes. The assistant is optional and the editor works fine without it.
 
 ## Install
 
 Download a build from the [releases page](https://github.com/1Mr-Newton/cutlass/releases).
 
-- **macOS** (Apple Silicon) — unzip and drag `Cutlass.app` to Applications.
-  On first launch, right-click the app and choose **Open** (builds aren't
-  notarized yet). Media decode/encode uses the OS's AVFoundation — nothing
-  else to install.
-- **Windows / Linux** — preview builds only for now: the editor UI runs, but
-  these platforms' native media backends aren't implemented yet, so imported
-  media won't play.
+- **macOS** (Apple Silicon): unzip and drag `Cutlass.app` to Applications.
+  On first launch, right-click the app and choose **Open**; builds aren't
+  notarized yet. Media decode/encode uses the system's AVFoundation, so
+  there's nothing else to install.
+- **Windows** (x64): unzip and run, or use the Setup.exe installer. Media
+  decode/encode uses Media Foundation, so nothing else to install. Builds are
+  unsigned for now; SmartScreen will warn on first run.
+- **Linux**: preview builds only. The UI runs, but the Linux media backend
+  isn't implemented yet, so imported media won't play.
 
 ## Setting up the AI assistant
 
-Cutlass doesn't ship a model. Point it at any OpenAI-compatible endpoint — a
-local one like [Ollama](https://ollama.com), or a cloud provider.
+Cutlass doesn't ship a model. Point it at any OpenAI-compatible endpoint:
+a local one like [Ollama](https://ollama.com), or a cloud provider.
 
 Create `~/.cutlass/config.toml`:
 
@@ -75,28 +81,25 @@ model = "qwen3:14b"
 # api_key_env = "OPENAI_API_KEY"          # read the key from an env var
 ```
 
-Your key stays in that file or your environment — it's never written into
-project files. Smaller local models work but tool-call less reliably; the
-assistant's dry-run mode lets you preview a plan before it touches anything.
+The key stays in that file or your environment; it's never written into
+project files. Small local models work but their tool calling is less
+reliable, which is part of why dry-run is the default.
 
 ## Projects
 
-Cutlass owns your projects, CapCut-style — there's no file to save by hand.
-Every edit auto-saves continuously, so a clean exit never loses work, and the
-launch screen lists your projects to reopen or delete. Rename a project inline
-from the title bar.
+Cutlass owns your projects, CapCut-style. There's no save button: every edit
+auto-saves, and the launch screen lists your projects to reopen or delete.
+Rename a project from the title bar.
 
-Use **Open file…** to import an external `.cutlass` into your projects, and
-**Export** to render an `.mp4`. Media is referenced from where it lives on
-disk, so importing a project from another machine may ask you to relink media.
+**Open file…** imports an external `.cutlass` into your projects, and
+**Export** renders an `.mp4`. Media is referenced from wherever it lives on
+disk, so a project from another machine may ask you to relink its media.
 
 ## Build from source
 
-You need a recent stable Rust toolchain. Media decode/encode is
-platform-native (AVFoundation/VideoToolbox on Apple platforms), so there are
-no third-party media libraries to install on macOS.
-
-Run the desktop editor:
+You need a recent stable Rust toolchain. There are no third-party media
+libraries to install; decode/encode is platform-native (AVFoundation and
+VideoToolbox on Apple platforms, Media Foundation on Windows).
 
 ```bash
 cargo run -p cutlass-desktop
@@ -104,7 +107,7 @@ cargo run -p cutlass-desktop
 cargo run -p cutlass-desktop -- path/to/video.mp4
 ```
 
-To build and test the whole workspace:
+Build and test everything:
 
 ```bash
 cargo build --workspace
@@ -112,24 +115,19 @@ cargo test --workspace
 ```
 
 The iOS/macOS SwiftUI app lives in `apps/cutlass-ios-macos` (built with Xcode
-on top of the same engine through `cutlass-mobile`), and the Android test app
-in `apps/cutlass-android`.
+on the same engine through `cutlass-mobile`), and the Android test app in
+`apps/cutlass-android`.
 
 ## Contributing
 
-Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for setup, the
-project layout, and the commit/PR style. Each crate also has its own README
-under `crates/`, and packaging notes live in [packaging/](packaging/README.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, project layout, and the
+commit/PR style. Each crate has its own README under `crates/`, and packaging
+notes live in [packaging/](packaging/README.md).
 
-A lot of Cutlass is written with AI coding tools and then reviewed by
-maintainers. Contributions are welcome on the same footing whether they come
-from a person or an assistant, as long as they're solid and meet the bar.
+A lot of Cutlass is written with AI coding tools and reviewed by maintainers.
+Contributions are judged on what they do, not how they were made.
 
 ## License
 
-Dual-licensed under either of [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT),
-at your option.
-
-Media decode/encode goes through the operating system's frameworks
-(AVFoundation/VideoToolbox on Apple platforms), so builds bundle no
-third-party media libraries.
+Dual-licensed under [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT), at
+your option.

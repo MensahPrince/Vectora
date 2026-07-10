@@ -33,6 +33,14 @@ impl TrackKind {
         !matches!(self, Self::Audio)
     }
 
+    /// Lanes whose clips composite as frames and can therefore take a
+    /// transition at their junctions. Audio has no frame; effect/filter/
+    /// adjustment segments resolve to canvas-wide passes, which the renderer
+    /// can't nest inside a transition.
+    pub const fn supports_transitions(self) -> bool {
+        matches!(self, Self::Video | Self::Sticker | Self::Text)
+    }
+
     /// Whether `content` may be placed on a track of this kind.
     pub fn accepts_content(self, content: &ClipSource) -> bool {
         matches!(
@@ -43,6 +51,7 @@ impl TrackKind {
                     Self::Sticker,
                     ClipSource::Generated(
                         Generator::Sticker { .. }
+                            | Generator::Lottie { .. }
                             | Generator::SolidColor { .. }
                             | Generator::Shape { .. },
                     ),
@@ -65,9 +74,10 @@ impl TrackKind {
     pub const fn for_generator(generator: &Generator) -> Option<Self> {
         match generator {
             Generator::Text { .. } => Some(Self::Text),
-            Generator::SolidColor { .. } | Generator::Shape { .. } | Generator::Sticker { .. } => {
-                Some(Self::Sticker)
-            }
+            Generator::SolidColor { .. }
+            | Generator::Shape { .. }
+            | Generator::Sticker { .. }
+            | Generator::Lottie { .. } => Some(Self::Sticker),
             Generator::Effect => Some(Self::Effect),
             Generator::Filter => Some(Self::Filter),
             Generator::Adjustment => Some(Self::Adjustment),

@@ -1,0 +1,45 @@
+// Launch-screen templates gallery, implemented in Rust (src/templates.rs
+// owns a worker thread; catalog fetches, preview downloads, and bundle
+// installs never touch the UI thread).
+//
+// The catalog arrives as a published tile list; preview images stream in
+// afterwards, patching rows in place (the thumbnail-registry pattern from
+// cloud-backend.slint). "Use" downloads the bundle from the CDN, installs
+// it into the app data dir, asks for the user's media picks, and replaces
+// the session via ApplyTemplate — the session-epoch bump then dismisses
+// the launch screen.
+
+// One gallery tile.
+export struct TemplateTile {
+    // Catalog id ("tpl-vlog-1"); the UI hands back the row index, the key
+    // guards against stale patches.
+    key: string,
+    name: string,
+    // snake_case TemplateCategory ("vlog", "travel", …).
+    category: string,
+    preview: image,
+    has-preview: bool,
+    // Corner chip: "0:12 · 3 clips".
+    label: string,
+    // "Cutlass" for first-party entries.
+    author: string,
+    // "" (idle) | "downloading" | "installing" | "picking" | "unsupported"
+    // | "failed".
+    state: string,
+    // 0..1 while downloading (0 when the size is unknown).
+    progress: float,
+}
+
+export global TemplatesBackend {
+    in-out property <[TemplateTile]> items: [];
+    // "idle" (never fetched) | "loading" | "results" | "empty" | "error".
+    in-out property <string> status: "idle";
+    in-out property <string> error: "";
+    // Active category filter ("all" or a snake_case TemplateCategory).
+    in-out property <string> category: "all";
+
+    // (Re)fetch the catalog, filtered to `category`.
+    callback refresh(category: string);
+    // Download, install, and fill row `index`'s template.
+    callback use-template(index: int);
+}

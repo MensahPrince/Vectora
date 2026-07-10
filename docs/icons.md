@@ -89,6 +89,7 @@ lacks cleanly (`letter-spacing`, `line-height`): **[Tabler](https://tabler.io/ic
 - [ ] `scissors` — placeholder `"Split"` — `panels/timeline/toolbar.slint` — split at playhead.
 - [ ] `flag` — placeholder `"Marker"` — `panels/timeline/toolbar.slint` — add marker.
 - [ ] `trash-2` — placeholder `"Delete"` — `panels/timeline/toolbar.slint`.
+- [ ] `audio-lines` — placeholder `"Extract"` — `panels/timeline/toolbar.slint` — extract audio from video clip.
 - [ ] `repeat` — placeholder `"Loop"` — `panels/timeline/toolbar.slint`.
 - [ ] `magnet` — placeholder `"Magnet"` — `panels/timeline/toolbar.slint` — main-track gapless magnet.
 - [ ] `magnet` (variant — must read different from Magnet) — placeholder `"Snap"` — `panels/timeline/toolbar.slint` — auto-snap toggle.

@@ -2,7 +2,7 @@
 
 MoviePy-style Python bindings for the [Cutlass](https://github.com/1mrnewton/cutlass)
 video engine. Build a project with explicit tracks, place clips, animate properties,
-and export — all through a track-first object model over the pure-Rust timeline,
+and export, all through a track-first object model over the pure-Rust timeline,
 GPU compositor, and platform-native exporter.
 
 See [api-design.md](./api-design.md) for the full v2 API reference.
@@ -93,7 +93,7 @@ main.add(still, start=0.0, duration=10.0)  # hold the still for 10s
 
 ## Track kinds
 
-`video`, `audio`, `text`, `sticker`, `effect`, `filter`, `adjustment` — the kind
+`video`, `audio`, `text`, `sticker`, `effect`, `filter`, `adjustment`. The kind
 must match the clip content (`TrackKindError` on mismatch): media goes on
 `video`/`audio`, `Text` on `text`, `Solid`, shapes, and `Sticker` on `sticker`.
 `Sticker("heart")` places a bundled sticker (static or animated); browse ids
@@ -126,6 +126,6 @@ DYLD_FRAMEWORK_PATH="$(python3 -c 'import sys; print(sys.base_prefix.rsplit("/Py
     cargo test --no-default-features
 ```
 
-> **Export:** uses the platform-native encoder — Apple (VideoToolbox) and Windows
+> **Export:** uses the platform-native encoder: Apple (VideoToolbox) and Windows
 > (Media Foundation), both H.264 + AAC → mp4. Other platforms raise until their
 > backends land.

@@ -106,6 +106,16 @@ export component Toolbar inherits Rectangle {
             }
         }
 
+        // CapCut "extract audio": detach the selected video clip's sound onto
+        // a linked audio-lane companion (same media, no new library asset).
+        ToolButton {
+            label: "Extract";
+            enabled: TimelineActions.can-extract-audio();
+            clicked => {
+                TimelineActions.extract-audio-selected();
+            }
+        }
+
         Rectangle {
             horizontal-stretch: 1;
 

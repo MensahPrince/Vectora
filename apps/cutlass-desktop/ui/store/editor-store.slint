@@ -77,6 +77,9 @@ export global EditorStore {
     // Toggle reverse playback on the primary selected clip (context menu).
     // The worker reads the current speed and flips `reversed`.
     callback on-clip-reversed(clip-id: string);
+    // CapCut "extract audio": detach the primary video clip's sound onto a
+    // linked audio-lane companion (same media, no new library asset).
+    callback on-clip-audio-extracted(clip-id: string);
     // Split the clip at `at-tick` (Ctrl/Cmd+B, toolbar). Caller guarantees
     // the tick is strictly inside the clip.
     callback on-clip-split(clip-id: string, at-tick: int);

@@ -7,6 +7,10 @@
 import { CutlassText } from "../../components/index.slint";
 import { AppStore, EditorStore, TimelineStore } from "../../store/index.slint";
 import { EffectsBackend } from "../../lib/effects-backend.slint";
+import { CloudBackend, StockTile } from "../../lib/cloud-backend.slint";
+import { SfxBackend, SfxTile } from "../../lib/sfx-backend.slint";
+import { TextPresetTile } from "../../lib/text-presets-backend.slint";
+import { AiBackend, AiItemTile } from "../../lib/ai-backend.slint";
 import { AppState } from "../../state.slint";
 import { Media, TrackKind } from "../../models/index.slint";
 
@@ -90,6 +94,13 @@ export component CatalogTile inherits Rectangle {
             if event.kind == PointerEventKind.up {
                 AppState.library-drag-active = false;
             }
+            if event.kind == PointerEventKind.cancel {
+                // Move cursor off-window so the timeline drop handler won't
+                // commit if the grab was stolen mid-drag.
+                AppState.library-drag-cursor-x = -10000px;
+                AppState.library-drag-cursor-y = -10000px;
+                AppState.library-drag-active = false;
+            }
         }
 
         moved => {
@@ -168,6 +179,11 @@ export component TransitionCatalogTile inherits Rectangle {
             if event.kind == PointerEventKind.up {
                 AppState.transition-drag-active = false;
             }
+            if event.kind == PointerEventKind.cancel {
+                AppState.transition-drag-cursor-x = -10000px;
+                AppState.transition-drag-cursor-y = -10000px;
+                AppState.transition-drag-active = false;
+            }
         }
 
         moved => {
@@ -193,6 +209,11 @@ export component TransitionCatalogTile inherits Rectangle {
 export component MediaTile inherits Rectangle {
     in property <Media> media;
 
+    // Lazy-content gate, bound by grid call sites to the grid's
+    // visible-index range so offscreen tiles skip the thumbnail
+    // element (and its texture) entirely. Chrome stays unconditional.
+    in property <bool> thumbnail-visible: true;
+
     // Audio tiles show the waveform card color while the waveform image is
     // still rendering; video tiles stay dark until the poster frame lands.
     background: media.is-audio ? #2A46C8 : AppStore.theme.surface.content-background;
@@ -206,7 +227,7 @@ export component MediaTile inherits Rectangle {
 
     // Poster frame (video) or waveform card (audio), generated off-thread
     // after import — empty until ready (see src/thumbnails.rs).
-    if media.thumbnail.width > 0: Image {
+    if thumbnail-visible && media.thumbnail.width > 0: Image {
         width: parent.width;
         height: parent.height;
         source: media.thumbnail;
@@ -240,6 +261,11 @@ export component MediaTile inherits Rectangle {
                 menu-popup.show();
             }
             if event.kind == PointerEventKind.up {
+                AppState.library-drag-active = false;
+            }
+            if event.kind == PointerEventKind.cancel {
+                AppState.library-drag-cursor-x = -10000px;
+                AppState.library-drag-cursor-y = -10000px;
                 AppState.library-drag-active = false;
             }
         }
@@ -329,11 +355,13 @@ export component MediaTile inherits Rectangle {
     menu-popup := PopupWindow {
         x: root.menu-x;
         y: root.menu-y;
+        width: 184px;
+        height: menu-list.preferred-height;
         close-policy: PopupClosePolicy.close-on-click-outside;
 
         Rectangle {
-            width: 184px;
-            height: menu-list.preferred-height;
+            width: 100%;
+            height: 100%;
             background: AppStore.theme.panel.background;
             border-radius: AppStore.theme.metrics.radius.md;
             border-width: 1px;
@@ -348,6 +376,7 @@ export component MediaTile inherits Rectangle {
 
                 Rectangle {
                     height: 28px;
+                    width: 100%;
                     border-radius: AppStore.theme.metrics.radius.sm;
                     background: remove-ta.has-hover ? #ffffff10 : transparent;
 
@@ -363,6 +392,9 @@ export component MediaTile inherits Rectangle {
                     }
 
                     remove-ta := TouchArea {
+                        width: 100%;
+                        height: 100%;
+                        mouse-cursor: pointer;
                         clicked => {
                             // Reclaim focus so the next Delete/etc. acts on the
                             // timeline, not a stale text box.
@@ -464,6 +496,11 @@ export component GeneratedTile inherits Rectangle {
             if event.kind == PointerEventKind.up {
                 AppState.library-drag-active = false;
             }
+            if event.kind == PointerEventKind.cancel {
+                AppState.library-drag-cursor-x = -10000px;
+                AppState.library-drag-cursor-y = -10000px;
+                AppState.library-drag-active = false;
+            }
         }
 
         moved => {
@@ -472,6 +509,466 @@ export component GeneratedTile inherits Rectangle {
             }
             AppState.library-drag-cursor-x = self.absolute-position.x + self.mouse-x;
             AppState.library-drag-cursor-y = self.absolute-position.y + self.mouse-y;
+        }
+    }
+}
+
+// One stock search result: thumbnail card, corner label chip (duration /
+// dimensions), attribution strip, and a click-to-import flow with inline
+// download progress. Stock tiles are not draggable — the file isn't local
+// until imported, at which point it appears under Local as normal pool
+// media (and gets the usual draggable MediaTile).
+export component StockMediaTile inherits Rectangle {
+    in property <StockTile> tile;
+    in property <int> index;
+
+    // Lazy-content gate, bound by grid call sites to the grid's
+    // visible-index range so offscreen tiles skip the thumbnail
+    // element (and its texture) entirely. Chrome stays unconditional.
+    in property <bool> thumbnail-visible: true;
+
+    background: AppStore.theme.surface.content-background;
+    border-radius: 4px;
+    clip: true;
+
+    if thumbnail-visible && tile.has-thumbnail: Image {
+        width: parent.width;
+        height: parent.height;
+        source: tile.thumbnail;
+        image-fit: cover;
+    }
+
+    // Corner chip: duration / dimensions.
+    if tile.label != "": Rectangle {
+        x: 4px;
+        y: 4px;
+        width: chip.preferred-width + 8px;
+        height: 16px;
+        border-radius: 3px;
+        background: #000000a0;
+
+        chip := CutlassText {
+            text: tile.label;
+            style: { size: 10px, weight: 500, italic: false };
+            foreground: #ffffffcc;
+        }
+    }
+
+    // Attribution strip (Pexels/Pixabay goodwill credit), hover-revealed.
+    if ta.has-hover && tile.attribution != "": VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 22px;
+            background: #000000a0;
+            CutlassText {
+                text: tile.attribution;
+                style: { size: 10px, weight: 400, italic: false };
+                overflow: elide;
+                x: 4px;
+                width: parent.width - 8px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    // Download state overlay.
+    if tile.state == "downloading": Rectangle {
+        background: #00000080;
+
+        VerticalLayout {
+            alignment: center;
+            padding: 12px;
+            spacing: 6px;
+
+            CutlassText {
+                text: "Downloading…";
+                style: AppStore.theme.typography.caption;
+                horizontal-alignment: center;
+            }
+
+            Rectangle {
+                height: 3px;
+                border-radius: 1.5px;
+                background: #ffffff22;
+
+                Rectangle {
+                    x: 0;
+                    width: parent.width * max(0.05, tile.progress);
+                    height: parent.height;
+                    border-radius: parent.border-radius;
+                    background: AppStore.theme.accent.primary;
+                }
+            }
+        }
+    }
+
+    if tile.state == "imported": Rectangle {
+        x: parent.width - self.width - 4px;
+        y: 4px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: AppStore.theme.accent.primary;
+
+        CutlassText {
+            text: "✓";
+            style: { size: 11px, weight: 700, italic: false };
+            foreground: #ffffff;
+        }
+    }
+
+    if tile.state == "failed": VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 22px;
+            background: #7a1f1fd0;
+            CutlassText {
+                text: "Download failed — click to retry";
+                style: { size: 10px, weight: 500, italic: false };
+                overflow: elide;
+                x: 4px;
+                width: parent.width - 8px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        clicked => {
+            if tile.state != "downloading" && tile.state != "imported" {
+                CloudBackend.stock-import(root.index);
+            }
+        }
+    }
+}
+
+// One catalog sound effect (Library > Audio > Sound effects): name over an
+// audio glyph stage, duration chip, provenance strip on hover, and the
+// stock click-to-import flow with inline download progress. Like stock,
+// SFX tiles are not draggable — importing lands the file in the pool under
+// Audio > Local as a normal draggable MediaTile.
+export component SfxAudioTile inherits Rectangle {
+    in property <SfxTile> tile;
+    in property <int> index;
+
+    background: AppStore.theme.surface.content-background;
+    border-radius: 4px;
+    clip: true;
+
+    CutlassText {
+        width: parent.width;
+        height: parent.height - 22px;
+        text: "♪";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        style: { size: 22px, weight: 400, italic: false };
+        foreground: AppStore.theme.text.muted;
+    }
+
+    // Corner chip: duration.
+    if tile.duration-label != "": Rectangle {
+        x: 4px;
+        y: 4px;
+        width: sfx-chip.preferred-width + 8px;
+        height: 16px;
+        border-radius: 3px;
+        background: #000000a0;
+
+        sfx-chip := CutlassText {
+            text: tile.duration-label;
+            style: { size: 10px, weight: 500, italic: false };
+            foreground: #ffffffcc;
+        }
+    }
+
+    // Name strip; hover swaps in the provenance credit.
+    VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 22px;
+            background: #000000a0;
+            CutlassText {
+                text: ta.has-hover && tile.attribution != "" ? tile.attribution : tile.name;
+                style: { size: 10px, weight: 500, italic: false };
+                overflow: elide;
+                x: 4px;
+                width: parent.width - 8px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    // Download state overlay.
+    if tile.state == "downloading": Rectangle {
+        background: #00000080;
+
+        VerticalLayout {
+            alignment: center;
+            padding: 12px;
+            spacing: 6px;
+
+            CutlassText {
+                text: "Downloading…";
+                style: AppStore.theme.typography.caption;
+                horizontal-alignment: center;
+            }
+
+            Rectangle {
+                height: 3px;
+                border-radius: 1.5px;
+                background: #ffffff22;
+
+                Rectangle {
+                    x: 0;
+                    width: parent.width * max(0.05, tile.progress);
+                    height: parent.height;
+                    border-radius: parent.border-radius;
+                    background: AppStore.theme.accent.primary;
+                }
+            }
+        }
+    }
+
+    if tile.state == "imported": Rectangle {
+        x: parent.width - self.width - 4px;
+        y: 4px;
+        width: 18px;
+        height: 18px;
+        border-radius: 9px;
+        background: AppStore.theme.accent.primary;
+
+        CutlassText {
+            text: "✓";
+            style: { size: 11px, weight: 700, italic: false };
+            foreground: #ffffff;
+        }
+    }
+
+    if tile.state == "failed": VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 22px;
+            background: #7a1f1fd0;
+            CutlassText {
+                text: "Download failed — click to retry";
+                style: { size: 10px, weight: 500, italic: false };
+                overflow: elide;
+                x: 4px;
+                width: parent.width - 8px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        clicked => {
+            if tile.state != "downloading" && tile.state != "imported" {
+                SfxBackend.import(root.index);
+            }
+        }
+    }
+}
+
+// One animated-text preset (Library > Text > Presets): the sample text in
+// the preset's fill color over a dark stage, a corner badge when look
+// animations are attached, and the preset name strip. Drags exactly like
+// GeneratedTile with the key "text-preset:<id>" — the drop resolver looks
+// the preset up in the registry src/text_presets.rs filled and places a
+// styled text clip.
+export component TextPresetLibraryTile inherits Rectangle {
+    in property <TextPresetTile> tile;
+
+    property <int> fps-num: EditorStore.project.sequence.fps.num;
+    property <int> fps-den: EditorStore.project.sequence.fps.den;
+
+    background: AppStore.theme.surface.content-background;
+    border-radius: 4px;
+    clip: true;
+
+    // Sample text on a dark stage.
+    CutlassText {
+        width: parent.width - 12px;
+        height: parent.height - 22px;
+        x: 6px;
+        text: tile.sample;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        style: { size: 16px, weight: 700, italic: false };
+        foreground: tile.fill;
+        wrap: word-wrap;
+        overflow: elide;
+    }
+
+    // Animation badge.
+    if tile.animated: Rectangle {
+        x: 4px;
+        y: 4px;
+        width: anim-chip.preferred-width + 8px;
+        height: 16px;
+        border-radius: 3px;
+        background: #000000a0;
+
+        anim-chip := CutlassText {
+            width: parent.width;
+            text: "anim";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            style: { size: 10px, weight: 500, italic: false };
+            foreground: #ffffffcc;
+        }
+    }
+
+    VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 22px;
+            background: #000000a0;
+            CutlassText {
+                text: tile.name;
+                style: AppStore.theme.typography.label;
+                overflow: elide;
+                x: 4px;
+                width: parent.width - 8px;
+                vertical-alignment: center;
+                horizontal-alignment: center;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        width: parent.width;
+        height: parent.height;
+
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
+                AppState.library-drag-media-id = "";
+                AppState.library-drag-generator = "text-preset:" + tile.key;
+                AppState.library-drag-lane-kind = TrackKind.text;
+                AppState.library-drag-duration-ticks =
+                    max(1, round(3 * root.fps-num / root.fps-den));
+                AppState.library-drag-w = root.width;
+                AppState.library-drag-h = root.height;
+                AppState.library-drag-tile-anchor-x = self.mouse-x;
+                AppState.library-drag-tile-anchor-y = self.mouse-y;
+                AppState.library-drag-cursor-x = self.absolute-position.x + self.mouse-x;
+                AppState.library-drag-cursor-y = self.absolute-position.y + self.mouse-y;
+                AppState.library-drag-active = true;
+            }
+            if event.kind == PointerEventKind.up {
+                AppState.library-drag-active = false;
+            }
+            if event.kind == PointerEventKind.cancel {
+                AppState.library-drag-cursor-x = -10000px;
+                AppState.library-drag-cursor-y = -10000px;
+                AppState.library-drag-active = false;
+            }
+        }
+
+        moved => {
+            if !self.pressed || !AppState.library-drag-active {
+                return;
+            }
+            AppState.library-drag-cursor-x = self.absolute-position.x + self.mouse-x;
+            AppState.library-drag-cursor-y = self.absolute-position.y + self.mouse-y;
+        }
+    }
+}
+
+// One AI generation result (Library > Media > AI media, Audio > AI
+// generated). Click imports into the media pool once ready; the tile
+// shows generation progress and failure states in place.
+export component AiMediaTile inherits Rectangle {
+    in property <AiItemTile> tile;
+    in property <int> index;
+
+    background: AppStore.theme.surface.content-background;
+    border-radius: 4px;
+    clip: true;
+
+    if tile.has-thumbnail: Image {
+        width: parent.width;
+        height: parent.height;
+        source: tile.thumbnail;
+        image-fit: cover;
+    }
+
+    // TTS results have no picture; show a waveform-ish glyph instead.
+    if !tile.has-thumbnail && tile.kind == "tts": CutlassText {
+        width: parent.width;
+        height: parent.height - 20px;
+        text: "♪";
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        style: AppStore.theme.typography.heading-md;
+    }
+
+    // Prompt strip along the bottom.
+    VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 20px;
+            background: #000000a0;
+            CutlassText {
+                text: tile.label;
+                style: { size: 10px, weight: 400, italic: false };
+                overflow: elide;
+                x: 4px;
+                width: parent.width - 8px;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    if tile.state == "generating": Rectangle {
+        background: #00000080;
+        CutlassText {
+            width: parent.width;
+            height: parent.height;
+            text: "Generating…";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            style: AppStore.theme.typography.caption;
+        }
+    }
+
+    if tile.state == "failed": Rectangle {
+        background: #00000080;
+        CutlassText {
+            width: parent.width;
+            height: parent.height;
+            text: "Failed";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            style: AppStore.theme.typography.caption;
+            foreground: #FF6B6B;
+        }
+    }
+
+    if tile.state == "imported": Rectangle {
+        x: parent.width - self.width - 4px;
+        y: 4px;
+        width: 16px;
+        height: 16px;
+        border-radius: 8px;
+        background: AppStore.theme.accent.primary;
+
+        CutlassText {
+            width: parent.width;
+            height: parent.height;
+            text: "✓";
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            style: { size: 10px, weight: 700, italic: false };
+            foreground: #000000;
+        }
+    }
+
+    ta := TouchArea {
+        mouse-cursor: tile.state == "ready" ? pointer : default;
+        clicked => {
+            if tile.state == "ready" {
+                AiBackend.import(tile.kind, index);
+            }
         }
     }
 }

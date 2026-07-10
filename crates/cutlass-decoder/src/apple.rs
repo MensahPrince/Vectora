@@ -22,6 +22,15 @@
 //! drained, so a scrub seek would decode-and-drop the rest of the in-flight
 //! range first, costing more than the reader rebuild it saves.)
 //!
+//! One caveat other backends don't share: `AVAssetReader` trims its output to
+//! the time range, decoding the GOP prefix *internally*, so
+//! [`VideoDecoder::frame_at_nearest`]'s "seek + one decode" here returns the
+//! frame at/after the target at the cost of the full prefix decode — there is
+//! no cheap snap-to-sync-frame on this backend. On long-GOP 4K that is
+//! hundreds of milliseconds per cold target (thumbnails, filmstrips); if that
+//! ever matters it needs demux/decode split apart (compressed sample output +
+//! our own `VTDecompressionSession`), not tuning here.
+//!
 //! Two pieces of lifecycle hygiene keep sustained scrubbing stable: an
 //! outgoing reader is [`AVAssetReader::cancelReading`]-ed when replaced or
 //! dropped (releasing a started reader without cancelling leaves its decode
@@ -32,7 +41,42 @@
 //! [`autoreleasepool`] because decode workers are plain Rust threads with no
 //! enclosing pool — without one, AVFoundation's autoreleased bookkeeping
 //! accumulates for the life of the thread.
+//!
+//! ## Open-GOP sources: seek-point decode recovery
+//!
+//! `AVAssetReader` starts decode at the container sync sample at/before the
+//! time range's start and trusts it blindly. Open-GOP H.264 (x264
+//! `open_gop=1`, some hardware encoders) marks **non-IDR I-frames** as sync
+//! samples, and most of those are followed in decode order by leading
+//! B-frames that display *before* the I-frame and reference the **previous**
+//! GOP. Starting decode there, VideoToolbox hits references that don't exist
+//! and — unlike FFmpeg, which drops the undecodable leading frames — fails
+//! the entire reader session (`AVErrorDecodeFailed`, "Cannot Decode") before
+//! vending a single frame. On a real-world 4K export with ~10 s GOPs this
+//! made *every seek into 8 of the file's 11 GOPs* a hard error, while
+//! sequential decode of the same file was flawless (the references exist by
+//! the time the boundary is crossed in order).
+//!
+//! The recovery ([`AvfDecoder::recover_read_failure`]): when the reader
+//! fails, rebuild it with the start pulled back from where the caller was —
+//! just past the last emitted frame, or the requested seek start — doubling
+//! the back-off (1 s, 2 s, 4 s, … clamped to 0, where the first sample must
+//! be genuinely decodable) until decode sticks, then walk forward and trim
+//! back up to that position. The failure can strike *at* the seek point
+//! (start sync sample has leading B-frames; the reader dies before vending
+//! anything) or *mid-walk* while crossing such a sync sample after a start
+//! at an earlier non-IDR one — resuming past the last emitted frame handles
+//! both. Failed attempts are cheap (VideoToolbox dies within a few frames of
+//! a bad start, and pre-bound frames skip conversion); the successful
+//! attempt pays one GOP-prefix walk, which is what a closed-GOP file would
+//! have charged for the seek anyway. If even the start of the stream won't
+//! decode (real corruption), the error surfaces — but through
+//! [`AvfDecoder::reset_failed_reader`], which replaces the dead reader (a
+//! `Failed` reader can never vend again) and clears the roll-forward anchor,
+//! so the next `frame_at` re-seeks on a healthy reader instead of re-reading
+//! the corpse forever.
 
+use core::cmp::Ordering;
 use std::path::Path;
 use std::ptr::NonNull;
 use std::slice;
@@ -66,7 +110,9 @@ use objc2_core_video::{
     CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
     kCVPixelBufferPixelFormatTypeKey,
 };
-use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSURL};
+use objc2_foundation::{
+    NSArray, NSDictionary, NSError, NSNumber, NSString, NSURL, NSUnderlyingErrorKey,
+};
 
 use cutlass_core::{
     ColorPrimaries, ColorRange, ColorSpace, CpuImage, DecodeError, FrameData, GpuSurface,
@@ -92,8 +138,13 @@ pub struct AvfDecoder {
     info: SourceInfo,
     mode: OutputMode,
     started: bool,
+    /// The requested start of the current reader (`None` = whole clip):
+    /// where a replacement reader is rebuilt after a failure, and the trim
+    /// point the failure recovery walks back up to (see the module docs).
+    start: Option<RationalTime>,
     /// PTS of the last emitted frame — the [`crate::seek`] roll-forward anchor.
-    /// Cleared on [`VideoDecoder::seek`] (decode position moved).
+    /// Cleared on [`VideoDecoder::seek`] (decode position moved) and on read
+    /// failure (the rebuilt reader is not at that position).
     last_pts: Option<RationalTime>,
     /// Observed seek/decode costs driving the adaptive roll window.
     seek_stats: crate::seek::SeekStats,
@@ -115,6 +166,33 @@ struct RetainedImageBuffer(#[allow(dead_code)] CFRetained<CVImageBuffer>);
 // drop there. We only ever hold (never mutate) the buffer.
 unsafe impl Send for RetainedImageBuffer {}
 unsafe impl Sync for RetainedImageBuffer {}
+
+/// Lower PTS bound for frames the failure-recovery walk may emit: the
+/// rebuilt reader starts earlier than the caller's position, and everything
+/// below the bound is trimmed without conversion.
+#[derive(Clone, Copy)]
+enum EmitFrom {
+    /// Emit the first frame at/after the bound (a requested seek start).
+    At(RationalTime),
+    /// Emit the first frame strictly after the bound (resuming past the
+    /// last frame the caller already has).
+    After(RationalTime),
+}
+
+impl EmitFrom {
+    fn bound(self) -> RationalTime {
+        match self {
+            EmitFrom::At(t) | EmitFrom::After(t) => t,
+        }
+    }
+
+    fn admits(self, pts: RationalTime) -> bool {
+        match self {
+            EmitFrom::At(t) => pts.compare(t) != Ordering::Less,
+            EmitFrom::After(t) => pts.compare(t) == Ordering::Greater,
+        }
+    }
+}
 
 impl AvfDecoder {
     /// Open `path` and probe its first video track.
@@ -141,26 +219,64 @@ impl AvfDecoder {
             info,
             mode,
             started: false,
+            start: None,
             last_pts: None,
             seek_stats: Default::default(),
         })
     }
 
-    /// Pull the next decoded sample buffer's pixel buffer, skipping any
-    /// marker-only buffers, and convert it to a [`VideoFrame`].
-    ///
-    /// Runs inside an autorelease pool: decode workers are plain Rust threads,
-    /// so without one AVFoundation's per-pull autoreleased objects would
-    /// accumulate until the thread exits. The returned frame only holds
-    /// explicitly retained references, so it safely outlives the pool.
+    /// Whether this decoder's asset also carries an audio track. Reads the
+    /// already-parsed asset, so the probe doesn't pay a second open of the
+    /// file.
+    pub(crate) fn has_audio_track(&self) -> bool {
+        let Some(media_audio) = (unsafe { AVMediaTypeAudio }) else {
+            return false;
+        };
+        #[allow(deprecated)]
+        let tracks = unsafe { self.asset.tracksWithMediaType(media_audio) };
+        tracks.firstObject().is_some()
+    }
+
+    /// Pull the next decoded frame, recovering from reader decode failures
+    /// (see the module docs on open-GOP sources). Non-reader errors — an
+    /// unsupported pixel format, a lock failure — pass through untouched;
+    /// reader failures that survive recovery surface only after
+    /// [`Self::reset_failed_reader`] has put the decoder back into a usable
+    /// state.
     fn next_pixel_frame(&mut self) -> Result<Option<VideoFrame>, DecodeError> {
+        let result = self.ensure_started().and_then(|()| self.pull_frame(None));
+        match result {
+            Err(err) if unsafe { self.reader.status() } == AVAssetReaderStatus::Failed => {
+                self.recover_read_failure(err)
+            }
+            other => other,
+        }
+    }
+
+    /// Start the reader if it hasn't been started yet.
+    fn ensure_started(&mut self) -> Result<(), DecodeError> {
         if !self.started {
             if !unsafe { self.reader.startReading() } {
                 return Err(self.reader_error("startReading failed"));
             }
             self.started = true;
         }
+        Ok(())
+    }
 
+    /// Pull the next decoded sample buffer's pixel buffer, skipping
+    /// marker-only buffers — and, when `emit_from` is set, frames below that
+    /// bound (the failure recovery reads from an earlier start and trims back
+    /// up to where the caller was) — and convert it to a [`VideoFrame`].
+    ///
+    /// Runs inside an autorelease pool: decode workers are plain Rust threads,
+    /// so without one AVFoundation's per-pull autoreleased objects would
+    /// accumulate until the thread exits. The returned frame only holds
+    /// explicitly retained references, so it safely outlives the pool.
+    fn pull_frame(
+        &mut self,
+        emit_from: Option<EmitFrom>,
+    ) -> Result<Option<VideoFrame>, DecodeError> {
         autoreleasepool(|_| {
             loop {
                 let Some(sample) = (unsafe { self.output.copyNextSampleBuffer() }) else {
@@ -183,11 +299,113 @@ impl AvfDecoder {
                 let pts = cmtime_to_rational(unsafe { sample.presentation_time_stamp() })
                     .unwrap_or_else(|| RationalTime::zero(self.info.time_base));
 
+                // Trim frames below the recovery bound without paying the
+                // plane copy / surface wrap for them.
+                if let Some(bound) = emit_from {
+                    if !bound.admits(pts) {
+                        continue;
+                    }
+                }
+
                 let frame = self.image_buffer_to_frame(image_buffer, pts)?;
                 self.last_pts = Some(pts);
                 return Ok(Some(frame));
             }
         })
+    }
+
+    /// Recover from a reader that failed mid-read. On valid files that is
+    /// VideoToolbox refusing an open-GOP start point (see the module docs):
+    /// the reader dies on the sync sample's leading B-frames — sometimes
+    /// after vending a few decodable frames — even though every frame the
+    /// caller actually wants decodes fine from an earlier, sounder start.
+    ///
+    /// Rebuild the reader progressively earlier (doubling back-off, clamped
+    /// to the start of the stream, where the first sample must be a real
+    /// sync frame) and walk forward to where the caller was: just past the
+    /// last emitted frame, or the requested seek start if nothing was
+    /// emitted yet. Attempts that fail at their own start point are
+    /// near-free (VideoToolbox rejects them before decoding much); the
+    /// successful attempt pays one GOP-prefix walk, which is what a
+    /// closed-GOP file would have charged for the seek anyway.
+    ///
+    /// Gives up — surfacing `original` after [`Self::reset_failed_reader`] —
+    /// when there is nowhere to back away from (a failure at the very start
+    /// of the stream) or when even the start of the stream won't decode
+    /// (real corruption; the bounded back-off makes the total give-up cost a
+    /// couple of decode walks, paid once per caller-visible error).
+    fn recover_read_failure(
+        &mut self,
+        original: DecodeError,
+    ) -> Result<Option<VideoFrame>, DecodeError> {
+        // Resume just past the last emitted frame (mid-walk failure), or at
+        // the requested start (nothing emitted since the seek).
+        let resume = match (self.last_pts, self.start) {
+            (Some(pts), _) => EmitFrom::After(pts),
+            (None, Some(start)) => EmitFrom::At(start),
+            (None, None) => {
+                // Cold open failing at the head of the stream: nothing to
+                // back away from.
+                self.reset_failed_reader();
+                return Err(original);
+            }
+        };
+        let anchor = resume.bound();
+        let mut backoff = one_second_ticks(anchor.rate);
+        loop {
+            let earlier = RationalTime::new((anchor.value - backoff).max(0), anchor.rate);
+            let attempt = self
+                .rebuild_reader_at(Some(earlier))
+                .and_then(|()| self.ensure_started())
+                .and_then(|()| self.pull_frame(Some(resume)));
+            match attempt {
+                // Recovered (`Some`), or the resume point really is past the
+                // end of the stream (`None`) — a healthy reader's answer.
+                Ok(frame) => return Ok(frame),
+                Err(err) if unsafe { self.reader.status() } != AVAssetReaderStatus::Failed => {
+                    // Not a reader failure (unsupported format, lock error):
+                    // an earlier start cannot change it.
+                    return Err(err);
+                }
+                Err(_) => {
+                    if earlier.value == 0 {
+                        // Even the start of the stream won't decode.
+                        self.reset_failed_reader();
+                        return Err(original);
+                    }
+                    backoff = backoff.saturating_mul(2);
+                }
+            }
+        }
+    }
+
+    /// Put the decoder back into a usable state after a read failure: a
+    /// `Failed` reader can never vend again, so replace it (best-effort) with
+    /// a fresh, un-started one at the last requested position, and clear the
+    /// roll-forward anchor so the next [`VideoDecoder::frame_at`] takes the
+    /// seek path on the healthy reader instead of rolling onto the dead one.
+    /// The decode *position* after a failure is unspecified; callers re-drive
+    /// through `frame_at`/`seek`, which both re-position.
+    fn reset_failed_reader(&mut self) {
+        self.last_pts = None;
+        // On rebuild failure the cancelled reader stays; the next pull then
+        // errors through `ensure_started` and lands back here — no loop, the
+        // recovery path is bounded and `frame_at` callers see the error.
+        let _ = self.rebuild_reader_at(self.start);
+    }
+
+    /// Replace the current reader with one whose time range starts at
+    /// `range_start` (`None` = whole clip). Builds the replacement first so a
+    /// failure leaves the decoder unchanged, then cancels the old reader
+    /// before releasing it (see the module docs on reader lifecycle).
+    fn rebuild_reader_at(&mut self, range_start: Option<RationalTime>) -> Result<(), DecodeError> {
+        let start = range_start.map(rational_to_cmtime);
+        let (reader, output) = build_reader(&self.asset, &self.track, start)?;
+        self.cancel_current_reader();
+        self.reader = reader;
+        self.output = output;
+        self.started = false;
+        Ok(())
     }
 
     /// Cancel the current reader's in-flight decode work before it is replaced
@@ -261,13 +479,64 @@ impl AvfDecoder {
         ))
     }
 
-    /// Build a [`DecodeError`] from the reader's `NSError`, if any.
+    /// Build a [`DecodeError`] from the reader's `NSError`, if any, carrying
+    /// enough to diagnose a failure from a log line alone: error domain +
+    /// code, the underlying error (for `AVErrorDecodeFailed` that is the
+    /// VideoToolbox `OSStatus`), and where the reader was positioned.
     fn reader_error(&self, context: &str) -> DecodeError {
         let detail = unsafe { self.reader.error() }
-            .map(|e| e.localizedDescription().to_string())
-            .unwrap_or_else(|| context.to_string());
-        DecodeError::Decode(format!("{context}: {detail}"))
+            .map(|e| describe_ns_error(&e))
+            .unwrap_or_else(|| "no NSError".to_string());
+        let start = match self.start {
+            Some(t) => format!("{:.3}s", rt_secs(t)),
+            None => "clip start".to_string(),
+        };
+        let position = match self.last_pts {
+            Some(t) => format!(", last pts {:.3}s", rt_secs(t)),
+            None => ", no frames delivered".to_string(),
+        };
+        DecodeError::Decode(format!(
+            "{context}: {detail} (reader start {start}{position})"
+        ))
     }
+}
+
+/// `NSError` → "description [domain code]", recursing one level into the
+/// underlying error, which for AVFoundation decode failures holds the
+/// otherwise-invisible VideoToolbox `OSStatus`.
+fn describe_ns_error(err: &NSError) -> String {
+    let mut text = format!(
+        "{} [{} {}]",
+        err.localizedDescription(),
+        err.domain(),
+        err.code()
+    );
+    let underlying = err
+        .userInfo()
+        .objectForKey(unsafe { NSUnderlyingErrorKey })
+        .and_then(|value| value.downcast::<NSError>().ok());
+    if let Some(u) = underlying {
+        text.push_str(&format!(
+            " (underlying: {} [{} {}])",
+            u.localizedDescription(),
+            u.domain(),
+            u.code()
+        ));
+    }
+    text
+}
+
+/// [`RationalTime`] in seconds, for error messages only.
+fn rt_secs(t: RationalTime) -> f64 {
+    t.value as f64 * f64::from(t.rate.den.max(1)) / f64::from(t.rate.num.max(1))
+}
+
+/// One second expressed in ticks of `rate`, rounded up, at least one tick —
+/// the base step of the seek-point recovery back-off.
+fn one_second_ticks(rate: Rational) -> i64 {
+    let num = i64::from(rate.num.max(1));
+    let den = i64::from(rate.den.max(1));
+    ((num + den - 1) / den).max(1)
 }
 
 impl VideoDecoder for AvfDecoder {
@@ -276,14 +545,9 @@ impl VideoDecoder for AvfDecoder {
     }
 
     fn seek(&mut self, target: RationalTime) -> Result<(), DecodeError> {
-        let start = rational_to_cmtime(target);
-        // Build the replacement first so a failed seek leaves the decoder
-        // usable, then cancel the old reader before releasing it.
-        let (reader, output) = build_reader(&self.asset, &self.track, Some(start))?;
-        self.cancel_current_reader();
-        self.reader = reader;
-        self.output = output;
-        self.started = false;
+        // Rebuild first so a failed seek leaves the decoder unchanged.
+        self.rebuild_reader_at(Some(target))?;
+        self.start = Some(target);
         self.last_pts = None;
         Ok(())
     }
@@ -326,12 +590,6 @@ fn first_video_track(asset: &AVURLAsset) -> Option<Retained<AVAssetTrack>> {
     #[allow(deprecated)]
     let tracks = unsafe { asset.tracksWithMediaType(media_video) };
     tracks.firstObject()
-}
-
-/// Whether the asset at `path` carries at least one audio track. Used by the
-/// probe to set [`crate::MediaProbe::has_audio`]; `false` on any error.
-pub(crate) fn has_audio_track(path: &Path) -> bool {
-    first_audio_track(path).is_some()
 }
 
 /// Duration of the first audio track at `path`, for probing sources with no
@@ -566,17 +824,31 @@ fn map_matrix(value: &CFString) -> MatrixCoefficients {
     }
 }
 
-/// Exact frame rate from the track's minimum frame duration, falling back to
-/// the (approximate) nominal rate.
+/// Frame rate from the track's minimum frame duration (exact for constant
+/// frame rates), guarded against VFR by the nominal average rate.
 fn frame_rate_of(track: &AVAssetTrack) -> Rational {
     let min_dur = unsafe { track.minFrameDuration() };
-    if min_dur.value > 0 && min_dur.timescale > 0 {
-        // fps = timescale / value (frames per second).
-        return Rational::new(min_dur.timescale, min_dur.value as i32);
+    // fps = timescale / value (frames per second).
+    let exact = (min_dur.value > 0 && min_dur.timescale > 0)
+        .then(|| Rational::new(min_dur.timescale, min_dur.value as i32));
+    resolve_frame_rate(exact, unsafe { track.nominalFrameRate() })
+}
+
+/// Pick the reported frame rate: the exact minimum-frame-duration rate when
+/// it agrees with the nominal average, the average otherwise. On VFR sources
+/// the smallest inter-frame gap is an artifact, not the cadence — reporting
+/// it inflates every duration-derived frame count, and the pool then asks
+/// for frames past EOF.
+fn resolve_frame_rate(min_duration_rate: Option<Rational>, nominal_fps: f32) -> Rational {
+    if let Some(exact) = min_duration_rate {
+        // 5%: comfortably above timescale rounding (23.976 vs 23.98), well
+        // below any real VFR spread.
+        if nominal_fps <= 0.0 || exact.as_f64() <= f64::from(nominal_fps) * 1.05 {
+            return exact;
+        }
     }
-    let nominal = unsafe { track.nominalFrameRate() };
-    if nominal > 0.0 {
-        Rational::new((nominal * 1000.0).round() as i32, 1000)
+    if nominal_fps > 0.0 {
+        Rational::new((nominal_fps * 1000.0).round() as i32, 1000)
     } else {
         Rational::FPS_30
     }
@@ -635,9 +907,21 @@ pub(crate) fn cmtime_to_rational(t: CMTime) -> Option<RationalTime> {
 
 /// [`RationalTime`] -> `CMTime` (seconds preserved exactly as value·den / num).
 pub(crate) fn rational_to_cmtime(t: RationalTime) -> CMTime {
+    let num = t.rate.num.max(1);
+    let den = i64::from(t.rate.den.max(1));
+    let (value, timescale) = match t.value.checked_mul(den) {
+        Some(value) => (value, num),
+        // value·den past i64 (an astronomical time on an extreme time base):
+        // approximate at microsecond resolution instead of wrapping into a
+        // nonsense — possibly negative — time.
+        None => (
+            (t.value as f64 * den as f64 / f64::from(num) * 1e6) as i64,
+            1_000_000,
+        ),
+    };
     CMTime {
-        value: t.value * i64::from(t.rate.den.max(1)),
-        timescale: t.rate.num.max(1),
+        value,
+        timescale,
         flags: CMTimeFlags::Valid,
         epoch: 0,
     }
@@ -775,6 +1059,61 @@ mod tests {
     }
 
     #[test]
+    fn resolve_frame_rate_prefers_exact_but_guards_vfr() {
+        // CFR: min frame duration agrees with nominal — keep the exact rate.
+        let ntsc = Rational::new(24_000, 1_001);
+        assert_eq!(resolve_frame_rate(Some(ntsc), 23.976), ntsc);
+        // Missing nominal still keeps the exact rate.
+        assert_eq!(resolve_frame_rate(Some(ntsc), 0.0), ntsc);
+        // VFR: the smallest gap (120 fps) is far above the 30 fps average —
+        // report the average, not the artifact.
+        assert_eq!(
+            resolve_frame_rate(Some(Rational::new(120, 1)), 30.0),
+            Rational::new(30_000, 1000)
+        );
+        // No min duration: nominal, then the 30 fps fallback.
+        assert_eq!(resolve_frame_rate(None, 25.0), Rational::new(25_000, 1000));
+        assert_eq!(resolve_frame_rate(None, 0.0), Rational::FPS_30);
+    }
+
+    #[test]
+    fn one_second_ticks_rounds_up_and_never_zero() {
+        assert_eq!(one_second_ticks(Rational::FPS_30), 30);
+        // 24000/1001 fps: one second is 23.976… ticks -> 24.
+        assert_eq!(one_second_ticks(Rational::new(24_000, 1_001)), 24);
+        assert_eq!(one_second_ticks(Rational::new(90_000, 1)), 90_000);
+        // Degenerate rates still make progress.
+        assert_eq!(one_second_ticks(Rational::new(0, 0)), 1);
+    }
+
+    #[test]
+    fn describe_ns_error_carries_domain_code_and_underlying() {
+        use objc2_foundation::NSInteger;
+        let underlying = unsafe {
+            NSError::errorWithDomain_code_userInfo(
+                &NSString::from_str("NSOSStatusErrorDomain"),
+                -12909 as NSInteger, // kVTVideoDecoderBadDataErr
+                None,
+            )
+        };
+        let key: &NSString = unsafe { NSUnderlyingErrorKey };
+        let value: &AnyObject = underlying.as_ref();
+        let user_info = NSDictionary::from_slices(&[key], &[value]);
+        let err = unsafe {
+            NSError::errorWithDomain_code_userInfo(
+                &NSString::from_str("AVFoundationErrorDomain"),
+                -11821 as NSInteger, // AVErrorDecodeFailed
+                Some(&user_info),
+            )
+        };
+        let text = describe_ns_error(&err);
+        assert!(text.contains("AVFoundationErrorDomain"), "{text}");
+        assert!(text.contains("-11821"), "{text}");
+        assert!(text.contains("NSOSStatusErrorDomain"), "{text}");
+        assert!(text.contains("-12909"), "{text}");
+    }
+
+    #[test]
     fn rational_to_cmtime_preserves_seconds() {
         // 5 frames at 30fps -> 5/30 s. Represent as value*den / num.
         // CMTime is a packed struct, so copy fields out before comparing.
@@ -788,6 +1127,16 @@ mod tests {
         let (n_val, n_scale) = (n.value, n.timescale);
         assert_eq!(n_val, 1001);
         assert_eq!(n_scale, 30000);
+    }
+
+    #[test]
+    fn rational_to_cmtime_survives_value_den_overflow() {
+        // value·den overflows i64: falls back to microsecond resolution
+        // instead of wrapping negative.
+        let t = rational_to_cmtime(RationalTime::new(i64::MAX / 2, Rational::new(1, 4)));
+        let (value, timescale) = (t.value, t.timescale);
+        assert_eq!(timescale, 1_000_000);
+        assert!(value > 0, "must not wrap negative");
     }
 
     #[test]
@@ -1239,6 +1588,82 @@ mod integration {
             seek_ms / roll_ms
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Open-GOP H.264 fixture (`tests/fixtures/opengop_h264.mp4`; 320×180,
+    /// 24 fps, 10 s, x264 `open_gop=1` with the reference structure of a
+    /// real-world 4K export that hard-failed every seek): sync samples every
+    /// 2 s, only frame 0 IDR, and the sync samples at 4 s and 8 s carry three
+    /// leading B-frames referencing the previous GOP — the start points
+    /// VideoToolbox refuses with `AVErrorDecodeFailed` ("Cannot Decode").
+    fn opengop_fixture() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opengop_h264.mp4")
+    }
+
+    const OPENGOP_FPS: Rational = Rational::new(24, 1);
+
+    /// The regression this fixture exists for: a seek whose effective sync
+    /// sample has leading B-frames must recover (back off, walk, trim) and
+    /// land on the exact requested frame — before the recovery path existed,
+    /// this exact call returned "Cannot Decode".
+    #[test]
+    fn open_gop_seek_point_failure_recovers_exactly() {
+        let mut dec = AvfDecoder::open(&opengop_fixture(), OutputMode::Cpu).expect("open");
+        // 5.0 s: inside the GOP whose sync sample (4.0 s) is undecodable as
+        // a start point.
+        let target = RationalTime::new(120, OPENGOP_FPS);
+        let frame = dec.frame_at(target).expect("must recover").expect("frame");
+        assert_eq!(cutlass_core::resample(frame.pts, OPENGOP_FPS).value, 120);
+
+        // The decoder is healthy afterwards: sequential decode continues.
+        let next = dec.next_frame().expect("decode").expect("frame");
+        assert_eq!(cutlass_core::resample(next.pts, OPENGOP_FPS).value, 121);
+    }
+
+    /// Random access across good and bad GOPs, both directions, lands
+    /// exactly everywhere — the whole timeline is reachable, not just the
+    /// GOPs whose sync samples happen to be closed.
+    #[test]
+    fn open_gop_random_access_reaches_every_gop() {
+        let mut dec = AvfDecoder::open(&opengop_fixture(), OutputMode::Cpu).expect("open");
+        // 5.5 s and 9 s sit in bad GOPs (syncs 4 s / 8 s); the rest are good
+        // or sequential rolls. Mix directions to exercise seek and roll.
+        for value in [132i64, 12, 216, 60, 220, 100, 230] {
+            let target = RationalTime::new(value, OPENGOP_FPS);
+            let frame = dec
+                .frame_at(target)
+                .unwrap_or_else(|e| panic!("frame_at {value}: {e}"))
+                .unwrap_or_else(|| panic!("frame_at {value}: no frame"));
+            assert_eq!(
+                cutlass_core::resample(frame.pts, OPENGOP_FPS).value,
+                value,
+                "target {value}"
+            );
+        }
+    }
+
+    /// The nearest-sync scrub path takes the same reader seek and must
+    /// recover the same way.
+    #[test]
+    fn open_gop_frame_at_nearest_recovers() {
+        let mut dec = AvfDecoder::open(&opengop_fixture(), OutputMode::Cpu).expect("open");
+        let target = RationalTime::new(216, OPENGOP_FPS); // 9.0 s, bad GOP
+        let frame = dec
+            .frame_at_nearest(target)
+            .expect("must recover")
+            .expect("frame");
+        // AVAssetReader trims to the requested range, so nearest on this
+        // backend is the frame at/after the target.
+        assert_eq!(cutlass_core::resample(frame.pts, OPENGOP_FPS).value, 216);
+    }
+
+    #[test]
+    fn hermetic_movie_reports_no_audio_track() {
+        let path = temp_movie("noaudio");
+        write_test_movie(&path, 160, 120, 4, 30, false);
+        let dec = AvfDecoder::open(&path, OutputMode::Cpu).expect("open");
+        assert!(!dec.has_audio_track(), "video-only fixture");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -78,6 +78,9 @@ pub use animation::{
     AnimationFrame, MAX_ANIMATION_DIMENSION, MAX_ANIMATION_FRAMES, decode_animation,
 };
 
+mod lottie;
+pub use lottie::{LOTTIE_MAX_DIMENSION, LOTTIE_MAX_SAMPLE_FPS, LottieAnimation};
+
 use std::path::Path;
 
 use cutlass_core::{AudioReader, DecodeError, VideoDecoder};
