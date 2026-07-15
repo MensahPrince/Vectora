@@ -23,6 +23,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Component, Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 /// Maximum number of bytes retained from an underlying error message.
 const MAX_ERROR_MESSAGE_BYTES: usize = 256;
@@ -413,6 +414,230 @@ impl StorageLayout {
         Ok(())
     }
 }
+
+/// An immutable, versioned copy of a [`SharedStorageLayout`].
+///
+/// The layout and generation are captured while holding one read lock, so
+/// every path resolved through this snapshot belongs to the reported
+/// generation. Mutating a layout returned by [`Self::into_parts`] cannot
+/// affect the shared value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StorageLayoutSnapshot {
+    layout: StorageLayout,
+    generation: u64,
+}
+
+impl StorageLayoutSnapshot {
+    /// Return the captured layout.
+    pub fn layout(&self) -> &StorageLayout {
+        &self.layout
+    }
+
+    /// Return the generation captured with the layout.
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Resolve a cache against the captured layout.
+    pub fn resolve(&self, id: CacheId) -> Option<PathBuf> {
+        self.layout.resolve(id)
+    }
+
+    /// Consume the snapshot into its detached layout and generation.
+    pub fn into_parts(self) -> (StorageLayout, u64) {
+        (self.layout, self.generation)
+    }
+}
+
+/// A cheap-to-clone, thread-safe, versioned [`StorageLayout`].
+///
+/// Clones share one layout through an [`Arc`]. Readers observe the layout and
+/// generation coherently, while writers use an expected generation to prevent
+/// stale worker results from replacing newer configuration. The initial
+/// generation is zero and each successful write increments it exactly once.
+///
+/// Lock poisoning is recovered internally. Write operations prepare a
+/// complete replacement before committing it, so an unwinding update leaves
+/// the prior layout and generation valid.
+#[derive(Debug, Clone)]
+pub struct SharedStorageLayout {
+    inner: Arc<RwLock<VersionedStorageLayout>>,
+}
+
+#[derive(Debug)]
+struct VersionedStorageLayout {
+    layout: StorageLayout,
+    generation: u64,
+}
+
+impl SharedStorageLayout {
+    /// Create shared storage state at generation zero.
+    ///
+    /// The supplied layout has already been validated by [`StorageLayout`]'s
+    /// constructors and mutation methods.
+    pub fn new(layout: StorageLayout) -> Self {
+        Self::from_generation(layout, 0)
+    }
+
+    /// Clone the current layout and generation under one coherent read.
+    pub fn snapshot(&self) -> StorageLayoutSnapshot {
+        let state = self.read_state();
+        StorageLayoutSnapshot {
+            layout: state.layout.clone(),
+            generation: state.generation,
+        }
+    }
+
+    /// Resolve one cache from a single coherent read of the current layout.
+    ///
+    /// Memory caches return `None`.
+    pub fn resolve(&self, id: CacheId) -> Option<PathBuf> {
+        self.resolve_versioned(id).0
+    }
+
+    /// Resolve one cache together with the generation used for that path.
+    ///
+    /// The returned path and generation are captured under the same read lock.
+    /// Memory caches return `None` for the path.
+    pub fn resolve_versioned(&self, id: CacheId) -> (Option<PathBuf>, u64) {
+        let state = self.read_state();
+        (state.layout.resolve(id), state.generation)
+    }
+
+    /// Replace the layout when `expected_generation` is still current.
+    ///
+    /// The replacement must be a previously validated [`StorageLayout`].
+    /// Success returns the newly installed generation. A stale generation or
+    /// exhausted generation leaves the current layout untouched.
+    pub fn replace(
+        &self,
+        expected_generation: u64,
+        replacement: StorageLayout,
+    ) -> Result<u64, SharedStorageLayoutError> {
+        let mut state = self.write_state();
+        let next_generation = checked_next_generation(&state, expected_generation)?;
+        *state = VersionedStorageLayout {
+            layout: replacement,
+            generation: next_generation,
+        };
+        Ok(next_generation)
+    }
+
+    /// Update a cloned layout when `expected_generation` is still current.
+    ///
+    /// The callback runs with the write lock held and should be brief. It must
+    /// not call methods on this shared value, which would deadlock. The clone
+    /// begins valid, and [`StorageLayout`] mutation methods preserve that
+    /// validity. The callback is responsible for handling their errors.
+    ///
+    /// A stale or exhausted generation refuses the update without invoking the
+    /// callback. If the callback panics, the panic propagates, no state is
+    /// committed, and subsequent operations recover the poisoned lock.
+    pub fn update<F>(
+        &self,
+        expected_generation: u64,
+        update: F,
+    ) -> Result<u64, SharedStorageLayoutError>
+    where
+        F: FnOnce(&mut StorageLayout),
+    {
+        let mut state = self.write_state();
+        let next_generation = checked_next_generation(&state, expected_generation)?;
+        let mut replacement = state.layout.clone();
+        update(&mut replacement);
+        *state = VersionedStorageLayout {
+            layout: replacement,
+            generation: next_generation,
+        };
+        Ok(next_generation)
+    }
+
+    fn from_generation(layout: StorageLayout, generation: u64) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(VersionedStorageLayout { layout, generation })),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_generation_for_test(layout: StorageLayout, generation: u64) -> Self {
+        Self::from_generation(layout, generation)
+    }
+
+    fn read_state(&self) -> RwLockReadGuard<'_, VersionedStorageLayout> {
+        match self.inner.read() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                self.inner.clear_poison();
+                state
+            }
+        }
+    }
+
+    fn write_state(&self) -> RwLockWriteGuard<'_, VersionedStorageLayout> {
+        match self.inner.write() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                self.inner.clear_poison();
+                state
+            }
+        }
+    }
+}
+
+impl From<StorageLayout> for SharedStorageLayout {
+    fn from(layout: StorageLayout) -> Self {
+        Self::new(layout)
+    }
+}
+
+fn checked_next_generation(
+    state: &VersionedStorageLayout,
+    expected_generation: u64,
+) -> Result<u64, SharedStorageLayoutError> {
+    if state.generation != expected_generation {
+        return Err(SharedStorageLayoutError::StaleGeneration {
+            expected: expected_generation,
+            current: state.generation,
+        });
+    }
+    state
+        .generation
+        .checked_add(1)
+        .ok_or(SharedStorageLayoutError::GenerationExhausted)
+}
+
+/// A rejected [`SharedStorageLayout`] write.
+///
+/// This error contains only generation numbers and never retains or displays
+/// storage paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedStorageLayoutError {
+    /// Another writer replaced the layout after the caller took its snapshot.
+    StaleGeneration {
+        /// Generation supplied by the caller.
+        expected: u64,
+        /// Generation currently installed.
+        current: u64,
+    },
+    /// The current generation is `u64::MAX` and cannot advance safely.
+    GenerationExhausted,
+}
+
+impl fmt::Display for SharedStorageLayoutError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StaleGeneration { expected, current } => write!(
+                f,
+                "stale storage layout generation: expected {expected}, current {current}"
+            ),
+            Self::GenerationExhausted => f.write_str("storage layout generation cannot advance"),
+        }
+    }
+}
+
+impl Error for SharedStorageLayoutError {}
 
 /// Cooperative cancellation check used by filesystem operations.
 pub trait Cancellation {
@@ -1245,6 +1470,30 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    fn shared_layout_generation_exhaustion_fails_closed() {
+        let temporary = TestDirectory::new();
+        let original = StorageLayout::new(temporary.path.join("original")).unwrap();
+        let replacement = StorageLayout::new(temporary.path.join("replacement")).unwrap();
+        let shared = SharedStorageLayout::with_generation_for_test(original.clone(), u64::MAX);
+
+        assert_eq!(
+            shared.replace(u64::MAX, replacement),
+            Err(SharedStorageLayoutError::GenerationExhausted)
+        );
+
+        let update_was_called = std::cell::Cell::new(false);
+        assert_eq!(
+            shared.update(u64::MAX, |_| update_was_called.set(true)),
+            Err(SharedStorageLayoutError::GenerationExhausted)
+        );
+        assert!(!update_was_called.get());
+
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.generation(), u64::MAX);
+        assert_eq!(snapshot.layout(), &original);
     }
 
     #[test]
