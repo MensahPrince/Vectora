@@ -69,12 +69,14 @@ impl ClipCapabilities {
             _ => (false, false),
         };
 
-        let media_has_audio = match &clip.content {
-            ClipSource::Media { media, .. } => project.media(*media).is_some_and(|m| m.has_audio),
+        let media_is_video_with_audio = match &clip.content {
+            ClipSource::Media { media, .. } => project
+                .media(*media)
+                .is_some_and(|media| media.kind() == crate::MediaKind::Video && media.has_audio),
             ClipSource::Generated(_) => false,
         };
         let can_extract_audio = kind == TrackKind::Video
-            && media_has_audio
+            && media_is_video_with_audio
             && !project.timeline().detached_to_audio_lane(clip.id);
 
         Self {
@@ -180,6 +182,15 @@ mod tests {
     #[test]
     fn media_video_without_audio_cannot_extract() {
         let (mut project, media) = project_with_media(false);
+        let clip = place_media(&mut project, media, TrackKind::Video);
+        let caps = ClipCapabilities::for_clip(&project, &clip, TrackKind::Video);
+        assert!(!caps.can_extract_audio);
+    }
+
+    #[test]
+    fn nonvideo_media_cannot_extract_even_with_an_audio_flag() {
+        let (mut project, media) = project_with_media(true);
+        project.media_mut(media).unwrap().is_image = true;
         let clip = place_media(&mut project, media, TrackKind::Video);
         let caps = ClipCapabilities::for_clip(&project, &clip, TrackKind::Video);
         assert!(!caps.can_extract_audio);

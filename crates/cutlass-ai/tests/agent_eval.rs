@@ -789,6 +789,106 @@ fn add_a_title_that_says_intro() {
     assert!(!host.engine.undo());
 }
 
+/// Creates the required audio lane first, then threads that runtime track id
+/// into the explicit-target extraction tool call.
+struct AudioExtractingModel {
+    clip: u64,
+}
+
+impl cutlass_ai::provider::ChatProvider for AudioExtractingModel {
+    fn chat(
+        &self,
+        request: &cutlass_ai::provider::ChatRequest<'_>,
+        _cancel: &AtomicBool,
+        _on_text: &mut dyn FnMut(&str),
+    ) -> Result<ChatTurn, cutlass_ai::provider::ProviderError> {
+        let last = request.messages.last().unwrap();
+        Ok(match last {
+            Message::User { .. } => tool_turn(vec![(
+                "extract_track",
+                "add_track",
+                serde_json::json!({ "kind": "audio", "name": "Extracted" }),
+            )]),
+            Message::ToolResult {
+                call_id, content, ..
+            } if call_id == "extract_track" => {
+                let track: u64 = content
+                    .rsplit("(track ")
+                    .next()
+                    .and_then(|text| text.trim_end_matches(')').parse().ok())
+                    .expect("created track id in tool result");
+                tool_turn(vec![(
+                    "extract_clip",
+                    "extract_audio",
+                    serde_json::json!({ "clip": self.clip, "track": track }),
+                )])
+            }
+            _ => text_turn("Extracted the clip's audio."),
+        })
+    }
+}
+
+#[test]
+fn extract_audio_after_creating_its_explicit_track_is_one_prompt_undo() {
+    let (mut host, _, _, clip) = fixture();
+    let model = AudioExtractingModel { clip };
+    let (outcome, _) = run_with(
+        &model,
+        &mut host,
+        &mut NullToolHost,
+        &EditorContext {
+            selected_clips: vec![clip],
+            ..Default::default()
+        },
+        "extract the selected clip's audio",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 2);
+    assert!(matches!(
+        outcome.actions[1].command,
+        WireCommand::ExtractAudio(_)
+    ));
+    assert!(
+        outcome.actions[1]
+            .description
+            .starts_with(&format!("extracted audio from clip {clip} onto track"))
+    );
+    let audio = host
+        .engine
+        .project()
+        .timeline()
+        .tracks_ordered()
+        .find(|track| track.kind == TrackKind::Audio)
+        .and_then(|track| track.clips().next())
+        .expect("extracted audio");
+    assert_eq!(audio.audio_role, Some(cutlass_models::AudioRole::Extracted));
+    assert!(
+        !host
+            .engine
+            .project()
+            .timeline()
+            .carries_own_audio(cutlass_models::ClipId::from_raw(clip))
+    );
+
+    assert!(host.engine.undo(), "one prompt is one undo entry");
+    assert!(
+        host.engine
+            .project()
+            .timeline()
+            .tracks_ordered()
+            .all(|track| track.kind != TrackKind::Audio)
+    );
+    assert!(
+        host.engine
+            .project()
+            .timeline()
+            .carries_own_audio(cutlass_models::ClipId::from_raw(clip))
+    );
+    assert!(!host.engine.undo());
+}
+
 #[test]
 fn delete_every_clip_on_the_music_track() {
     // Fixture with a second (audio) track holding three clips.

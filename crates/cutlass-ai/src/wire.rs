@@ -44,7 +44,8 @@ use serde::{Deserialize, Serialize};
 /// 21: prompt extensions add the read-only `read_skill` tool.
 /// 22: complete-group unlinking (`unlink_clips`) and bounded link-group lists.
 /// 23: effect-chain reordering (`move_effect`).
-pub const TOOL_SCHEMA_VERSION: u32 = 23;
+/// 24: explicit-target audio extraction (`extract_audio`).
+pub const TOOL_SCHEMA_VERSION: u32 = 24;
 
 /// Model-facing clip lists stay small enough for deterministic validation and
 /// useful rejection messages while covering realistic linked groups.
@@ -131,6 +132,16 @@ pub struct AddClip {
     pub source_duration: f64,
     /// Where the clip begins on the timeline, in seconds.
     pub start: f64,
+}
+
+/// Detach a video clip's embedded sound onto an explicit audio track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ExtractAudio {
+    /// Source media clip on a video track.
+    pub clip: u64,
+    /// Target unlocked audio track. This is required: call `add_track` first
+    /// when no suitable audio lane exists, then use its returned id.
+    pub track: u64,
 }
 
 /// Place a generated clip (text, solid color, shape) on a matching track.
@@ -837,6 +848,7 @@ pub struct SetCanvas {
 pub enum WireCommand {
     AddTrack(AddTrack),
     AddClip(AddClip),
+    ExtractAudio(ExtractAudio),
     AddGenerated(AddGenerated),
     SetGenerator(SetGenerator),
     SetClipTransform(SetClipTransform),
@@ -915,6 +927,10 @@ impl WireCommand {
         match self {
             WireCommand::AddTrack(_) => {}
             WireCommand::AddClip(a) => track(&mut a.track),
+            WireCommand::ExtractAudio(a) => {
+                clip(&mut a.clip);
+                track(&mut a.track);
+            }
             WireCommand::AddGenerated(a) => track(&mut a.track),
             WireCommand::SetGenerator(a) => clip(&mut a.clip),
             WireCommand::SetClipTransform(a) => clip(&mut a.clip),
@@ -1071,6 +1087,8 @@ tools! {
         "Add a track to the timeline stack (video, audio, text, or sticker overlay lane). Lanes keep CapCut zones: audio at the bottom, then the main video track, overlays above it, text on top — the index only orders a lane within its zone.";
     "add_clip" => AddClip(AddClip),
         "Place a trimmed range of an imported media file on a video or audio track. Times are in seconds.";
+    "extract_audio" => ExtractAudio(ExtractAudio),
+        "Detach a video clip's embedded sound onto an existing unlocked audio track, preserving its exact placement and audio/retime settings. The track id is required: call add_track with kind audio first when needed, then pass the returned id. Keeping the target explicit lets planned track ids remap correctly during replay.";
     "add_generated" => AddGenerated(AddGenerated),
         "Place a generated clip (text title, solid color, or shape) on a matching track. Times are in seconds.";
     "set_generator" => SetGenerator(SetGenerator),
@@ -1290,6 +1308,13 @@ mod tests {
             })
         );
 
+        let mut extract = WireCommand::ExtractAudio(ExtractAudio { clip: 10, track: 2 });
+        extract.remap_ids(&clip_map, &track_map, &marker_map);
+        assert_eq!(
+            extract,
+            WireCommand::ExtractAudio(ExtractAudio { clip: 99, track: 7 })
+        );
+
         // Unmapped ids pass through; link lists remap element-wise.
         let mut link = WireCommand::LinkClips(LinkClips {
             clips: vec![10, 11],
@@ -1336,7 +1361,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 45);
+        assert_eq!(specs.len(), 46);
         for spec in &specs {
             assert!(
                 !spec.description.is_empty(),
@@ -1350,6 +1375,29 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn extract_audio_schema_requires_explicit_clip_and_track() {
+        let specs = tool_specs();
+        let extract = specs
+            .iter()
+            .find(|spec| spec.name == "extract_audio")
+            .expect("extract_audio tool");
+        assert_eq!(
+            extract.parameters["required"],
+            serde_json::json!(["clip", "track"])
+        );
+        assert!(
+            extract
+                .description
+                .contains("planned track ids remap correctly")
+        );
+        assert!(
+            WireCommand::from_tool_call("extract_audio", serde_json::json!({"clip": 7}))
+                .unwrap_err()
+                .contains("missing field `track`")
+        );
     }
 
     #[test]

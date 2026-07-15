@@ -98,6 +98,10 @@ fn edit_samples() -> Vec<EditCommand> {
             source: tr(0, 90),
             start: t(30),
         },
+        EditCommand::ExtractAudio {
+            clip: clip(4),
+            to_track: Some(track(2)),
+        },
         EditCommand::DuplicateClip {
             clip: clip(4),
             to_track: track(2),
@@ -384,6 +388,7 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
     match cmd {
         EditCommand::AddTrack { .. } => "AddTrack",
         EditCommand::AddClip { .. } => "AddClip",
+        EditCommand::ExtractAudio { .. } => "ExtractAudio",
         EditCommand::DuplicateClip { .. } => "DuplicateClip",
         EditCommand::AddGenerated { .. } => "AddGenerated",
         EditCommand::SetGenerator { .. } => "SetGenerator",
@@ -447,7 +452,7 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
 #[test]
 fn command_variant_counts_are_locked() {
     assert_eq!(project_samples().len(), 9);
-    assert_eq!(edit_samples().len(), 57);
+    assert_eq!(edit_samples().len(), 58);
 }
 
 #[test]
@@ -518,6 +523,27 @@ fn golden_add_clip() {
             },
             "start": {"value": 30, "rate": {"num": 30, "den": 1}},
         })
+    );
+}
+
+#[test]
+fn golden_extract_audio() {
+    let explicit = Command::Edit(EditCommand::ExtractAudio {
+        clip: clip(4),
+        to_track: Some(track(2)),
+    });
+    assert_eq!(
+        serde_json::to_value(&explicit).unwrap(),
+        json!({"type": "ExtractAudio", "clip": 4, "to_track": 2})
+    );
+
+    let automatic = Command::Edit(EditCommand::ExtractAudio {
+        clip: clip(4),
+        to_track: None,
+    });
+    assert_eq!(
+        serde_json::to_value(&automatic).unwrap(),
+        json!({"type": "ExtractAudio", "clip": 4, "to_track": null})
     );
 }
 

@@ -297,7 +297,7 @@ pub fn run(engine: &mut Engine, intent: Intent) -> Result<serde_json::Value, Eng
         } => grouped(engine, |e| add_audio(e, &path, at_seconds, role)),
         Intent::Duplicate { clip } => grouped(engine, |e| duplicate(e, clip)),
         Intent::ReplaceMedia { clip, path } => grouped(engine, |e| replace_media(e, clip, &path)),
-        Intent::ExtractAudio { clip } => grouped(engine, |e| extract_audio(e, clip)),
+        Intent::ExtractAudio { clip } => extract_audio(engine, clip),
         Intent::Freeze {
             clip,
             seconds,
@@ -1174,55 +1174,22 @@ fn replace_media(
 }
 
 fn extract_audio(engine: &mut Engine, clip: ClipId) -> Result<serde_json::Value, EngineError> {
-    let rate = engine.project().timeline().frame_rate;
-    let (track_id, snapshot) = clip_snapshot(engine.project(), clip)?;
-    let kind = engine
+    let audio_clip = match engine.apply(Command::Edit(EditCommand::ExtractAudio {
+        clip,
+        to_track: None,
+    }))? {
+        ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
+        other => {
+            return Err(invalid(format!(
+                "expected an extracted audio clip, got {other:?}"
+            )));
+        }
+    };
+    let lane = engine
         .project()
         .timeline()
-        .track(track_id)
-        .ok_or(ModelError::UnknownTrack(track_id))?
-        .kind;
-    if kind != TrackKind::Video {
-        return Err(invalid("extract audio targets a video-lane clip"));
-    }
-    let ClipSource::Media { media, source } = snapshot.content else {
-        return Err(invalid("extract audio targets a media clip"));
-    };
-    if !engine.project().media(media).is_some_and(|m| m.has_audio) {
-        return Err(invalid("clip's media has no audio stream"));
-    }
-
-    let s = snapshot.timeline.start.value;
-    let d = snapshot.timeline.duration.value;
-    let placed_len = cutlass_models::resample(source.duration, rate).value.max(1);
-    let reserve = placed_len.max(d);
-    let range = TimeRange::at_rate(s, reserve, rate);
-    let lane = ensure_host_lane(engine, TrackKind::Audio, range, None)?;
-    let audio_clip = apply_created(
-        engine,
-        EditCommand::AddClip {
-            track: lane,
-            media,
-            source,
-            start: RationalTime::new(s, rate),
-        },
-    )?;
-    if snapshot.speed != Rational::new(1, 1) || snapshot.reversed {
-        engine.apply(Command::Edit(EditCommand::SetClipSpeed {
-            clip: audio_clip,
-            speed: snapshot.speed,
-            reversed: snapshot.reversed,
-        }))?;
-    }
-    // Linkage moves the audible half to the audio lane: a video clip with a
-    // linked audio partner goes silent on its own lane by the audibility rule.
-    engine.apply(Command::Edit(EditCommand::LinkClips {
-        clips: vec![clip, audio_clip],
-    }))?;
-    engine.apply(Command::Edit(EditCommand::SetAudioRole {
-        clip: audio_clip,
-        role: Some(AudioRole::Extracted),
-    }))?;
+        .track_of(audio_clip)
+        .ok_or(ModelError::UnknownClip(audio_clip))?;
     Ok(serde_json::json!({ "clip": audio_clip.raw(), "track": lane.raw() }))
 }
 
@@ -1571,6 +1538,47 @@ mod tests {
         assert_eq!(speed_to_rational(0.3333), Rational::new(333, 1000));
         assert_eq!(speed_to_rational(0.0), Rational::new(50, 1000));
         assert_eq!(speed_to_rational(500.0), Rational::new(100_000, 1000));
+    }
+
+    #[test]
+    fn extract_audio_delegates_once_and_rejects_a_second_request() {
+        let mut project = Project::new("extract", FPS);
+        let media = project.add_media(MediaSource::new(
+            "/tmp/extract-mobile.mp4",
+            1920,
+            1080,
+            FPS,
+            300,
+            true,
+        ));
+        let main = project.add_track(TrackKind::Video, "Main");
+        let video = project
+            .add_clip(
+                main,
+                media,
+                TimeRange::at_rate(30, 90, FPS),
+                RationalTime::new(60, FPS),
+            )
+            .unwrap();
+        let mut engine =
+            Engine::with_project(cutlass_engine::EngineConfig::default(), project).expect("engine");
+
+        let first = run(&mut engine, Intent::ExtractAudio { clip: video }).unwrap();
+        assert!(first["clip"].is_u64());
+        assert!(first["track"].is_u64());
+        assert_eq!(engine.project().timeline().clip_count(), 2);
+        assert!(!engine.project().timeline().carries_own_audio(video));
+
+        let before = serde_json::to_vec(engine.project()).unwrap();
+        let error = run(&mut engine, Intent::ExtractAudio { clip: video })
+            .expect_err("already-extracted audio must be strict");
+        assert!(error.to_string().contains("already has extracted audio"));
+        assert_eq!(serde_json::to_vec(engine.project()).unwrap(), before);
+
+        assert!(engine.undo(), "the first extraction is one history entry");
+        assert_eq!(engine.project().timeline().clip_count(), 1);
+        assert!(engine.project().timeline().carries_own_audio(video));
+        assert!(!engine.undo(), "the rejected retry records no history");
     }
 
     fn project_with_main() -> (Project, TrackId) {

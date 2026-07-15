@@ -1935,6 +1935,36 @@ impl Clip {
         }
     }
 
+    /// Build the audio-lane companion for CapCut-style audio extraction.
+    ///
+    /// This is deliberately placement- and linkage-free: the engine owns lane
+    /// selection, atomic insertion, and the shared [`LinkId`]. Only properties
+    /// that affect audio playback ride across. Every visual, look, animation,
+    /// and template field starts from the ordinary media-clip defaults.
+    pub fn extracted_audio_companion(&self) -> Result<Self, ModelError> {
+        let ClipSource::Media { media, source } = &self.content else {
+            return Err(ModelError::InvalidParam(
+                "audio extraction requires a media-backed clip".into(),
+            ));
+        };
+
+        let mut companion = Self::from_media(*media, *source, self.timeline);
+        companion.speed = self.speed;
+        // Reversed audio is not decoded yet by the forward-only mixers, but
+        // preserving the flag keeps the detached half semantically exact for
+        // future reverse-audio support and for undo/redo.
+        companion.reversed = self.reversed;
+        companion.speed_curve = self.speed_curve.clone();
+        companion.preserve_pitch = self.preserve_pitch;
+        companion.volume = self.volume.clone();
+        companion.fade_in = self.fade_in;
+        companion.fade_out = self.fade_out;
+        companion.denoise = self.denoise;
+        companion.beats = self.beats.clone();
+        companion.audio_role = Some(crate::look::AudioRole::Extracted);
+        Ok(companion)
+    }
+
     /// A generated clip (text, shape, solid, ...).
     pub fn generated(generator: Generator, timeline: TimeRange) -> Self {
         Self {
@@ -2418,6 +2448,83 @@ mod tests {
 
     fn media_clip(media: MediaId, source: TimeRange, timeline: TimeRange) -> Clip {
         Clip::from_media(media, source, timeline)
+    }
+
+    #[test]
+    fn extracted_audio_companion_copies_only_audio_and_retime_state() {
+        let media = MediaId::from_raw(41);
+        let source_range = tr(12, 120, R24);
+        let timeline = tr(36, 80, R24);
+        let mut source = Clip::from_media(media, source_range, timeline);
+
+        source.link = Some(LinkId::from_raw(9));
+        source.speed = Rational::new(3, 2);
+        source.reversed = true;
+        source.speed_curve = speed_preset("hero").unwrap();
+        source.preserve_pitch = false;
+        source.volume = Param::Keyframed {
+            keyframes: vec![
+                Keyframe {
+                    tick: 0,
+                    value: 0.25,
+                    easing: Easing::EaseIn,
+                },
+                Keyframe {
+                    tick: 79,
+                    value: 0.8,
+                    easing: Easing::Linear,
+                },
+            ],
+        };
+        source.fade_in = 7;
+        source.fade_out = 11;
+        source.denoise = true;
+        source.beats = vec![12, 36, 72];
+
+        // Non-audio state is intentionally noisy: none of it may leak to the
+        // audio-lane companion.
+        source.transform = ClipTransform {
+            position: [0.2, -0.3],
+            anchor_point: [0.1, 0.9],
+            scale: 1.5,
+            rotation: 20.0,
+            opacity: 0.6,
+        }
+        .into();
+        source.crop = CropRect {
+            x: 0.1,
+            y: 0.2,
+            w: 0.7,
+            h: 0.6,
+        };
+        source.flip_h = true;
+        source.filter = Some(crate::look::Filter {
+            id: "vivid".into(),
+            intensity: 0.4,
+        });
+        source.animation_in = Some(crate::look::AnimationRef::new("fade_in"));
+        source.replaceable = Some(Replaceable::new(3));
+        source.text_editable = true;
+
+        let companion = source.extracted_audio_companion().unwrap();
+        let mut expected = Clip::from_media(media, source_range, timeline);
+        expected.id = companion.id;
+        expected.speed = source.speed;
+        expected.reversed = source.reversed;
+        expected.speed_curve = source.speed_curve.clone();
+        expected.preserve_pitch = source.preserve_pitch;
+        expected.volume = source.volume.clone();
+        expected.fade_in = source.fade_in;
+        expected.fade_out = source.fade_out;
+        expected.denoise = source.denoise;
+        expected.beats = source.beats.clone();
+        expected.audio_role = Some(crate::look::AudioRole::Extracted);
+
+        assert_eq!(companion, expected);
+        assert_ne!(companion.id, source.id);
+        assert_eq!(companion.timeline, source.timeline);
+        assert_eq!(companion.content, source.content);
+        assert_eq!(companion.link, None);
     }
 
     // --- generator serde compat -------------------------------------------

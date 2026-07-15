@@ -953,6 +953,12 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             secs(a.start),
             a.track,
         ),
+        WireCommand::ExtractAudio(a) => {
+            format!(
+                "extracted audio from clip {} onto track {}",
+                a.clip, a.track
+            )
+        }
         WireCommand::AddGenerated(a) => format!(
             "added {} at {} for {} on track {}",
             generator_phrase(&a.generator),
@@ -1336,6 +1342,12 @@ mod tests {
         assert_eq!(
             describe_action(&move_effect, None),
             "moved effect 0 to 2 on clip 7"
+        );
+
+        let extract = WireCommand::ExtractAudio(wire::ExtractAudio { clip: 7, track: 3 });
+        assert_eq!(
+            describe_action(&extract, Some(&EditOutcome::Created(ClipId::from_raw(22)))),
+            "extracted audio from clip 7 onto track 3 (new clip 22)"
         );
 
         let trim = WireCommand::TrimClip(wire::TrimClip {

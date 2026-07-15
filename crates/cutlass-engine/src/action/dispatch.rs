@@ -151,6 +151,13 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::ExtractAudio { clip, to_track } => {
+            let (id, inverse) = edit::extract_audio::execute(ctx, clip, to_track)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
+        }
         EditCommand::DuplicateClip {
             clip,
             to_track,

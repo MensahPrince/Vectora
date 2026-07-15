@@ -101,6 +101,17 @@ pub enum EditCommand {
         source: TimeRange,
         start: RationalTime,
     },
+    /// Detach a video clip's embedded sound onto an audio-lane companion.
+    ///
+    /// `to_track: Some` targets that unlocked audio lane exactly; `None`
+    /// chooses the first unlocked lane without an overlap and creates an
+    /// unpinned `A{n}` lane when none fits. The companion reuses the media and
+    /// source window, copies only audio/retime properties, and is linked back
+    /// to the source. One command is one atomic undo entry.
+    ExtractAudio {
+        clip: ClipId,
+        to_track: Option<TrackId>,
+    },
     /// Deep-copy one clip to an explicit track/start. The copy receives a
     /// fresh id and is unlinked; every other clip property and keyframe is
     /// preserved. This is a pure placement edit: no search, ripple, transition

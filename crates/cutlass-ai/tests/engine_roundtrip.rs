@@ -9,8 +9,8 @@ use cutlass_ai::{summarize, validate};
 use cutlass_commands::{Command, EditOutcome};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
 use cutlass_models::{
-    ClipParam, Easing, Generator, LinkId, MediaSource, ParamValue, Project, Rational, RationalTime,
-    TimeRange, TrackKind,
+    AudioRole, ClipParam, Easing, Generator, LinkId, MediaSource, ParamValue, Project, Rational,
+    RationalTime, TimeRange, TrackKind,
 };
 
 const R24: Rational = Rational::FPS_24;
@@ -250,6 +250,71 @@ fn move_effect_lowers_applies_and_undoes_exactly() {
     assert_eq!(engine.project().clip(clip).unwrap().effects, before);
     assert!(engine.redo());
     assert_eq!(engine.project().clip(clip).unwrap().effects, expected);
+}
+
+#[test]
+fn extract_audio_lowers_applies_and_undoes_as_one_edit() {
+    let mut project = Project::new("agent extract", R24);
+    let media = project.add_media(MediaSource::new(
+        "/tmp/agent-extract.mp4",
+        1920,
+        1080,
+        R24,
+        480,
+        true,
+    ));
+    let video_track = project.add_track(TrackKind::Video, "V1");
+    let audio_track = project.add_track(TrackKind::Audio, "A1");
+    let video = project
+        .add_clip(
+            video_track,
+            media,
+            TimeRange::at_rate(24, 96, R24),
+            RationalTime::new(48, R24),
+        )
+        .unwrap();
+    let mut engine = engine_with(project);
+
+    let outcome = apply(
+        &mut engine,
+        WireCommand::ExtractAudio(wire::ExtractAudio {
+            clip: video.raw(),
+            track: audio_track.raw(),
+        }),
+    );
+    let audio = match outcome {
+        ApplyOutcome::Edited(EditOutcome::Created(id)) => id,
+        other => panic!("expected Created, got {other:?}"),
+    };
+    let snapshot = engine.project().clip(audio).unwrap().clone();
+    assert_eq!(
+        snapshot.timeline,
+        engine.project().clip(video).unwrap().timeline
+    );
+    assert_eq!(snapshot.audio_role, Some(AudioRole::Extracted));
+    assert_eq!(
+        engine.project().timeline().track_of(audio),
+        Some(audio_track)
+    );
+    assert!(!engine.project().timeline().carries_own_audio(video));
+
+    assert!(engine.undo());
+    assert!(engine.project().clip(audio).is_none());
+    assert!(
+        engine
+            .project()
+            .timeline()
+            .track(audio_track)
+            .is_some_and(|track| track.is_empty())
+    );
+    assert!(engine.project().timeline().carries_own_audio(video));
+    assert!(
+        !engine.undo(),
+        "the extraction was exactly one history entry"
+    );
+
+    assert!(engine.redo());
+    assert_eq!(engine.project().clip(audio).unwrap(), &snapshot);
 }
 
 #[test]

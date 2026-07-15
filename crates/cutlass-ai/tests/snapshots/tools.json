@@ -101,6 +101,34 @@
       }
     },
     {
+      "description": "Detach a video clip's embedded sound onto an existing unlocked audio track, preserving its exact placement and audio/retime settings. The track id is required: call add_track with kind audio first when needed, then pass the returned id. Keeping the target explicit lets planned track ids remap correctly during replay.",
+      "name": "extract_audio",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Detach a video clip's embedded sound onto an explicit audio track.",
+        "properties": {
+          "clip": {
+            "description": "Source media clip on a video track.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "track": {
+            "description": "Target unlocked audio track. This is required: call `add_track` first\nwhen no suitable audio lane exists, then use its returned id.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "clip",
+          "track"
+        ],
+        "title": "ExtractAudio",
+        "type": "object"
+      }
+    },
+    {
       "description": "Place a generated clip (text title, solid color, or shape) on a matching track. Times are in seconds.",
       "name": "add_generated",
       "parameters": {
@@ -1950,5 +1978,5 @@
       }
     }
   ],
-  "version": 23
+  "version": 24
 }
