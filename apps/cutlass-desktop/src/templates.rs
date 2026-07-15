@@ -17,7 +17,7 @@
 //! engine worker.
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
@@ -491,6 +491,7 @@ impl Worker {
 }
 
 const INSTALLED_TEMPLATE_FILE: &str = "template.cutlasst";
+const MAX_UNTRUSTED_TEMPLATE_ID_BYTES: usize = 128;
 
 /// Stable, traversal-safe directory name carried across the asynchronous
 /// picker. Absolute cache paths are always regenerated from an operation
@@ -501,6 +502,29 @@ struct InstalledTemplateId(String);
 impl InstalledTemplateId {
     fn from_catalog_id(id: &str) -> Self {
         Self(safe_id(id))
+    }
+
+    fn from_untrusted(id: &str) -> Result<Self, &'static str> {
+        // Check the byte bound before sanitizing allocates or any caller joins
+        // the value into a filesystem path.
+        if id.is_empty() {
+            return Err("template id must not be empty");
+        }
+        if id.len() > MAX_UNTRUSTED_TEMPLATE_ID_BYTES {
+            return Err("template id is too long");
+        }
+        if id == "unnamed" {
+            return Err("template id must not be the sanitizer fallback");
+        }
+        if id.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Err("template id must be lowercase");
+        }
+
+        let sanitized = safe_id(id);
+        if sanitized != id {
+            return Err("template id must be an exact canonical safe id");
+        }
+        Ok(Self(sanitized))
     }
 
     fn as_str(&self) -> &str {
@@ -515,6 +539,254 @@ fn installed_template_paths(
     let install_dir = templates_root(lease)?.join(template_id.as_str());
     let template_path = install_dir.join(INSTALLED_TEMPLATE_FILE);
     Ok((install_dir, template_path))
+}
+
+/// Resolve an already-installed canonical template id in the leased layout.
+///
+/// This is deliberately resolution-only: it never creates, downloads, or
+/// installs anything. The caller must retain `lease` through the acknowledged
+/// worker RPC that consumes the returned path so cache relocation cannot start
+/// between resolution and use. Filesystem entries are inspected and
+/// re-inspected here, but a path-only handoff cannot pin them against hostile
+/// replacement after this function returns.
+#[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+pub(crate) fn resolve_installed_template_path(
+    lease: &StorageLayoutLease<'_>,
+    template_id: &str,
+) -> Result<PathBuf, String> {
+    let template_id = InstalledTemplateId::from_untrusted(template_id).map_err(str::to_owned)?;
+    let root = templates_root(lease).map_err(str::to_owned)?;
+    if !root.is_absolute() {
+        return Err("template cache path is not absolute".into());
+    }
+
+    let (install_dir, template_path) =
+        installed_template_paths(lease, &template_id).map_err(str::to_owned)?;
+    if install_dir.parent() != Some(root.as_path())
+        || template_path.parent() != Some(install_dir.as_path())
+    {
+        return Err("template path escaped the template cache".into());
+    }
+
+    let root_entry =
+        inspect_installed_entry(&root, "template cache", InstalledEntryKind::Directory)?;
+    let install_entry = inspect_installed_entry(
+        &install_dir,
+        "template install directory",
+        InstalledEntryKind::Directory,
+    )?;
+    if install_entry.canonical != root_entry.canonical.join(template_id.as_str()) {
+        return Err("template install directory is not the exact cache child".into());
+    }
+
+    let template_entry = inspect_installed_entry(
+        &template_path,
+        "installed template file",
+        InstalledEntryKind::File,
+    )?;
+    if template_entry.canonical != install_entry.canonical.join(INSTALLED_TEMPLATE_FILE) {
+        return Err("installed template file is outside its install directory".into());
+    }
+
+    // Repeat the point-in-time inspection before publishing the path. Identity
+    // comparison catches ordinary remove/replace races, while canonical path
+    // comparison catches parent remapping and filesystem aliases.
+    ensure_installed_entry_unchanged(
+        &root,
+        "template cache",
+        InstalledEntryKind::Directory,
+        &root_entry,
+    )?;
+    ensure_installed_entry_unchanged(
+        &install_dir,
+        "template install directory",
+        InstalledEntryKind::Directory,
+        &install_entry,
+    )?;
+    ensure_installed_entry_unchanged(
+        &template_path,
+        "installed template file",
+        InstalledEntryKind::File,
+        &template_entry,
+    )?;
+    ensure_installed_entry_unchanged(
+        &root,
+        "template cache",
+        InstalledEntryKind::Directory,
+        &root_entry,
+    )?;
+
+    Ok(template_path)
+}
+
+#[derive(Clone, Copy)]
+enum InstalledEntryKind {
+    Directory,
+    File,
+}
+
+impl InstalledEntryKind {
+    fn matches(self, metadata: &std::fs::Metadata) -> bool {
+        match self {
+            Self::Directory => metadata.file_type().is_dir(),
+            Self::File => metadata.file_type().is_file(),
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::File => "regular file",
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct InspectedInstalledEntry {
+    canonical: PathBuf,
+    identity: InstalledEntryIdentity,
+}
+
+fn inspect_installed_entry(
+    path: &Path,
+    role: &str,
+    kind: InstalledEntryKind,
+) -> Result<InspectedInstalledEntry, String> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| format!("could not inspect {role} at {}: {error}", path.display()))?;
+    ensure_installed_entry_type(path, role, kind, &metadata)?;
+
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|error| format!("could not resolve {role} at {}: {error}", path.display()))?;
+    let canonical_metadata = std::fs::symlink_metadata(&canonical).map_err(|error| {
+        format!(
+            "could not reinspect resolved {role} at {}: {error}",
+            canonical.display()
+        )
+    })?;
+    ensure_installed_entry_type(&canonical, role, kind, &canonical_metadata)?;
+
+    let identity = installed_entry_identity(&metadata);
+    if identity != installed_entry_identity(&canonical_metadata) {
+        return Err(format!(
+            "{role} changed while it was inspected at {}",
+            path.display()
+        ));
+    }
+
+    Ok(InspectedInstalledEntry {
+        canonical,
+        identity,
+    })
+}
+
+fn ensure_installed_entry_type(
+    path: &Path,
+    role: &str,
+    kind: InstalledEntryKind,
+    metadata: &std::fs::Metadata,
+) -> Result<(), String> {
+    if metadata.file_type().is_symlink() || metadata_is_reparse_point(metadata) {
+        return Err(format!(
+            "{role} must not be a symlink or reparse point: {}",
+            path.display()
+        ));
+    }
+    if !kind.matches(metadata) {
+        return Err(format!(
+            "{role} is not a real {}: {}",
+            kind.description(),
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_installed_entry_unchanged(
+    path: &Path,
+    role: &str,
+    kind: InstalledEntryKind,
+    expected: &InspectedInstalledEntry,
+) -> Result<(), String> {
+    let current = inspect_installed_entry(path, role, kind)?;
+    if current != *expected {
+        return Err(format!(
+            "{role} changed during template resolution at {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+struct InstalledEntryIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn installed_entry_identity(metadata: &std::fs::Metadata) -> InstalledEntryIdentity {
+    use std::os::unix::fs::MetadataExt as _;
+
+    InstalledEntryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+#[cfg(windows)]
+#[derive(Debug, PartialEq, Eq)]
+struct InstalledEntryIdentity {
+    volume_serial_number: Option<u32>,
+    file_index: Option<u64>,
+    creation_time: u64,
+}
+
+#[cfg(windows)]
+fn installed_entry_identity(metadata: &std::fs::Metadata) -> InstalledEntryIdentity {
+    use std::os::windows::fs::MetadataExt as _;
+
+    InstalledEntryIdentity {
+        volume_serial_number: metadata.volume_serial_number(),
+        file_index: metadata.file_index(),
+        creation_time: metadata.creation_time(),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+#[derive(Debug, PartialEq, Eq)]
+struct InstalledEntryIdentity {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+#[cfg(not(any(unix, windows)))]
+fn installed_entry_identity(metadata: &std::fs::Metadata) -> InstalledEntryIdentity {
+    InstalledEntryIdentity {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+
+#[cfg(windows)]
+fn windows_attributes_are_reparse_point(attributes: u32) -> bool {
+    attributes & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(windows)]
+fn metadata_is_reparse_point(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt as _;
+
+    windows_attributes_are_reparse_point(metadata.file_attributes())
+}
+
+#[cfg(not(windows))]
+fn metadata_is_reparse_point(_metadata: &std::fs::Metadata) -> bool {
+    false
 }
 
 /// Resolve and enqueue after the picker without ever waiting on the Slint UI
@@ -639,6 +911,7 @@ mod tests {
     use super::*;
     use cutlass_cloud::dto::AssetKind;
     use cutlass_storage::StorageLayout;
+    use std::fs;
 
     fn entry(duration: Option<f64>, slots: Option<u32>) -> CatalogEntry {
         CatalogEntry {
@@ -659,6 +932,23 @@ mod tests {
         }
     }
 
+    fn template_layout(templates_root: &Path) -> SharedStorageLayout {
+        let mut layout =
+            StorageLayout::new(templates_root.parent().unwrap().join("default")).unwrap();
+        layout
+            .set_override(CacheId::Templates, templates_root)
+            .unwrap();
+        SharedStorageLayout::new(layout)
+    }
+
+    fn write_installed_template(templates_root: &Path, id: &str) -> PathBuf {
+        let install_dir = templates_root.join(id);
+        fs::create_dir_all(&install_dir).unwrap();
+        let template_path = install_dir.join(INSTALLED_TEMPLATE_FILE);
+        fs::write(&template_path, b"template").unwrap();
+        template_path
+    }
+
     #[test]
     fn tile_labels() {
         assert_eq!(tile_label(&entry(Some(72.4), Some(3))), "1:12 · 3 clips");
@@ -671,6 +961,141 @@ mod tests {
         assert_eq!(safe_id("tpl-vlog-1"), "tpl-vlog-1");
         assert_eq!(safe_id("../../etc/passwd"), "etcpasswd");
         assert_eq!(safe_id("..."), "unnamed");
+    }
+
+    #[test]
+    fn strict_installed_template_resolution_returns_the_current_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_root = dir.path().join("templates");
+        let template_path = write_installed_template(&templates_root, "tpl-vlog_1.2");
+        let layout = template_layout(&templates_root);
+        let lease = layout.lease();
+
+        assert!(template_path.is_absolute());
+        assert_eq!(
+            resolve_installed_template_path(&lease, "tpl-vlog_1.2").unwrap(),
+            template_path
+        );
+    }
+
+    #[test]
+    fn strict_template_ids_reject_malformed_paths_traversal_and_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_root = dir.path().join("templates");
+        let template_path = write_installed_template(&templates_root, "tpl-vlog-1");
+        write_installed_template(&templates_root, "unnamed");
+        let layout = template_layout(&templates_root);
+        let lease = layout.lease();
+
+        let invalid = [
+            "",
+            "unnamed",
+            ".",
+            "..",
+            "../tpl-vlog-1",
+            ".tpl-vlog-1.",
+            "tpl-vlog-1/",
+            "tpl/vlog-1",
+            "tpl\\vlog-1",
+            "tpl-vlog-1/../other",
+            "TPL-VLOG-1",
+            "Tpl-vlog-1",
+            "tpl vlog-1",
+            "tpl-vlog-💥",
+        ];
+        for id in invalid {
+            assert!(
+                InstalledTemplateId::from_untrusted(id).is_err(),
+                "strict parser accepted {id:?}"
+            );
+            assert!(
+                resolve_installed_template_path(&lease, id).is_err(),
+                "resolver accepted {id:?}"
+            );
+        }
+
+        let full_path = template_path.to_string_lossy();
+        assert!(InstalledTemplateId::from_untrusted(&full_path).is_err());
+        assert!(resolve_installed_template_path(&lease, &full_path).is_err());
+
+        let too_long = "a".repeat(MAX_UNTRUSTED_TEMPLATE_ID_BYTES + 1);
+        assert!(InstalledTemplateId::from_untrusted(&too_long).is_err());
+        assert!(resolve_installed_template_path(&lease, &too_long).is_err());
+    }
+
+    #[test]
+    fn installed_template_resolution_rejects_missing_install_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_root = dir.path().join("templates");
+        fs::create_dir(&templates_root).unwrap();
+        let layout = template_layout(&templates_root);
+        let lease = layout.lease();
+
+        assert!(resolve_installed_template_path(&lease, "missing").is_err());
+
+        fs::create_dir(templates_root.join("missing")).unwrap();
+        assert!(resolve_installed_template_path(&lease, "missing").is_err());
+    }
+
+    #[test]
+    fn installed_template_resolution_rejects_directory_at_template_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let templates_root = dir.path().join("templates");
+        let install_dir = templates_root.join("tpl-vlog-1");
+        fs::create_dir_all(install_dir.join(INSTALLED_TEMPLATE_FILE)).unwrap();
+        let layout = template_layout(&templates_root);
+        let lease = layout.lease();
+
+        assert!(resolve_installed_template_path(&lease, "tpl-vlog-1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_template_resolution_refuses_symlink_install_directory() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let templates_root = dir.path().join("templates");
+        fs::create_dir(&templates_root).unwrap();
+        let outside = dir.path().join("outside-install");
+        let outside_template = write_installed_template(dir.path(), "outside-install");
+        symlink(&outside, templates_root.join("tpl-vlog-1")).unwrap();
+        let layout = template_layout(&templates_root);
+        let lease = layout.lease();
+
+        assert!(resolve_installed_template_path(&lease, "tpl-vlog-1").is_err());
+        assert_eq!(fs::read(outside_template).unwrap(), b"template");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_template_resolution_refuses_symlink_template_file() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let templates_root = dir.path().join("templates");
+        let install_dir = templates_root.join("tpl-vlog-1");
+        fs::create_dir_all(&install_dir).unwrap();
+        let outside = dir.path().join("outside.cutlasst");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, install_dir.join(INSTALLED_TEMPLATE_FILE)).unwrap();
+        let layout = template_layout(&templates_root);
+        let lease = layout.lease();
+
+        assert!(resolve_installed_template_path(&lease, "tpl-vlog-1").is_err());
+        assert_eq!(fs::read(outside).unwrap(), b"outside");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reparse_attribute_helper_rejects_all_reparse_points() {
+        assert!(windows_attributes_are_reparse_point(
+            WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+        ));
+        assert!(windows_attributes_are_reparse_point(
+            WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT | 0x10
+        ));
+        assert!(!windows_attributes_are_reparse_point(0x10));
     }
 
     #[test]
