@@ -339,29 +339,32 @@ impl Worker {
         let Some(url) = url else { return };
 
         let cache_key = format!("ai/{}.{}", stable_key(&url), extension_of(kind, &url));
-        let dest = match self.cache.hit(&cache_key) {
-            Some(path) => path,
-            None => {
-                let dest = match self.cache.path_for(&cache_key) {
-                    Ok(dest) => dest,
-                    Err(e) => {
-                        warn!("ai cache path failed: {e}");
-                        return;
-                    }
-                };
-                let cancel = Arc::new(AtomicBool::new(false));
-                if let Err(e) = download::download_to(&url, &dest, &cancel, |_| {}) {
-                    warn!("ai result download failed: {e}");
-                    let message = "Download failed — the result may have expired; regenerate.";
-                    self.on_ui(move |b| b.set_error(message.into()));
-                    return;
-                }
-                self.cache.enforce_quota();
-                dest
+        let lease = match self.cache.lease(&cache_key) {
+            Ok(lease) => lease,
+            Err(e) => {
+                warn!("ai cache path failed: {e}");
+                return;
             }
+        };
+        let dest = lease.path().to_path_buf();
+        let downloaded = if self.cache.hit(&cache_key).is_some() {
+            false
+        } else {
+            let cancel = Arc::new(AtomicBool::new(false));
+            if let Err(e) = download::download_to(&url, &dest, &cancel, |_| {}) {
+                warn!("ai result download failed: {e}");
+                let message = "Download failed — the result may have expired; regenerate.";
+                self.on_ui(move |b| b.set_error(message.into()));
+                return;
+            }
+            true
         };
         info!("importing AI result \"{prompt}\" from {}", dest.display());
         self.import_handle.import(dest);
+        drop(lease);
+        if downloaded {
+            self.cache.enforce_quota();
+        }
         self.patch(kind, index, |tile| tile.state = "imported".into());
     }
 
@@ -374,19 +377,21 @@ impl Worker {
             return;
         }
         let cache_key = format!("ai-thumbs/{}.img", stable_key(url));
-        let path = match self.cache.path_for(&cache_key) {
-            Ok(path) => path,
+        let lease = match self.cache.lease(&cache_key) {
+            Ok(lease) => lease,
             Err(_) => return,
         };
+        let path = lease.path();
         if !path.is_file() {
             let cancel = Arc::new(AtomicBool::new(false));
-            if download::download_to(url, &path, &cancel, |_| {}).is_err() {
+            if download::download_to(url, path, &cancel, |_| {}).is_err() {
                 return;
             }
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = std::fs::read(path) else {
             return;
         };
+        drop(lease);
         let Ok(decoded) = cutlass_decoder::decode_image_bytes(&bytes) else {
             return;
         };

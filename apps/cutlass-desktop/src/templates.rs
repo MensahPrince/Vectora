@@ -23,7 +23,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::cache::DownloadCache;
+use cutlass_cloud::cache::{DownloadCache, DownloadCacheLease};
 use cutlass_cloud::dto::CatalogEntry;
 use cutlass_cloud::{CloudClient, download};
 use cutlass_commands::TemplatePick;
@@ -256,26 +256,28 @@ impl Worker {
             return;
         };
         let key = entry.id.clone();
-        let path = match self
+        let lease = match self
             .cache
-            .path_for(&format!("template-previews/{}.img", safe_id(&entry.id)))
+            .lease(&format!("template-previews/{}.img", safe_id(&entry.id)))
         {
-            Ok(path) => path,
+            Ok(lease) => lease,
             Err(e) => {
                 warn!("template preview cache path failed: {e}");
                 return;
             }
         };
+        let path = lease.path();
         if !path.is_file() {
             let cancel = Arc::new(AtomicBool::new(false));
-            if let Err(e) = download::download_to(url, &path, &cancel, |_| {}) {
+            if let Err(e) = download::download_to(url, path, &cancel, |_| {}) {
                 warn!("template preview download failed: {e}");
                 return;
             }
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = std::fs::read(path) else {
             return;
         };
+        drop(lease);
         let Ok(decoded) = cutlass_decoder::decode_image_bytes(&bytes) else {
             warn!("template preview decode failed for {key}");
             return;
@@ -311,9 +313,14 @@ impl Worker {
             cutlass_models::Template::load_from_file(&template_path)
         } else {
             match self.download_bundle(index, &entry) {
-                Ok(bundle) => {
+                Ok((bundle, downloaded)) => {
                     self.patch_row(index, key.clone(), |tile| tile.state = "installing".into());
-                    template_bundle::install(&bundle, &install_dir)
+                    let template = template_bundle::install(bundle.path(), &install_dir);
+                    drop(bundle);
+                    if downloaded {
+                        self.cache.enforce_quota();
+                    }
+                    template
                 }
                 Err(message) => {
                     warn!("template bundle download failed: {message}");
@@ -342,12 +349,17 @@ impl Worker {
 
     /// Download the bundle into the download cache, with tile progress and
     /// a checksum check when the catalog carries one.
-    fn download_bundle(&self, index: usize, entry: &CatalogEntry) -> Result<PathBuf, String> {
+    fn download_bundle(
+        &self,
+        index: usize,
+        entry: &CatalogEntry,
+    ) -> Result<(DownloadCacheLease<'_>, bool), String> {
         let cache_key = format!("templates/{}.cutlassb", safe_id(&entry.id));
-        if let Some(path) = self.cache.hit(&cache_key) {
-            return Ok(path);
+        let bundle = self.cache.lease(&cache_key).map_err(|e| e.to_string())?;
+        if self.cache.hit(&cache_key).is_some() {
+            return Ok((bundle, false));
         }
-        let dest = self.cache.path_for(&cache_key).map_err(|e| e.to_string())?;
+        let dest = bundle.path();
         let key = entry.id.clone();
         self.patch_row(index, key.clone(), |tile| {
             tile.state = "downloading".into();
@@ -356,7 +368,7 @@ impl Worker {
 
         let cancel = Arc::new(AtomicBool::new(false));
         let mut last_published = 0.0_f32;
-        download::download_to(&entry.file_url, &dest, &cancel, |p| {
+        download::download_to(&entry.file_url, dest, &cancel, |p| {
             if p.total_bytes == 0 {
                 return;
             }
@@ -369,17 +381,16 @@ impl Worker {
         .map_err(|e| e.to_string())?;
 
         if !entry.checksum_sha256.is_empty() {
-            let actual = download::sha256_hex(&dest).map_err(|e| e.to_string())?;
+            let actual = download::sha256_hex(dest).map_err(|e| e.to_string())?;
             if !actual.eq_ignore_ascii_case(&entry.checksum_sha256) {
-                let _ = std::fs::remove_file(&dest);
+                let _ = std::fs::remove_file(dest);
                 return Err(format!(
                     "checksum mismatch for {} (expected {}, got {actual})",
                     entry.id, entry.checksum_sha256
                 ));
             }
         }
-        self.cache.enforce_quota();
-        Ok(dest)
+        Ok((bundle, true))
     }
 
     /// Hop to the UI thread for the media-pick dialog, then hand the filled
