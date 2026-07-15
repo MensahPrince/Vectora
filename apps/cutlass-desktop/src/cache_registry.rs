@@ -160,6 +160,12 @@ impl CacheRegistry {
     ) -> Result<Self, String> {
         let snapshot = layout.snapshot();
         validate_layout(snapshot.layout())?;
+        snapshot.layout().validate_filesystem().map_err(|error| {
+            bounded_error(
+                "cache layout failed filesystem validation",
+                &error.to_string(),
+            )
+        })?;
         validate_download_root(snapshot.layout(), &download_cache.root())?;
         Ok(Self {
             layout,
@@ -213,6 +219,12 @@ impl CacheRegistry {
             GATE_WAIT_SLICE,
         )?;
         let layout = self.layout.lease();
+        layout.layout().validate_filesystem().map_err(|error| {
+            bounded_error(
+                "cache layout failed filesystem validation",
+                &error.to_string(),
+            )
+        })?;
         validate_download_root(layout.layout(), &self.download_cache.root())?;
         ensure_not_cancelled(cancel, "cancelled before clearing the cache")?;
 
@@ -290,6 +302,12 @@ impl CacheRegistry {
             .map_err(|error| {
                 bounded_error("cache relocation destination is unsafe", &error.to_string())
             })?;
+        replacement.validate_filesystem().map_err(|error| {
+            bounded_error(
+                "cache relocation layout failed filesystem validation",
+                &error.to_string(),
+            )
+        })?;
         let new_path = disk_path(&replacement, id)?;
         validate_relocation_paths(&old_path, &new_path)?;
         validate_relocation_destination(&new_path)?;
@@ -316,6 +334,12 @@ impl CacheRegistry {
                         "storage layout changed before cache relocation",
                     ));
                 }
+                new_layout.validate_filesystem().map_err(|error| {
+                    CacheRelocationFailure::with_detail(
+                        "cache relocation layout failed filesystem validation",
+                        &error.to_string(),
+                    )
+                })?;
 
                 // Lock order is SharedStorageLayout -> project maintenance ->
                 // DownloadCache (for the download target only).
