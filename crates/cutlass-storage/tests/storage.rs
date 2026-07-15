@@ -260,6 +260,182 @@ fn layout_rejects_invalid_overrides() {
 }
 
 #[test]
+fn filesystem_validation_accepts_distinct_existing_roots() {
+    let temporary = TestDirectory::new();
+    let root = temporary.path.join("storage");
+    fs::create_dir(&root).unwrap();
+    let layout = StorageLayout::new(&root).unwrap();
+
+    for (_, path) in layout.resolved_disk_paths() {
+        fs::create_dir(&path).unwrap();
+    }
+
+    layout.validate_filesystem().unwrap();
+}
+
+#[test]
+fn filesystem_validation_allows_missing_leaves_without_creating_directories() {
+    let temporary = TestDirectory::new();
+    let missing_parent = temporary.path.join("missing-parent");
+    let root = missing_parent.join("storage");
+    let layout = StorageLayout::new(&root).unwrap();
+
+    assert!(!missing_parent.exists());
+    layout.validate_filesystem().unwrap();
+    assert!(!missing_parent.exists());
+    for (_, path) in layout.resolved_disk_paths() {
+        assert!(!path.exists());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_validation_rejects_same_target_parent_aliases_deterministically() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TestDirectory::new();
+    let physical_parent = temporary.path.join("physical");
+    let shared = physical_parent.join("shared");
+    let alias_parent = temporary.path.join("alias");
+    fs::create_dir(&physical_parent).unwrap();
+    fs::create_dir(&shared).unwrap();
+    symlink(&physical_parent, &alias_parent).unwrap();
+
+    let layout = StorageLayout::with_overrides(
+        temporary.path.join("defaults"),
+        [
+            ("download", alias_parent.join("shared")),
+            ("proxies", shared),
+        ],
+    )
+    .unwrap();
+    let error = layout.validate_filesystem().unwrap_err();
+
+    assert!(matches!(
+        &error,
+        StorageError::CachePathsOverlap {
+            cache: CacheId::Proxies,
+            other: CacheId::Download,
+        }
+    ));
+    assert!(
+        !error
+            .to_string()
+            .contains(temporary.path.to_string_lossy().as_ref())
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_validation_rejects_alias_nested_roots() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TestDirectory::new();
+    let physical_parent = temporary.path.join("physical");
+    let cache = physical_parent.join("cache");
+    let nested = cache.join("nested");
+    let alias_parent = temporary.path.join("alias");
+    fs::create_dir(&physical_parent).unwrap();
+    fs::create_dir(&cache).unwrap();
+    fs::create_dir(&nested).unwrap();
+    symlink(&physical_parent, &alias_parent).unwrap();
+
+    let layout = StorageLayout::with_overrides(
+        temporary.path.join("defaults"),
+        [
+            ("download", alias_parent.join("cache").join("nested")),
+            ("proxies", cache),
+        ],
+    )
+    .unwrap();
+
+    assert!(matches!(
+        layout.validate_filesystem(),
+        Err(StorageError::CachePathsOverlap {
+            cache: CacheId::Proxies,
+            other: CacheId::Download,
+        })
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_validation_rejects_symlink_leaf() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TestDirectory::new();
+    let target = temporary.path.join("target");
+    let cache_link = temporary.path.join("cache-link");
+    fs::create_dir(&target).unwrap();
+    symlink(&target, &cache_link).unwrap();
+    let layout =
+        StorageLayout::with_overrides(temporary.path.join("defaults"), [("proxies", cache_link)])
+            .unwrap();
+
+    assert!(matches!(
+        layout.validate_filesystem(),
+        Err(StorageError::SymlinkRoot)
+    ));
+}
+
+#[test]
+fn filesystem_validation_rejects_non_directory_leaf_and_ancestor() {
+    let temporary = TestDirectory::new();
+    let file_leaf = temporary.path.join("file-leaf");
+    fs::write(&file_leaf, b"not a directory").unwrap();
+    let leaf_layout = StorageLayout::with_overrides(
+        temporary.path.join("leaf-defaults"),
+        [("proxies", file_leaf)],
+    )
+    .unwrap();
+    assert!(matches!(
+        leaf_layout.validate_filesystem(),
+        Err(StorageError::NotDirectory)
+    ));
+
+    let file_ancestor = temporary.path.join("file-ancestor");
+    fs::write(&file_ancestor, b"not a directory").unwrap();
+    let ancestor_layout = StorageLayout::with_overrides(
+        temporary.path.join("ancestor-defaults"),
+        [("proxies", file_ancestor.join("missing-cache"))],
+    )
+    .unwrap();
+    assert!(matches!(
+        ancestor_layout.validate_filesystem(),
+        Err(StorageError::NotDirectory)
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn filesystem_validation_reports_alias_resolution_io_without_paths() {
+    use std::os::unix::fs::symlink;
+
+    let temporary = TestDirectory::new();
+    let alias = temporary.path.join("dangling-alias");
+    symlink(temporary.path.join("missing-target"), &alias).unwrap();
+    let layout = StorageLayout::with_overrides(
+        temporary.path.join("defaults"),
+        [("proxies", alias.join("cache"))],
+    )
+    .unwrap();
+    let error = layout.validate_filesystem().unwrap_err();
+
+    match &error {
+        StorageError::Io { operation, .. } => {
+            assert_eq!(*operation, "canonicalize cache layout ancestor");
+            assert!(operation.len() < 64);
+        }
+        other => panic!("expected alias resolution I/O error, got {other:?}"),
+    }
+    assert!(
+        !error
+            .to_string()
+            .contains(temporary.path.to_string_lossy().as_ref())
+    );
+}
+
+#[test]
 fn shared_layout_snapshot_and_path_are_version_coherent() {
     let temporary = TestDirectory::new();
     let first_layout = StorageLayout::new(temporary.path.join("first")).unwrap();

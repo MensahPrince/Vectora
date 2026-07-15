@@ -387,6 +387,40 @@ impl StorageLayout {
             .collect()
     }
 
+    /// Validate every resolved disk cache root against the current filesystem.
+    ///
+    /// Existing parent symlinks are resolved to compare physical locations.
+    /// Existing cache roots must be real directories, while missing roots are
+    /// allowed beneath the nearest existing directory. This check is read-only
+    /// and never creates missing paths.
+    ///
+    /// This is a point-in-time validation, not a race-free filesystem
+    /// transaction; filesystem entries can change after it returns.
+    pub fn validate_filesystem(&self) -> Result<(), StorageError> {
+        let mut physical_paths = Vec::new();
+        for descriptor in cache_descriptors() {
+            if descriptor.kind != CacheKind::Disk {
+                continue;
+            }
+            let path = self
+                .resolve(descriptor.id)
+                .ok_or(StorageError::DangerousPath("disk cache has no path"))?;
+            physical_paths.push((descriptor.id, resolve_physical_cache_root(&path)?));
+        }
+
+        for (index, (cache, path)) in physical_paths.iter().enumerate() {
+            for (other, other_path) in &physical_paths[index + 1..] {
+                if paths_overlap(path, other_path) {
+                    return Err(StorageError::CachePathsOverlap {
+                        cache: *cache,
+                        other: *other,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn ensure_override_is_disjoint(
         &self,
         id: CacheId,
@@ -809,9 +843,9 @@ pub enum StorageError {
     DuplicateOverride(CacheId),
     /// Two cache roots overlap, so clearing either could remove the other.
     CachePathsOverlap {
-        /// Cache whose override was rejected.
+        /// Cache path being validated or compared.
         cache: CacheId,
-        /// Existing/default cache path it overlaps.
+        /// Other cache path it overlaps.
         other: CacheId,
     },
     /// The operation root itself is a symbolic link.
@@ -1436,6 +1470,56 @@ fn normalize_absolute(
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
+}
+
+fn resolve_physical_cache_root(path: &Path) -> Result<PathBuf, StorageError> {
+    let mut cursor = normalize_absolute(path, "resolved cache root", false)?;
+    let mut missing_components = Vec::new();
+
+    loop {
+        match fs::symlink_metadata(&cursor) {
+            Ok(metadata) => {
+                let file_type = metadata.file_type();
+                if missing_components.is_empty() {
+                    reject_root_type(&metadata)?;
+                } else if !file_type.is_dir() && !file_type.is_symlink() {
+                    return Err(StorageError::NotDirectory);
+                }
+
+                let mut physical = fs::canonicalize(&cursor)
+                    .map_err(|error| io_error("canonicalize cache layout ancestor", error))?;
+                let ancestor_metadata = fs::metadata(&physical)
+                    .map_err(|error| io_error("inspect canonical cache ancestor", error))?;
+                if !ancestor_metadata.is_dir() {
+                    return Err(StorageError::NotDirectory);
+                }
+
+                for component in missing_components.iter().rev() {
+                    physical.push(component);
+                }
+                return normalize_absolute(&physical, "physical cache root", false);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = match cursor.components().next_back() {
+                    Some(Component::Normal(component)) => component.to_os_string(),
+                    _ => {
+                        return Err(StorageError::DangerousPath(
+                            "cache root has no existing ancestor",
+                        ));
+                    }
+                };
+                let parent = cursor.parent().ok_or(StorageError::DangerousPath(
+                    "cache root has no existing ancestor",
+                ))?;
+                missing_components.push(component);
+                cursor = parent.to_path_buf();
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotADirectory => {
+                return Err(StorageError::NotDirectory);
+            }
+            Err(error) => return Err(io_error("inspect cache layout path", error)),
+        }
+    }
 }
 
 fn canonicalize_candidate(path: &Path) -> Result<PathBuf, StorageError> {
