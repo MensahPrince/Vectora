@@ -158,6 +158,11 @@ impl Worker {
             .is_ok_and(|metadata| metadata.file_type().is_file())
         {
             if checksum_ok(lease.path(), &entry.checksum_sha256) {
+                if let Err(error) = self.cache.protect_path(lease.path()) {
+                    warn!("sfx import could not protect its source: {error}");
+                    self.patch_row(index, key, |tile| tile.state = "failed".into());
+                    return;
+                }
                 self.import_handle.import(lease.path().to_path_buf());
                 self.patch_row(index, key, |tile| tile.state = "imported".into());
                 return;
@@ -193,6 +198,11 @@ impl Worker {
                     entry.file_url,
                     lease.path().display()
                 );
+                if let Err(error) = self.cache.protect_path(lease.path()) {
+                    warn!("sfx import could not protect its source: {error}");
+                    self.patch_row(index, key, |tile| tile.state = "failed".into());
+                    return;
+                }
                 self.import_handle.import(lease.path().to_path_buf());
                 self.patch_row(index, key, |tile| tile.state = "imported".into());
                 drop(lease);

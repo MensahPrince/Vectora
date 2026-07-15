@@ -360,6 +360,13 @@ impl Worker {
             true
         };
         info!("importing AI result \"{prompt}\" from {}", dest.display());
+        if let Err(error) = self.cache.protect_path(&dest) {
+            warn!("AI import could not protect its source: {error}");
+            self.on_ui(|backend| {
+                backend.set_error("The downloaded result could not be imported safely.".into());
+            });
+            return;
+        }
         self.import_handle.import(dest);
         drop(lease);
         if downloaded {
