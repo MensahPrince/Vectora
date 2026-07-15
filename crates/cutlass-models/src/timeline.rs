@@ -499,16 +499,20 @@ impl Timeline {
     ///
     /// CapCut keeps a video's sound on the video clip itself; a dropped clip
     /// is audible without a second lane. `true` for audio-lane media clips and
-    /// for video-lane media clips, with one exception: a video clip whose sound
-    /// has been *detached* to a linked audio-lane partner (CapCut "separate
-    /// audio") goes silent on its own lane — the partner carries it instead.
-    /// `false` for lanes that never carry media audio (text/effect/etc.).
+    /// for video-lane media clips, with two exceptions: freeze-frame clips are
+    /// semantically silent, and a video clip whose sound has been *detached*
+    /// to a linked audio-lane partner (CapCut "separate audio") goes silent on
+    /// its own lane — the partner carries it instead. `false` for lanes that
+    /// never carry media audio (text/effect/etc.).
     ///
     /// Callers still layer mute / silence / `has_audio` on top; this answers
     /// only "does this clip's media audio belong to *this* lane?". The detach
     /// scan only runs for *linked* video clips, so undetached drops (the common
     /// case, `link == None`) short-circuit.
     pub fn carries_own_audio(&self, clip_id: ClipId) -> bool {
+        if self.clip(clip_id).is_none_or(|clip| clip.freeze_frame) {
+            return false;
+        }
         let Some(track) = self.track_of(clip_id).and_then(|t| self.track(t)) else {
             return false;
         };

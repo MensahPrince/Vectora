@@ -4,7 +4,7 @@ use crate::effects::EffectInstance;
 use crate::error::ModelError;
 use crate::ids::{ClipId, LinkId, MediaId};
 use crate::param::{Easing, Keyframe, Param};
-use crate::time::{Rational, RationalTime, TimeRange, resample, time_sub};
+use crate::time::{Rational, RationalTime, TimeRange, check_same_rate, resample, time_sub};
 
 /// What a clip draws. Either a trimmed range of imported media, or synthetic
 /// content rendered by the engine (text, shapes, solids, ...).
@@ -1663,6 +1663,12 @@ pub struct Clip {
     pub id: ClipId,
     pub content: ClipSource,
     pub timeline: TimeRange,
+    /// A media-backed still made from one resolved video frame. The source
+    /// window is exactly one native frame while `timeline` may have any
+    /// positive duration. Frozen clips never own media audio and cannot be
+    /// retimed. Absent from saves for ordinary clips.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub freeze_frame: bool,
     /// Link group (CapCut linkage): clips sharing a `LinkId` are selected,
     /// moved, and trimmed together — e.g. the video+audio pair created by
     /// dropping media with an audio stream. `None` ⇔ unlinked.
@@ -1965,6 +1971,7 @@ impl Clip {
             id: ClipId::next(),
             content: ClipSource::Media { media, source },
             timeline,
+            freeze_frame: false,
             link: None,
             transform: AnimatedTransform::identity(),
             speed: unit_speed(),
@@ -2007,6 +2014,11 @@ impl Clip {
                 "audio extraction requires a media-backed clip".into(),
             ));
         };
+        if self.freeze_frame {
+            return Err(ModelError::InvalidParam(
+                "freeze-frame clips are silent".into(),
+            ));
+        }
 
         let mut companion = Self::from_media(*media, *source, self.timeline);
         companion.speed = self.speed;
@@ -2025,12 +2037,90 @@ impl Clip {
         Ok(companion)
     }
 
+    /// Derive a silent still clip from this media clip at an already-resolved
+    /// native source timestamp.
+    ///
+    /// `timeline.start` is also the absolute timeline position whose ordinary
+    /// transform/effect animation state is baked into constants. The returned
+    /// clip has a fresh unlinked identity, a one-frame source window, neutral
+    /// retiming/audio/template state, and no edge/combo look animations.
+    pub fn frozen_frame(
+        &self,
+        source_time: RationalTime,
+        timeline: TimeRange,
+    ) -> Result<Self, ModelError> {
+        let ClipSource::Media { media, source } = &self.content else {
+            return Err(ModelError::InvalidParam(
+                "freeze frame requires a media-backed clip".into(),
+            ));
+        };
+        if self.freeze_frame {
+            return Err(ModelError::InvalidParam(
+                "clip is already a freeze frame".into(),
+            ));
+        }
+        check_same_rate(source_time.rate, source.start.rate)?;
+        check_same_rate(timeline.start.rate, self.timeline.start.rate)?;
+        check_same_rate(timeline.duration.rate, timeline.start.rate)?;
+        let source_end = source.end()?;
+        if !source_time.rate.is_valid()
+            || !timeline.start.rate.is_valid()
+            || timeline.is_empty()
+            || source_time.value < source.start.value
+            || source_time.value >= source_end.value
+        {
+            return Err(ModelError::InvalidRange);
+        }
+        // Validate the arbitrary hold's exclusive end without unchecked
+        // `TimeRange::end_tick` arithmetic.
+        timeline.end()?;
+
+        let animation_tick = self.animation_tick(timeline.start.value);
+        let held_transform = self.transform.sample(animation_tick);
+        let mut frozen = self.clone();
+        frozen.id = ClipId::next();
+        frozen.content = ClipSource::Media {
+            media: *media,
+            source: TimeRange::at_rate(source_time.value, 1, source_time.rate),
+        };
+        frozen.timeline = timeline;
+        frozen.freeze_frame = true;
+        frozen.link = None;
+
+        frozen.transform.set_constant(held_transform);
+        for effect in &mut frozen.effects {
+            for param in effect.params.values_mut() {
+                let held = param.sample(animation_tick);
+                param.set_constant(held);
+            }
+        }
+
+        frozen.speed = unit_speed();
+        frozen.reversed = false;
+        frozen.speed_curve = default_speed_curve();
+        frozen.preserve_pitch = default_preserve_pitch();
+        frozen.volume = default_volume();
+        frozen.fade_in = 0;
+        frozen.fade_out = 0;
+        frozen.denoise = false;
+        frozen.beats.clear();
+        frozen.audio_role = None;
+
+        frozen.animation_in = None;
+        frozen.animation_out = None;
+        frozen.animation_combo = None;
+        frozen.replaceable = None;
+        frozen.text_editable = false;
+        Ok(frozen)
+    }
+
     /// A generated clip (text, shape, solid, ...).
     pub fn generated(generator: Generator, timeline: TimeRange) -> Self {
         Self {
             id: ClipId::next(),
             content: ClipSource::Generated(generator),
             timeline,
+            freeze_frame: false,
             link: None,
             transform: AnimatedTransform::identity(),
             speed: unit_speed(),
@@ -2096,11 +2186,12 @@ impl Clip {
         self.volume.is_animated()
     }
 
-    /// True iff the clip is inaudible: a constant gain of `0` (or below). A
-    /// keyframed envelope is never treated as silent — it may be non-zero
-    /// elsewhere — so the mixers keep it and sample per sample-frame.
+    /// True iff the clip is inaudible: a freeze frame or a constant gain of
+    /// `0` (or below). A keyframed envelope on an ordinary clip is never
+    /// treated as silent — it may be non-zero elsewhere — so the mixers keep
+    /// it and sample per sample-frame.
     pub fn is_silent(&self) -> bool {
-        matches!(self.volume.constant(), Some(v) if v <= 0.0)
+        self.freeze_frame || matches!(self.volume.constant(), Some(v) if v <= 0.0)
     }
 
     /// True iff the clip carries detected beat markers (M8 Phase 6).
@@ -2262,6 +2353,9 @@ impl Clip {
         }
         match &self.content {
             ClipSource::Media { source, .. } => {
+                if self.freeze_frame {
+                    return Ok(Some(source.start));
+                }
                 let offset_tl = time_sub(&timeline_pos, &self.timeline.start)?;
                 let first = source.start.value;
                 let last = first + (source.duration.value - 1).max(0);

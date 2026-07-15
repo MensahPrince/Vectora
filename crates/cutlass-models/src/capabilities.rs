@@ -62,6 +62,7 @@ impl ClipCapabilities {
     pub fn for_clip(project: &Project, clip: &Clip, kind: TrackKind) -> Self {
         let is_visual = kind.is_visual();
         let is_media = clip.source_range().is_some();
+        let can_retime = is_media && !clip.freeze_frame;
 
         let (has_text, has_shape) = match &clip.content {
             ClipSource::Generated(Generator::Text { .. }) => (true, false),
@@ -76,20 +77,21 @@ impl ClipCapabilities {
             ClipSource::Generated(_) => false,
         };
         let can_extract_audio = kind == TrackKind::Video
+            && !clip.freeze_frame
             && media_is_video_with_audio
             && !project.timeline().detached_to_audio_lane(clip.id);
 
         Self {
             has_transform: is_visual,
             has_crop: is_visual,
-            has_audio: kind == TrackKind::Audio,
-            has_speed: is_media,
+            has_audio: kind == TrackKind::Audio && !clip.freeze_frame,
+            has_speed: can_retime,
             has_text,
             has_shape,
             has_effects: is_visual,
             has_filter_adjust: is_visual,
             can_split: true,
-            can_reverse: is_media,
+            can_reverse: can_retime,
             can_ripple_delete: true,
             can_extract_audio,
         }
