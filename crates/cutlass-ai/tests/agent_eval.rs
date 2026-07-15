@@ -1698,6 +1698,9 @@ fn engine_sense_observes_rehearsed_edits_and_returns_images() {
         event,
         AgentEvent::HostAction { name, .. } if name == "media_screenshot_preview"
     )));
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Image(image) if image.label == "sandbox preview")
+    ));
 }
 
 #[test]
@@ -1748,7 +1751,7 @@ fn engine_senses_are_read_only_filtered_and_outrank_host_collisions() {
 
 /// Host dispatch round-trip: the call reaches the host with its exact
 /// arguments, the output's text and image ride back as the tool result,
-/// and the transcript hears about it as a HostAction.
+/// and the transcript hears about both its action and bounded image.
 #[test]
 fn host_tool_round_trip_carries_arguments_images_and_events() {
     let (mut host, _, _, _) = fixture();
@@ -1812,6 +1815,73 @@ fn host_tool_round_trip_carries_arguments_images_and_events() {
         )),
         "{events:?}"
     );
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Image(image) if image.label == "preview at 1.50s")
+    ));
+}
+
+#[test]
+fn inline_image_events_match_the_request_wide_budget() {
+    let (mut bridge, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![
+            ("call_1", "media_frame", serde_json::json!({ "at": 1 })),
+            ("call_2", "media_frame", serde_json::json!({ "at": 2 })),
+        ]),
+        text_turn("Compared the frames."),
+    ]);
+    let mut tool_host = ScriptedHost::new(
+        vec![host_spec("media_frame")],
+        vec![
+            Ok(ToolOutput {
+                text: "old frame".into(),
+                images: vec![ImagePart::png(vec![1, 2, 3], "old")],
+            }),
+            Ok(ToolOutput {
+                text: "new frame".into(),
+                images: vec![ImagePart::png(vec![4, 5, 6], "new")],
+            }),
+        ],
+    );
+    let config = AgentConfig {
+        max_images: 1,
+        max_image_bytes: 10,
+        ..AgentConfig::default()
+    };
+
+    let (outcome, events) = run_with(
+        &provider,
+        &mut bridge,
+        &mut tool_host,
+        &EditorContext::default(),
+        "compare two frames",
+        &config,
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    let requests = provider.requests();
+    let results: Vec<_> = requests[1]
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResult {
+                content, images, ..
+            } => Some((content, images)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 2);
+    assert!(results[0].0.contains("image no longer attached: old"));
+    assert!(results[0].1.is_empty());
+    assert_eq!(results[1].1[0].label, "new");
+
+    let labels: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Image(image) => Some(image.label.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(labels, vec!["new"]);
 }
 
 #[test]

@@ -116,6 +116,7 @@ fn main() {
             }
             AgentEvent::Action(a) => println!("  ⚙ {}", a.description),
             AgentEvent::HostAction { name, summary } => println!("  ⚙ {name}: {summary}"),
+            AgentEvent::Image(image) => println!("  ◫ {}", image.label),
         },
     );
 

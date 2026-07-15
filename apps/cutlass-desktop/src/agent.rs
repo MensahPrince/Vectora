@@ -218,6 +218,87 @@ fn push_entry(store: &slint::Weak<AgentStore<'static>>, kind: &'static str, text
     with_transcript(store, move |model| model.push(entry(kind, text)));
 }
 
+fn push_image_entry(store: &slint::Weak<AgentStore<'static>>, image: cutlass_ai::ImagePart) {
+    let label = transcript_image_label(&image.label);
+    let frame = match decode_transcript_image(&image) {
+        Ok(frame) => frame,
+        Err(error) => {
+            push_entry(
+                store,
+                "status",
+                format!("Could not display image '{label}': {error}"),
+            );
+            return;
+        }
+    };
+    let aspect = frame.width as f32 / frame.height as f32;
+    let (width, height, pixels) = (frame.width, frame.height, frame.pixels);
+    with_transcript(store, move |model| {
+        let buffer =
+            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&pixels, width, height);
+        model.push(AgentEntry {
+            kind: "image".into(),
+            text: label.into(),
+            image: slint::Image::from_rgba8(buffer),
+            image_aspect: aspect,
+        });
+    });
+}
+
+fn decode_transcript_image(
+    image: &cutlass_ai::ImagePart,
+) -> Result<cutlass_render::RgbaImage, String> {
+    const MAX_EDGE: u32 = 2_048;
+    const MAX_PIXELS: u64 = 4 * 1024 * 1024;
+
+    let frame = match image.media_type.as_str() {
+        "image/png" => {
+            cutlass_render::decode_png(image.data.as_slice()).map_err(|error| error.to_string())?
+        }
+        "image/jpeg" => cutlass_decoder::decode_image_bytes(image.data.as_slice())
+            .map_err(|error| error.to_string())?,
+        media_type => return Err(format!("unsupported transcript image type '{media_type}'")),
+    };
+    let pixels = u64::from(frame.width)
+        .checked_mul(u64::from(frame.height))
+        .ok_or_else(|| "transcript image dimensions overflow".to_string())?;
+    if frame.width == 0
+        || frame.height == 0
+        || frame.width > MAX_EDGE
+        || frame.height > MAX_EDGE
+        || pixels > MAX_PIXELS
+    {
+        return Err(format!(
+            "transcript image dimensions {}x{} exceed the display bound",
+            frame.width, frame.height
+        ));
+    }
+    if !frame.is_well_formed() {
+        return Err("transcript image has a malformed RGBA buffer".into());
+    }
+    Ok(frame)
+}
+
+fn transcript_image_label(label: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let mut safe = String::with_capacity(label.len().min(MAX_CHARS));
+    for character in label.chars().take(MAX_CHARS) {
+        safe.push(if character.is_control() {
+            '\u{fffd}'
+        } else {
+            character
+        });
+    }
+    if label.chars().count() > MAX_CHARS {
+        safe.push('…');
+    }
+    if safe.trim().is_empty() {
+        "Agent image".to_string()
+    } else {
+        safe
+    }
+}
+
 fn append_assistant_text(store: &slint::Weak<AgentStore<'static>>, delta: String) {
     with_transcript(store, move |model| {
         let last = model.row_count().wrapping_sub(1);
@@ -931,6 +1012,7 @@ fn run_one_prompt(
         AgentEvent::HostAction { name, summary } => {
             push_entry(&event_store, "action", format!("{name}: {summary}"))
         }
+        AgentEvent::Image(image) => push_image_entry(&event_store, image),
     };
 
     info!(prompt, dry_run, "agent prompt started");
@@ -1239,6 +1321,37 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn transcript_images_decode_through_the_bounded_rgba_boundary() {
+        let expected = cutlass_render::RgbaImage::new(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 128]);
+        let image = cutlass_ai::ImagePart::png(
+            cutlass_render::encode_png(&expected).expect("encode fixture"),
+            "fixture",
+        );
+        assert_eq!(decode_transcript_image(&image).expect("decode"), expected);
+
+        let unsupported = cutlass_ai::ImagePart {
+            media_type: "image/gif".into(),
+            data: Arc::new(vec![1, 2, 3]),
+            label: "animated".into(),
+        };
+        assert!(
+            decode_transcript_image(&unsupported)
+                .expect_err("unsupported type")
+                .contains("unsupported")
+        );
+    }
+
+    #[test]
+    fn transcript_image_labels_are_safe_and_bounded() {
+        assert_eq!(transcript_image_label(""), "Agent image");
+        assert_eq!(transcript_image_label("bad\nlabel"), "bad\u{fffd}label");
+        let long = "x".repeat(200);
+        let label = transcript_image_label(&long);
+        assert_eq!(label.chars().count(), 161);
+        assert!(label.ends_with('…'));
     }
 
     fn fixture_project() -> (Project, u64) {

@@ -116,6 +116,10 @@ pub enum AgentEvent {
     Action(ActionLogEntry),
     /// A host tool ran; `summary` is the first line of its output.
     HostAction { name: String, summary: String },
+    /// One image returned by a successful host/sense tool, after runtime
+    /// payload limits. Embedders can render it inline while the same encoded
+    /// bytes continue to the model.
+    Image(ImagePart),
 }
 
 /// How the prompt ended.
@@ -387,6 +391,10 @@ pub fn run_prompt_with_host(
     let mut edit_calls = 0usize;
     let mut host_calls = 0usize;
     let mut final_text = String::new();
+    // The first image-bearing tool result is appended after the current user
+    // message. Images are surfaced only after the whole request budget has run,
+    // immediately before those exact attachments are sent to the provider.
+    let mut image_event_cursor = messages.len();
     // Call ids of `describe_project` results, collapsed in `turn_messages`
     // so the session history never carries a full stale project blob.
     let mut describe_call_ids: Vec<String> = Vec::new();
@@ -410,6 +418,14 @@ pub fn run_prompt_with_host(
 
     for _turn in 0..config.max_turns {
         enforce_image_budget(&mut messages, config.max_images, config.max_image_bytes);
+        for message in messages.iter().skip(image_event_cursor) {
+            if let Message::ToolResult { images, .. } = message {
+                for image in images {
+                    on_event(AgentEvent::Image(image.clone()));
+                }
+            }
+        }
+        image_event_cursor = messages.len();
         let turn = {
             let mut forward = |delta: &str| on_event(AgentEvent::TextDelta(delta.to_string()));
             match provider.chat(
@@ -491,16 +507,22 @@ pub fn run_prompt_with_host(
                 match bridge.sense(&call.name, &call.arguments, cancel) {
                     Err(reason) => format!("rejected: {reason}"),
                     Ok(output) => {
-                        let content = if output.text.is_empty() {
+                        let mut content = if output.text.is_empty() {
                             "ok".to_string()
                         } else {
                             output.text
                         };
+                        images = output.images;
+                        enforce_tool_output_image_budget(
+                            &mut content,
+                            &mut images,
+                            config.max_images,
+                            config.max_image_bytes,
+                        );
                         on_event(AgentEvent::HostAction {
                             name: call.name.clone(),
                             summary: host_action_summary(&content),
                         });
-                        images = output.images;
                         content
                     }
                 }
@@ -522,16 +544,22 @@ pub fn run_prompt_with_host(
                 {
                     Err(reason) => format!("rejected: {reason}"),
                     Ok(output) => {
-                        let content = if output.text.is_empty() {
+                        let mut content = if output.text.is_empty() {
                             "ok".to_string()
                         } else {
                             output.text
                         };
+                        images = output.images;
+                        enforce_tool_output_image_budget(
+                            &mut content,
+                            &mut images,
+                            config.max_images,
+                            config.max_image_bytes,
+                        );
                         on_event(AgentEvent::HostAction {
                             name: call.name.clone(),
                             summary: host_action_summary(&content),
                         });
-                        images = output.images;
                         content
                     }
                 }
@@ -638,6 +666,37 @@ fn read_skill_result(skills: &[crate::extend::Skill], arguments: &serde_json::Va
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+    }
+}
+
+/// Bound a single extensible tool result before it reaches either the
+/// transcript or the request history. Count and encoded-byte limits both keep
+/// the newest attachments, matching the whole-request policy below.
+fn enforce_tool_output_image_budget(
+    content: &mut String,
+    images: &mut Vec<ImagePart>,
+    max_images: usize,
+    max_bytes: usize,
+) {
+    let mut count = images.len();
+    let mut bytes = images
+        .iter()
+        .map(|image| image.data.len())
+        .fold(0usize, usize::saturating_add);
+    let mut drop_count = 0usize;
+    for image in images.iter() {
+        if count <= max_images && bytes <= max_bytes {
+            break;
+        }
+        count = count.saturating_sub(1);
+        bytes = bytes.saturating_sub(image.data.len());
+        drop_count += 1;
+    }
+    for dropped in images.drain(..drop_count) {
+        content.push_str(&format!(
+            "\n[image not attached because it exceeded the request budget: {}]",
+            dropped.label
+        ));
     }
 }
 
@@ -1383,6 +1442,27 @@ mod tests {
         );
         assert!(content.contains("new four bytes"));
         assert!(content.contains("newest five bytes"));
+    }
+
+    #[test]
+    fn tool_output_budget_drops_before_transcript_delivery() {
+        let mut content = "frames ready".to_string();
+        let mut images = vec![
+            ImagePart::png(vec![1; 5], "old"),
+            ImagePart::png(vec![2; 4], "middle"),
+            ImagePart::png(vec![3; 3], "new"),
+        ];
+
+        enforce_tool_output_image_budget(&mut content, &mut images, 2, 7);
+
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["middle", "new"]
+        );
+        assert!(content.contains("request budget: old"), "{content}");
     }
 
     #[test]
