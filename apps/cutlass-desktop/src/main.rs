@@ -7,6 +7,7 @@ mod agent_system;
 mod agent_vision;
 mod ai_media;
 mod audio;
+mod cache_references;
 mod cache_registry;
 mod cloud;
 mod download_safety;

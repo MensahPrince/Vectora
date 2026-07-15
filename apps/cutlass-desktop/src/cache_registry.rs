@@ -5,6 +5,7 @@
 //! coordination slice. All public operations are synchronous and intended for
 //! an off-UI worker thread.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -150,7 +151,7 @@ impl CacheRegistry {
             GATE_WAIT_TIMEOUT,
             GATE_WAIT_SLICE,
         )?;
-        let layout = self.layout.snapshot();
+        let layout = self.layout.lease();
         validate_download_root(layout.layout(), &self.download_cache.root())?;
         self.snapshot_all_locked(layout.layout(), cancel)
     }
@@ -167,7 +168,7 @@ impl CacheRegistry {
             GATE_WAIT_TIMEOUT,
             GATE_WAIT_SLICE,
         )?;
-        let layout = self.layout.snapshot();
+        let layout = self.layout.lease();
         validate_download_root(layout.layout(), &self.download_cache.root())?;
         ensure_not_cancelled(cancel, "cancelled before clearing the cache")?;
 
@@ -179,7 +180,9 @@ impl CacheRegistry {
                 ensure_memory_has_no_path(layout.layout(), id)?;
                 self.clear_memory_cache(id, cancel)?
             }
-            CacheKind::Disk if id == CacheId::Download => self.clear_download_cache(cancel)?,
+            CacheKind::Disk if id == CacheId::Download => {
+                self.clear_download_cache(layout.layout(), cancel)?
+            }
             CacheKind::Disk => clear_disk_contents(layout.layout(), id, cancel)?,
         };
 
@@ -238,11 +241,15 @@ impl CacheRegistry {
         }
     }
 
-    fn clear_download_cache(&self, cancel: &AtomicBool) -> Result<CacheUsage, String> {
+    fn clear_download_cache(
+        &self,
+        layout: &StorageLayout,
+        cancel: &AtomicBool,
+    ) -> Result<CacheUsage, String> {
         ensure_not_cancelled(cancel, "cancelled before protecting project downloads")?;
-        let saved = crate::download_safety::protect_saved_draft_downloads(
-            self.download_cache.as_ref(),
+        let saved = crate::cache_references::scan_saved_draft_references(
             &crate::drafts::root_dir(),
+            layout,
         );
         if !saved.is_complete() {
             self.download_cache.block_destructive_operations();
@@ -250,18 +257,23 @@ impl CacheRegistry {
                 "saved project media inventory is incomplete; download clear was refused".into(),
             );
         }
+        protect_download_references(
+            self.download_cache.as_ref(),
+            &saved.references.by_cache[&CacheId::Download],
+        )?;
         let project = self.preview.snapshot_project().ok_or_else(|| {
             "current project is unavailable; download clear was refused".to_string()
         })?;
-        let protected = crate::download_safety::protect_project_downloads(
-            self.download_cache.as_ref(),
-            &project,
-        );
-        if protected.rejected != 0 {
+        let live = crate::cache_references::analyze_project_references(&project, layout);
+        if !live.is_complete() {
             return Err(
                 "current project media could not be protected; download clear was refused".into(),
             );
         }
+        protect_download_references(
+            self.download_cache.as_ref(),
+            &live.by_cache[&CacheId::Download],
+        )?;
         ensure_not_cancelled(cancel, "cancelled before clearing downloads")?;
         let report = self.download_cache.clear().map_err(|error| {
             bounded_error("download cache could not be cleared", &error.to_string())
@@ -539,6 +551,21 @@ pub(crate) fn cache_can_be_cleared(id: CacheId) -> bool {
 
 fn cache_requires_reference_migration(id: CacheId) -> bool {
     matches!(id, CacheId::Luts | CacheId::Lottie | CacheId::Templates)
+}
+
+fn protect_download_references(
+    cache: &DownloadCache,
+    paths: &BTreeSet<PathBuf>,
+) -> Result<(), String> {
+    for path in paths {
+        cache.protect_path(path).map_err(|error| {
+            bounded_error(
+                "project download could not be protected",
+                &error.to_string(),
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_layout(layout: &StorageLayout) -> Result<(), String> {
