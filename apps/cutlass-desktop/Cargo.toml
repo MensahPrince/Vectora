@@ -26,6 +26,7 @@ cutlass-compositor = { path = "../../crates/cutlass-compositor" }
 cutlass-decoder = { path = "../../crates/cutlass-decoder" }
 cutlass-encoder = { path = "../../crates/cutlass-encoder" }
 cutlass-engine = { path = "../../crates/cutlass-engine" }
+cutlass-jobs = { path = "../../crates/cutlass-jobs" }
 cutlass-text = { path = "../../crates/cutlass-text" }
 cutlass-models = { path = "../../crates/cutlass-models" }
 cutlass-render = { path = "../../crates/cutlass-render" }

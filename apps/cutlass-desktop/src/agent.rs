@@ -30,6 +30,7 @@ use cutlass_ai::{
 };
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
+use cutlass_jobs::JobManager;
 use cutlass_settings::Autonomy;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use tracing::{error, info, warn};
@@ -153,6 +154,7 @@ struct AgentRuntimeHandles {
     store: slint::Weak<AgentStore<'static>>,
     app: slint::Weak<AppWindow>,
     cache_registry: CacheRegistry,
+    job_manager: JobManager,
 }
 
 impl AgentWorker {
@@ -161,6 +163,7 @@ impl AgentWorker {
         store: slint::Weak<AgentStore<'static>>,
         app: slint::Weak<AppWindow>,
         cache_registry: CacheRegistry,
+        job_manager: JobManager,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded();
         let (approval_tx, approval_rx) = unbounded();
@@ -178,6 +181,7 @@ impl AgentWorker {
                         store,
                         app,
                         cache_registry,
+                        job_manager,
                     },
                     rx,
                     thread_cancel,
@@ -724,13 +728,30 @@ fn clear_approval_card(store: &slint::Weak<AgentStore<'static>>) {
     });
 }
 
-/// The desktop host-tool surface: reversible `app_*` controls plus the
-/// approval broker that gates every System-tier call.
-pub struct DesktopToolHost {
-    autonomy: Autonomy,
+#[derive(Clone)]
+struct DesktopToolHandles {
     store: slint::Weak<AgentStore<'static>>,
     app: slint::Weak<AppWindow>,
     cache_registry: Option<CacheRegistry>,
+    job_manager: JobManager,
+}
+
+impl From<&AgentRuntimeHandles> for DesktopToolHandles {
+    fn from(runtime: &AgentRuntimeHandles) -> Self {
+        Self {
+            store: runtime.store.clone(),
+            app: runtime.app.clone(),
+            cache_registry: Some(runtime.cache_registry.clone()),
+            job_manager: runtime.job_manager.clone(),
+        }
+    }
+}
+
+/// The desktop host-tool surface: app and job controls plus the approval
+/// broker that gates every System-tier call.
+pub struct DesktopToolHost {
+    autonomy: Autonomy,
+    runtime: DesktopToolHandles,
     approval_rx: Receiver<ApprovalDecision>,
     pending_approval_id: Arc<AtomicU64>,
     approval_id_allocator: Arc<AtomicU64>,
@@ -740,18 +761,14 @@ pub struct DesktopToolHost {
 impl DesktopToolHost {
     fn new(
         autonomy: Autonomy,
-        store: slint::Weak<AgentStore<'static>>,
-        app: slint::Weak<AppWindow>,
-        cache_registry: Option<CacheRegistry>,
+        runtime: DesktopToolHandles,
         approval_rx: Receiver<ApprovalDecision>,
         pending_approval_id: Arc<AtomicU64>,
         approval_id_allocator: Arc<AtomicU64>,
     ) -> Self {
         Self {
             autonomy,
-            store,
-            app,
-            cache_registry,
+            runtime,
             approval_rx,
             pending_approval_id,
             approval_id_allocator,
@@ -767,6 +784,7 @@ impl DesktopToolHost {
 impl ToolHost for DesktopToolHost {
     fn tools(&self) -> Vec<HostToolSpec> {
         let mut specs = crate::agent_app_control::specs();
+        specs.extend(crate::agent_jobs::specs());
         specs.extend(crate::agent_system::specs());
         specs
     }
@@ -792,16 +810,19 @@ impl ToolHost for DesktopToolHost {
         self.pending_approval_id
             .compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "another system tool approval is already pending".to_string())?;
-        if let Err(error) =
-            publish_approval_card(&self.store, name, arguments, self.cache_registry.as_ref())
-        {
+        if let Err(error) = publish_approval_card(
+            &self.runtime.store,
+            name,
+            arguments,
+            self.runtime.cache_registry.as_ref(),
+        ) {
             let _ = self.pending_approval_id.compare_exchange(
                 request_id,
                 0,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             );
-            clear_approval_card(&self.store);
+            clear_approval_card(&self.runtime.store);
             return Err(error);
         }
 
@@ -817,7 +838,7 @@ impl ToolHost for DesktopToolHost {
             Ordering::AcqRel,
             Ordering::Acquire,
         );
-        clear_approval_card(&self.store);
+        clear_approval_card(&self.runtime.store);
 
         match outcome {
             ApprovalWaitOutcome::Approved if cancel.load(Ordering::Acquire) => {
@@ -843,16 +864,22 @@ impl ToolHost for DesktopToolHost {
         cancel: &AtomicBool,
     ) -> Result<ToolOutput, String> {
         let namespace = cutlass_ai::namespace(name);
-        if matches!(namespace, "app" | "project" | "system") {
+        if matches!(namespace, "app" | "project" | "system") || name == "job_cancel" {
             // Set this before dispatch: an error can still follow a partial
             // host-side effect, so abort messaging must be conservative.
             self.ordinary_host_call_attempted = true;
         }
         match namespace {
-            "app" => crate::agent_app_control::call(self.app.clone(), name, arguments, cancel),
-            "system" => {
-                crate::agent_system::call(self.cache_registry.as_ref(), name, arguments, cancel)
+            "app" => {
+                crate::agent_app_control::call(self.runtime.app.clone(), name, arguments, cancel)
             }
+            "job" => crate::agent_jobs::call(&self.runtime.job_manager, name, arguments, cancel),
+            "system" => crate::agent_system::call(
+                self.runtime.cache_registry.as_ref(),
+                name,
+                arguments,
+                cancel,
+            ),
             other => Err(format!("unsupported desktop tool namespace '{other}'")),
         }
     }
@@ -915,11 +942,7 @@ fn agent_main(
     pending_approval_id: Arc<AtomicU64>,
     approval_id_allocator: Arc<AtomicU64>,
 ) {
-    let AgentRuntimeHandles {
-        store,
-        app,
-        cache_registry,
-    } = runtime;
+    let store = runtime.store.clone();
     let mut sandbox: Option<Engine> = None;
     let mut senses = AgentSenses::new();
     let mut preview = Preview::default();
@@ -982,9 +1005,7 @@ fn agent_main(
 
                 run_one_prompt(
                     &worker,
-                    &store,
-                    &app,
-                    &cache_registry,
+                    &runtime,
                     &mut sandbox,
                     &mut senses,
                     &mut preview,
@@ -1056,9 +1077,7 @@ fn agent_main(
 #[allow(clippy::too_many_arguments)]
 fn run_one_prompt(
     worker: &WorkerHandle,
-    store: &slint::Weak<AgentStore<'static>>,
-    app: &slint::Weak<AppWindow>,
-    cache_registry: &CacheRegistry,
+    runtime: &AgentRuntimeHandles,
     sandbox: &mut Option<Engine>,
     senses: &mut AgentSenses,
     preview: &mut Preview,
@@ -1072,6 +1091,7 @@ fn run_one_prompt(
     pending_approval_id: &Arc<AtomicU64>,
     approval_id_allocator: &Arc<AtomicU64>,
 ) {
+    let store = &runtime.store;
     let config_path = cutlass_settings::default_config_path();
     let section = match cutlass_settings::load(&config_path) {
         Ok(settings) => settings.ai,
@@ -1192,9 +1212,7 @@ fn run_one_prompt(
     };
     let mut tool_host = DesktopToolHost::new(
         section.autonomy,
-        store.clone(),
-        app.clone(),
-        Some(cache_registry.clone()),
+        DesktopToolHandles::from(runtime),
         approval_rx.clone(),
         pending_approval_id.clone(),
         approval_id_allocator.clone(),
@@ -1386,6 +1404,15 @@ mod tests {
         ApprovalDecision { request_id, choice }
     }
 
+    fn test_tool_handles(job_manager: JobManager) -> DesktopToolHandles {
+        DesktopToolHandles {
+            store: slint::Weak::default(),
+            app: slint::Weak::default(),
+            cache_registry: None,
+            job_manager,
+        }
+    }
+
     #[test]
     fn ask_approval_accepts_the_matching_run_decision() {
         let (tx, rx) = unbounded();
@@ -1501,9 +1528,7 @@ mod tests {
         let allocator = Arc::new(AtomicU64::new(0));
         let mut host = DesktopToolHost::new(
             Autonomy::Full,
-            slint::Weak::default(),
-            slint::Weak::default(),
-            None,
+            test_tool_handles(JobManager::new()),
             rx,
             pending.clone(),
             allocator.clone(),
@@ -1556,9 +1581,7 @@ mod tests {
         let allocator = Arc::new(AtomicU64::new(0));
         let mut host = DesktopToolHost::new(
             Autonomy::Ask,
-            slint::Weak::default(),
-            slint::Weak::default(),
-            None,
+            test_tool_handles(JobManager::new()),
             rx,
             pending.clone(),
             allocator.clone(),
@@ -1582,19 +1605,17 @@ mod tests {
     }
 
     #[test]
-    fn desktop_host_registers_app_controls_and_system_handoffs_by_tier() {
+    fn desktop_host_registers_app_job_and_system_tools_by_tier() {
         let (_tx, rx) = unbounded();
         let host = DesktopToolHost::new(
             Autonomy::Ask,
-            slint::Weak::default(),
-            slint::Weak::default(),
-            None,
+            test_tool_handles(JobManager::new()),
             rx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
         let specs = host.tools();
-        assert_eq!(specs.len(), 17);
+        assert_eq!(specs.len(), 20);
         assert_eq!(
             specs
                 .iter()
@@ -1608,6 +1629,18 @@ mod tests {
                 .find(|spec| spec.name == "app_close")
                 .map(|spec| spec.tier),
             Some(ToolTier::System)
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.name.starts_with("job_"))
+                .map(|spec| (spec.name.as_str(), spec.tier))
+                .collect::<Vec<_>>(),
+            vec![
+                ("job_list", ToolTier::ReadOnly),
+                ("job_status", ToolTier::ReadOnly),
+                ("job_cancel", ToolTier::Workspace),
+            ]
         );
         assert!(
             specs
@@ -1633,13 +1666,47 @@ mod tests {
     }
 
     #[test]
-    fn desktop_host_tracks_attempts_before_dispatch_without_ui() {
+    fn desktop_host_dispatches_jobs_and_tracks_cancel_but_not_reads() {
+        let (_tx, rx) = unbounded();
+        let jobs = JobManager::new();
+        let mut host = DesktopToolHost::new(
+            Autonomy::Full,
+            test_tool_handles(jobs),
+            rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let cancel = AtomicBool::new(false);
+
+        assert!(!host.ordinary_host_call_attempted());
+        let list = host
+            .call("job_list", &serde_json::json!({}), &cancel)
+            .expect("job namespace must dispatch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&list.text).unwrap()["status"],
+            "ok"
+        );
+        assert!(!host.ordinary_host_call_attempted());
+
+        let status_error = host
+            .call("job_status", &serde_json::json!({ "job_id": 1 }), &cancel)
+            .expect_err("unknown job status");
+        assert!(status_error.contains("unknown or has been pruned"));
+        assert!(!host.ordinary_host_call_attempted());
+
+        let cancel_error = host
+            .call("job_cancel", &serde_json::json!({ "job_id": 1 }), &cancel)
+            .expect_err("unknown job cancellation");
+        assert!(cancel_error.contains("unknown or has been pruned"));
+        assert!(host.ordinary_host_call_attempted());
+    }
+
+    #[test]
+    fn desktop_host_tracks_unknown_effect_namespaces_before_dispatch() {
         let (_tx, rx) = unbounded();
         let mut host = DesktopToolHost::new(
             Autonomy::Full,
-            slint::Weak::default(),
-            slint::Weak::default(),
-            None,
+            test_tool_handles(JobManager::new()),
             rx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),

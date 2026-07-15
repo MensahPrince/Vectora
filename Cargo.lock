@@ -1416,6 +1416,7 @@ dependencies = [
  "cutlass-decoder",
  "cutlass-encoder",
  "cutlass-engine",
+ "cutlass-jobs",
  "cutlass-models",
  "cutlass-render",
  "cutlass-settings",

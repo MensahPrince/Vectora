@@ -1,6 +1,7 @@
 mod account;
 mod agent;
 mod agent_app_control;
+mod agent_jobs;
 mod agent_senses;
 mod agent_session;
 mod agent_system;
@@ -800,6 +801,7 @@ fn main() -> Result<(), slint::PlatformError> {
     // AI assistant: a dedicated worker rehearses each prompt on a sandbox
     // engine, then replays the validated plan through the preview worker as
     // one undoable group.
+    let job_manager = cutlass_jobs::JobManager::new();
     let agent_store = app.global::<AgentStore>();
     agent_store.set_transcript(ModelRc::new(VecModel::<AgentEntry>::default()));
     agent_store.set_configured(app_settings.ai.is_configured());
@@ -1130,6 +1132,7 @@ fn main() -> Result<(), slint::PlatformError> {
         agent_store.as_weak(),
         app.as_weak(),
         cache_registry.clone(),
+        job_manager.clone(),
     )
     .map_err(slint::PlatformError::from)?;
 
