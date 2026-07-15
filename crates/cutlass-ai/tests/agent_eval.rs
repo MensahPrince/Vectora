@@ -16,7 +16,9 @@ use cutlass_ai::tools::{HostToolSpec, NullToolHost, ToolHost, ToolOutput, ToolTi
 use cutlass_ai::{EditorContext, ProjectSummary, WireCommand, summarize, validate};
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
-use cutlass_models::{MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind};
+use cutlass_models::{
+    Generator, LinkId, MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind,
+};
 
 const R24: Rational = Rational::FPS_24;
 
@@ -285,6 +287,83 @@ fn cut_the_first_three_seconds() {
         }
         other => panic!("expected system message, got {other:?}"),
     }
+}
+
+#[test]
+fn unlink_one_member_commits_the_complete_group_as_one_phase() {
+    let mut project = Project::new("eval-unlink", R24);
+    let track = project.add_track(TrackKind::Sticker, "Overlays");
+    let clips = [
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                TimeRange::at_rate(0, 24, R24),
+            )
+            .unwrap(),
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
+                TimeRange::at_rate(24, 24, R24),
+            )
+            .unwrap(),
+    ];
+    let link = LinkId::next();
+    for clip in clips {
+        project.timeline_mut().clip_mut(clip).unwrap().link = Some(link);
+    }
+    let mut host = EngineHost::new(project);
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "unlink_clips",
+            serde_json::json!({ "clips": [clips[1].raw()] }),
+        )]),
+        tool_turn(vec![("call_2", "commit_progress", serde_json::json!({}))]),
+        text_turn("Unlinked the selected group."),
+    ]);
+
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &EditorContext {
+            selected_clips: vec![clips[1].raw()],
+            ..Default::default()
+        },
+        "unlink the selected clip group and commit",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 1);
+    assert_eq!(outcome.phase_breaks, vec![1]);
+    assert_eq!(
+        outcome.actions[0].command,
+        WireCommand::UnlinkClips(cutlass_ai::wire::UnlinkClips {
+            clips: vec![clips[1].raw()]
+        })
+    );
+    assert_eq!(
+        outcome.actions[0].description,
+        format!(
+            "unlinked complete groups touched by clips {}",
+            clips[1].raw()
+        )
+    );
+    for clip in clips {
+        assert_eq!(host.engine.project().clip(clip).unwrap().link, None);
+    }
+
+    assert!(host.engine.undo(), "the committed phase is one undo step");
+    for clip in clips {
+        assert_eq!(host.engine.project().clip(clip).unwrap().link, Some(link));
+    }
+    assert!(!host.engine.undo(), "the fixture itself created no history");
 }
 
 #[test]

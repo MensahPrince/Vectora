@@ -1187,6 +1187,14 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        WireCommand::UnlinkClips(a) => format!(
+            "unlinked complete groups touched by clips {}",
+            a.clips
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         WireCommand::AddMarker(a) => {
             let name = match &a.name {
                 Some(name) if !name.is_empty() => format!(" '{name}'"),

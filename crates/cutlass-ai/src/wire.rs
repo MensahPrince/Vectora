@@ -41,7 +41,13 @@ use serde::{Deserialize, Serialize};
 ///     tool descriptions drop the "linked audio companion" steering.
 /// 20: look tools (mask/chroma/stabilize/filter/adjust/animation/audio_role);
 ///     removed unsupported `duck` and `detect_beats`.
-pub const TOOL_SCHEMA_VERSION: u32 = 21;
+/// 21: prompt extensions add the read-only `read_skill` tool.
+/// 22: complete-group unlinking (`unlink_clips`) and bounded link-group lists.
+pub const TOOL_SCHEMA_VERSION: u32 = 22;
+
+/// Model-facing clip lists stay small enough for deterministic validation and
+/// useful rejection messages while covering realistic linked groups.
+pub(crate) const MAX_MULTI_CLIP_REFS: usize = 64;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -691,6 +697,18 @@ pub struct RippleInsert {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LinkClips {
     /// Ids of the clips to link (at least two).
+    #[schemars(length(min = 2, max = MAX_MULTI_CLIP_REFS))]
+    pub clips: Vec<u64>,
+}
+
+/// Dissolve every link group touched by one or more clips. Naming any member
+/// clears the complete group; distinct members of the same group are harmless
+/// and coalesced by the engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UnlinkClips {
+    /// Ids of linked clips whose complete groups should be dissolved. List
+    /// each clip id once; callers do not need to enumerate every group member.
+    #[schemars(length(min = 1, max = MAX_MULTI_CLIP_REFS))]
     pub clips: Vec<u64>,
 }
 
@@ -843,6 +861,7 @@ pub enum WireCommand {
     ShiftClips(ShiftClips),
     RippleInsert(RippleInsert),
     LinkClips(LinkClips),
+    UnlinkClips(UnlinkClips),
     AddMarker(AddMarker),
     RemoveMarker(RemoveMarker),
     SetMarker(SetMarker),
@@ -922,6 +941,7 @@ impl WireCommand {
             WireCommand::ShiftClips(a) => track(&mut a.track),
             WireCommand::RippleInsert(a) => track(&mut a.track),
             WireCommand::LinkClips(a) => a.clips.iter_mut().for_each(clip),
+            WireCommand::UnlinkClips(a) => a.clips.iter_mut().for_each(clip),
             WireCommand::AddMarker(_) => {}
             WireCommand::RemoveMarker(a) => marker(&mut a.marker),
             WireCommand::SetMarker(a) => marker(&mut a.marker),
@@ -1110,6 +1130,8 @@ tools! {
         "Insert a trimmed range of media at a timeline position, shifting later clips right to make room. Times are in seconds.";
     "link_clips" => LinkClips(LinkClips),
         "Link two or more clips so they select, move, and trim together (replaces their previous links).";
+    "unlink_clips" => UnlinkClips(UnlinkClips),
+        "Dissolve every link group touched by one or more clip ids. Naming any member clears the complete group; distinct members of the same group are coalesced.";
     "add_marker" => AddMarker(AddMarker),
         "Drop a named, colored marker on the timeline ruler at a position in seconds. Omit color to cycle the palette.";
     "remove_marker" => RemoveMarker(RemoveMarker),
@@ -1248,6 +1270,17 @@ mod tests {
             })
         );
 
+        let mut unlink = WireCommand::UnlinkClips(UnlinkClips {
+            clips: vec![11, 10],
+        });
+        unlink.remap_ids(&clip_map, &track_map, &marker_map);
+        assert_eq!(
+            unlink,
+            WireCommand::UnlinkClips(UnlinkClips {
+                clips: vec![11, 99],
+            })
+        );
+
         // Marker references follow the marker map (sandbox add_marker ids
         // land on the live engine's ids during plan replay).
         let mut set = WireCommand::SetMarker(SetMarker {
@@ -1271,7 +1304,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 43);
+        assert_eq!(specs.len(), 44);
         for spec in &specs {
             assert!(
                 !spec.description.is_empty(),
@@ -1285,5 +1318,20 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn unlink_schema_is_a_bounded_nonempty_clip_list() {
+        let specs = tool_specs();
+        let unlink = specs
+            .iter()
+            .find(|spec| spec.name == "unlink_clips")
+            .expect("unlink_clips tool");
+        let clips = &unlink.parameters["properties"]["clips"];
+        assert_eq!(clips["type"], "array");
+        assert_eq!(clips["minItems"], 1);
+        assert_eq!(clips["maxItems"], MAX_MULTI_CLIP_REFS);
+        assert_eq!(clips["items"]["type"], "integer");
+        assert_eq!(unlink.parameters["required"], serde_json::json!(["clips"]));
     }
 }

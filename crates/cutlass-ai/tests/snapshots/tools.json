@@ -1678,6 +1678,8 @@
               "minimum": 0,
               "type": "integer"
             },
+            "maxItems": 64,
+            "minItems": 2,
             "type": "array"
           }
         },
@@ -1685,6 +1687,32 @@
           "clips"
         ],
         "title": "LinkClips",
+        "type": "object"
+      }
+    },
+    {
+      "description": "Dissolve every link group touched by one or more clip ids. Naming any member clears the complete group; distinct members of the same group are coalesced.",
+      "name": "unlink_clips",
+      "parameters": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "description": "Dissolve every link group touched by one or more clips. Naming any member\nclears the complete group; distinct members of the same group are harmless\nand coalesced by the engine.",
+        "properties": {
+          "clips": {
+            "description": "Ids of linked clips whose complete groups should be dissolved. List\neach clip id once; callers do not need to enumerate every group member.",
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 64,
+            "minItems": 1,
+            "type": "array"
+          }
+        },
+        "required": [
+          "clips"
+        ],
+        "title": "UnlinkClips",
         "type": "object"
       }
     },
@@ -1888,5 +1916,5 @@
       }
     }
   ],
-  "version": 21
+  "version": 22
 }

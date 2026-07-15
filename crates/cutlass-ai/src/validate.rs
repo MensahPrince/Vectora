@@ -8,6 +8,8 @@
 //! engine remains the authority (overlaps, source bounds, rate math) and
 //! re-validates everything on apply.
 
+use std::collections::HashSet;
+
 use cutlass_commands::{Command, EditCommand};
 use cutlass_models::{
     AnimationRef, AnimationSlot, AudioRole, CanvasAspect, ChromaKey, Clip, ClipId, ClipParam,
@@ -17,9 +19,9 @@ use cutlass_models::{
 };
 
 use crate::wire::{
-    WireAnimationSlot, WireAudioRole, WireCanvasAspect, WireChromaKey, WireClipParam, WireCommand,
-    WireEasing, WireGenerator, WireMarkerColor, WireMask, WireMaskKind, WireShape,
-    WireStabilizeLevel, WireTrackKind,
+    MAX_MULTI_CLIP_REFS, WireAnimationSlot, WireAudioRole, WireCanvasAspect, WireChromaKey,
+    WireClipParam, WireCommand, WireEasing, WireGenerator, WireMarkerColor, WireMask, WireMaskKind,
+    WireShape, WireStabilizeLevel, WireTrackKind,
 };
 
 /// A wire command the project as it stands cannot accept. The message is
@@ -766,11 +768,52 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                     "link_clips needs at least two clip ids".to_string(),
                 ));
             }
+            if args.clips.len() > MAX_MULTI_CLIP_REFS {
+                return Err(Rejection::new(format!(
+                    "link_clips accepts at most {MAX_MULTI_CLIP_REFS} clip ids (got {})",
+                    args.clips.len()
+                )));
+            }
             let mut clips = Vec::with_capacity(args.clips.len());
             for &raw in &args.clips {
                 clips.push(clip_ref(project, raw)?.id);
             }
             EditCommand::LinkClips { clips }
+        }
+        WireCommand::UnlinkClips(args) => {
+            if args.clips.is_empty() {
+                return Err(Rejection::new(
+                    "unlink_clips needs at least one clip id".to_string(),
+                ));
+            }
+            if args.clips.len() > MAX_MULTI_CLIP_REFS {
+                return Err(Rejection::new(format!(
+                    "unlink_clips accepts at most {MAX_MULTI_CLIP_REFS} clip ids (got {})",
+                    args.clips.len()
+                )));
+            }
+            let mut seen = HashSet::with_capacity(args.clips.len());
+            for &raw in &args.clips {
+                if !seen.insert(raw) {
+                    return Err(Rejection::new(format!(
+                        "unlink_clips contains duplicate clip id {raw}; list each clip once"
+                    )));
+                }
+            }
+
+            let mut clips = Vec::with_capacity(args.clips.len());
+            let mut any_linked = false;
+            for &raw in &args.clips {
+                let clip = clip_ref(project, raw)?;
+                any_linked |= clip.link.is_some();
+                clips.push(clip.id);
+            }
+            if !any_linked {
+                return Err(Rejection::new(
+                    "unlink_clips found no linked clips; all referenced clips are already unlinked",
+                ));
+            }
+            EditCommand::UnlinkClips { clips }
         }
         WireCommand::AddMarker(args) => {
             require_non_negative(args.at, "at")?;
@@ -2351,7 +2394,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_rejects_sub_frame_delta_and_link_needs_two() {
+    fn shift_rejects_sub_frame_delta_and_link_lists_are_bounded() {
         let (project, _, video, _, clip, _) = fixture();
         let msg = reject(
             &project,
@@ -2368,6 +2411,96 @@ mod tests {
             WireCommand::LinkClips(wire::LinkClips { clips: vec![clip] }),
         );
         assert!(msg.contains("at least two"), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::LinkClips(wire::LinkClips {
+                clips: vec![clip; MAX_MULTI_CLIP_REFS + 1],
+            }),
+        );
+        assert!(msg.contains("at most 64"), "{msg}");
+    }
+
+    #[test]
+    fn unlink_one_member_lowers_to_the_complete_group_command() {
+        let (mut project, _, _, _, clip, title) = fixture();
+        let link = cutlass_models::LinkId::next();
+        for id in [clip, title] {
+            project
+                .timeline_mut()
+                .clip_mut(ClipId::from_raw(id))
+                .unwrap()
+                .link = Some(link);
+        }
+
+        let edit = lower(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips { clips: vec![title] }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::UnlinkClips {
+                clips: vec![ClipId::from_raw(title)]
+            }
+        );
+        assert_eq!(
+            project.clip(ClipId::from_raw(clip)).unwrap().link,
+            Some(link)
+        );
+        assert_eq!(
+            project.clip(ClipId::from_raw(title)).unwrap().link,
+            Some(link)
+        );
+    }
+
+    #[test]
+    fn unlink_rejects_invalid_lists_before_mutation() {
+        let (project, _, _, _, clip, title) = fixture();
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips { clips: vec![] }),
+        );
+        assert!(msg.contains("at least one"), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips {
+                clips: vec![clip, clip],
+            }),
+        );
+        assert!(msg.contains("duplicate clip id"), "{msg}");
+        assert!(msg.contains(&clip.to_string()), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips {
+                clips: vec![clip, 999],
+            }),
+        );
+        assert!(msg.contains("clip 999 does not exist"), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips {
+                clips: vec![clip, title],
+            }),
+        );
+        assert!(
+            msg.contains("all referenced clips are already unlinked"),
+            "{msg}"
+        );
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips {
+                clips: vec![clip; MAX_MULTI_CLIP_REFS + 1],
+            }),
+        );
+        assert!(msg.contains("at most 64"), "{msg}");
+
+        assert_eq!(project.clip(ClipId::from_raw(clip)).unwrap().link, None);
+        assert_eq!(project.clip(ClipId::from_raw(title)).unwrap().link, None);
     }
 
     #[test]

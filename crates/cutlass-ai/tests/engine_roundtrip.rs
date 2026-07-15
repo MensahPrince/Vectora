@@ -8,7 +8,7 @@ use cutlass_ai::wire::{self, WireCommand, WireGenerator};
 use cutlass_ai::{summarize, validate};
 use cutlass_commands::{Command, EditOutcome};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
-use cutlass_models::{MediaSource, Project, Rational};
+use cutlass_models::{Generator, LinkId, MediaSource, Project, Rational, TimeRange, TrackKind};
 
 const R24: Rational = Rational::FPS_24;
 
@@ -193,6 +193,71 @@ fn prompt_sized_scenario_round_trips_and_unwinds() {
     assert_eq!(undone, 10);
     assert_eq!(engine.project().timeline().track_count(), 0);
     assert_eq!(engine.project().timeline().clip_count(), 0);
+}
+
+#[test]
+fn unlink_one_member_dissolves_complete_group_and_undoes_once() {
+    let mut project = Project::new("agent-unlink", R24);
+    let track = project.add_track(TrackKind::Sticker, "Overlays");
+    let clips = [
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [255, 0, 0, 255],
+                },
+                TimeRange::at_rate(0, 24, R24),
+            )
+            .unwrap(),
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 255, 0, 255],
+                },
+                TimeRange::at_rate(24, 24, R24),
+            )
+            .unwrap(),
+        project
+            .add_generated(
+                track,
+                Generator::SolidColor {
+                    rgba: [0, 0, 255, 255],
+                },
+                TimeRange::at_rate(48, 24, R24),
+            )
+            .unwrap(),
+    ];
+    let link = LinkId::next();
+    for clip in clips {
+        project.timeline_mut().clip_mut(clip).unwrap().link = Some(link);
+    }
+    let mut engine = engine_with(project);
+
+    let outcome = apply(
+        &mut engine,
+        WireCommand::UnlinkClips(wire::UnlinkClips {
+            clips: vec![clips[1].raw()],
+        }),
+    );
+    assert!(matches!(
+        outcome,
+        ApplyOutcome::Edited(EditOutcome::Updated(id)) if id == clips[1]
+    ));
+    for clip in clips {
+        assert_eq!(engine.project().clip(clip).unwrap().link, None);
+    }
+
+    assert!(engine.undo(), "the unlink is one history step");
+    for clip in clips {
+        assert_eq!(engine.project().clip(clip).unwrap().link, Some(link));
+    }
+    assert!(!engine.undo(), "the fixture itself created no history");
+
+    assert!(engine.redo());
+    for clip in clips {
+        assert_eq!(engine.project().clip(clip).unwrap().link, None);
+    }
 }
 
 #[test]
