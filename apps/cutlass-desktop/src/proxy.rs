@@ -13,11 +13,11 @@
 //!   between frames while the user scrubs or plays ([`InteractionGate`]):
 //!   proxy decode + composite must never compete with the preview for the
 //!   decode engine or the GPU.
-//! * Output lands in `<os-data>/Cutlass/proxies/<key>.mp4`, keyed by the
-//!   source's path, size, and mtime — a moved or re-encoded source gets a
-//!   fresh proxy while a re-import reuses the existing file instantly.
-//!   Encodes write a `.part.mp4` sibling and rename on success, so a crash
-//!   can't leave a truncated proxy that a later session would trust.
+//! * Output lands in the configured proxies cache, keyed by the source's
+//!   path, size, and mtime — a moved or re-encoded source gets a fresh proxy
+//!   while a re-import reuses the existing file instantly. Encodes write a
+//!   `.part.mp4` sibling and rename on success, so a crash can't leave a
+//!   truncated proxy that a later session would trust.
 //! * Availability (freshly encoded or found on disk) is reported through
 //!   `on_ready` with the source path the job was keyed to; the preview
 //!   worker validates that the pool entry still names that source before
@@ -37,6 +37,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Sender, unbounded};
 use cutlass_models::{MediaSource, Project, RationalTime, TimeRange, TrackKind};
 use cutlass_render::{ExportSettings, Renderer};
+use cutlass_storage::{CacheId, SharedStorageLayout, StorageLayoutLease};
 use tracing::{error, info};
 
 use crate::interaction::InteractionGate;
@@ -90,15 +91,14 @@ impl ProxyHandle {
 /// every [`ProxyHandle`] is dropped (after finishing the job in flight).
 pub fn spawn(
     gate: Arc<InteractionGate>,
+    storage_layout: SharedStorageLayout,
     on_ready: impl Fn(u64, PathBuf, PathBuf) + Send + 'static,
 ) -> Result<ProxyHandle, String> {
     let (tx, rx) = unbounded::<ProxyMsg>();
     std::thread::Builder::new()
         .name("cutlass-proxy".into())
         .spawn(move || {
-            // A crash mid-encode leaves a `.part.mp4` behind; sweep the
-            // stragglers once per session so they can't accumulate.
-            sweep_partials();
+            let mut swept_generation = None;
             while let Ok(ProxyMsg::Request {
                 media_id,
                 path,
@@ -109,15 +109,35 @@ pub fn spawn(
                 if width.max(height) <= SOURCE_LONG_SIDE_MAX {
                     continue;
                 }
+                // One lease pins the root for the complete job. A settings
+                // transition waits for sweep, lookup, encode, and callback
+                // completion; the frame loop never reads the layout lock.
+                let layout_lease = storage_layout.lease();
+                let proxy_root = match proxy_job_root(&layout_lease) {
+                    Ok(root) => root,
+                    Err(message) => {
+                        error!(media_id, "{message}");
+                        continue;
+                    }
+                };
+                let generation = layout_lease.generation();
+                // A crash mid-encode leaves a `.part.mp4` behind. Sweep once
+                // for every generation we actually use, including a root
+                // selected by a live settings update.
+                if swept_generation != Some(generation) {
+                    sweep_partials(&proxy_root);
+                    swept_generation = Some(generation);
+                }
                 // Keyed by (path, size, mtime); `None` means the source
                 // can't be stat'ed (vanished since import) — nothing to do,
                 // a relink will re-request.
-                let Some(out) = proxy_output_path(&path) else {
+                let Some(out) = proxy_output_path(&proxy_root, &path) else {
                     continue;
                 };
                 if out.exists() {
                     info!(media_id, proxy = %out.display(), "proxy already on disk");
                     on_ready(media_id, path, out);
+                    drop(layout_lease);
                     continue;
                 }
                 info!(
@@ -143,6 +163,7 @@ pub fn spawn(
                         error!(media_id, src = %path.display(), "proxy generation failed: {e}")
                     }
                 }
+                drop(layout_lease);
             }
         })
         .map_err(|e| e.to_string())?;
@@ -237,9 +258,8 @@ fn generate(src: &Path, out: &Path, gate: &InteractionGate) -> Result<u64, Strin
 /// Delete `.part.mp4` leftovers from encodes a previous session never
 /// finished. Best-effort: a missing proxies dir (first run) is normal, and
 /// a locked file just stays until the next sweep.
-fn sweep_partials() {
-    let dir = crate::paths::data_dir().join("proxies");
-    let Ok(entries) = std::fs::read_dir(dir) else {
+fn sweep_partials(proxy_root: &Path) {
+    let Ok(entries) = std::fs::read_dir(proxy_root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -262,24 +282,27 @@ fn proxy_size(w: u32, h: u32) -> (u32, u32) {
     (side(w), side(h))
 }
 
-/// `<os-data>/Cutlass/proxies/<key>.mp4` for the source at `path`, keyed by
-/// its path, size, and mtime — any change to the source re-keys (and thus
-/// regenerates) its proxy. `None` when the source can't be stat'ed.
-fn proxy_output_path(path: &Path) -> Option<PathBuf> {
-    let meta = std::fs::metadata(path).ok()?;
+/// `<proxy cache root>/<key>.mp4` for `source`, keyed by its path, size, and
+/// mtime — any change to the source re-keys (and thus regenerates) its proxy.
+/// `None` when the source can't be stat'ed.
+fn proxy_output_path(proxy_root: &Path, source: &Path) -> Option<PathBuf> {
+    let meta = std::fs::metadata(source).ok()?;
     let mtime_ns = meta
         .modified()
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_nanos() as u64);
-    let mut key = fnv1a(FNV_OFFSET, path.to_string_lossy().as_bytes());
+    let mut key = fnv1a(FNV_OFFSET, source.to_string_lossy().as_bytes());
     key = fnv1a(key, &meta.len().to_le_bytes());
     key = fnv1a(key, &mtime_ns.to_le_bytes());
-    Some(
-        crate::paths::data_dir()
-            .join("proxies")
-            .join(format!("{key:016x}.mp4")),
-    )
+    Some(proxy_root.join(format!("{key:016x}.mp4")))
+}
+
+/// Resolve the proxy root from the lease held for the complete job.
+fn proxy_job_root(lease: &StorageLayoutLease<'_>) -> Result<PathBuf, &'static str> {
+    lease
+        .resolve(CacheId::Proxies)
+        .ok_or("proxy cache has no disk path")
 }
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -382,11 +405,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let a = dir.path().join("a.mp4");
         let b = dir.path().join("b.mp4");
+        let proxy_root = dir.path().join("proxies");
         std::fs::write(&a, b"aaaa").unwrap();
         std::fs::write(&b, b"aaaa").unwrap();
+        assert_eq!(
+            proxy_output_path(&proxy_root, &a)
+                .expect("stat succeeds")
+                .parent(),
+            Some(proxy_root.as_path())
+        );
 
         let name = |p: &Path| {
-            proxy_output_path(p)
+            proxy_output_path(&proxy_root, p)
                 .expect("stat succeeds")
                 .file_name()
                 .expect("proxy paths end in a file name")
@@ -402,6 +432,32 @@ mod tests {
         assert_ne!(before, name(&a));
 
         // Missing sources produce no key at all.
-        assert!(proxy_output_path(&dir.path().join("gone.mp4")).is_none());
+        assert!(proxy_output_path(&proxy_root, &dir.path().join("gone.mp4")).is_none());
+    }
+
+    #[test]
+    fn proxy_jobs_use_one_override_then_pick_up_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("proxy-a");
+        let second_root = dir.path().join("proxy-b");
+
+        let mut first = cutlass_storage::StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first.set_override(CacheId::Proxies, &first_root).unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_lease = layout.lease();
+        let first_generation = first_lease.generation();
+        assert_eq!(first_generation, 0);
+        assert_eq!(proxy_job_root(&first_lease).unwrap(), first_root);
+
+        let mut second = cutlass_storage::StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second.set_override(CacheId::Proxies, &second_root).unwrap();
+        // Replacing while the read lease is live would correctly wait.
+        drop(first_lease);
+        assert_eq!(layout.replace(first_generation, second).unwrap(), 1);
+
+        let second_lease = layout.lease();
+        assert_eq!(second_lease.generation(), 1);
+        assert_eq!(proxy_job_root(&second_lease).unwrap(), second_root);
     }
 }

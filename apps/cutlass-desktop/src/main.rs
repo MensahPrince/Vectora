@@ -791,22 +791,22 @@ fn main() -> Result<(), slint::PlatformError> {
     let proxy_ready_slot: std::sync::Arc<std::sync::Mutex<Option<preview_worker::WorkerHandle>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let ready_slot = proxy_ready_slot.clone();
-    let proxy_handle =
-        proxy::spawn(
-            interaction_gate.clone(),
-            move |media_id, source, proxy| match ready_slot
-                .lock()
-                .expect("proxy slot poisoned")
-                .as_ref()
-            {
-                Some(handle) => handle.proxy_ready(media_id, source, proxy),
-                None => tracing::error!(
-                    media_id,
-                    "proxy finished before the preview worker wired up"
-                ),
-            },
-        )
-        .map_err(slint::PlatformError::Other)?;
+    let proxy_handle = proxy::spawn(
+        interaction_gate.clone(),
+        storage_layout.clone(),
+        move |media_id, source, proxy| match ready_slot
+            .lock()
+            .expect("proxy slot poisoned")
+            .as_ref()
+        {
+            Some(handle) => handle.proxy_ready(media_id, source, proxy),
+            None => tracing::error!(
+                media_id,
+                "proxy finished before the preview worker wired up"
+            ),
+        },
+    )
+    .map_err(slint::PlatformError::Other)?;
 
     // The worker thread owns the Engine (decoders aren't Send); the UI talks
     // to it through a message queue and it answers with projection publishes
@@ -831,7 +831,8 @@ fn main() -> Result<(), slint::PlatformError> {
         "engine session ready"
     );
 
-    let download_root = storage_layout
+    let download_layout_lease = storage_layout.lease();
+    let download_root = download_layout_lease
         .resolve(cutlass_storage::CacheId::Download)
         .ok_or_else(|| slint::PlatformError::from("download cache has no disk path"))?;
     let download_cache = std::sync::Arc::new(cutlass_cloud::cache::DownloadCache::new(
@@ -861,10 +862,11 @@ fn main() -> Result<(), slint::PlatformError> {
             "download cache maintenance remains blocked because project inventory was incomplete"
         );
     }
+    drop(download_layout_lease);
     // Keep this owner in main for the upcoming Settings wiring; the agent
     // receives a clone of the same registry and operation gate.
     let cache_registry = cache_registry::CacheRegistry::new(
-        storage_layout,
+        storage_layout.clone(),
         app.as_weak(),
         preview_worker.handle(),
         std::sync::Arc::clone(&download_cache),
@@ -878,6 +880,7 @@ fn main() -> Result<(), slint::PlatformError> {
         app.as_weak(),
         preview_worker.handle(),
         std::sync::Arc::clone(&download_cache),
+        storage_layout.clone(),
     )
     .map_err(slint::PlatformError::Other)?;
     {
@@ -912,6 +915,7 @@ fn main() -> Result<(), slint::PlatformError> {
         app.as_weak(),
         preview_worker.handle(),
         std::sync::Arc::clone(&download_cache),
+        storage_layout.clone(),
     )
     .map_err(slint::PlatformError::Other)?;
     {
@@ -978,9 +982,12 @@ fn main() -> Result<(), slint::PlatformError> {
     // generated-drop resolver below.
     let text_preset_registry: text_presets::PresetRegistry =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let text_presets_worker =
-        text_presets::TextPresetsWorker::spawn(app.as_weak(), text_preset_registry.clone())
-            .map_err(slint::PlatformError::Other)?;
+    let text_presets_worker = text_presets::TextPresetsWorker::spawn(
+        app.as_weak(),
+        text_preset_registry.clone(),
+        storage_layout.clone(),
+    )
+    .map_err(slint::PlatformError::Other)?;
     {
         let refresh_handle = text_presets_worker.handle();
         app.global::<TextPresetsBackend>()
@@ -992,9 +999,12 @@ fn main() -> Result<(), slint::PlatformError> {
     // (src/lottie_stickers.rs); the registry feeds the drop resolver below.
     let lottie_registry: lottie_stickers::LottieRegistry =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let lottie_worker =
-        lottie_stickers::LottieWorker::spawn(app.as_weak(), lottie_registry.clone())
-            .map_err(slint::PlatformError::Other)?;
+    let lottie_worker = lottie_stickers::LottieWorker::spawn(
+        app.as_weak(),
+        lottie_registry.clone(),
+        storage_layout.clone(),
+    )
+    .map_err(slint::PlatformError::Other)?;
     {
         let refresh_handle = lottie_worker.handle();
         app.global::<LottieBackend>()
@@ -1007,6 +1017,7 @@ fn main() -> Result<(), slint::PlatformError> {
         app.as_weak(),
         preview_worker.handle(),
         std::sync::Arc::clone(&download_cache),
+        storage_layout.clone(),
     )
     .map_err(slint::PlatformError::Other)?;
     {
@@ -1025,8 +1036,9 @@ fn main() -> Result<(), slint::PlatformError> {
     // catalog ids to downloaded files for `set-clip-lut`.
     let lut_registry: lut_catalog::LutRegistry =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let lut_worker = lut_catalog::LutWorker::spawn(app.as_weak(), lut_registry.clone())
-        .map_err(slint::PlatformError::Other)?;
+    let lut_worker =
+        lut_catalog::LutWorker::spawn(app.as_weak(), lut_registry.clone(), storage_layout.clone())
+            .map_err(slint::PlatformError::Other)?;
     {
         let refresh_handle = lut_worker.handle();
         app.global::<InspectorBackend>()

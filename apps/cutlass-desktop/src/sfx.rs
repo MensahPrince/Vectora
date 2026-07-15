@@ -15,10 +15,10 @@ use crossbeam_channel::{Sender, unbounded};
 use cutlass_cloud::cache::DownloadCache;
 use cutlass_cloud::dto::CatalogEntry;
 use cutlass_cloud::{CloudClient, download};
+use cutlass_storage::{CacheId, SharedStorageLayout, StorageLayoutLease};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tracing::{info, warn};
 
-use crate::paths;
 use crate::preview_worker::WorkerHandle;
 use crate::{SfxBackend, SfxTile};
 
@@ -53,12 +53,13 @@ impl SfxWorker {
         backend_weak: slint::Weak<crate::AppWindow>,
         import_handle: WorkerHandle,
         cache: Arc<DownloadCache>,
+        storage_layout: SharedStorageLayout,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-sfx".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, import_handle, cache);
+                let mut worker = Worker::new(backend_weak, import_handle, cache, storage_layout);
                 while let Ok(command) = rx.recv() {
                     match command {
                         Command::Refresh => worker.refresh(),
@@ -82,8 +83,9 @@ impl SfxWorker {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     import_handle: WorkerHandle,
-    client: CloudClient,
     cache: Arc<DownloadCache>,
+    storage_layout: SharedStorageLayout,
+    base_url: String,
     /// The worker-side mirror of the published tile list.
     entries: Vec<CatalogEntry>,
 }
@@ -93,22 +95,30 @@ impl Worker {
         backend_weak: slint::Weak<crate::AppWindow>,
         import_handle: WorkerHandle,
         cache: Arc<DownloadCache>,
+        storage_layout: SharedStorageLayout,
     ) -> Self {
         Self {
             backend_weak,
             import_handle,
-            client: CloudClient::new(
-                &crate::account::base_url(),
-                Some(paths::data_dir().join("catalog-cache")),
-            ),
             cache,
+            storage_layout,
+            base_url: crate::account::base_url(),
             entries: Vec::new(),
         }
     }
 
     fn refresh(&mut self) {
+        let layout_lease = self.storage_layout.lease();
+        let catalog_root = match catalog_root(&layout_lease) {
+            Ok(root) => root,
+            Err(message) => {
+                self.set_status("error", message);
+                return;
+            }
+        };
         self.set_status("loading", "");
-        let entries = match self.client.sfx() {
+        let client = CloudClient::new(&self.base_url, Some(catalog_root));
+        let entries = match client.sfx() {
             Ok(catalog) => catalog.entries,
             Err(e) => {
                 self.set_status("error", &user_message(&e));
@@ -136,6 +146,7 @@ impl Worker {
             backend.set_status(status.as_str().into());
             backend.set_error("".into());
         });
+        drop(layout_lease);
     }
 
     fn import(&self, index: usize) {
@@ -257,6 +268,12 @@ impl Worker {
     }
 }
 
+fn catalog_root(lease: &StorageLayoutLease<'_>) -> Result<std::path::PathBuf, &'static str> {
+    lease
+        .resolve(CacheId::Catalog)
+        .ok_or("catalog cache has no disk path")
+}
+
 /// Send-safe snapshot of a tile (built worker-side).
 struct TileSeed {
     key: String,
@@ -341,6 +358,7 @@ fn user_message(e: &cutlass_cloud::CloudError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cutlass_storage::StorageLayout;
 
     #[test]
     fn duration_chip_formats_minutes_seconds() {
@@ -377,5 +395,31 @@ mod tests {
         assert_eq!(extension("https://c/x.WAV?dl=1"), "wav");
         assert_eq!(extension("https://c/x.mp3"), "mp3");
         assert_eq!(extension("https://c/x"), "wav");
+    }
+
+    #[test]
+    fn refresh_uses_catalog_override_then_picks_up_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("catalog-a");
+        let second_root = dir.path().join("catalog-b");
+
+        let mut first = StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first.set_override(CacheId::Catalog, &first_root).unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_lease = layout.lease();
+        let first_generation = first_lease.generation();
+        let first_refresh = catalog_root(&first_lease).unwrap();
+        assert_eq!(first_refresh, first_root);
+
+        let mut second = StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second.set_override(CacheId::Catalog, &second_root).unwrap();
+        drop(first_lease);
+        layout.replace(first_generation, second).unwrap();
+
+        assert_eq!(first_refresh, first_root);
+        let second_lease = layout.lease();
+        assert_eq!(second_lease.generation(), first_generation + 1);
+        assert_eq!(catalog_root(&second_lease).unwrap(), second_root);
     }
 }

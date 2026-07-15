@@ -1,7 +1,7 @@
 //! Cloud LUTs: the Rust half of the look inspector's LUT section.
 //!
 //! The worker fetches the anonymous LUT catalog (`/v1/assets/luts`),
-//! downloads the `.cube` files into the app-data asset cache (eager — every
+//! downloads the `.cube` files into the configured LUT cache (eager — every
 //! published entry is immediately applicable offline, and a `.cube` is
 //! ~1 MB), verifies checksums, and fills a shared registry the
 //! `set-clip-lut` callback reads to resolve a catalog id to a local file
@@ -16,10 +16,10 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
 use cutlass_cloud::CloudClient;
+use cutlass_storage::{CacheId, SharedStorageLayout, StorageLayoutLease};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tracing::warn;
 
-use crate::paths;
 use crate::{CatalogEntry, InspectorBackend};
 
 /// Catalog id → downloaded `.cube` path, shared between the fetch worker
@@ -51,12 +51,13 @@ impl LutWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         registry: LutRegistry,
+        storage_layout: SharedStorageLayout,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-luts".into())
             .spawn(move || {
-                let worker = Worker::new(backend_weak, registry);
+                let worker = Worker::new(backend_weak, registry, storage_layout);
                 while let Ok(Command::Refresh) = rx.recv() {
                     worker.refresh();
                 }
@@ -77,24 +78,38 @@ impl LutWorker {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     registry: LutRegistry,
-    client: CloudClient,
+    storage_layout: SharedStorageLayout,
+    base_url: String,
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, registry: LutRegistry) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        registry: LutRegistry,
+        storage_layout: SharedStorageLayout,
+    ) -> Self {
         Self {
             backend_weak,
             registry,
-            client: CloudClient::new(
-                &crate::account::base_url(),
-                Some(paths::data_dir().join("catalog-cache")),
-            ),
+            storage_layout,
+            base_url: crate::account::base_url(),
         }
     }
 
     fn refresh(&self) {
+        // Pin catalog metadata and downloaded LUTs to one generation until
+        // verification and registry/UI publication both finish.
+        let layout_lease = self.storage_layout.lease();
+        let roots = match refresh_roots(&layout_lease) {
+            Ok(roots) => roots,
+            Err(message) => {
+                self.set_status("error", message);
+                return;
+            }
+        };
         self.set_status("loading", "");
-        let entries = match self.client.luts() {
+        let client = CloudClient::new(&self.base_url, Some(roots.catalog));
+        let entries = match client.luts() {
             Ok(catalog) => catalog.entries,
             Err(e) => {
                 self.set_status("error", &user_message(&e));
@@ -104,11 +119,10 @@ impl Worker {
 
         // Download missing (or corrupted) files; failures skip the entry,
         // never the section.
-        let dir = paths::data_dir().join("luts");
         let mut rows: Vec<(String, String)> = Vec::new();
         let mut assets: HashMap<String, PathBuf> = HashMap::new();
         for entry in &entries {
-            let dest = dir.join(format!("{}.cube", entry.id));
+            let dest = roots.luts.join(format!("{}.cube", entry.id));
             let cached_ok = dest.is_file() && checksum_ok(&dest, &entry.checksum_sha256);
             if !cached_ok {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -147,6 +161,7 @@ impl Worker {
             backend.set_lut_status(status.as_str().into());
             backend.set_lut_error("".into());
         });
+        drop(layout_lease);
     }
 
     fn set_status(&self, status: &str, error: &str) {
@@ -168,6 +183,23 @@ impl Worker {
             warn!("LUT UI update failed: {e}");
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RefreshRoots {
+    catalog: PathBuf,
+    luts: PathBuf,
+}
+
+fn refresh_roots(lease: &StorageLayoutLease<'_>) -> Result<RefreshRoots, &'static str> {
+    Ok(RefreshRoots {
+        catalog: lease
+            .resolve(CacheId::Catalog)
+            .ok_or("catalog cache has no disk path")?,
+        luts: lease
+            .resolve(CacheId::Luts)
+            .ok_or("LUT cache has no disk path")?,
+    })
 }
 
 /// True when the file matches the catalog checksum (or the catalog doesn't
@@ -197,5 +229,63 @@ fn user_message(e: &cutlass_cloud::CloudError) -> String {
         }
         CloudError::Protocol(_) => "The LUT catalog sent an unexpected response.".into(),
         CloudError::Io(_) | CloudError::Cancelled => "The catalog fetch was interrupted.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cutlass_storage::StorageLayout;
+
+    #[test]
+    fn refresh_uses_coherent_overrides_then_picks_up_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_catalog = dir.path().join("catalog-a");
+        let first_luts = dir.path().join("luts-a");
+        let second_catalog = dir.path().join("catalog-b");
+        let second_luts = dir.path().join("luts-b");
+
+        let mut first = StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first
+            .set_override(CacheId::Catalog, &first_catalog)
+            .unwrap();
+        first.set_override(CacheId::Luts, &first_luts).unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_lease = layout.lease();
+        let first_generation = first_lease.generation();
+        let first_refresh = refresh_roots(&first_lease).unwrap();
+        assert_eq!(
+            first_refresh,
+            RefreshRoots {
+                catalog: first_catalog.clone(),
+                luts: first_luts.clone(),
+            }
+        );
+
+        let mut second = StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second
+            .set_override(CacheId::Catalog, &second_catalog)
+            .unwrap();
+        second.set_override(CacheId::Luts, &second_luts).unwrap();
+        drop(first_lease);
+        layout.replace(first_generation, second).unwrap();
+
+        assert_eq!(
+            first_refresh,
+            RefreshRoots {
+                catalog: first_catalog,
+                luts: first_luts,
+            }
+        );
+        let second_lease = layout.lease();
+        assert_eq!(second_lease.generation(), first_generation + 1);
+        assert_eq!(
+            refresh_roots(&second_lease).unwrap(),
+            RefreshRoots {
+                catalog: second_catalog,
+                luts: second_luts,
+            }
+        );
     }
 }

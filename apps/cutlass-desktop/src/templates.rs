@@ -4,10 +4,10 @@
 //! image fetches, bundle downloads) — network never touches the UI or
 //! engine threads. The catalog is anonymous and comes from the Cutlass
 //! backend; bundles download **directly from the asset CDN** into the
-//! quota-managed download cache, install into a per-template folder in
-//! the app data dir (`template_bundle::install` rewrites media paths to
-//! absolute — install once, open forever), and fill through the engine's
-//! `ApplyTemplate` after the user picks their media.
+//! quota-managed download cache, install into a per-template folder in the
+//! configured templates cache (`template_bundle::install` rewrites media
+//! paths to absolute — install once, open forever), and fill through the
+//! engine's `ApplyTemplate` after the user picks their media.
 //!
 //! Threading mirrors `cloud.rs`: commands in over a channel, results
 //! hopped to the UI thread with `invoke_from_event_loop`, model rows
@@ -28,10 +28,10 @@ use cutlass_cloud::dto::CatalogEntry;
 use cutlass_cloud::{CloudClient, download};
 use cutlass_commands::TemplatePick;
 use cutlass_models::{PROJECT_SCHEMA_VERSION, template_bundle};
+use cutlass_storage::{CacheId, SharedStorageLayout, StorageLayoutLease};
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use tracing::{info, warn};
 
-use crate::paths;
 use crate::preview_worker::WorkerHandle;
 use crate::{TemplateTile, TemplatesBackend};
 
@@ -66,12 +66,13 @@ impl TemplatesWorker {
         backend_weak: slint::Weak<crate::AppWindow>,
         preview_handle: WorkerHandle,
         cache: Arc<DownloadCache>,
+        storage_layout: SharedStorageLayout,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-templates".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, preview_handle, cache);
+                let mut worker = Worker::new(backend_weak, preview_handle, cache, storage_layout);
                 // Preview fetches interleave with commands: commands take
                 // priority (a queued "use" shouldn't wait for previews),
                 // previews drain in the gaps.
@@ -111,8 +112,9 @@ impl TemplatesWorker {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     preview_handle: WorkerHandle,
-    client: CloudClient,
     cache: Arc<DownloadCache>,
+    storage_layout: SharedStorageLayout,
+    base_url: String,
     /// The worker-side mirror of the published (filtered) tile list.
     entries: Vec<CatalogEntry>,
 }
@@ -122,15 +124,14 @@ impl Worker {
         backend_weak: slint::Weak<crate::AppWindow>,
         preview_handle: WorkerHandle,
         cache: Arc<DownloadCache>,
+        storage_layout: SharedStorageLayout,
     ) -> Self {
         Self {
             backend_weak,
             preview_handle,
-            client: CloudClient::new(
-                &crate::account::base_url(),
-                Some(paths::data_dir().join("catalog-cache")),
-            ),
             cache,
+            storage_layout,
+            base_url: crate::account::base_url(),
             entries: Vec::new(),
         }
     }
@@ -139,8 +140,18 @@ impl Worker {
         match command {
             Command::Refresh { category } => {
                 previews.clear();
+                let layout_lease = self.storage_layout.lease();
+                let catalog_root = match catalog_root(&layout_lease) {
+                    Ok(root) => root,
+                    Err(message) => {
+                        self.entries.clear();
+                        self.set_status("error", message);
+                        return;
+                    }
+                };
                 self.set_status("loading", "");
-                match self.client.templates() {
+                let client = CloudClient::new(&self.base_url, Some(catalog_root));
+                match client.templates() {
                     Ok(catalog) => {
                         self.entries = catalog
                             .entries
@@ -164,6 +175,7 @@ impl Worker {
                         self.set_status("error", &user_message(&e));
                     }
                 }
+                drop(layout_lease);
             }
             Command::Use { index } => self.use_template(index),
         }
@@ -305,8 +317,19 @@ impl Worker {
             return;
         }
 
-        let install_dir = paths::data_dir().join("templates").join(safe_id(&entry.id));
-        let template_path = install_dir.join("template.cutlasst");
+        // Acquire before any DownloadCache lease and keep it through all
+        // pre-picker install/load work. The picker handoff carries no path.
+        let layout_lease = self.storage_layout.lease();
+        let template_id = InstalledTemplateId::from_catalog_id(&entry.id);
+        let (install_dir, template_path) =
+            match installed_template_paths(&layout_lease, &template_id) {
+                Ok(paths) => paths,
+                Err(message) => {
+                    warn!("{message}");
+                    self.patch_row(index, key, |tile| tile.state = "failed".into());
+                    return;
+                }
+            };
 
         // Install once, open forever: skip download + install when present.
         let template = if template_path.is_file() {
@@ -344,7 +367,8 @@ impl Worker {
             "template installed; asking for picks"
         );
         self.patch_row(index, key.clone(), |tile| tile.state = "picking".into());
-        self.run_pick_flow(index, key, template_path, template.slot_count());
+        self.run_pick_flow(index, key, template_id, template.slot_count());
+        drop(layout_lease);
     }
 
     /// Download the bundle into the download cache, with tile progress and
@@ -397,9 +421,16 @@ impl Worker {
     /// template to the engine worker. Fewer picks than slots is fine (the
     /// remaining slots keep their sample media, exactly like CapCut); extra
     /// picks are truncated. Cancelling the dialog just resets the tile.
-    fn run_pick_flow(&self, row: usize, key: String, template_path: PathBuf, slots: usize) {
+    fn run_pick_flow(
+        &self,
+        row: usize,
+        key: String,
+        template_id: InstalledTemplateId,
+        slots: usize,
+    ) {
         let weak = self.backend_weak.clone();
         let preview_handle = self.preview_handle.clone();
+        let storage_layout = self.storage_layout.clone();
         if let Err(e) = slint::invoke_from_event_loop(move || {
             let task = slint::spawn_local(async move {
                 let title = if slots == 1 {
@@ -441,10 +472,14 @@ impl Worker {
                         source_in: None,
                     })
                     .collect();
-                // Flush the outgoing draft (a no-op from the launch screen),
-                // then swap the session — ordered on the worker's queue.
-                preview_handle.save_project(None);
-                preview_handle.apply_template(template_path, picks);
+                // Resolving can wait behind a long relocation, so do it off
+                // the UI thread. The lease pins the post-relocation path
+                // through both ordered preview-worker queue sends.
+                if let Err(message) =
+                    spawn_template_apply(storage_layout, preview_handle, template_id, picks)
+                {
+                    warn!("{message}");
+                }
             });
             if let Err(e) = task {
                 tracing::error!("failed to open template pick dialog: {e}");
@@ -453,6 +488,76 @@ impl Worker {
             warn!("template pick flow failed to reach the UI thread: {e}");
         }
     }
+}
+
+const INSTALLED_TEMPLATE_FILE: &str = "template.cutlasst";
+
+/// Stable, traversal-safe directory name carried across the asynchronous
+/// picker. Absolute cache paths are always regenerated from an operation
+/// lease after the picker returns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct InstalledTemplateId(String);
+
+impl InstalledTemplateId {
+    fn from_catalog_id(id: &str) -> Self {
+        Self(safe_id(id))
+    }
+
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+fn installed_template_paths(
+    lease: &StorageLayoutLease<'_>,
+    template_id: &InstalledTemplateId,
+) -> Result<(PathBuf, PathBuf), &'static str> {
+    let install_dir = templates_root(lease)?.join(template_id.as_str());
+    let template_path = install_dir.join(INSTALLED_TEMPLATE_FILE);
+    Ok((install_dir, template_path))
+}
+
+/// Resolve and enqueue after the picker without ever waiting on the Slint UI
+/// thread. Queue order is save → apply; a relocation that acquires exclusivity
+/// after this lease can only enqueue project maintenance behind both.
+fn spawn_template_apply(
+    storage_layout: SharedStorageLayout,
+    preview_handle: WorkerHandle,
+    template_id: InstalledTemplateId,
+    picks: Vec<TemplatePick>,
+) -> Result<(), &'static str> {
+    std::thread::Builder::new()
+        .name("cutlass-template-apply".into())
+        .spawn(move || {
+            let layout_lease = storage_layout.lease();
+            let (_, template_path) = match installed_template_paths(&layout_lease, &template_id) {
+                Ok(paths) => paths,
+                Err(message) => {
+                    warn!("{message}");
+                    return;
+                }
+            };
+
+            // Flush the outgoing draft (a no-op from the launch screen), then
+            // swap the session. Keep the lease through both channel sends.
+            preview_handle.save_project(None);
+            preview_handle.apply_template(template_path, picks);
+            drop(layout_lease);
+        })
+        .map(|_| ())
+        .map_err(|_| "template apply worker could not start")
+}
+
+fn catalog_root(lease: &StorageLayoutLease<'_>) -> Result<PathBuf, &'static str> {
+    lease
+        .resolve(CacheId::Catalog)
+        .ok_or("catalog cache has no disk path")
+}
+
+fn templates_root(lease: &StorageLayoutLease<'_>) -> Result<PathBuf, &'static str> {
+    lease
+        .resolve(CacheId::Templates)
+        .ok_or("template cache has no disk path")
 }
 
 /// Send-safe snapshot of a `CatalogEntry`'s tile fields (built worker-side;
@@ -533,6 +638,7 @@ fn user_message(e: &cutlass_cloud::CloudError) -> String {
 mod tests {
     use super::*;
     use cutlass_cloud::dto::AssetKind;
+    use cutlass_storage::StorageLayout;
 
     fn entry(duration: Option<f64>, slots: Option<u32>) -> CatalogEntry {
         CatalogEntry {
@@ -565,5 +671,101 @@ mod tests {
         assert_eq!(safe_id("tpl-vlog-1"), "tpl-vlog-1");
         assert_eq!(safe_id("../../etc/passwd"), "etcpasswd");
         assert_eq!(safe_id("..."), "unnamed");
+    }
+
+    #[test]
+    fn deferred_apply_rebuilds_path_from_the_post_picker_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("templates-a");
+        let second_root = dir.path().join("templates-b");
+        let template_id = InstalledTemplateId::from_catalog_id("../../tpl-vlog-1");
+        assert_eq!(template_id.as_str(), "tpl-vlog-1");
+
+        let mut first = StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first.set_override(CacheId::Templates, &first_root).unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_lease = layout.lease();
+        let first_generation = first_lease.generation();
+        let (first_install_dir, first_template_path) =
+            installed_template_paths(&first_lease, &template_id).unwrap();
+        assert_eq!(first_install_dir, first_root.join("tpl-vlog-1"));
+        assert_eq!(
+            first_template_path,
+            first_root.join("tpl-vlog-1").join(INSTALLED_TEMPLATE_FILE)
+        );
+        drop(first_lease);
+
+        let mut second = StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second
+            .set_override(CacheId::Templates, &second_root)
+            .unwrap();
+        layout.replace(first_generation, second).unwrap();
+
+        let second_lease = layout.lease();
+        assert_eq!(second_lease.generation(), first_generation + 1);
+        let (second_install_dir, second_template_path) =
+            installed_template_paths(&second_lease, &template_id).unwrap();
+        assert_eq!(second_install_dir, second_root.join("tpl-vlog-1"));
+        assert_eq!(
+            second_template_path,
+            second_root.join("tpl-vlog-1").join(INSTALLED_TEMPLATE_FILE)
+        );
+        assert_ne!(first_template_path, second_template_path);
+    }
+
+    #[test]
+    fn operations_use_overrides_then_pick_up_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_catalog = dir.path().join("catalog-a");
+        let first_templates = dir.path().join("templates-a");
+        let second_catalog = dir.path().join("catalog-b");
+        let second_templates = dir.path().join("templates-b");
+
+        let mut first = StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first
+            .set_override(CacheId::Catalog, &first_catalog)
+            .unwrap();
+        first
+            .set_override(CacheId::Templates, &first_templates)
+            .unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_refresh_lease = layout.lease();
+        let first_generation = first_refresh_lease.generation();
+        let first_refresh = catalog_root(&first_refresh_lease).unwrap();
+        drop(first_refresh_lease);
+
+        let first_install_lease = layout.lease();
+        assert_eq!(first_install_lease.generation(), first_generation);
+        let first_install = templates_root(&first_install_lease).unwrap();
+        drop(first_install_lease);
+
+        assert_eq!(first_refresh, first_catalog);
+        assert_eq!(first_install, first_templates);
+
+        let mut second = StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second
+            .set_override(CacheId::Catalog, &second_catalog)
+            .unwrap();
+        second
+            .set_override(CacheId::Templates, &second_templates)
+            .unwrap();
+        layout.replace(first_generation, second).unwrap();
+
+        assert_eq!(first_refresh, first_catalog);
+        assert_eq!(first_install, first_templates);
+
+        let second_refresh_lease = layout.lease();
+        assert_eq!(second_refresh_lease.generation(), first_generation + 1);
+        assert_eq!(catalog_root(&second_refresh_lease).unwrap(), second_catalog);
+        drop(second_refresh_lease);
+
+        let second_install_lease = layout.lease();
+        assert_eq!(second_install_lease.generation(), first_generation + 1);
+        assert_eq!(
+            templates_root(&second_install_lease).unwrap(),
+            second_templates
+        );
     }
 }
