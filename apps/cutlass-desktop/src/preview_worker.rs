@@ -64,6 +64,37 @@ pub(crate) struct PreviewCacheStats {
     pub(crate) bytes: u64,
 }
 
+/// Result of an acknowledged media-pool import. The path is read back from
+/// the engine after import, so callers receive its canonical/current value
+/// rather than merely the path they requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportMediaRpcResult {
+    pub(crate) media_id: u64,
+    pub(crate) path: PathBuf,
+}
+
+/// Result of an acknowledged project save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SaveProjectRpcResult {
+    pub(crate) path: PathBuf,
+    /// Always false. An `Ok` result is withheld if the engine remains dirty.
+    pub(crate) dirty: bool,
+}
+
+/// One acknowledged media relink, also used by folder-relink results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelinkMediaRpcResult {
+    pub(crate) media_id: u64,
+    pub(crate) path: PathBuf,
+}
+
+/// Result of an acknowledged folder relink. Entries are sorted by raw media
+/// id, independent of media-pool iteration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelinkFolderRpcResult {
+    pub(crate) relinked: Vec<RelinkMediaRpcResult>,
+}
+
 /// Work submitted to the engine thread. Scrub frames coalesce to the latest
 /// pending tick; imports must not be dropped by that coalescing (see
 /// [`worker_loop`]).
@@ -77,6 +108,12 @@ enum WorkerMsg {
         height: u32,
     },
     Import(PathBuf),
+    /// Queue-ordered, acknowledged counterpart to [`WorkerMsg::Import`].
+    ImportMediaRpc {
+        path: PathBuf,
+        reply: Sender<Result<ImportMediaRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// OS files dropped on the window (Finder / Explorer). With `target`
     /// — the drop landed on the timeline: (lane-list row, sequence tick)
     /// under the cursor — every file is imported and placed end-to-end from
@@ -539,6 +576,13 @@ enum WorkerMsg {
     SaveProject {
         path: Option<PathBuf>,
     },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::SaveProject`].
+    SaveProjectRpc {
+        path: Option<PathBuf>,
+        reply: Sender<Result<SaveProjectRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Replace the session from a `.cutlass` file (tolerant: entries whose
     /// media file is gone are kept and surface through the relink flow —
     /// the projection republish carries the missing set, and app.slint
@@ -560,10 +604,25 @@ enum WorkerMsg {
         media: String,
         path: PathBuf,
     },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::RelinkMedia`].
+    RelinkMediaRpc {
+        media: String,
+        path: PathBuf,
+        reply: Sender<Result<RelinkMediaRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Try `folder/<filename>` for every missing pool entry (locate-folder
     /// gesture in the relink dialog).
     RelinkFolder {
         folder: PathBuf,
+    },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::RelinkFolder`].
+    RelinkFolderRpc {
+        folder: PathBuf,
+        reply: Sender<Result<RelinkFolderRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
     },
     /// Delete a source (raw id) from the media pool / Library bin. `force`
     /// false removes only when no clip references it (the engine rejects a
@@ -699,6 +758,14 @@ const PREVIEW_CACHE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const PREVIEW_CACHE_RPC_WAIT_SLICE: Duration = Duration::from_millis(25);
 #[allow(dead_code)] // Used by the staged maintenance entry point below.
 const PROJECT_MAINTENANCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total queue + execution deadline for acknowledged project mutations.
+///
+/// Cancellation can prove "not started" only while the operation is pending.
+/// Once claimed, cancellation is ignored and the caller waits for the real
+/// result until this deadline. A deadline or disconnect after claim is
+/// reported as "outcome unknown": the worker may already have mutated the
+/// engine and may still finish the operation.
+const PROJECT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const WORKER_RPC_PENDING: u8 = 0;
 const WORKER_RPC_RUNNING: u8 = 1;
 const WORKER_RPC_ABANDONED: u8 = 2;
@@ -818,6 +885,21 @@ fn serve_project_maintenance(
     }
 }
 
+/// Claim a queued acknowledged operation before invoking its handler.
+///
+/// A caller that cancelled or timed out while this message was queued changes
+/// the operation to `ABANDONED`; the failed claim then guarantees `run` is
+/// never called and therefore cannot mutate the engine.
+fn serve_worker_rpc<T>(
+    reply: Sender<Result<T, String>>,
+    operation: Arc<WorkerRpcOperation>,
+    run: impl FnOnce() -> Result<T, String>,
+) {
+    if operation.claim() {
+        let _ = reply.send(run());
+    }
+}
+
 impl WorkerHandle {
     pub fn request_frame(&self, tick: i64) {
         let _ = self.tx.send(WorkerMsg::Frame(tick));
@@ -831,6 +913,30 @@ impl WorkerHandle {
 
     pub fn import(&self, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::Import(path));
+    }
+
+    /// Import media in queue order and wait for an acknowledged result.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn import_media_rpc(&self, path: PathBuf) -> Result<ImportMediaRpcResult, String> {
+        self.import_media_rpc_with_cancel(path, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn import_media_rpc_with_cancel(
+        &self,
+        path: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<ImportMediaRpcResult, String> {
+        self.project_rpc(
+            "import media",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::ImportMediaRpc {
+                path,
+                reply,
+                operation,
+            },
+        )
     }
 
     /// OS file drop: import `paths` and, when `target` names a timeline
@@ -853,6 +959,33 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::SaveProject { path });
     }
 
+    /// Save in queue order and return the engine's actual bound path.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn save_project_rpc(
+        &self,
+        path: Option<PathBuf>,
+    ) -> Result<SaveProjectRpcResult, String> {
+        self.save_project_rpc_with_cancel(path, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn save_project_rpc_with_cancel(
+        &self,
+        path: Option<PathBuf>,
+        cancel: &AtomicBool,
+    ) -> Result<SaveProjectRpcResult, String> {
+        self.project_rpc(
+            "save project",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::SaveProjectRpc {
+                path,
+                reply,
+                operation,
+            },
+        )
+    }
+
     pub fn open_project(&self, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::OpenProject { path });
     }
@@ -867,6 +1000,105 @@ impl WorkerHandle {
 
     pub fn rename_project(&self, name: String) {
         let _ = self.tx.send(WorkerMsg::RenameProject { name });
+    }
+
+    /// Send one queue-ordered project mutation and wait for its bounded reply.
+    ///
+    /// Cancellation abandons only a still-pending request, which guarantees
+    /// the worker cannot later claim or mutate for it. If the worker has
+    /// already claimed the request, cancellation no longer returns early:
+    /// the actual operation result wins whenever it arrives before `timeout`.
+    /// A timeout or disconnect after claim says "outcome unknown" explicitly,
+    /// because the mutation may have happened even if its reply was lost.
+    fn project_rpc<T>(
+        &self,
+        name: &'static str,
+        timeout: Duration,
+        cancel: &AtomicBool,
+        request: impl FnOnce(Sender<Result<T, String>>, Arc<WorkerRpcOperation>) -> WorkerMsg,
+    ) -> Result<T, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(format!(
+                "{name} request cancelled before worker claim; not started"
+            ));
+        }
+        let (reply, response) = bounded(1);
+        let operation = Arc::new(WorkerRpcOperation::pending());
+        self.tx
+            .send(request(reply, Arc::clone(&operation)))
+            .map_err(|_| {
+                operation.abandon();
+                format!("{name} request failed: preview worker is not running; not started")
+            })?;
+
+        let started = Instant::now();
+        loop {
+            // A delivered result always wins cancellation/deadline races.
+            match response.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Disconnected) => {
+                    let detail = if operation.abandon() {
+                        "not started"
+                    } else {
+                        "outcome unknown after worker claim"
+                    };
+                    return Err(format!(
+                        "{name} request failed: preview worker stopped before replying; {detail}"
+                    ));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            if cancel.load(Ordering::Acquire) && operation.abandon() {
+                return Err(format!(
+                    "{name} request cancelled before worker claim; not started"
+                ));
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // Close the race where a reply entered the channel between
+                // the first try_recv and the deadline observation.
+                match response.try_recv() {
+                    Ok(result) => return result,
+                    Err(TryRecvError::Disconnected) => {
+                        let detail = if operation.abandon() {
+                            "not started"
+                        } else {
+                            "outcome unknown after worker claim"
+                        };
+                        return Err(format!(
+                            "{name} request failed: preview worker stopped before replying; {detail}"
+                        ));
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+                let detail = if operation.abandon() {
+                    "before worker claim; not started"
+                } else {
+                    "after worker claim; outcome unknown"
+                };
+                return Err(format!(
+                    "{name} request timed out {detail} after {} ms",
+                    timeout.as_millis()
+                ));
+            }
+
+            match response.recv_timeout(PREVIEW_CACHE_RPC_WAIT_SLICE.min(remaining)) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    let detail = if operation.abandon() {
+                        "not started"
+                    } else {
+                        "outcome unknown after worker claim"
+                    };
+                    return Err(format!(
+                        "{name} request failed: preview worker stopped before replying; {detail}"
+                    ));
+                }
+            }
+        }
     }
 
     /// Return exact preview-frame cache usage, ordered with all worker
@@ -916,6 +1148,9 @@ impl WorkerHandle {
         cancel: &AtomicBool,
         request: impl FnOnce(Sender<PreviewCacheStats>, Arc<WorkerRpcOperation>) -> WorkerMsg,
     ) -> Result<PreviewCacheStats, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(format!("preview cache {operation} request was cancelled"));
+        }
         let (reply, response) = bounded(1);
         let operation_state = Arc::new(WorkerRpcOperation::pending());
         self.tx
@@ -976,6 +1211,9 @@ impl WorkerHandle {
         cancel: &AtomicBool,
         timeout: Duration,
     ) -> Result<ProjectMaintenanceGuard, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("project maintenance request was cancelled before worker claim".into());
+        }
         let (reply, response) = bounded(1);
         // The guard owns the sole sender. Its one typed action fits without
         // waiting; sender drop also wakes the worker as an ordinary resume.
@@ -1072,8 +1310,66 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::RelinkMedia { media, path });
     }
 
+    /// Relink one pool entry in queue order and return its resulting path.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn relink_media_rpc(
+        &self,
+        media: String,
+        path: PathBuf,
+    ) -> Result<RelinkMediaRpcResult, String> {
+        self.relink_media_rpc_with_cancel(media, path, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn relink_media_rpc_with_cancel(
+        &self,
+        media: String,
+        path: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<RelinkMediaRpcResult, String> {
+        self.project_rpc(
+            "relink media",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::RelinkMediaRpc {
+                media,
+                path,
+                reply,
+                operation,
+            },
+        )
+    }
+
     pub fn relink_folder(&self, folder: PathBuf) {
         let _ = self.tx.send(WorkerMsg::RelinkFolder { folder });
+    }
+
+    /// Relink matching missing media in queue order. The returned entries are
+    /// sorted by raw media id.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn relink_folder_rpc(
+        &self,
+        folder: PathBuf,
+    ) -> Result<RelinkFolderRpcResult, String> {
+        self.relink_folder_rpc_with_cancel(folder, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn relink_folder_rpc_with_cancel(
+        &self,
+        folder: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<RelinkFolderRpcResult, String> {
+        self.project_rpc(
+            "relink folder",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::RelinkFolderRpc {
+                folder,
+                reply,
+                operation,
+            },
+        )
     }
 
     pub fn remove_media(&self, media: String, force: bool) {
@@ -1701,6 +1997,13 @@ fn worker_loop(
                 fit.set_viewport(width, height);
             }
             WorkerMsg::Import(path) => import_and_publish(engine, &path, &ui),
+            WorkerMsg::ImportMediaRpc {
+                path,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                import_media_rpc_and_publish(engine, &path, Some(&ui))
+            }),
             WorkerMsg::DropFiles { paths, target } => {
                 drop_files_and_publish(engine, &paths, target, *main_magnet, &ui);
             }
@@ -2069,11 +2372,33 @@ fn worker_loop(
                 export_state.cancel.store(true, Ordering::Relaxed);
             }
             WorkerMsg::SaveProject { path } => save_project_and_publish(engine, path, &ui),
+            WorkerMsg::SaveProjectRpc {
+                path,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                save_project_rpc_and_publish(engine, path, Some(&ui))
+            }),
             WorkerMsg::OpenProject { path } => open_project_and_publish(engine, path, &ui),
             WorkerMsg::RelinkMedia { media, path } => {
                 relink_media_and_publish(engine, &media, &path, &ui)
             }
+            WorkerMsg::RelinkMediaRpc {
+                media,
+                path,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                relink_media_rpc_and_publish(engine, &media, &path, Some(&ui))
+            }),
             WorkerMsg::RelinkFolder { folder } => relink_folder_and_publish(engine, folder, &ui),
+            WorkerMsg::RelinkFolderRpc {
+                folder,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                relink_folder_rpc_and_publish(engine, folder, Some(&ui))
+            }),
             WorkerMsg::RemoveMedia { media, force } => {
                 remove_media_and_publish(engine, &media, force, &ui)
             }
@@ -2530,7 +2855,7 @@ fn worker_loop(
                 }
             }
             other => {
-                let redraw = mutation_redraws_preview(&other);
+                let redraw = message_invalidates_preview(&other);
                 mutate(
                     engine,
                     &mut clipboard,
@@ -2629,7 +2954,7 @@ fn next_message(
 /// `ClearTransformOverride` render themselves with their own tick, so they're
 /// excluded here to avoid a redundant second composite; pure session ops
 /// (import, copy, auto-save, export, linkage, rename) don't alter the canvas.
-fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
+fn message_invalidates_preview(msg: &WorkerMsg) -> bool {
     matches!(
         msg,
         WorkerMsg::AddClip { .. }
@@ -2678,6 +3003,8 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             // Relinked media decodes again — refresh the stale composite.
             | WorkerMsg::RelinkMedia { .. }
             | WorkerMsg::RelinkFolder { .. }
+            | WorkerMsg::RelinkMediaRpc { .. }
+            | WorkerMsg::RelinkFolderRpc { .. }
             // A bound proxy swaps the decode source; repaint through it so
             // the (cleared) frame cache refills at the cheap decode cost.
             | WorkerMsg::ProxyReady { .. }
@@ -3076,6 +3403,16 @@ fn remove_keyframes_at_and_publish(
 // to its native decoders, so the worker sends nothing.
 
 fn import_and_publish(engine: &mut Engine, path: &Path, ui: &UiSink) {
+    let _ = import_media_rpc_and_publish(engine, path, Some(ui));
+}
+
+/// Shared import implementation for fire-and-forget UI work and acknowledged
+/// RPCs. `ui` is `None` only in engine-level unit tests.
+fn import_media_rpc_and_publish(
+    engine: &mut Engine,
+    path: &Path,
+    ui: Option<&UiSink>,
+) -> Result<ImportMediaRpcResult, String> {
     match engine.apply(Command::Project(ProjectCommand::Import {
         path: path.to_path_buf(),
     })) {
@@ -3088,13 +3425,43 @@ fn import_and_publish(engine: &mut Engine, path: &Path, ui: &UiSink) {
             );
             // Kick off tile thumbnail generation off-thread; the tile shows
             // its placeholder until the image lands (see src/thumbnails.rs).
-            if let Some(source) = engine.project().media(media) {
-                register_media_with_workers(source, ui);
+            let current_path = engine
+                .project()
+                .media(media)
+                .map(|source| {
+                    if let Some(ui) = ui {
+                        register_media_with_workers(source, ui);
+                    }
+                    source.path().to_path_buf()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "import succeeded for {} but media {} is missing from the pool",
+                        path.display(),
+                        media.raw()
+                    )
+                })?;
+            if let Some(ui) = ui {
+                publish_projection(engine, ui);
             }
-            publish_projection(engine, ui);
+            Ok(ImportMediaRpcResult {
+                media_id: media.raw(),
+                path: current_path,
+            })
         }
-        Ok(other) => error!(path = %path.display(), "unexpected import outcome: {other:?}"),
-        Err(e) => error!(path = %path.display(), "import failed: {e}"),
+        Ok(other) => {
+            let message = format!(
+                "unexpected import outcome for {}: {other:?}",
+                path.display()
+            );
+            error!("{message}");
+            Err(message)
+        }
+        Err(e) => {
+            let message = format!("import failed for {}: {e}", path.display());
+            error!("{message}");
+            Err(message)
+        }
     }
 }
 
@@ -3311,23 +3678,60 @@ fn occupied_spans(track: &Track) -> Vec<(i64, i64)> {
 /// `None` flush with no bound draft (e.g. New from the launch screen over the
 /// empty boot session) has nothing to persist and is a quiet no-op.
 fn save_project_and_publish(engine: &mut Engine, path: Option<PathBuf>, ui: &UiSink) {
+    let _ = save_project_rpc_and_publish(engine, path, Some(ui));
+}
+
+/// Shared save implementation for fire-and-forget UI work and acknowledged
+/// RPCs. A missing implicit path remains a quiet UI no-op, but is an explicit
+/// RPC error. `ui` is `None` only in engine-level unit tests.
+fn save_project_rpc_and_publish(
+    engine: &mut Engine,
+    path: Option<PathBuf>,
+    ui: Option<&UiSink>,
+) -> Result<SaveProjectRpcResult, String> {
     let Some(path) = path.or_else(|| engine.project_path().cloned()) else {
-        return;
+        return Err("save project failed: no current project path is bound".into());
     };
     match engine.apply(Command::Project(ProjectCommand::Save {
         path: path.clone(),
     })) {
         Ok(ApplyOutcome::Saved) => {
             crate::drafts::write_meta(&path, &engine.project().name);
-            publish_projection(engine, ui);
+            if let Some(ui) = ui {
+                publish_projection(engine, ui);
+            }
+            let actual_path = engine.project_path().cloned().ok_or_else(|| {
+                format!(
+                    "save reported success for {} but the engine has no current project path",
+                    path.display()
+                )
+            })?;
+            if engine.is_dirty() {
+                return Err(format!(
+                    "save reported success for {} but the engine remains dirty",
+                    actual_path.display()
+                ));
+            }
+            Ok(SaveProjectRpcResult {
+                path: actual_path,
+                dirty: false,
+            })
         }
-        Ok(other) => error!(path = %path.display(), "unexpected save outcome: {other:?}"),
+        Ok(other) => {
+            let message = format!("unexpected save outcome for {}: {other:?}", path.display());
+            error!("{message}");
+            Err(message)
+        }
         Err(e) => {
-            error!(path = %path.display(), "auto-save failed: {e}");
-            publish_session_error(
-                ui,
-                format!("Couldn't save the project to {}: {e}", path.display()),
-            );
+            let message = format!("save failed for {}: {e}", path.display());
+            error!("{message}");
+            if let Some(ui) = ui {
+                publish_session_error(
+                    ui,
+                    format!("Couldn't save the project to {}: {e}", path.display()),
+                );
+            }
+            Err(message)
         }
     }
 }
@@ -3431,32 +3835,121 @@ fn apply_template_and_publish(
 /// the dialog's count. Failures (unreadable file, probe error) surface
 /// through `session-error` and leave the entry untouched.
 fn relink_media_and_publish(engine: &mut Engine, media: &str, path: &Path, ui: &UiSink) {
+    let _ = relink_media_rpc_and_publish(engine, media, path, Some(ui));
+}
+
+/// Shared single-media relink implementation for UI work and acknowledged
+/// RPCs. `ui` is `None` only in engine-level unit tests.
+fn relink_media_rpc_and_publish(
+    engine: &mut Engine,
+    media: &str,
+    path: &Path,
+    ui: Option<&UiSink>,
+) -> Result<RelinkMediaRpcResult, String> {
     let Some(media_id) = parse_raw_id(media).map(MediaId::from_raw) else {
-        error!(media, "relink ignored: unparsable media id");
-        return;
+        let message = format!("relink failed: unparsable media id `{media}`");
+        error!("{message}");
+        return Err(message);
     };
     match engine.apply(Command::Project(ProjectCommand::RelinkMedia {
         media: media_id,
         path: path.to_path_buf(),
     })) {
-        Ok(ApplyOutcome::Relinked { media }) => {
-            info!(?media, path = %path.display(), "relinked media");
-            if let Some(source) = engine.project().media(media) {
-                register_media_with_workers(source, ui);
+        Ok(ApplyOutcome::Relinked { media: relinked }) => {
+            if relinked != media_id {
+                let message = format!(
+                    "relink for media {} returned mismatched media {}",
+                    media_id.raw(),
+                    relinked.raw()
+                );
+                error!("{message}");
+                return Err(message);
             }
-            publish_projection(engine, ui);
+            info!(?relinked, path = %path.display(), "relinked media");
+            let current_path = engine
+                .project()
+                .media(relinked)
+                .map(|source| {
+                    if let Some(ui) = ui {
+                        register_media_with_workers(source, ui);
+                    }
+                    source.path().to_path_buf()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "relink succeeded but media {} is missing from the pool",
+                        relinked.raw()
+                    )
+                })?;
+            if let Some(ui) = ui {
+                publish_projection(engine, ui);
+            }
+            Ok(RelinkMediaRpcResult {
+                media_id: relinked.raw(),
+                path: current_path,
+            })
         }
-        Ok(other) => error!(path = %path.display(), "unexpected relink outcome: {other:?}"),
+        Ok(other) => {
+            let message = format!(
+                "unexpected relink outcome for media {} to {}: {other:?}",
+                media_id.raw(),
+                path.display()
+            );
+            error!("{message}");
+            Err(message)
+        }
         Err(e) => {
-            error!(path = %path.display(), "relink failed: {e}");
-            publish_session_error(ui, format!("Couldn't relink to {}: {e}", path.display()));
+            let message = format!(
+                "relink failed for media {} to {}: {e}",
+                media_id.raw(),
+                path.display()
+            );
+            error!("{message}");
+            if let Some(ui) = ui {
+                publish_session_error(ui, format!("Couldn't relink to {}: {e}", path.display()));
+            }
+            Err(message)
         }
     }
 }
 
 /// Try `folder/<filename>` for every missing pool entry; relink each match.
 fn relink_folder_and_publish(engine: &mut Engine, folder: PathBuf, ui: &UiSink) {
-    let candidates: Vec<(MediaId, PathBuf)> = engine
+    let result = relink_folder_rpc_and_publish(engine, folder, Some(ui));
+    report_relink_folder_error(&result, |message| publish_session_error(ui, message));
+}
+
+/// Invoke `report` exactly once for a failed UI folder relink and never for
+/// success. Keeping this decision outside the shared operation gives errors a
+/// single owner: fire-and-forget UI calls publish `session-error`, while RPC
+/// calls return the same string to their caller without a duplicate dialog.
+fn report_relink_folder_error(
+    result: &Result<RelinkFolderRpcResult, String>,
+    report: impl FnOnce(String),
+) {
+    if let Err(message) = result {
+        report(message.clone());
+    }
+}
+
+/// Shared folder-relink operation for UI work and acknowledged RPCs.
+///
+/// `RelinkMedia` is intentionally non-undoable, so an engine history group
+/// cannot make this operation atomic. Every candidate is canonicalized and
+/// probed before the first mutation. The engine then re-probes while applying
+/// each relink; a filesystem race can still make an individual apply fail.
+/// In that case all remaining candidates are attempted, successful relinks
+/// stay applied, the UI is published once, and the RPC returns an explicit
+/// partial-failure error naming the retained successes. Error reporting is
+/// deliberately transport-neutral: this function logs and returns errors but
+/// never publishes `session-error`. `ui` supplies success-side worker
+/// registration/projection effects and is `None` only in engine-level tests.
+fn relink_folder_rpc_and_publish(
+    engine: &mut Engine,
+    folder: PathBuf,
+    ui: Option<&UiSink>,
+) -> Result<RelinkFolderRpcResult, String> {
+    let mut candidates: Vec<(MediaId, PathBuf)> = engine
         .project()
         .media_iter()
         .filter(|media| !media.path().exists())
@@ -3468,40 +3961,115 @@ fn relink_folder_and_publish(engine: &mut Engine, folder: PathBuf, ui: &UiSink) 
         })
         .filter(|(_, candidate)| candidate.exists())
         .collect();
+    candidates.sort_by_key(|(media, _)| media.raw());
 
     if candidates.is_empty() {
-        publish_session_error(
-            ui,
-            format!(
-                "No missing media files were found in {}. \
-                 Pick individual files or choose a folder that contains them.",
-                folder.display()
-            ),
+        let message = format!(
+            "No missing media files were found in {}. \
+             Pick individual files or choose a folder that contains them.",
+            folder.display()
         );
-        return;
+        return Err(message);
     }
 
-    let mut relinked = 0usize;
+    // Validate every candidate before the first non-undoable mutation. This
+    // is the same native probe RelinkMedia performs after canonicalization.
+    for (media, path) in &mut candidates {
+        let canonical = path.canonicalize().map_err(|e| {
+            let message = format!(
+                "folder relink preflight failed for media {} at {}: {e}; no media was relinked",
+                media.raw(),
+                path.display()
+            );
+            error!("{message}");
+            message
+        })?;
+        cutlass_decoder::probe(&canonical).map_err(|e| {
+            let message = format!(
+                "folder relink preflight failed for media {} at {}: {e}; no media was relinked",
+                media.raw(),
+                canonical.display()
+            );
+            error!("{message}");
+            message
+        })?;
+        *path = canonical;
+    }
+
+    let mut relinked = Vec::with_capacity(candidates.len());
+    let mut failures = Vec::new();
     for (media_id, path) in candidates {
         match engine.apply(Command::Project(ProjectCommand::RelinkMedia {
             media: media_id,
             path: path.clone(),
         })) {
-            Ok(ApplyOutcome::Relinked { media }) => {
-                relinked += 1;
-                if let Some(source) = engine.project().media(media) {
-                    register_media_with_workers(source, ui);
+            Ok(ApplyOutcome::Relinked { media }) => match engine.project().media(media) {
+                Some(source) => {
+                    if let Some(ui) = ui {
+                        register_media_with_workers(source, ui);
+                    }
+                    relinked.push(RelinkMediaRpcResult {
+                        media_id: media.raw(),
+                        path: source.path().to_path_buf(),
+                    });
                 }
+                None => {
+                    let message = format!(
+                        "media {} disappeared after a successful relink to {}",
+                        media.raw(),
+                        path.display()
+                    );
+                    error!("{message}");
+                    failures.push(message);
+                }
+            },
+            Ok(other) => {
+                let message = format!(
+                    "unexpected folder relink outcome for media {} at {}: {other:?}",
+                    media_id.raw(),
+                    path.display()
+                );
+                error!("{message}");
+                failures.push(message);
             }
-            Ok(other) => error!(path = %path.display(), "unexpected relink outcome: {other:?}"),
-            Err(e) => error!(path = %path.display(), "folder relink failed: {e}"),
+            Err(e) => {
+                let message = format!(
+                    "folder relink failed for media {} at {}: {e}",
+                    media_id.raw(),
+                    path.display()
+                );
+                error!("{message}");
+                failures.push(message);
+            }
         }
     }
 
-    if relinked > 0 {
-        info!(count = relinked, folder = %folder.display(), "relinked media from folder");
-        publish_projection(engine, ui);
+    relinked.sort_by_key(|entry| entry.media_id);
+    if !relinked.is_empty() {
+        info!(count = relinked.len(), folder = %folder.display(), "relinked media from folder");
+        if let Some(ui) = ui {
+            publish_projection(engine, ui);
+        }
     }
+
+    if !failures.is_empty() {
+        let retained = relinked
+            .iter()
+            .map(|entry| entry.media_id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let partial = if relinked.is_empty() {
+            "no relinks succeeded".to_string()
+        } else {
+            format!("non-undoable successful relinks remain applied for media ids [{retained}]")
+        };
+        return Err(format!(
+            "folder relink completed with individual failures; {partial}; {}",
+            failures.join("; ")
+        ));
+    }
+
+    Ok(RelinkFolderRpcResult { relinked })
 }
 
 /// Delete a source from the media pool (Library bin). `force` false removes
@@ -7413,6 +7981,15 @@ mod tests {
         SharedPixelBuffer::new(width, height)
     }
 
+    fn image_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/cutlass-decoder/tests/fixtures/halves.jpg")
+    }
+
+    fn copy_image_fixture(path: &Path) {
+        std::fs::copy(image_fixture(), path).expect("copy image fixture");
+    }
+
     #[test]
     fn frame_cache_reports_exact_insert_and_replacement_accounting() {
         let cache = FrameCache::default();
@@ -7475,6 +8052,423 @@ mod tests {
     }
 
     #[test]
+    fn project_rpc_reports_a_disconnected_worker_as_not_started() {
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let handle = WorkerHandle { tx };
+
+        assert_eq!(
+            handle
+                .import_media_rpc(PathBuf::from("/unused/disconnected.jpg"))
+                .unwrap_err(),
+            "import media request failed: preview worker is not running; not started"
+        );
+    }
+
+    #[test]
+    fn project_rpc_pre_cancel_does_not_enqueue() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            handle
+                .save_project_rpc_with_cancel(None, &cancel)
+                .unwrap_err(),
+            "save project request cancelled before worker claim; not started"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "pre-cancelled RPC must not enqueue a worker message"
+        );
+    }
+
+    #[test]
+    fn project_rpc_cancellation_abandons_an_enqueued_pending_request() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let caller_cancel = Arc::clone(&cancel);
+        let (done_tx, done_rx) = bounded(1);
+        let caller = std::thread::spawn(move || {
+            let result = handle.import_media_rpc_with_cancel(
+                PathBuf::from("/unused/pending.jpg"),
+                caller_cancel.as_ref(),
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        let WorkerMsg::ImportMediaRpc {
+            reply, operation, ..
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected enqueued import RPC");
+        };
+        cancel.store(true, Ordering::Release);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err(),
+            "import media request cancelled before worker claim; not started"
+        );
+        assert!(
+            !operation.claim(),
+            "cancellation must atomically abandon the pending operation"
+        );
+
+        let mut mutated = false;
+        serve_worker_rpc(reply, operation, || {
+            mutated = true;
+            Ok(ImportMediaRpcResult {
+                media_id: 1,
+                path: PathBuf::from("/unused/should-not-run.jpg"),
+            })
+        });
+        assert!(!mutated, "an abandoned handler must remain a no-op");
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn project_rpc_queue_timeout_prevents_worker_claim() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(false);
+
+        let result: Result<ImportMediaRpcResult, String> = handle.project_rpc(
+            "import media",
+            Duration::ZERO,
+            &cancel,
+            |reply, operation| WorkerMsg::ImportMediaRpc {
+                path: PathBuf::from("/unused/timeout.jpg"),
+                reply,
+                operation,
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "import media request timed out before worker claim; not started after 0 ms"
+        );
+        let WorkerMsg::ImportMediaRpc { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected queued import RPC");
+        };
+        assert!(
+            !operation.claim(),
+            "timed-out queued RPC must remain abandoned"
+        );
+    }
+
+    #[test]
+    fn project_rpc_post_claim_timeout_reports_outcome_unknown() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(false);
+
+        let result: Result<ImportMediaRpcResult, String> = handle.project_rpc(
+            "import media",
+            Duration::ZERO,
+            &cancel,
+            |reply, operation| {
+                assert!(operation.claim(), "simulate a worker claim before waiting");
+                WorkerMsg::ImportMediaRpc {
+                    path: PathBuf::from("/unused/claimed-timeout.jpg"),
+                    reply,
+                    operation,
+                }
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "import media request timed out after worker claim; outcome unknown after 0 ms"
+        );
+
+        let WorkerMsg::ImportMediaRpc { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected claimed import RPC");
+        };
+        assert!(!operation.abandon());
+    }
+
+    #[test]
+    fn project_rpc_claim_ignores_late_cancellation_and_delivers_result() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let caller_cancel = Arc::clone(&cancel);
+        let (done_tx, done_rx) = bounded(1);
+        let caller = std::thread::spawn(move || {
+            let result = handle.import_media_rpc_with_cancel(
+                PathBuf::from("/unused/claimed.jpg"),
+                caller_cancel.as_ref(),
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        let WorkerMsg::ImportMediaRpc {
+            reply, operation, ..
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected import RPC");
+        };
+        assert!(operation.claim());
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(done_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let expected = ImportMediaRpcResult {
+            media_id: 41,
+            path: PathBuf::from("/canonical/claimed.jpg"),
+        };
+        reply.send(Ok(expected.clone())).unwrap();
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn abandoned_project_rpc_handler_never_runs_mutation() {
+        let operation = Arc::new(WorkerRpcOperation::pending());
+        assert!(operation.abandon());
+        let (reply, response) = bounded(1);
+        let mut mutated = false;
+
+        serve_worker_rpc(reply, operation, || {
+            mutated = true;
+            Ok::<_, String>(())
+        });
+
+        assert!(!mutated);
+        assert!(matches!(
+            response.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn project_rpc_handler_delivers_helper_success_and_error_dtos() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        copy_image_fixture(&source);
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+
+        let (reply, response) = bounded(1);
+        serve_worker_rpc(reply, Arc::new(WorkerRpcOperation::pending()), || {
+            import_media_rpc_and_publish(&mut engine, &source, None)
+        });
+        let imported = response.recv().unwrap().expect("import DTO");
+        assert_eq!(imported.path, source.canonicalize().unwrap());
+
+        let (reply, response) = bounded(1);
+        serve_worker_rpc(reply, Arc::new(WorkerRpcOperation::pending()), || {
+            import_media_rpc_and_publish(&mut engine, &dir.path().join("missing.jpg"), None)
+        });
+        assert!(
+            response
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("import failed")
+        );
+    }
+
+    #[test]
+    fn import_rpc_helper_returns_canonical_dto_and_preserves_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        copy_image_fixture(&source);
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+
+        let result =
+            import_media_rpc_and_publish(&mut engine, &source, None).expect("import result");
+        assert_eq!(result.path, source.canonicalize().unwrap());
+        assert_eq!(
+            engine
+                .project()
+                .media(MediaId::from_raw(result.media_id))
+                .unwrap()
+                .path(),
+            result.path
+        );
+
+        let count = engine.project().media_count();
+        let error =
+            import_media_rpc_and_publish(&mut engine, &dir.path().join("missing.jpg"), None)
+                .unwrap_err();
+        assert!(error.contains("import failed"));
+        assert_eq!(engine.project().media_count(), count);
+    }
+
+    #[test]
+    fn save_rpc_helper_returns_actual_clean_path_and_missing_path_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        copy_image_fixture(&source);
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        import_media_rpc_and_publish(&mut engine, &source, None).expect("dirty engine");
+        assert!(engine.is_dirty());
+
+        let project_path = dir.path().join("project.cutlass");
+        let result = save_project_rpc_and_publish(&mut engine, Some(project_path.clone()), None)
+            .expect("save result");
+        assert_eq!(result.path, project_path);
+        assert!(!result.dirty);
+        assert!(!engine.is_dirty());
+
+        let mut unbound = Engine::new(EngineConfig::default()).expect("unbound engine");
+        assert_eq!(
+            save_project_rpc_and_publish(&mut unbound, None, None).unwrap_err(),
+            "save project failed: no current project path is bound"
+        );
+    }
+
+    #[test]
+    fn relink_media_rpc_helper_returns_current_path_and_validation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.jpg");
+        let target = dir.path().join("replacement.jpg");
+        copy_image_fixture(&target);
+        let mut project = Project::new("relink", Rational::FPS_30);
+        let media = project.add_media(cutlass_models::MediaSource::image(missing, 32, 32));
+        let mut engine =
+            Engine::with_project(EngineConfig::default(), project).expect("relink engine");
+
+        let result =
+            relink_media_rpc_and_publish(&mut engine, &media.raw().to_string(), &target, None)
+                .expect("relink result");
+        assert_eq!(result.media_id, media.raw());
+        assert_eq!(result.path, target.canonicalize().unwrap());
+        assert_eq!(
+            engine.project().media(media).unwrap().path(),
+            result.path.as_path()
+        );
+
+        assert!(
+            relink_media_rpc_and_publish(&mut engine, "not-an-id", &target, None)
+                .unwrap_err()
+                .contains("unparsable media id")
+        );
+        assert!(
+            relink_media_rpc_and_publish(&mut engine, "999999", &target, None)
+                .unwrap_err()
+                .contains("relink failed")
+        );
+    }
+
+    #[test]
+    fn relink_folder_rpc_helper_returns_sorted_results_and_no_candidate_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let originals = dir.path().join("originals");
+        let replacements = dir.path().join("replacements");
+        std::fs::create_dir(&replacements).unwrap();
+        copy_image_fixture(&replacements.join("z.jpg"));
+        copy_image_fixture(&replacements.join("a.jpg"));
+
+        let mut project = Project::new("folder relink", Rational::FPS_30);
+        let z = project.add_media(cutlass_models::MediaSource::image(
+            originals.join("z.jpg"),
+            32,
+            32,
+        ));
+        let a = project.add_media(cutlass_models::MediaSource::image(
+            originals.join("a.jpg"),
+            32,
+            32,
+        ));
+        let mut engine =
+            Engine::with_project(EngineConfig::default(), project).expect("folder engine");
+
+        let result = relink_folder_rpc_and_publish(&mut engine, replacements.clone(), None)
+            .expect("folder relink result");
+        let ids: Vec<u64> = result.relinked.iter().map(|entry| entry.media_id).collect();
+        assert_eq!(ids, {
+            let mut expected = vec![z.raw(), a.raw()];
+            expected.sort_unstable();
+            expected
+        });
+        assert!(
+            result
+                .relinked
+                .iter()
+                .all(|entry| entry.path.is_absolute() && entry.path.exists())
+        );
+
+        let error = relink_folder_rpc_and_publish(&mut engine, replacements, None).unwrap_err();
+        assert!(error.contains("No missing media files were found"));
+    }
+
+    #[test]
+    fn relink_folder_error_reporter_emits_each_error_once_without_rewriting() {
+        let messages = [
+            "No missing media files were found in /missing.",
+            "folder relink preflight failed; no media was relinked",
+            "folder relink completed with individual failures; non-undoable successful relinks \
+             remain applied for media ids [7]; media 8 failed",
+        ];
+        for expected in messages {
+            let result: Result<RelinkFolderRpcResult, String> = Err(expected.into());
+            let mut reported = Vec::new();
+            report_relink_folder_error(&result, |message| reported.push(message));
+            assert_eq!(reported.len(), 1);
+            assert_eq!(reported[0], expected);
+        }
+
+        let result = Ok(RelinkFolderRpcResult {
+            relinked: Vec::new(),
+        });
+        let mut reported = Vec::new();
+        report_relink_folder_error(&result, |message| reported.push(message));
+        assert!(reported.is_empty());
+    }
+
+    #[test]
+    fn relink_folder_rpc_preflight_failure_mutates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let originals = dir.path().join("originals");
+        let replacements = dir.path().join("replacements");
+        std::fs::create_dir(&replacements).unwrap();
+        copy_image_fixture(&replacements.join("good.jpg"));
+        std::fs::write(replacements.join("bad.jpg"), b"not media").unwrap();
+
+        let mut project = Project::new("folder preflight", Rational::FPS_30);
+        let good_path = originals.join("good.jpg");
+        let bad_path = originals.join("bad.jpg");
+        let good = project.add_media(cutlass_models::MediaSource::image(
+            good_path.clone(),
+            32,
+            32,
+        ));
+        let bad = project.add_media(cutlass_models::MediaSource::image(bad_path.clone(), 32, 32));
+        let mut engine =
+            Engine::with_project(EngineConfig::default(), project).expect("preflight engine");
+
+        let error = relink_folder_rpc_and_publish(&mut engine, replacements, None).unwrap_err();
+        assert!(error.contains("preflight failed"));
+        assert!(error.contains("no media was relinked"));
+        assert_eq!(engine.project().media(good).unwrap().path(), good_path);
+        assert_eq!(engine.project().media(bad).unwrap().path(), bad_path);
+    }
+
+    #[test]
+    fn acknowledged_relinks_invalidate_preview_like_ui_relinks() {
+        let (media_reply, _) = bounded(1);
+        let (folder_reply, _) = bounded(1);
+        assert!(message_invalidates_preview(&WorkerMsg::RelinkMediaRpc {
+            media: "1".into(),
+            path: PathBuf::from("/unused/relink.jpg"),
+            reply: media_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+        assert!(message_invalidates_preview(&WorkerMsg::RelinkFolderRpc {
+            folder: PathBuf::from("/unused"),
+            reply: folder_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+    }
+
+    #[test]
     fn preview_cache_rpc_reports_a_disconnected_worker() {
         let (tx, rx) = unbounded();
         drop(rx);
@@ -7514,25 +8508,23 @@ mod tests {
     }
 
     #[test]
-    fn preview_cache_rpc_cancellation_abandons_a_queued_clear() {
+    fn preview_cache_rpc_pre_cancel_does_not_enqueue() {
         let (tx, rx) = unbounded();
         let handle = WorkerHandle { tx };
         let cancel = AtomicBool::new(true);
 
-        assert!(
-            handle
-                .clear_preview_cache_with_cancel(&cancel)
-                .unwrap_err()
-                .contains("cancelled")
+        assert_eq!(
+            handle.clear_preview_cache_with_cancel(&cancel).unwrap_err(),
+            "preview cache clear request was cancelled"
         );
-        let WorkerMsg::ClearPreviewCache { operation, .. } = rx.try_recv().unwrap() else {
-            panic!("expected queued clear request");
-        };
-        assert!(!operation.claim());
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "pre-cancelled cache RPC must not enqueue a worker message"
+        );
     }
 
     #[test]
-    fn project_maintenance_cancellation_abandons_a_queued_request() {
+    fn project_maintenance_pre_cancel_does_not_enqueue() {
         let (tx, rx) = unbounded();
         let handle = WorkerHandle { tx };
         let cancel = AtomicBool::new(true);
@@ -7546,18 +8538,10 @@ mod tests {
             error,
             "project maintenance request was cancelled before worker claim"
         );
-
-        let WorkerMsg::BeginProjectMaintenance {
-            resume, operation, ..
-        } = rx.try_recv().unwrap()
-        else {
-            panic!("expected queued maintenance request");
-        };
         assert!(
-            !operation.claim(),
-            "cancelled queued maintenance must remain abandoned"
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "pre-cancelled maintenance must not enqueue a worker message"
         );
-        assert!(matches!(resume.try_recv(), Err(TryRecvError::Disconnected)));
     }
 
     #[test]
