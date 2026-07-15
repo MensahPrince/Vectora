@@ -41,7 +41,16 @@ use serde::{Deserialize, Serialize};
 ///     tool descriptions drop the "linked audio companion" steering.
 /// 20: look tools (mask/chroma/stabilize/filter/adjust/animation/audio_role);
 ///     removed unsupported `duck` and `detect_beats`.
-pub const TOOL_SCHEMA_VERSION: u32 = 21;
+/// 21: prompt extensions add the read-only `read_skill` tool.
+/// 22: complete-group unlinking (`unlink_clips`) and bounded link-group lists.
+/// 23: effect-chain reordering (`move_effect`).
+/// 24: explicit-target audio extraction (`extract_audio`).
+/// 25: explicit-target, property-preserving clip duplication (`duplicate_clip`).
+pub const TOOL_SCHEMA_VERSION: u32 = 25;
+
+/// Model-facing clip lists stay small enough for deterministic validation and
+/// useful rejection messages while covering realistic linked groups.
+pub(crate) const MAX_MULTI_CLIP_REFS: usize = 64;
 
 /// Track lane categories the agent may create or target.
 ///
@@ -123,6 +132,29 @@ pub struct AddClip {
     /// Length of the source range to use, in seconds.
     pub source_duration: f64,
     /// Where the clip begins on the timeline, in seconds.
+    pub start: f64,
+}
+
+/// Detach a video clip's embedded sound onto an explicit audio track.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ExtractAudio {
+    /// Source media clip on a video track.
+    pub clip: u64,
+    /// Target unlocked audio track. This is required: call `add_track` first
+    /// when no suitable audio lane exists, then use its returned id.
+    pub track: u64,
+}
+
+/// Make a deep property-preserving copy of one clip at an explicit target
+/// track and timeline start. The copy receives a fresh unlinked clip id.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct DuplicateClip {
+    /// Source clip to copy.
+    pub clip: u64,
+    /// Explicit destination track id.
+    pub to_track: u64,
+    /// Explicit destination start in timeline seconds.
     pub start: f64,
 }
 
@@ -235,6 +267,18 @@ pub struct RemoveEffect {
     pub clip: u64,
     /// Index of the effect in the clip's chain (0 = first).
     pub index: u32,
+}
+
+/// Reorder one effect within a clip's chain. Both indices address the current
+/// pre-move chain; `to_index` is the moved effect's final index after removal
+/// and insertion. Use `describe_project` to inspect the current order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct MoveEffect {
+    pub clip: u64,
+    /// Current index of the effect to move (0 = first).
+    pub from_index: u32,
+    /// Final index for the moved effect (0 = first).
+    pub to_index: u32,
 }
 
 /// Set one parameter of an effect already on a clip to a fixed value. The
@@ -691,6 +735,18 @@ pub struct RippleInsert {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct LinkClips {
     /// Ids of the clips to link (at least two).
+    #[schemars(length(min = 2, max = MAX_MULTI_CLIP_REFS))]
+    pub clips: Vec<u64>,
+}
+
+/// Dissolve every link group touched by one or more clips. Naming any member
+/// clears the complete group; distinct members of the same group are harmless
+/// and coalesced by the engine.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UnlinkClips {
+    /// Ids of linked clips whose complete groups should be dissolved. List
+    /// each clip id once; callers do not need to enumerate every group member.
+    #[schemars(length(min = 1, max = MAX_MULTI_CLIP_REFS))]
     pub clips: Vec<u64>,
 }
 
@@ -806,12 +862,15 @@ pub struct SetCanvas {
 pub enum WireCommand {
     AddTrack(AddTrack),
     AddClip(AddClip),
+    ExtractAudio(ExtractAudio),
+    DuplicateClip(DuplicateClip),
     AddGenerated(AddGenerated),
     SetGenerator(SetGenerator),
     SetClipTransform(SetClipTransform),
     SetClipCrop(SetClipCrop),
     AddEffect(AddEffect),
     RemoveEffect(RemoveEffect),
+    MoveEffect(MoveEffect),
     SetEffectParam(SetEffectParam),
     AddTransition(AddTransition),
     RemoveTransition(RemoveTransition),
@@ -843,6 +902,7 @@ pub enum WireCommand {
     ShiftClips(ShiftClips),
     RippleInsert(RippleInsert),
     LinkClips(LinkClips),
+    UnlinkClips(UnlinkClips),
     AddMarker(AddMarker),
     RemoveMarker(RemoveMarker),
     SetMarker(SetMarker),
@@ -882,12 +942,21 @@ impl WireCommand {
         match self {
             WireCommand::AddTrack(_) => {}
             WireCommand::AddClip(a) => track(&mut a.track),
+            WireCommand::ExtractAudio(a) => {
+                clip(&mut a.clip);
+                track(&mut a.track);
+            }
+            WireCommand::DuplicateClip(a) => {
+                clip(&mut a.clip);
+                track(&mut a.to_track);
+            }
             WireCommand::AddGenerated(a) => track(&mut a.track),
             WireCommand::SetGenerator(a) => clip(&mut a.clip),
             WireCommand::SetClipTransform(a) => clip(&mut a.clip),
             WireCommand::SetClipCrop(a) => clip(&mut a.clip),
             WireCommand::AddEffect(a) => clip(&mut a.clip),
             WireCommand::RemoveEffect(a) => clip(&mut a.clip),
+            WireCommand::MoveEffect(a) => clip(&mut a.clip),
             WireCommand::SetEffectParam(a) => clip(&mut a.clip),
             WireCommand::AddTransition(a) => clip(&mut a.clip),
             WireCommand::RemoveTransition(a) => clip(&mut a.clip),
@@ -922,6 +991,7 @@ impl WireCommand {
             WireCommand::ShiftClips(a) => track(&mut a.track),
             WireCommand::RippleInsert(a) => track(&mut a.track),
             WireCommand::LinkClips(a) => a.clips.iter_mut().for_each(clip),
+            WireCommand::UnlinkClips(a) => a.clips.iter_mut().for_each(clip),
             WireCommand::AddMarker(_) => {}
             WireCommand::RemoveMarker(a) => marker(&mut a.marker),
             WireCommand::SetMarker(a) => marker(&mut a.marker),
@@ -934,8 +1004,10 @@ impl WireCommand {
 /// arguments.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    /// Owned so host/MCP tool catalogs discovered at runtime can share the
+    /// same provider wire as the static edit vocabulary.
+    pub name: String,
+    pub description: String,
     pub parameters: serde_json::Value,
 }
 
@@ -949,8 +1021,8 @@ fn spec<T: JsonSchema>(name: &'static str, description: &'static str) -> ToolSpe
     let parameters = serde_json::to_value(settings.into_generator().into_root_schema_for::<T>())
         .expect("tool argument schemas are plain data and always serialize");
     ToolSpec {
-        name,
-        description,
+        name: name.to_string(),
+        description: description.to_string(),
         parameters,
     }
 }
@@ -975,10 +1047,11 @@ fn argument_hint(tool: &str) -> Option<&'static str> {
 /// touching dispatch.
 pub fn describe_project_spec() -> ToolSpec {
     ToolSpec {
-        name: "describe_project",
+        name: "describe_project".into(),
         description: "Get the current state of the project: tracks, clips with ids and \
                       times in seconds, the media pool, and the user's selection and \
-                      playhead. Call this whenever you are unsure about ids or timing.",
+                      playhead. Call this whenever you are unsure about ids or timing."
+            .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {},
@@ -1033,6 +1106,10 @@ tools! {
         "Add a track to the timeline stack (video, audio, text, or sticker overlay lane). Lanes keep CapCut zones: audio at the bottom, then the main video track, overlays above it, text on top — the index only orders a lane within its zone.";
     "add_clip" => AddClip(AddClip),
         "Place a trimmed range of an imported media file on a video or audio track. Times are in seconds.";
+    "extract_audio" => ExtractAudio(ExtractAudio),
+        "Detach a video clip's embedded sound onto an existing unlocked audio track, preserving its exact placement and audio/retime settings. The track id is required: call add_track with kind audio first when needed, then pass the returned id. Keeping the target explicit lets planned track ids remap correctly during replay.";
+    "duplicate_clip" => DuplicateClip(DuplicateClip),
+        "Make a deep property-preserving copy of one clip at an explicit target track and start (timeline seconds). The copy gets a fresh unlinked clip id. This tool does not ripple clips or search for space; choose a non-overlapping destination explicitly.";
     "add_generated" => AddGenerated(AddGenerated),
         "Place a generated clip (text title, solid color, or shape) on a matching track. Times are in seconds.";
     "set_generator" => SetGenerator(SetGenerator),
@@ -1045,6 +1122,8 @@ tools! {
         "Add a visual effect to a clip's effect chain. Available effects: gaussian_blur (param 'radius'), vignette (param 'amount'). Effects render on the placed layer, in chain order. Not valid on audio tracks.";
     "remove_effect" => RemoveEffect(RemoveEffect),
         "Remove an effect from a clip's chain by its index (0 = first). See describe_project for a clip's current effects.";
+    "move_effect" => MoveEffect(MoveEffect),
+        "Reorder a clip's effect chain. Both from_index and to_index address the current pre-move chain; to_index is the effect's final index. See describe_project for the current order.";
     "set_effect_param" => SetEffectParam(SetEffectParam),
         "Set a parameter of an effect on a clip to a value (e.g. gaussian_blur 'radius', vignette 'amount'). Use describe_project to see effect indices and current params.";
     "add_transition" => AddTransition(AddTransition),
@@ -1107,6 +1186,8 @@ tools! {
         "Insert a trimmed range of media at a timeline position, shifting later clips right to make room. Times are in seconds.";
     "link_clips" => LinkClips(LinkClips),
         "Link two or more clips so they select, move, and trim together (replaces their previous links).";
+    "unlink_clips" => UnlinkClips(UnlinkClips),
+        "Dissolve every link group touched by one or more clip ids. Naming any member clears the complete group; distinct members of the same group are coalesced.";
     "add_marker" => AddMarker(AddMarker),
         "Drop a named, colored marker on the timeline ruler at a position in seconds. Omit color to cycle the palette.";
     "remove_marker" => RemoveMarker(RemoveMarker),
@@ -1149,6 +1230,45 @@ mod tests {
                 .unwrap();
         assert_eq!(cmd, WireCommand::SplitClip(SplitClip { clip: 7, at: 12.4 }));
         assert_eq!(cmd.tool_name(), "split_clip");
+    }
+
+    #[test]
+    fn duplicate_clip_tagged_json_and_tool_arguments_are_strict() {
+        let json = serde_json::json!({
+            "command": "duplicate_clip",
+            "clip": 7,
+            "to_track": 3,
+            "start": 12.5,
+        });
+        let command: WireCommand = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            command,
+            WireCommand::DuplicateClip(DuplicateClip {
+                clip: 7,
+                to_track: 3,
+                start: 12.5,
+            })
+        );
+        assert_eq!(command.tool_name(), "duplicate_clip");
+
+        let missing = WireCommand::from_tool_call(
+            "duplicate_clip",
+            serde_json::json!({ "clip": 7, "to_track": 3 }),
+        )
+        .unwrap_err();
+        assert!(missing.contains("missing field `start`"), "{missing}");
+
+        let extra = WireCommand::from_tool_call(
+            "duplicate_clip",
+            serde_json::json!({
+                "clip": 7,
+                "to_track": 3,
+                "start": 12.5,
+                "ripple": true,
+            }),
+        )
+        .unwrap_err();
+        assert!(extra.contains("unknown field `ripple`"), "{extra}");
     }
 
     #[test]
@@ -1233,6 +1353,43 @@ mod tests {
             })
         );
 
+        let mut move_effect = WireCommand::MoveEffect(MoveEffect {
+            clip: 10,
+            from_index: 0,
+            to_index: 2,
+        });
+        move_effect.remap_ids(&clip_map, &track_map, &marker_map);
+        assert_eq!(
+            move_effect,
+            WireCommand::MoveEffect(MoveEffect {
+                clip: 99,
+                from_index: 0,
+                to_index: 2,
+            })
+        );
+
+        let mut extract = WireCommand::ExtractAudio(ExtractAudio { clip: 10, track: 2 });
+        extract.remap_ids(&clip_map, &track_map, &marker_map);
+        assert_eq!(
+            extract,
+            WireCommand::ExtractAudio(ExtractAudio { clip: 99, track: 7 })
+        );
+
+        let mut duplicate = WireCommand::DuplicateClip(DuplicateClip {
+            clip: 10,
+            to_track: 2,
+            start: 8.0,
+        });
+        duplicate.remap_ids(&clip_map, &track_map, &marker_map);
+        assert_eq!(
+            duplicate,
+            WireCommand::DuplicateClip(DuplicateClip {
+                clip: 99,
+                to_track: 7,
+                start: 8.0,
+            })
+        );
+
         // Unmapped ids pass through; link lists remap element-wise.
         let mut link = WireCommand::LinkClips(LinkClips {
             clips: vec![10, 11],
@@ -1242,6 +1399,17 @@ mod tests {
             link,
             WireCommand::LinkClips(LinkClips {
                 clips: vec![99, 11],
+            })
+        );
+
+        let mut unlink = WireCommand::UnlinkClips(UnlinkClips {
+            clips: vec![11, 10],
+        });
+        unlink.remap_ids(&clip_map, &track_map, &marker_map);
+        assert_eq!(
+            unlink,
+            WireCommand::UnlinkClips(UnlinkClips {
+                clips: vec![11, 99],
             })
         );
 
@@ -1268,7 +1436,7 @@ mod tests {
     #[test]
     fn tool_specs_cover_every_command_with_object_schemas() {
         let specs = tool_specs();
-        assert_eq!(specs.len(), 43);
+        assert_eq!(specs.len(), 47);
         for spec in &specs {
             assert!(
                 !spec.description.is_empty(),
@@ -1282,5 +1450,92 @@ mod tests {
                 spec.name
             );
         }
+    }
+
+    #[test]
+    fn extract_audio_schema_requires_explicit_clip_and_track() {
+        let specs = tool_specs();
+        let extract = specs
+            .iter()
+            .find(|spec| spec.name == "extract_audio")
+            .expect("extract_audio tool");
+        assert_eq!(
+            extract.parameters["required"],
+            serde_json::json!(["clip", "track"])
+        );
+        assert!(
+            extract
+                .description
+                .contains("planned track ids remap correctly")
+        );
+        assert!(
+            WireCommand::from_tool_call("extract_audio", serde_json::json!({"clip": 7}))
+                .unwrap_err()
+                .contains("missing field `track`")
+        );
+    }
+
+    #[test]
+    fn duplicate_clip_schema_requires_only_explicit_placement_fields() {
+        let specs = tool_specs();
+        let duplicate = specs
+            .iter()
+            .find(|spec| spec.name == "duplicate_clip")
+            .expect("duplicate_clip tool");
+        assert_eq!(
+            duplicate.parameters["required"],
+            serde_json::json!(["clip", "to_track", "start"])
+        );
+        assert_eq!(duplicate.parameters["additionalProperties"], false);
+        assert!(
+            duplicate
+                .description
+                .contains("deep property-preserving copy")
+        );
+        assert!(duplicate.description.contains("fresh unlinked clip id"));
+        assert!(
+            duplicate
+                .description
+                .contains("explicit target track and start")
+        );
+        assert!(
+            duplicate
+                .description
+                .contains("does not ripple clips or search for space")
+        );
+    }
+
+    #[test]
+    fn move_effect_schema_uses_u32_indices() {
+        let specs = tool_specs();
+        let move_effect = specs
+            .iter()
+            .find(|spec| spec.name == "move_effect")
+            .expect("move_effect tool");
+        assert_eq!(
+            move_effect.parameters["required"],
+            serde_json::json!(["clip", "from_index", "to_index"])
+        );
+        for field in ["from_index", "to_index"] {
+            let index = &move_effect.parameters["properties"][field];
+            assert_eq!(index["type"], "integer");
+            assert_eq!(index["format"], "uint32");
+            assert_eq!(index["minimum"], 0);
+        }
+    }
+
+    #[test]
+    fn unlink_schema_is_a_bounded_nonempty_clip_list() {
+        let specs = tool_specs();
+        let unlink = specs
+            .iter()
+            .find(|spec| spec.name == "unlink_clips")
+            .expect("unlink_clips tool");
+        let clips = &unlink.parameters["properties"]["clips"];
+        assert_eq!(clips["type"], "array");
+        assert_eq!(clips["minItems"], 1);
+        assert_eq!(clips["maxItems"], MAX_MULTI_CLIP_REFS);
+        assert_eq!(clips["items"]["type"], "integer");
+        assert_eq!(unlink.parameters["required"], serde_json::json!(["clips"]));
     }
 }

@@ -4,6 +4,7 @@
 // stays generic (Slint's string type has no `contains`).
 
 import { CutlassText } from "text.slint";
+import { CutlassLineInput } from "text-input.slint";
 import { CutlassScrollView } from "scroll-view.slint";
 import { AppStore } from "../store/index.slint";
 import { AppState } from "../state.slint";
@@ -78,38 +79,11 @@ export component CutlassDropdown inherits Rectangle {
                 padding: AppStore.theme.metrics.spacing.sm;
                 spacing: AppStore.theme.metrics.spacing.sm;
 
-                if root.searchable: Rectangle {
+                if root.searchable: search := CutlassLineInput {
                     height: 26px;
-                    border-radius: AppStore.theme.metrics.radius.sm;
-                    background: #111111;
-                    border-width: search.has-focus ? 1px : 0px;
-                    border-color: AppStore.theme.accent.primary;
-                    clip: true;
-                    forward-focus: search;
-
-                    search := TextInput {
-                        x: AppStore.theme.metrics.spacing.sm;
-                        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
-                        height: parent.height;
-                        vertical-alignment: center;
-                        single-line: true;
-                        color: AppStore.theme.text.primary;
-                        font-size: AppStore.theme.typography.body.size;
-                        selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
-                        text <=> root.query;
-                        accessible-role: none;
-                    }
-
-                    placeholder := CutlassText {
-                        x: AppStore.theme.metrics.spacing.sm;
-                        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
-                        height: parent.height;
-                        vertical-alignment: center;
-                        text: (root.query == "" && search.preedit-text == "") ? "Search" : "";
-                        style: AppStore.theme.typography.body;
-                        foreground: AppStore.theme.text.muted;
-                        accessible-role: none;
-                    }
+                    text <=> root.query;
+                    placeholder-text: "Search";
+                    accessibility-label: "Filter options";
                 }
 
                 CutlassScrollView {

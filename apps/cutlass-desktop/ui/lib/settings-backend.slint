@@ -1,13 +1,28 @@
 // App settings plumbing, implemented in Rust (src/main.rs loads the values
 // at startup and wires the callbacks). The settings screen (shell/
 // settings-dialog.slint) two-way binds these properties to its fields and
-// calls `save` to persist them to ~/.cutlass/config.toml via the
-// cutlass-settings crate.
+// calls `save`; a true result means persistence succeeded and the dialog may
+// close.
 //
 // The theme is the one setting that lives elsewhere (AppStore.theme-id), so
 // it can drive the live theme binding the whole shell reads; `save` folds it
-// in from there. (No cache section on this branch: the engine decodes
-// through the native media stack with no disk cache to configure.)
+// in from there. Storage/cache state is projected by the shared cache
+// registry so Settings and the assistant address the same exact caches.
+export struct CacheUsageRow {
+    // Stable CacheId key; callbacks always hand this back instead of a row
+    // index so a refresh cannot retarget an operation.
+    id: string,
+    label: string,
+    // "memory" | "disk".
+    kind: string,
+    size-label: string,
+    item-count-label: string,
+    // Empty for memory caches.
+    path: string,
+    clearable: bool,
+    relocatable: bool,
+}
+
 export global SettingsBackend {
     // --- AI provider ([ai]) --------------------------------------------
     in-out property <string> ai-base-url;
@@ -18,8 +33,27 @@ export global SettingsBackend {
     // credits-metered) instead of the endpoint fields above.
     in-out property <bool> ai-use-account;
 
+    // --- Storage & cache ([storage]) -----------------------------------
+    // Displayed root and editable download-cache quota. Choosing a new root
+    // goes through `choose-storage-root`; the UI never writes a path directly.
+    in-out property <string> storage-root;
+    in-out property <string> download-quota-mib;
+    in-out property <[CacheUsageRow]> cache-rows: [];
+    in-out property <bool> cache-loading: false;
+    // Stable cache id for the operation in flight; empty while idle.
+    in-out property <string> cache-busy-id;
+    in-out property <string> cache-status;
+    in-out property <string> cache-error;
+    // Per-cache moves and aggregate default-root relocation are separate
+    // capabilities. Rust enables only the operation it can complete safely.
+    in-out property <bool> cache-relocation-enabled: false;
+    in-out property <bool> storage-root-relocation-enabled: false;
+
     // The config file path, shown at the foot of the screen.
     in-out property <string> config-path;
+    // Generic persistence feedback. Detailed parser or filesystem errors stay
+    // in the log so unrelated config contents are never reflected into UI.
+    in-out property <string> save-error;
 
     // --- Test connection feedback (set by Rust) ------------------------
     in-out property <bool> ai-testing: false;
@@ -28,11 +62,18 @@ export global SettingsBackend {
 
     // Persist every value (plus AppStore.theme-id) to config.toml. The Rust
     // handler also applies the live-settable bits immediately (the agent's
-    // configured state).
-    callback save();
+    // configured state). False leaves the dialog open with `save-error`.
+    callback save() -> bool;
     // Probe the endpoint with the *current, unsaved* AI fields and report
     // back through `ai-test-status` / `ai-test-ok`.
     callback test-connection();
+    // Cache inventory and exact-cache actions. There is intentionally no
+    // aggregate clear callback.
+    callback refresh-caches();
+    callback clear-cache(cache-id: string);
+    callback reveal-cache(cache-id: string);
+    callback relocate-cache(cache-id: string);
+    callback choose-storage-root();
     // Reveal the config file in the OS file browser.
     callback reveal-config();
 }

@@ -18,6 +18,7 @@ import {
     EditorStore,
     TimelineActions,
 } from "../../store/index.slint";
+import { AppState } from "../../state.slint";
 
 // Circular send/stop affordance pinned inside the composer (ChatGPT-style).
 component ComposerAction inherits Rectangle {
@@ -75,9 +76,16 @@ component PromptInput inherits Rectangle {
     private property <bool> scrolls: text-block-h > editor-area-h;
 
     height: clamp(max(input.preferred-height + 2 * self.pad-y, self.composer-min-h), self.composer-min-h, 110px);
+    min-width: 120px;
     horizontal-stretch: 1;
     border-radius: AppStore.theme.metrics.radius.md;
-    background: AppStore.theme.agent.input-bg;
+    border-width: 1px;
+    border-color: root.enabled && input.has-focus
+        ? AppStore.theme.accent.primary
+        : #ffffff14;
+    background: input.has-focus && root.enabled
+        ? AppStore.theme.agent.input-bg.brighter(0.04)
+        : AppStore.theme.agent.input-bg;
     opacity: enabled ? 1.0 : 0.55;
     clip: true;
     forward-focus: input;
@@ -87,14 +95,15 @@ component PromptInput inherits Rectangle {
         easing: ease-out;
     }
 
-    TouchArea {
+    focus-area := TouchArea {
+        enabled: root.enabled;
         mouse-cursor: MouseCursor.text;
         clicked => {
             input.focus();
         }
     }
 
-    if root.text == "" && !input.has-focus: CutlassText {
+    if root.text == "" && input.preedit-text == "": CutlassText {
         x: root.pad-x;
         width: max(0px, parent.width - root.pad-x - root.pad-x - root.text-inset-right);
         height: parent.height;
@@ -103,6 +112,7 @@ component PromptInput inherits Rectangle {
         style: AppStore.theme.typography.body;
         foreground: AppStore.theme.text.muted;
         overflow: elide;
+        accessible-role: none;
     }
 
     editor-scroll := CutlassScrollView {
@@ -128,8 +138,13 @@ component PromptInput inherits Rectangle {
             selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
             selection-foreground-color: AppStore.theme.text.primary;
             page-height: editor-scroll.height;
-            accessible-role: none;
+            accessible-label: "Editing prompt";
+            accessible-placeholder-text: "Describe an edit";
             key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    AppState.refocus-shortcuts();
+                    return accept;
+                }
                 if (event.text == Key.Return && !event.modifiers.shift) {
                     root.accepted(root.text);
                     return accept;
@@ -237,6 +252,58 @@ component TranscriptEntry inherits VerticalLayout {
         wrap: word-wrap;
         style: AppStore.theme.typography.body;
         foreground: AppStore.theme.text.secondary;
+    }
+
+    // Tool-produced screenshots and timeline maps stay inline with the
+    // conversation. The neutral viewport also reads cleanly behind alpha.
+    if entry.kind == "image": image-card := Rectangle {
+        horizontal-stretch: 1;
+        private property <float> safe-aspect: entry.image-aspect > 0.0
+            ? entry.image-aspect
+            : 16.0 / 9.0;
+        private property <length> image-viewport-height: clamp(
+            max(0px, self.width) / self.safe-aspect,
+            120px,
+            320px,
+        );
+
+        background: AppStore.theme.agent.input-bg;
+        border-width: AppStore.theme.metrics.stroke.hairline;
+        border-color: AppStore.theme.text.muted.with-alpha(0.35);
+        border-radius: AppStore.theme.metrics.radius.md;
+        clip: true;
+
+        VerticalLayout {
+            spacing: AppStore.theme.metrics.spacing.none;
+
+            image-viewport := Rectangle {
+                height: image-card.image-viewport-height;
+                background: AppStore.theme.surface.content-background;
+
+                Image {
+                    width: parent.width;
+                    height: parent.height;
+                    source: entry.image;
+                    image-fit: ImageFit.contain;
+                    accessible-label: "Agent image attachment";
+                }
+            }
+
+            if entry.text != "": VerticalLayout {
+                padding-left: AppStore.theme.metrics.spacing.sm;
+                padding-right: AppStore.theme.metrics.spacing.sm;
+                padding-top: AppStore.theme.metrics.spacing.xs;
+                padding-bottom: AppStore.theme.metrics.spacing.sm;
+
+                CutlassText {
+                    horizontal-stretch: 1;
+                    text: entry.text;
+                    wrap: word-wrap;
+                    style: AppStore.theme.typography.caption;
+                    foreground: AppStore.theme.text.muted;
+                }
+            }
+        }
     }
 
     // One edit line: accent tick so applied work scans at a glance.
@@ -387,6 +454,60 @@ export component AgentPanel inherits PanelBase {
             }
         }
 
+        // System-tier host tools execute outside the rehearsed timeline
+        // plan, so each call pauses here unless Full autonomy is enabled.
+        if AgentStore.approval-pending: Rectangle {
+            background: AppStore.theme.agent.plan-bg;
+            border-width: 1px;
+            border-color: AppStore.theme.agent.plan-border;
+            border-radius: AppStore.theme.metrics.radius.md;
+
+            VerticalLayout {
+                padding: AppStore.theme.metrics.spacing.md;
+                spacing: AppStore.theme.metrics.spacing.sm;
+
+                CutlassText {
+                    text: AgentStore.approval-title;
+                    wrap: word-wrap;
+                    style: AppStore.theme.typography.label;
+                }
+
+                CutlassText {
+                    text: AgentStore.approval-detail;
+                    wrap: word-wrap;
+                    mono: true;
+                    style: AppStore.theme.typography.caption;
+                    foreground: AppStore.theme.text.secondary;
+                }
+
+                CutlassText {
+                    text: "This action runs now and cannot be undone from Cutlass.";
+                    wrap: word-wrap;
+                    style: AppStore.theme.typography.caption;
+                    foreground: AppStore.theme.agent.error;
+                }
+
+                HorizontalLayout {
+                    spacing: AppStore.theme.metrics.spacing.sm;
+                    alignment: start;
+
+                    AccentButton {
+                        label: "Run";
+                        clicked => {
+                            AgentStore.approve-system-tool();
+                        }
+                    }
+
+                    SubtleButton {
+                        label: "Decline";
+                        clicked => {
+                            AgentStore.deny-system-tool();
+                        }
+                    }
+                }
+            }
+        }
+
         // The rehearsed plan, waiting on the user (preview-before-apply).
         if AgentStore.plan-pending: Rectangle {
             background: AppStore.theme.agent.plan-bg;
@@ -458,13 +579,25 @@ export component AgentPanel inherits PanelBase {
                     foreground: AppStore.theme.text.muted;
                 }
 
-                Rectangle {
+                rules-editor := Rectangle {
                     height: 90px;
+                    min-width: 96px;
                     border-radius: AppStore.theme.metrics.radius.md;
-                    background: AppStore.theme.agent.input-bg;
+                    border-width: 1px;
+                    border-color: rules-input.has-focus
+                        ? AppStore.theme.accent.primary
+                        : #ffffff14;
+                    background: rules-input.has-focus
+                        ? AppStore.theme.agent.input-bg.brighter(0.04)
+                        : AppStore.theme.agent.input-bg;
                     clip: true;
 
-                    TouchArea {
+                    animate border-color {
+                        duration: 120ms;
+                        easing: ease-out;
+                    }
+
+                    rules-focus-area := TouchArea {
                         mouse-cursor: MouseCursor.text;
                         clicked => {
                             rules-input.focus();
@@ -479,7 +612,7 @@ export component AgentPanel inherits PanelBase {
                         viewport-width: self.width;
                         viewport-height: max(self.height, rules-input.preferred-height);
                         show-horizontal-scrollbar: false;
-                        show-vertical-scrollbar: false;
+                        show-vertical-scrollbar: rules-input.preferred-height > self.height;
 
                         rules-input := TextInput {
                             width: rules-scroll.width;
@@ -493,8 +626,48 @@ export component AgentPanel inherits PanelBase {
                             selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
                             selection-foreground-color: AppStore.theme.text.primary;
                             page-height: rules-scroll.height;
-                            accessible-role: none;
+                            accessible-label: "Project rules";
+                            accessible-placeholder-text: "Add project-specific instructions";
+
+                            key-pressed(event) => {
+                                if (event.text == Key.Escape) {
+                                    root.rules-draft = EditorStore.project.agent-rules;
+                                    root.rules-open = false;
+                                    AppState.refocus-shortcuts();
+                                    return accept;
+                                }
+                                reject
+                            }
+
+                            cursor-position-changed(cpos) => {
+                                if (cpos.y + rules-scroll.viewport-y < 8px) {
+                                    rules-scroll.viewport-y = min(0px, max(
+                                        rules-scroll.height - self.height,
+                                        -cpos.y + 8px,
+                                    ));
+                                } else if (
+                                    cpos.y + rules-scroll.viewport-y
+                                        > rules-scroll.height - 24px
+                                ) {
+                                    rules-scroll.viewport-y = min(0px, max(
+                                        rules-scroll.height - self.height,
+                                        rules-scroll.height - cpos.y - 24px,
+                                    ));
+                                }
+                            }
                         }
+                    }
+
+                    if root.rules-draft == "" && rules-input.preedit-text == "": CutlassText {
+                        x: AppStore.theme.metrics.spacing.md;
+                        y: AppStore.theme.metrics.spacing.sm;
+                        width: max(0px, parent.width - 2 * AppStore.theme.metrics.spacing.md);
+                        height: AppStore.theme.typography.body.size + 6px;
+                        text: "Add project-specific instructions…";
+                        style: AppStore.theme.typography.body;
+                        foreground: AppStore.theme.text.muted;
+                        overflow: TextOverflow.elide;
+                        accessible-role: none;
                     }
                 }
 
@@ -507,13 +680,16 @@ export component AgentPanel inherits PanelBase {
                         clicked => {
                             AgentStore.set-project-rules(root.rules-draft);
                             root.rules-open = false;
+                            AppState.refocus-shortcuts();
                         }
                     }
 
                     SubtleButton {
                         label: "Cancel";
                         clicked => {
+                            root.rules-draft = EditorStore.project.agent-rules;
                             root.rules-open = false;
+                            AppState.refocus-shortcuts();
                         }
                     }
                 }
@@ -595,6 +771,7 @@ export component AgentPanel inherits PanelBase {
                     clicked => {
                         if (root.rules-open) {
                             root.rules-open = false;
+                            AppState.refocus-shortcuts();
                         } else {
                             root.rules-draft = EditorStore.project.agent-rules;
                             root.rules-open = true;

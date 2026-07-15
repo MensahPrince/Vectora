@@ -295,6 +295,14 @@ impl EffectInstance {
         Ok(())
     }
 
+    /// Shift every clip-relative parameter keyframe by `delta` ticks.
+    pub(crate) fn shift_param_ticks(&mut self, delta: i64) -> Result<(), ModelError> {
+        for param in self.params.values_mut() {
+            param.shift_ticks(delta)?;
+        }
+        Ok(())
+    }
+
     /// `Ok` iff the id is known, every set parameter names a real slot, every
     /// curve is structurally sound, and every value lies in range.
     pub fn validate(&self) -> Result<(), ModelError> {

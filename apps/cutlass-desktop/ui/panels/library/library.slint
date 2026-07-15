@@ -5,6 +5,7 @@
 // already has its final shape.
 
 import {
+    CutlassLineInput,
     CutlassGridView,
     CutlassText,
     SubtleButton,
@@ -18,6 +19,7 @@ import { EffectsBackend, CloudBackend, TextPresetsBackend, AiBackend, LottieBack
 import { MediaTile, GeneratedTile, CatalogTile, TransitionCatalogTile, StockMediaTile, TextPresetLibraryTile, AiMediaTile, SfxAudioTile } from "tiles.slint";
 import { SectionPlaceholder } from "placeholder.slint";
 import { CutlassScrollView } from "../../components/scroll-view.slint";
+import { AppState } from "../../state.slint";
 
 // Active tab + per-tab section. A global rather than panel state: the panel
 // unmounts while fullscreen preview is up, and the selection should survive
@@ -77,6 +79,7 @@ component LibraryTab inherits Rectangle {
     ta := TouchArea {
         clicked => {
             LibraryState.active-tab = root.tab-id;
+            AppState.refocus-shortcuts();
         }
     }
 }
@@ -109,6 +112,7 @@ component SectionItem inherits Rectangle {
     ta := TouchArea {
         clicked => {
             root.activate();
+            AppState.refocus-shortcuts();
         }
     }
 }
@@ -133,46 +137,6 @@ component SectionList inherits VerticalLayout {
         activate => {
             root.select(s.id);
         }
-    }
-}
-
-// Search field for the stock browser, styled like the settings text field.
-component StockSearchField inherits Rectangle {
-    height: 28px;
-    horizontal-stretch: 1;
-    border-radius: AppStore.theme.metrics.radius.sm;
-    background: #111111;
-    border-width: 1px;
-    border-color: input.has-focus ? AppStore.theme.accent.primary : #ffffff14;
-    clip: true;
-    forward-focus: input;
-
-    input := TextInput {
-        x: AppStore.theme.metrics.spacing.sm;
-        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
-        height: parent.height;
-        vertical-alignment: center;
-        single-line: true;
-        text <=> CloudBackend.stock-query;
-        color: AppStore.theme.text.primary;
-        font-size: AppStore.theme.typography.body.size;
-        selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
-        selection-foreground-color: AppStore.theme.text.primary;
-        accessible-role: none;
-        accepted => {
-            CloudBackend.stock-search();
-        }
-    }
-
-    if CloudBackend.stock-query == "" && !input.has-focus: CutlassText {
-        x: AppStore.theme.metrics.spacing.sm;
-        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
-        height: parent.height;
-        vertical-alignment: center;
-        text: "Search stock media…";
-        style: AppStore.theme.typography.body;
-        foreground: AppStore.theme.text.muted;
-        overflow: elide;
     }
 }
 
@@ -206,51 +170,8 @@ component StockKindChip inherits Rectangle {
                     CloudBackend.stock-search();
                 }
             }
+            AppState.refocus-shortcuts();
         }
-    }
-}
-
-// Prompt field for the AI generation sections.
-component AiPromptField inherits Rectangle {
-    in property <string> placeholder;
-    in-out property <string> value;
-    callback accepted();
-
-    height: 28px;
-    horizontal-stretch: 1;
-    border-radius: AppStore.theme.metrics.radius.sm;
-    background: #111111;
-    border-width: 1px;
-    border-color: input.has-focus ? AppStore.theme.accent.primary : #ffffff14;
-    clip: true;
-    forward-focus: input;
-
-    input := TextInput {
-        x: AppStore.theme.metrics.spacing.sm;
-        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
-        height: parent.height;
-        vertical-alignment: center;
-        single-line: true;
-        text <=> root.value;
-        color: AppStore.theme.text.primary;
-        font-size: AppStore.theme.typography.body.size;
-        selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
-        selection-foreground-color: AppStore.theme.text.primary;
-        accessible-role: none;
-        accepted => {
-            root.accepted();
-        }
-    }
-
-    if root.value == "" && !input.has-focus: CutlassText {
-        x: AppStore.theme.metrics.spacing.sm;
-        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
-        height: parent.height;
-        vertical-alignment: center;
-        text: root.placeholder;
-        style: AppStore.theme.typography.body;
-        foreground: AppStore.theme.text.muted;
-        overflow: elide;
     }
 }
 
@@ -279,6 +200,7 @@ component AiKindChip inherits Rectangle {
     ta := TouchArea {
         clicked => {
             AiBackend.media-kind = root.kind;
+            AppState.refocus-shortcuts();
         }
     }
 }
@@ -315,6 +237,7 @@ component ImportToolbar inherits HorizontalLayout {
         label: "+  Import";
         clicked => {
             EditorStore.on-import-clicked();
+            AppState.refocus-shortcuts();
         }
     }
 }
@@ -514,20 +437,32 @@ export component LibraryPanel inherits PanelBase {
                 if LibraryState.active-tab == "media" && LibraryState.media-section == "stock": VerticalLayout {
                     spacing: AppStore.theme.metrics.spacing.none;
 
-                    HorizontalLayout {
+                    VerticalLayout {
                         padding: AppStore.theme.metrics.spacing.sm;
                         spacing: AppStore.theme.metrics.spacing.sm;
 
-                        StockSearchField { }
-
-                        StockKindChip {
-                            kind: "video";
-                            label: "Videos";
+                        CutlassLineInput {
+                            text <=> CloudBackend.stock-query;
+                            placeholder-text: "Search stock media…";
+                            accessibility-label: "Stock media search";
+                            accepted(_) => {
+                                CloudBackend.stock-search();
+                            }
                         }
 
-                        StockKindChip {
-                            kind: "photo";
-                            label: "Photos";
+                        HorizontalLayout {
+                            spacing: AppStore.theme.metrics.spacing.sm;
+                            alignment: start;
+
+                            StockKindChip {
+                                kind: "video";
+                                label: "Videos";
+                            }
+
+                            StockKindChip {
+                                kind: "photo";
+                                label: "Photos";
+                            }
                         }
                     }
 
@@ -590,6 +525,7 @@ export component LibraryPanel inherits PanelBase {
                                 label: "Retry";
                                 clicked => {
                                     CloudBackend.stock-search();
+                                    AppState.refocus-shortcuts();
                                 }
                             }
                         }
@@ -634,6 +570,7 @@ export component LibraryPanel inherits PanelBase {
                                     if !CloudBackend.stock-loading-more {
                                         CloudBackend.stock-load-more();
                                     }
+                                    AppState.refocus-shortcuts();
                                 }
                             }
                         }
@@ -646,35 +583,46 @@ export component LibraryPanel inherits PanelBase {
                 if LibraryState.active-tab == "media" && LibraryState.media-section == "ai": VerticalLayout {
                     spacing: AppStore.theme.metrics.spacing.none;
 
-                    HorizontalLayout {
+                    VerticalLayout {
                         padding: AppStore.theme.metrics.spacing.sm;
                         spacing: AppStore.theme.metrics.spacing.sm;
 
-                        AiPromptField {
-                            placeholder: "Describe an image or clip…";
-                            value <=> AiBackend.media-prompt;
-                            accepted => {
-                                if !AiBackend.busy && AiBackend.media-prompt != "" {
-                                    AiBackend.generate(AiBackend.media-kind, AiBackend.media-prompt);
+                        CutlassLineInput {
+                            placeholder-text: "Describe an image or clip…";
+                            accessibility-label: "AI media prompt";
+                            text <=> AiBackend.media-prompt;
+                            accepted(prompt) => {
+                                if !AiBackend.busy && prompt != "" {
+                                    AiBackend.generate(AiBackend.media-kind, prompt);
                                 }
                             }
                         }
 
-                        AiKindChip {
-                            kind: "image";
-                            label: "Image";
-                        }
+                        HorizontalLayout {
+                            spacing: AppStore.theme.metrics.spacing.sm;
+                            alignment: start;
 
-                        AiKindChip {
-                            kind: "video";
-                            label: "Video";
-                        }
+                            AiKindChip {
+                                kind: "image";
+                                label: "Image";
+                            }
 
-                        SubtleButton {
-                            label: AiBackend.busy ? "Generating…" : "Generate";
-                            enabled: !AiBackend.busy && AiBackend.media-prompt != "";
-                            clicked => {
-                                AiBackend.generate(AiBackend.media-kind, AiBackend.media-prompt);
+                            AiKindChip {
+                                kind: "video";
+                                label: "Video";
+                            }
+
+                            Rectangle {
+                                horizontal-stretch: 1;
+                            }
+
+                            SubtleButton {
+                                label: AiBackend.busy ? "Generating…" : "Generate";
+                                enabled: !AiBackend.busy && AiBackend.media-prompt != "";
+                                clicked => {
+                                    AiBackend.generate(AiBackend.media-kind, AiBackend.media-prompt);
+                                    AppState.refocus-shortcuts();
+                                }
                             }
                         }
                     }
@@ -814,6 +762,7 @@ export component LibraryPanel inherits PanelBase {
                                 label: "Retry";
                                 clicked => {
                                     SfxBackend.refresh();
+                                    AppState.refocus-shortcuts();
                                 }
                             }
                         }
@@ -854,25 +803,31 @@ export component LibraryPanel inherits PanelBase {
                 if LibraryState.active-tab == "audio" && LibraryState.audio-section == "ai": VerticalLayout {
                     spacing: AppStore.theme.metrics.spacing.none;
 
-                    HorizontalLayout {
+                    VerticalLayout {
                         padding: AppStore.theme.metrics.spacing.sm;
                         spacing: AppStore.theme.metrics.spacing.sm;
 
-                        AiPromptField {
-                            placeholder: "Text to speak…";
-                            value <=> AiBackend.tts-prompt;
-                            accepted => {
-                                if !AiBackend.busy && AiBackend.tts-prompt != "" {
-                                    AiBackend.generate("tts", AiBackend.tts-prompt);
+                        CutlassLineInput {
+                            placeholder-text: "Text to speak…";
+                            accessibility-label: "Text to speak";
+                            text <=> AiBackend.tts-prompt;
+                            accepted(prompt) => {
+                                if !AiBackend.busy && prompt != "" {
+                                    AiBackend.generate("tts", prompt);
                                 }
                             }
                         }
 
-                        SubtleButton {
-                            label: AiBackend.busy ? "Generating…" : "Generate";
-                            enabled: !AiBackend.busy && AiBackend.tts-prompt != "";
-                            clicked => {
-                                AiBackend.generate("tts", AiBackend.tts-prompt);
+                        HorizontalLayout {
+                            alignment: end;
+
+                            SubtleButton {
+                                label: AiBackend.busy ? "Generating…" : "Generate";
+                                enabled: !AiBackend.busy && AiBackend.tts-prompt != "";
+                                clicked => {
+                                    AiBackend.generate("tts", AiBackend.tts-prompt);
+                                    AppState.refocus-shortcuts();
+                                }
                             }
                         }
                     }
@@ -989,6 +944,7 @@ export component LibraryPanel inherits PanelBase {
                                 label: "Retry";
                                 clicked => {
                                     TextPresetsBackend.refresh();
+                                    AppState.refocus-shortcuts();
                                 }
                             }
                         }
@@ -1068,6 +1024,7 @@ export component LibraryPanel inherits PanelBase {
                                 label: "Retry";
                                 clicked => {
                                     LottieBackend.refresh();
+                                    AppState.refocus-shortcuts();
                                 }
                             }
                         }

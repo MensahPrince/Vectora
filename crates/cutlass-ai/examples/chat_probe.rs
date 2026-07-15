@@ -42,12 +42,11 @@ fn main() {
     let provider = OpenAiCompatProvider::new(&ai.base_url, &ai.model, api_key);
 
     let messages = vec![
-        Message::System {
-            content: "You are the editing agent inside the Cutlass video editor. \
-                      You edit the timeline by calling tools."
-                .to_string(),
-        },
-        Message::User { content: prompt },
+        Message::system(
+            "You are the editing agent inside the Cutlass video editor. \
+             You edit the timeline by calling tools.",
+        ),
+        Message::user(prompt),
     ];
     let mut tools = cutlass_ai::tool_specs();
     tools.push(cutlass_ai::wire::describe_project_spec());

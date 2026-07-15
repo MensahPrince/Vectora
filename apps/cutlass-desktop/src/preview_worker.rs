@@ -9,18 +9,18 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TryRecvError, bounded, unbounded};
 use cutlass_commands::{Command, EditCommand, EditOutcome, ProjectCommand, TemplatePick};
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig, SeekPolicy};
 use cutlass_models::{
-    AnimatedTransform, AudioRole, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments,
-    CropRect, Easing, Filter, Generator, LinkId, Lut, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId,
-    MediaId, Param, ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId,
-    TrackKind, resample,
+    AnimatedTransform, ClipId, ClipParam, ClipSource, ClipTransform, ColorAdjustments, CropRect,
+    Easing, Filter, Generator, LinkId, Lut, MAX_SPEED, MIN_SPEED, MarkerColor, MarkerId, MediaId,
+    Param, ParamValue, Project, Rational, RationalTime, TimeRange, Track, TrackId, TrackKind,
+    resample,
 };
 use cutlass_render::{ExportSettings, RenderError, Renderer};
 use slint::{Rgba8Pixel, SharedPixelBuffer};
@@ -57,6 +57,74 @@ pub struct PreviewSession {
     pub tl_rate: Rational,
 }
 
+/// Exact in-memory usage of the composited preview-frame cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct PreviewCacheStats {
+    pub(crate) entries: usize,
+    pub(crate) bytes: u64,
+}
+
+/// Result of an acknowledged media-pool import. The path is read back from
+/// the engine after import, so callers receive its canonical/current value
+/// rather than merely the path they requested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ImportMediaRpcResult {
+    pub(crate) media_id: u64,
+    pub(crate) path: PathBuf,
+}
+
+/// Result of an acknowledged project save.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SaveProjectRpcResult {
+    pub(crate) path: PathBuf,
+    /// Always false. An `Ok` result is withheld if the engine remains dirty.
+    pub(crate) dirty: bool,
+}
+
+/// One acknowledged media relink, also used by folder-relink results.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelinkMediaRpcResult {
+    pub(crate) media_id: u64,
+    pub(crate) path: PathBuf,
+}
+
+/// Result of an acknowledged folder relink. Entries are sorted by raw media
+/// id, independent of media-pool iteration order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RelinkFolderRpcResult {
+    pub(crate) relinked: Vec<RelinkMediaRpcResult>,
+}
+
+/// Result of an acknowledged project open. `path` is read back from the
+/// engine after the load, and therefore names the session's actual binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenProjectRpcResult {
+    pub(crate) path: PathBuf,
+    pub(crate) project_name: String,
+    pub(crate) missing_media_count: usize,
+}
+
+/// Result of an acknowledged fresh-session replacement. A new session is
+/// intentionally unbound until the host creates an app-owned draft and sends
+/// a separate [`WorkerHandle::save_project_rpc`] in queue order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewProjectRpcResult {
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) project_name: String,
+    pub(crate) missing_media_count: usize,
+    pub(crate) requires_save_binding: bool,
+}
+
+/// Result of an acknowledged template application. An `Ok` result is only
+/// returned after the filled in-memory project has been saved and the engine
+/// reports this actual app-owned draft binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApplyTemplateRpcResult {
+    pub(crate) path: PathBuf,
+    pub(crate) project_name: String,
+    pub(crate) missing_media_count: usize,
+}
+
 /// Work submitted to the engine thread. Scrub frames coalesce to the latest
 /// pending tick; imports must not be dropped by that coalescing (see
 /// [`worker_loop`]).
@@ -70,6 +138,12 @@ enum WorkerMsg {
         height: u32,
     },
     Import(PathBuf),
+    /// Queue-ordered, acknowledged counterpart to [`WorkerMsg::Import`].
+    ImportMediaRpc {
+        path: PathBuf,
+        reply: Sender<Result<ImportMediaRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// OS files dropped on the window (Finder / Explorer). With `target`
     /// — the drop landed on the timeline: (lane-list row, sequence tick)
     /// under the cursor — every file is imported and placed end-to-end from
@@ -532,6 +606,13 @@ enum WorkerMsg {
     SaveProject {
         path: Option<PathBuf>,
     },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::SaveProject`].
+    SaveProjectRpc {
+        path: Option<PathBuf>,
+        reply: Sender<Result<SaveProjectRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Replace the session from a `.cutlass` file (tolerant: entries whose
     /// media file is gone are kept and surface through the relink flow —
     /// the projection republish carries the missing set, and app.slint
@@ -544,6 +625,13 @@ enum WorkerMsg {
     OpenProject {
         path: PathBuf,
     },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::OpenProject`].
+    OpenProjectRpc {
+        path: PathBuf,
+        reply: Sender<Result<OpenProjectRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Re-point a media-pool entry (raw id) at a new file (missing-media
     /// relink, M0): the engine re-probes the file and swaps the entry's
     /// path/metadata in place (id and clips untouched), the tile workers
@@ -553,10 +641,25 @@ enum WorkerMsg {
         media: String,
         path: PathBuf,
     },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::RelinkMedia`].
+    RelinkMediaRpc {
+        media: String,
+        path: PathBuf,
+        reply: Sender<Result<RelinkMediaRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Try `folder/<filename>` for every missing pool entry (locate-folder
     /// gesture in the relink dialog).
     RelinkFolder {
         folder: PathBuf,
+    },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::RelinkFolder`].
+    RelinkFolderRpc {
+        folder: PathBuf,
+        reply: Sender<Result<RelinkFolderRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
     },
     /// Delete a source (raw id) from the media pool / Library bin. `force`
     /// false removes only when no clip references it (the engine rejects a
@@ -570,16 +673,32 @@ enum WorkerMsg {
     /// `project.cutlass` is written by the `SaveProject` that follows).
     /// Same epoch bump as `OpenProject`.
     NewProject,
+    /// Queue-ordered, acknowledged counterpart to [`WorkerMsg::NewProject`].
+    /// It deliberately does not create or bind a draft; the orchestration
+    /// layer follows it with an acknowledged save to its chosen app-owned path.
+    NewProjectRpc {
+        reply: Sender<Result<NewProjectRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Replace the session with an installed `.cutlasst` template filled by
     /// `picks` (CapCut "use template"). On success a fresh draft directory
     /// is created and the filled project saved into it (the engine resets
     /// the project path, so the bind happens here, not via a queued
     /// `SaveProject` that would also run after a failure). Same epoch bump
-    /// as `OpenProject`; failure publishes `session-error` and leaves the
-    /// current session untouched.
+    /// as `OpenProject`. A pre-apply failure leaves the current session
+    /// untouched; a later draft/binding failure publishes the applied
+    /// in-memory session and reports that partial outcome explicitly.
     ApplyTemplate {
         path: PathBuf,
         picks: Vec<TemplatePick>,
+    },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::ApplyTemplate`].
+    ApplyTemplateRpc {
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+        reply: Sender<Result<ApplyTemplateRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
     },
     /// Rename the current draft (its display name). Applied as one undoable
     /// edit; the projection republish updates the title bar and the next
@@ -587,17 +706,41 @@ enum WorkerMsg {
     RenameProject {
         name: String,
     },
+    /// Report the preview-frame cache's exact current in-memory usage.
+    #[allow(dead_code)] // Wired into the cache registry in its follow-up phase.
+    GetPreviewCacheStats {
+        reply: Sender<PreviewCacheStats>,
+        operation: Arc<WorkerRpcOperation>,
+    },
+    /// Drop every composited preview frame and report the exact pre-clear
+    /// usage (the entries and bytes removed).
+    #[allow(dead_code)] // Wired into the cache registry in its follow-up phase.
+    ClearPreviewCache {
+        reply: Sender<PreviewCacheStats>,
+        operation: Arc<WorkerRpcOperation>,
+    },
+    /// Hand an off-UI maintenance worker a coherent clone of the live project,
+    /// then stop consuming this queue until its guard sends or disconnects
+    /// `resume`. The operation state prevents an abandoned queued request from
+    /// pausing the worker when it is eventually dequeued.
+    #[allow(dead_code)] // Wired into cache relocation by its coordination slice.
+    BeginProjectMaintenance {
+        reply: Sender<Result<Project, ()>>,
+        resume: Receiver<ProjectMaintenanceResumeAction>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Clone the live project for the AI agent's sandbox rehearsal
     /// (`src/agent.rs`). Ordered with mutations, so the snapshot always
     /// reflects every edit sent before it.
     SnapshotProject {
         reply: Sender<Project>,
     },
-    /// Replay a rehearsed agent plan as one history group, re-validating
-    /// every step against the live project and remapping ids the sandbox
-    /// allocated. All-or-nothing: any failure rolls the group back.
+    /// Replay a rehearsed agent plan, one history group per phase,
+    /// re-validating every step against the live project and remapping ids
+    /// the sandbox allocated. A failure rolls back the failing phase only
+    /// and stops; phases already committed stay, each its own undo step.
     AgentApplyPlan {
-        steps: Vec<AgentPlanStep>,
+        phases: Vec<Vec<AgentPlanStep>>,
         reply: Sender<Result<(), String>>,
     },
 }
@@ -662,6 +805,154 @@ pub struct WorkerHandle {
     tx: Sender<WorkerMsg>,
 }
 
+/// Cache-management calls must not wait forever behind a stuck render.
+#[allow(dead_code)] // Used once the cache registry consumes this Phase 2b RPC.
+const PREVIEW_CACHE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const PREVIEW_CACHE_RPC_WAIT_SLICE: Duration = Duration::from_millis(25);
+#[allow(dead_code)] // Used by the staged maintenance entry point below.
+const PROJECT_MAINTENANCE_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Total queue + execution deadline for acknowledged project mutations.
+///
+/// Cancellation can prove "not started" only while the operation is pending.
+/// Once claimed, cancellation is ignored and the caller waits for the real
+/// result until this deadline. A deadline or disconnect after claim is
+/// reported as "outcome unknown": the worker may already have mutated the
+/// engine and may still finish the operation.
+const PROJECT_RPC_TIMEOUT: Duration = Duration::from_secs(30);
+const WORKER_RPC_PENDING: u8 = 0;
+const WORKER_RPC_RUNNING: u8 = 1;
+const WORKER_RPC_ABANDONED: u8 = 2;
+
+/// Shared claim state for bounded worker RPCs. Only a request still in
+/// `PENDING` may be started by the worker or abandoned by its caller.
+struct WorkerRpcOperation(AtomicU8);
+
+impl WorkerRpcOperation {
+    fn pending() -> Self {
+        Self(AtomicU8::new(WORKER_RPC_PENDING))
+    }
+
+    fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                WORKER_RPC_PENDING,
+                WORKER_RPC_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                WORKER_RPC_PENDING,
+                WORKER_RPC_ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
+
+/// Work the preview worker performs synchronously before it resumes its normal
+/// queue after a project-maintenance lease.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ProjectMaintenanceResumeAction {
+    /// Resume without changing any worker-owned runtime state.
+    #[default]
+    Resume,
+    /// Proxy cache storage moved; discard old bindings and look them up again.
+    RefreshProxies,
+}
+
+/// Exclusive maintenance lease over a coherent live-project snapshot.
+///
+/// While this value is alive the preview worker is paused and consumes no
+/// edit, import, relink, template, or other queued messages. The guard owns no
+/// engine state and is safe to move to the background maintenance thread that
+/// performs the filesystem operation.
+#[must_use = "dropping the maintenance guard resumes the preview worker"]
+#[allow(dead_code)] // Constructed once cache relocation consumes the staged API.
+pub(crate) struct ProjectMaintenanceGuard {
+    project: Project,
+    resume: Option<Sender<ProjectMaintenanceResumeAction>>,
+    resume_action: ProjectMaintenanceResumeAction,
+}
+
+impl ProjectMaintenanceGuard {
+    #[allow(dead_code)] // Read by the cache relocation coordination slice.
+    pub(crate) fn project(&self) -> &Project {
+        &self.project
+    }
+
+    /// Refresh every runtime proxy binding before normal preview work resumes.
+    #[allow(dead_code)] // Called by cache relocation once its move is published.
+    pub(crate) fn refresh_proxies_on_resume(&mut self) {
+        self.resume_action = ProjectMaintenanceResumeAction::RefreshProxies;
+    }
+}
+
+impl Drop for ProjectMaintenanceGuard {
+    fn drop(&mut self) {
+        if let Some(resume) = self.resume.take() {
+            // Capacity one means this never waits for the worker. Sending is
+            // best-effort; dropping the sole sender immediately afterward
+            // still wakes a receiver if the channel has disconnected.
+            let _ = resume.try_send(self.resume_action);
+        }
+    }
+}
+
+#[allow(dead_code)] // Reachable through the intentionally staged API below.
+fn project_maintenance_result(
+    reply: Result<Project, ()>,
+    resume: Sender<ProjectMaintenanceResumeAction>,
+) -> Result<ProjectMaintenanceGuard, String> {
+    match reply {
+        Ok(project) => Ok(ProjectMaintenanceGuard {
+            project,
+            resume: Some(resume),
+            resume_action: ProjectMaintenanceResumeAction::Resume,
+        }),
+        Err(()) => Err("project maintenance request was refused by preview worker".into()),
+    }
+}
+
+/// Claim, snapshot, and pause for one maintenance request. The blocking
+/// receive has no timeout: only guard drop resumes worker message processing.
+/// A disconnected action channel safely means an ordinary resume.
+fn serve_project_maintenance(
+    project: &Project,
+    reply: Sender<Result<Project, ()>>,
+    resume: Receiver<ProjectMaintenanceResumeAction>,
+    operation: Arc<WorkerRpcOperation>,
+) -> ProjectMaintenanceResumeAction {
+    if !operation.claim() {
+        return ProjectMaintenanceResumeAction::Resume;
+    }
+    if reply.send(Ok(project.clone())).is_ok() {
+        resume.recv().unwrap_or_default()
+    } else {
+        ProjectMaintenanceResumeAction::Resume
+    }
+}
+
+/// Claim a queued acknowledged operation before invoking its handler.
+///
+/// A caller that cancelled or timed out while this message was queued changes
+/// the operation to `ABANDONED`; the failed claim then guarantees `run` is
+/// never called and therefore cannot mutate the engine.
+fn serve_worker_rpc<T>(
+    reply: Sender<Result<T, String>>,
+    operation: Arc<WorkerRpcOperation>,
+    run: impl FnOnce() -> Result<T, String>,
+) {
+    if operation.claim() {
+        let _ = reply.send(run());
+    }
+}
+
 impl WorkerHandle {
     pub fn request_frame(&self, tick: i64) {
         let _ = self.tx.send(WorkerMsg::Frame(tick));
@@ -675,6 +966,30 @@ impl WorkerHandle {
 
     pub fn import(&self, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::Import(path));
+    }
+
+    /// Import media in queue order and wait for an acknowledged result.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn import_media_rpc(&self, path: PathBuf) -> Result<ImportMediaRpcResult, String> {
+        self.import_media_rpc_with_cancel(path, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn import_media_rpc_with_cancel(
+        &self,
+        path: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<ImportMediaRpcResult, String> {
+        self.project_rpc(
+            "import media",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::ImportMediaRpc {
+                path,
+                reply,
+                operation,
+            },
+        )
     }
 
     /// OS file drop: import `paths` and, when `target` names a timeline
@@ -697,20 +1012,410 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::SaveProject { path });
     }
 
+    /// Save in queue order and return the engine's actual bound path.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn save_project_rpc(
+        &self,
+        path: Option<PathBuf>,
+    ) -> Result<SaveProjectRpcResult, String> {
+        self.save_project_rpc_with_cancel(path, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn save_project_rpc_with_cancel(
+        &self,
+        path: Option<PathBuf>,
+        cancel: &AtomicBool,
+    ) -> Result<SaveProjectRpcResult, String> {
+        self.project_rpc(
+            "save project",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::SaveProjectRpc {
+                path,
+                reply,
+                operation,
+            },
+        )
+    }
+
     pub fn open_project(&self, path: PathBuf) {
         let _ = self.tx.send(WorkerMsg::OpenProject { path });
+    }
+
+    /// Open a project in queue order and return its actual bound path and
+    /// acknowledged session state.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn open_project_rpc(&self, path: PathBuf) -> Result<OpenProjectRpcResult, String> {
+        self.open_project_rpc_with_cancel(path, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn open_project_rpc_with_cancel(
+        &self,
+        path: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<OpenProjectRpcResult, String> {
+        self.project_rpc(
+            "open project",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::OpenProjectRpc {
+                path,
+                reply,
+                operation,
+            },
+        )
     }
 
     pub fn apply_template(&self, path: PathBuf, picks: Vec<TemplatePick>) {
         let _ = self.tx.send(WorkerMsg::ApplyTemplate { path, picks });
     }
 
+    /// Apply and bind a template in queue order. `Ok` confirms the actual
+    /// app-owned draft path; a post-apply binding failure is returned as an
+    /// explicit uncertain/partially committed outcome.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn apply_template_rpc(
+        &self,
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+    ) -> Result<ApplyTemplateRpcResult, String> {
+        self.apply_template_rpc_with_cancel(path, picks, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn apply_template_rpc_with_cancel(
+        &self,
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+        cancel: &AtomicBool,
+    ) -> Result<ApplyTemplateRpcResult, String> {
+        self.project_rpc(
+            "apply template",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::ApplyTemplateRpc {
+                path,
+                picks,
+                reply,
+                operation,
+            },
+        )
+    }
+
     pub fn new_project(&self) {
         let _ = self.tx.send(WorkerMsg::NewProject);
     }
 
+    /// Replace the live session with a fresh unbound project in queue order.
+    /// Binding remains a separate acknowledged save owned by the caller.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn new_project_rpc(&self) -> Result<NewProjectRpcResult, String> {
+        self.new_project_rpc_with_cancel(&AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn new_project_rpc_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<NewProjectRpcResult, String> {
+        self.project_rpc(
+            "new project",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::NewProjectRpc { reply, operation },
+        )
+    }
+
     pub fn rename_project(&self, name: String) {
         let _ = self.tx.send(WorkerMsg::RenameProject { name });
+    }
+
+    /// Send one queue-ordered project mutation and wait for its bounded reply.
+    ///
+    /// Cancellation abandons only a still-pending request, which guarantees
+    /// the worker cannot later claim or mutate for it. If the worker has
+    /// already claimed the request, cancellation no longer returns early:
+    /// the actual operation result wins whenever it arrives before `timeout`.
+    /// A timeout or disconnect after claim says "outcome unknown" explicitly,
+    /// because the mutation may have happened even if its reply was lost.
+    fn project_rpc<T>(
+        &self,
+        name: &'static str,
+        timeout: Duration,
+        cancel: &AtomicBool,
+        request: impl FnOnce(Sender<Result<T, String>>, Arc<WorkerRpcOperation>) -> WorkerMsg,
+    ) -> Result<T, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(format!(
+                "{name} request cancelled before worker claim; not started"
+            ));
+        }
+        let (reply, response) = bounded(1);
+        let operation = Arc::new(WorkerRpcOperation::pending());
+        self.tx
+            .send(request(reply, Arc::clone(&operation)))
+            .map_err(|_| {
+                operation.abandon();
+                format!("{name} request failed: preview worker is not running; not started")
+            })?;
+
+        let started = Instant::now();
+        loop {
+            // A delivered result always wins cancellation/deadline races.
+            match response.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Disconnected) => {
+                    let detail = if operation.abandon() {
+                        "not started"
+                    } else {
+                        "outcome unknown after worker claim"
+                    };
+                    return Err(format!(
+                        "{name} request failed: preview worker stopped before replying; {detail}"
+                    ));
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            if cancel.load(Ordering::Acquire) && operation.abandon() {
+                return Err(format!(
+                    "{name} request cancelled before worker claim; not started"
+                ));
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // Close the race where a reply entered the channel between
+                // the first try_recv and the deadline observation.
+                match response.try_recv() {
+                    Ok(result) => return result,
+                    Err(TryRecvError::Disconnected) => {
+                        let detail = if operation.abandon() {
+                            "not started"
+                        } else {
+                            "outcome unknown after worker claim"
+                        };
+                        return Err(format!(
+                            "{name} request failed: preview worker stopped before replying; {detail}"
+                        ));
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+                let detail = if operation.abandon() {
+                    "before worker claim; not started"
+                } else {
+                    "after worker claim; outcome unknown"
+                };
+                return Err(format!(
+                    "{name} request timed out {detail} after {} ms",
+                    timeout.as_millis()
+                ));
+            }
+
+            match response.recv_timeout(PREVIEW_CACHE_RPC_WAIT_SLICE.min(remaining)) {
+                Ok(result) => return result,
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    let detail = if operation.abandon() {
+                        "not started"
+                    } else {
+                        "outcome unknown after worker claim"
+                    };
+                    return Err(format!(
+                        "{name} request failed: preview worker stopped before replying; {detail}"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Return exact preview-frame cache usage, ordered with all worker
+    /// requests submitted before this call.
+    #[allow(dead_code)] // Public(crate) seam for the follow-up registry wiring.
+    pub(crate) fn preview_cache_stats(&self) -> Result<PreviewCacheStats, String> {
+        self.preview_cache_stats_with_cancel(&AtomicBool::new(false))
+    }
+
+    pub(crate) fn preview_cache_stats_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<PreviewCacheStats, String> {
+        self.preview_cache_rpc(
+            "stats",
+            PREVIEW_CACHE_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::GetPreviewCacheStats { reply, operation },
+        )
+    }
+
+    /// Clear only composited preview frames and return their exact pre-clear
+    /// usage. The cache is empty when the worker produces the reply; later
+    /// queued renders may refill it.
+    #[allow(dead_code)] // Public(crate) seam for the follow-up registry wiring.
+    pub(crate) fn clear_preview_cache(&self) -> Result<PreviewCacheStats, String> {
+        self.clear_preview_cache_with_cancel(&AtomicBool::new(false))
+    }
+
+    pub(crate) fn clear_preview_cache_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<PreviewCacheStats, String> {
+        self.preview_cache_rpc(
+            "clear",
+            PREVIEW_CACHE_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::ClearPreviewCache { reply, operation },
+        )
+    }
+
+    #[allow(dead_code)] // Reachable through the intentionally staged APIs above.
+    fn preview_cache_rpc(
+        &self,
+        operation: &'static str,
+        timeout: Duration,
+        cancel: &AtomicBool,
+        request: impl FnOnce(Sender<PreviewCacheStats>, Arc<WorkerRpcOperation>) -> WorkerMsg,
+    ) -> Result<PreviewCacheStats, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err(format!("preview cache {operation} request was cancelled"));
+        }
+        let (reply, response) = bounded(1);
+        let operation_state = Arc::new(WorkerRpcOperation::pending());
+        self.tx
+            .send(request(reply, Arc::clone(&operation_state)))
+            .map_err(|_| {
+                operation_state.abandon();
+                format!("preview cache {operation} request failed: preview worker is not running")
+            })?;
+
+        let started = Instant::now();
+        loop {
+            if cancel.load(Ordering::Acquire) && operation_state.abandon() {
+                return Err(format!("preview cache {operation} request was cancelled"));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let detail = if operation_state.abandon() {
+                    "while still queued"
+                } else {
+                    "after the worker started it"
+                };
+                return Err(format!(
+                    "preview cache {operation} request timed out {detail} after {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            match response.recv_timeout(PREVIEW_CACHE_RPC_WAIT_SLICE.min(remaining)) {
+                Ok(stats) => return Ok(stats),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    operation_state.abandon();
+                    return Err(format!(
+                        "preview cache {operation} request failed: preview worker stopped before replying"
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Freeze the preview worker in queue order and return a coherent clone of
+    /// its live project. Dropping the returned guard resumes message handling.
+    ///
+    /// This synchronous RPC must run on a background maintenance thread,
+    /// never the UI thread. Acquisition is cancellation-aware and bounded;
+    /// after acquisition there is deliberately no lease timeout, because a
+    /// legitimate cache relocation may take arbitrarily long.
+    #[allow(dead_code)] // Public(crate) seam for cache relocation wiring.
+    pub(crate) fn begin_project_maintenance_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<ProjectMaintenanceGuard, String> {
+        self.begin_project_maintenance_with_timeout(cancel, PROJECT_MAINTENANCE_ACQUIRE_TIMEOUT)
+    }
+
+    #[allow(dead_code)] // Testable timeout seam used by the public(crate) API.
+    fn begin_project_maintenance_with_timeout(
+        &self,
+        cancel: &AtomicBool,
+        timeout: Duration,
+    ) -> Result<ProjectMaintenanceGuard, String> {
+        if cancel.load(Ordering::Acquire) {
+            return Err("project maintenance request was cancelled before worker claim".into());
+        }
+        let (reply, response) = bounded(1);
+        // The guard owns the sole sender. Its one typed action fits without
+        // waiting; sender drop also wakes the worker as an ordinary resume.
+        let (resume, wait_for_resume) = bounded::<ProjectMaintenanceResumeAction>(1);
+        let operation = Arc::new(WorkerRpcOperation::pending());
+        self.tx
+            .send(WorkerMsg::BeginProjectMaintenance {
+                reply,
+                resume: wait_for_resume,
+                operation: Arc::clone(&operation),
+            })
+            .map_err(|_| {
+                operation.abandon();
+                "project maintenance request failed: preview worker is not running".to_string()
+            })?;
+
+        let started = Instant::now();
+        loop {
+            // A delivered grant wins a cancellation race after worker claim.
+            // Returning it transfers the only resume sender into the guard.
+            match response.try_recv() {
+                Ok(reply) => return project_maintenance_result(reply, resume),
+                Err(TryRecvError::Disconnected) => {
+                    return Err(
+                        "project maintenance request failed: preview worker stopped before replying"
+                            .into(),
+                    );
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+
+            if cancel.load(Ordering::Acquire) && operation.abandon() {
+                return Err("project maintenance request was cancelled before worker claim".into());
+            }
+
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                // Close the smallest race between the timeout check and a
+                // grant already entering the bounded response channel.
+                match response.try_recv() {
+                    Ok(reply) => return project_maintenance_result(reply, resume),
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(
+                            "project maintenance request failed: preview worker stopped before replying"
+                                .into(),
+                        );
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+                let detail = if operation.abandon() {
+                    "while still queued"
+                } else {
+                    "after worker claim"
+                };
+                return Err(format!(
+                    "project maintenance request timed out {detail} after {} ms",
+                    timeout.as_millis()
+                ));
+            }
+
+            match response.recv_timeout(PREVIEW_CACHE_RPC_WAIT_SLICE.min(remaining)) {
+                Ok(reply) => return project_maintenance_result(reply, resume),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    operation.abandon();
+                    return Err(
+                        "project maintenance request failed: preview worker stopped before replying"
+                            .into(),
+                    );
+                }
+            }
+        }
     }
 
     /// Synchronous round-trip: clone of the live project as of every edit
@@ -721,12 +1426,12 @@ impl WorkerHandle {
         rx.recv().ok()
     }
 
-    /// Synchronous round-trip: replay a rehearsed agent plan as one undo
-    /// entry. `None` only if the worker thread is gone.
-    pub fn agent_apply_plan(&self, steps: Vec<AgentPlanStep>) -> Option<Result<(), String>> {
+    /// Synchronous round-trip: replay a rehearsed agent plan, one undo
+    /// entry per phase. `None` only if the worker thread is gone.
+    pub fn agent_apply_plan(&self, phases: Vec<Vec<AgentPlanStep>>) -> Option<Result<(), String>> {
         let (reply, rx) = bounded(1);
         self.tx
-            .send(WorkerMsg::AgentApplyPlan { steps, reply })
+            .send(WorkerMsg::AgentApplyPlan { phases, reply })
             .ok()?;
         rx.recv().ok()
     }
@@ -735,8 +1440,66 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::RelinkMedia { media, path });
     }
 
+    /// Relink one pool entry in queue order and return its resulting path.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn relink_media_rpc(
+        &self,
+        media: String,
+        path: PathBuf,
+    ) -> Result<RelinkMediaRpcResult, String> {
+        self.relink_media_rpc_with_cancel(media, path, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn relink_media_rpc_with_cancel(
+        &self,
+        media: String,
+        path: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<RelinkMediaRpcResult, String> {
+        self.project_rpc(
+            "relink media",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::RelinkMediaRpc {
+                media,
+                path,
+                reply,
+                operation,
+            },
+        )
+    }
+
     pub fn relink_folder(&self, folder: PathBuf) {
         let _ = self.tx.send(WorkerMsg::RelinkFolder { folder });
+    }
+
+    /// Relink matching missing media in queue order. The returned entries are
+    /// sorted by raw media id.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn relink_folder_rpc(
+        &self,
+        folder: PathBuf,
+    ) -> Result<RelinkFolderRpcResult, String> {
+        self.relink_folder_rpc_with_cancel(folder, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn relink_folder_rpc_with_cancel(
+        &self,
+        folder: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<RelinkFolderRpcResult, String> {
+        self.project_rpc(
+            "relink folder",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::RelinkFolderRpc {
+                folder,
+                reply,
+                operation,
+            },
+        )
     }
 
     pub fn remove_media(&self, media: String, force: bool) {
@@ -1364,6 +2127,13 @@ fn worker_loop(
                 fit.set_viewport(width, height);
             }
             WorkerMsg::Import(path) => import_and_publish(engine, &path, &ui),
+            WorkerMsg::ImportMediaRpc {
+                path,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                import_media_rpc_and_publish(engine, &path, Some(&ui))
+            }),
             WorkerMsg::DropFiles { paths, target } => {
                 drop_files_and_publish(engine, &paths, target, *main_magnet, &ui);
             }
@@ -1732,24 +2502,86 @@ fn worker_loop(
                 export_state.cancel.store(true, Ordering::Relaxed);
             }
             WorkerMsg::SaveProject { path } => save_project_and_publish(engine, path, &ui),
+            WorkerMsg::SaveProjectRpc {
+                path,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                save_project_rpc_and_publish(engine, path, Some(&ui))
+            }),
             WorkerMsg::OpenProject { path } => open_project_and_publish(engine, path, &ui),
+            WorkerMsg::OpenProjectRpc {
+                path,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                open_project_rpc_and_publish(engine, path, Some(&ui))
+            }),
             WorkerMsg::RelinkMedia { media, path } => {
                 relink_media_and_publish(engine, &media, &path, &ui)
             }
+            WorkerMsg::RelinkMediaRpc {
+                media,
+                path,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                relink_media_rpc_and_publish(engine, &media, &path, Some(&ui))
+            }),
             WorkerMsg::RelinkFolder { folder } => relink_folder_and_publish(engine, folder, &ui),
+            WorkerMsg::RelinkFolderRpc {
+                folder,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                relink_folder_rpc_and_publish(engine, folder, Some(&ui))
+            }),
             WorkerMsg::RemoveMedia { media, force } => {
                 remove_media_and_publish(engine, &media, force, &ui)
             }
             WorkerMsg::NewProject => new_project_and_publish(engine, &ui),
+            WorkerMsg::NewProjectRpc { reply, operation } => {
+                serve_worker_rpc(reply, operation, || {
+                    new_project_rpc_and_publish(engine, Some(&ui))
+                })
+            }
             WorkerMsg::ApplyTemplate { path, picks } => {
                 apply_template_and_publish(engine, path, picks, &ui)
             }
+            WorkerMsg::ApplyTemplateRpc {
+                path,
+                picks,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                apply_template_rpc_and_publish(engine, path, picks, Some(&ui))
+            }),
             WorkerMsg::RenameProject { name } => rename_project_and_publish(engine, name, &ui),
+            WorkerMsg::GetPreviewCacheStats { reply, operation } => {
+                if operation.claim() {
+                    let _ = reply.send(cache.stats());
+                }
+            }
+            WorkerMsg::ClearPreviewCache { reply, operation } => {
+                if operation.claim() {
+                    let _ = reply.send(cache.clear());
+                }
+            }
+            WorkerMsg::BeginProjectMaintenance {
+                reply,
+                resume,
+                operation,
+            } => {
+                let action = serve_project_maintenance(engine.project(), reply, resume, operation);
+                if action == ProjectMaintenanceResumeAction::RefreshProxies {
+                    refresh_proxies_after_maintenance(engine, &cache, &ui);
+                }
+            }
             WorkerMsg::SnapshotProject { reply } => {
                 let _ = reply.send(engine.project().clone());
             }
-            WorkerMsg::AgentApplyPlan { steps, reply } => {
-                let _ = reply.send(agent_apply_and_publish(engine, steps, &ui));
+            WorkerMsg::AgentApplyPlan { phases, reply } => {
+                let _ = reply.send(agent_apply_and_publish(engine, phases, &ui));
             }
             WorkerMsg::Frame(_) => unreachable!("frames are handled by the drain below"),
             WorkerMsg::TransformOverride { .. } => {
@@ -1820,7 +2652,13 @@ fn worker_loop(
         };
         // Scrub/seek frames are reads — they must not push the auto-save
         // deadline out, or playback over a pending edit would never flush.
-        let resets_deadline = !matches!(msg, WorkerMsg::Frame(_));
+        let resets_deadline = !matches!(
+            msg,
+            WorkerMsg::Frame(_)
+                | WorkerMsg::GetPreviewCacheStats { .. }
+                | WorkerMsg::ClearPreviewCache { .. }
+                | WorkerMsg::BeginProjectMaintenance { .. }
+        );
         match msg {
             WorkerMsg::Frame(mut tick) => {
                 // Frame requests coalesced away right here: when > 0 the UI
@@ -2167,7 +3005,7 @@ fn worker_loop(
                 }
             }
             other => {
-                let redraw = mutation_redraws_preview(&other);
+                let redraw = message_invalidates_preview(&other);
                 mutate(
                     engine,
                     &mut clipboard,
@@ -2266,7 +3104,7 @@ fn next_message(
 /// `ClearTransformOverride` render themselves with their own tick, so they're
 /// excluded here to avoid a redundant second composite; pure session ops
 /// (import, copy, auto-save, export, linkage, rename) don't alter the canvas.
-fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
+fn message_invalidates_preview(msg: &WorkerMsg) -> bool {
     matches!(
         msg,
         WorkerMsg::AddClip { .. }
@@ -2309,12 +3147,17 @@ fn mutation_redraws_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::SetMainMagnet(_)
             | WorkerMsg::SetTrackFlag { .. }
             | WorkerMsg::OpenProject { .. }
+            | WorkerMsg::OpenProjectRpc { .. }
             | WorkerMsg::NewProject
+            | WorkerMsg::NewProjectRpc { .. }
             // A filled template is a whole new composite.
             | WorkerMsg::ApplyTemplate { .. }
+            | WorkerMsg::ApplyTemplateRpc { .. }
             // Relinked media decodes again — refresh the stale composite.
             | WorkerMsg::RelinkMedia { .. }
             | WorkerMsg::RelinkFolder { .. }
+            | WorkerMsg::RelinkMediaRpc { .. }
+            | WorkerMsg::RelinkFolderRpc { .. }
             // A bound proxy swaps the decode source; repaint through it so
             // the (cleared) frame cache refills at the cheap decode cost.
             | WorkerMsg::ProxyReady { .. }
@@ -2713,6 +3556,16 @@ fn remove_keyframes_at_and_publish(
 // to its native decoders, so the worker sends nothing.
 
 fn import_and_publish(engine: &mut Engine, path: &Path, ui: &UiSink) {
+    let _ = import_media_rpc_and_publish(engine, path, Some(ui));
+}
+
+/// Shared import implementation for fire-and-forget UI work and acknowledged
+/// RPCs. `ui` is `None` only in engine-level unit tests.
+fn import_media_rpc_and_publish(
+    engine: &mut Engine,
+    path: &Path,
+    ui: Option<&UiSink>,
+) -> Result<ImportMediaRpcResult, String> {
     match engine.apply(Command::Project(ProjectCommand::Import {
         path: path.to_path_buf(),
     })) {
@@ -2725,13 +3578,43 @@ fn import_and_publish(engine: &mut Engine, path: &Path, ui: &UiSink) {
             );
             // Kick off tile thumbnail generation off-thread; the tile shows
             // its placeholder until the image lands (see src/thumbnails.rs).
-            if let Some(source) = engine.project().media(media) {
-                register_media_with_workers(source, ui);
+            let current_path = engine
+                .project()
+                .media(media)
+                .map(|source| {
+                    if let Some(ui) = ui {
+                        register_media_with_workers(source, ui);
+                    }
+                    source.path().to_path_buf()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "import succeeded for {} but media {} is missing from the pool",
+                        path.display(),
+                        media.raw()
+                    )
+                })?;
+            if let Some(ui) = ui {
+                publish_projection(engine, ui);
             }
-            publish_projection(engine, ui);
+            Ok(ImportMediaRpcResult {
+                media_id: media.raw(),
+                path: current_path,
+            })
         }
-        Ok(other) => error!(path = %path.display(), "unexpected import outcome: {other:?}"),
-        Err(e) => error!(path = %path.display(), "import failed: {e}"),
+        Ok(other) => {
+            let message = format!(
+                "unexpected import outcome for {}: {other:?}",
+                path.display()
+            );
+            error!("{message}");
+            Err(message)
+        }
+        Err(e) => {
+            let message = format!("import failed for {}: {e}", path.display());
+            error!("{message}");
+            Err(message)
+        }
     }
 }
 
@@ -2948,80 +3831,250 @@ fn occupied_spans(track: &Track) -> Vec<(i64, i64)> {
 /// `None` flush with no bound draft (e.g. New from the launch screen over the
 /// empty boot session) has nothing to persist and is a quiet no-op.
 fn save_project_and_publish(engine: &mut Engine, path: Option<PathBuf>, ui: &UiSink) {
+    let _ = save_project_rpc_and_publish(engine, path, Some(ui));
+}
+
+/// Shared save implementation for fire-and-forget UI work and acknowledged
+/// RPCs. A missing implicit path remains a quiet UI no-op, but is an explicit
+/// RPC error. `ui` is `None` only in engine-level unit tests.
+fn save_project_rpc_and_publish(
+    engine: &mut Engine,
+    path: Option<PathBuf>,
+    ui: Option<&UiSink>,
+) -> Result<SaveProjectRpcResult, String> {
     let Some(path) = path.or_else(|| engine.project_path().cloned()) else {
-        return;
+        return Err("save project failed: no current project path is bound".into());
     };
     match engine.apply(Command::Project(ProjectCommand::Save {
         path: path.clone(),
     })) {
         Ok(ApplyOutcome::Saved) => {
             crate::drafts::write_meta(&path, &engine.project().name);
-            publish_projection(engine, ui);
+            if let Some(ui) = ui {
+                publish_projection(engine, ui);
+            }
+            let actual_path = engine.project_path().cloned().ok_or_else(|| {
+                format!(
+                    "save reported success for {} but the engine has no current project path",
+                    path.display()
+                )
+            })?;
+            if engine.is_dirty() {
+                return Err(format!(
+                    "save reported success for {} but the engine remains dirty",
+                    actual_path.display()
+                ));
+            }
+            Ok(SaveProjectRpcResult {
+                path: actual_path,
+                dirty: false,
+            })
         }
-        Ok(other) => error!(path = %path.display(), "unexpected save outcome: {other:?}"),
+        Ok(other) => {
+            let message = format!("unexpected save outcome for {}: {other:?}", path.display());
+            error!("{message}");
+            Err(message)
+        }
         Err(e) => {
-            error!(path = %path.display(), "auto-save failed: {e}");
-            publish_session_error(
-                ui,
-                format!("Couldn't save the project to {}: {e}", path.display()),
-            );
+            let message = format!("save failed for {}: {e}", path.display());
+            error!("{message}");
+            if let Some(ui) = ui {
+                publish_session_error(
+                    ui,
+                    format!("Couldn't save the project to {}: {e}", path.display()),
+                );
+            }
+            Err(message)
         }
     }
 }
 
-/// Replace the session from a `.cutlass` file. Tolerant (`Load`, not the
-/// strict `Open`): entries whose media file is gone are kept so the user
-/// can relink them instead of being locked out of the project — the
-/// projection republish carries the missing set (count + per-tile badges)
-/// and app.slint raises the relink dialog on the epoch bump. On success
-/// every still-present pool media re-registers with the thumbnail and
-/// strip workers — the same bookkeeping an import does — the projection
-/// republish swaps the UI over, and the session epoch bump resets UI
-/// session state (playhead, selection, in/out range). On failure the
-/// current session is untouched (the engine rejects before replacing) and
-/// `session-error` names the offending path.
-fn open_project_and_publish(engine: &mut Engine, path: PathBuf, ui: &UiSink) {
+/// Internal error contract for a whole-session operation. The worker transport
+/// gets `rpc_message`; the fire-and-forget UI transport gets `ui_message`.
+/// `session_replaced_in_memory` distinguishes a rejected atomic operation from
+/// a post-replacement persistence/binding failure that still needs projection
+/// publication and an epoch bump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionReplacementError {
+    rpc_message: String,
+    ui_message: String,
+    session_replaced_in_memory: bool,
+}
+
+impl SessionReplacementError {
+    fn unchanged(rpc_message: String, ui_message: String) -> Self {
+        Self {
+            rpc_message,
+            ui_message,
+            session_replaced_in_memory: false,
+        }
+    }
+
+    fn after_replacement(rpc_message: String, ui_message: String) -> Self {
+        Self {
+            rpc_message,
+            ui_message,
+            session_replaced_in_memory: true,
+        }
+    }
+}
+
+/// An `Ok` session operation always replaced the session. An error only did
+/// so when it occurred after the atomic engine replacement (currently draft
+/// creation/binding after a template apply).
+fn session_was_replaced<T>(result: &Result<T, SessionReplacementError>) -> bool {
+    result
+        .as_ref()
+        .map(|_| true)
+        .unwrap_or_else(|error| error.session_replaced_in_memory)
+}
+
+fn count_missing_media(engine: &Engine) -> usize {
+    engine
+        .project()
+        .media_iter()
+        .filter(|media| !media.path().exists())
+        .count()
+}
+
+/// Finish one transport-neutral session operation. UI fire-and-forget callers
+/// opt into one `session-error`; acknowledged RPC callers receive the explicit
+/// error instead. A replaced in-memory session is published and bumps the
+/// epoch exactly once even when its subsequent template binding failed.
+fn complete_session_replacement<T>(
+    engine: &mut Engine,
+    ui: Option<&UiSink>,
+    result: Result<T, SessionReplacementError>,
+    publish_ui_error: bool,
+) -> Result<T, String> {
+    if publish_ui_error && let (Some(ui), Err(error)) = (ui, &result) {
+        publish_session_error(ui, error.ui_message.clone());
+    }
+
+    if session_was_replaced(&result)
+        && let Some(ui) = ui
+    {
+        for media in engine.project().media_iter() {
+            if media.path().exists() {
+                register_media_with_workers(media, ui);
+            }
+        }
+        publish_projection(engine, ui);
+        bump_session_epoch(ui);
+    }
+
+    result.map_err(|error| error.rpc_message)
+}
+
+/// Transport-neutral tolerant project load. Missing media is retained for the
+/// relink flow, and the result reads the actual binding back from the engine.
+fn open_project_core(
+    engine: &mut Engine,
+    path: PathBuf,
+) -> Result<OpenProjectRpcResult, SessionReplacementError> {
     match engine.apply(Command::Project(ProjectCommand::Load {
         path: path.clone(),
     })) {
         Ok(ApplyOutcome::Loaded) => {
+            let Some(actual_path) = engine.project_path().cloned() else {
+                let message = format!(
+                    "open project outcome uncertain/partially committed: {} replaced the \
+                     in-memory session, but the engine reports no bound project path",
+                    path.display()
+                );
+                error!("{message}");
+                return Err(SessionReplacementError::after_replacement(
+                    message,
+                    "The project was opened, but its file binding couldn't be confirmed.".into(),
+                ));
+            };
             info!(
-                path = %path.display(),
+                path = %actual_path.display(),
                 pool = engine.project().media_count(),
                 "opened project"
             );
-            for media in engine.project().media_iter() {
-                if media.path().exists() {
-                    register_media_with_workers(media, ui);
-                }
-            }
-            publish_projection(engine, ui);
-            bump_session_epoch(ui);
+            Ok(OpenProjectRpcResult {
+                path: actual_path,
+                project_name: engine.project().name.clone(),
+                missing_media_count: count_missing_media(engine),
+            })
         }
-        Ok(other) => error!(path = %path.display(), "unexpected open outcome: {other:?}"),
+        Ok(other) => {
+            let message = format!("unexpected open outcome for {}: {other:?}", path.display());
+            error!("{message}");
+            Err(SessionReplacementError::unchanged(
+                message,
+                format!(
+                    "Couldn't open {}: unexpected engine outcome {other:?}",
+                    path.display()
+                ),
+            ))
+        }
         Err(e) => {
-            error!(path = %path.display(), "open failed: {e}");
-            publish_session_error(ui, format!("Couldn't open {}: {e}", path.display()));
+            let message = format!("open project failed for {}: {e}", path.display());
+            error!("{message}");
+            Err(SessionReplacementError::unchanged(
+                message,
+                format!("Couldn't open {}: {e}", path.display()),
+            ))
         }
     }
 }
 
-/// Replace the session with an installed template filled by the user's
-/// picks (the launch gallery's "Use template"). `ApplyTemplate` is atomic
-/// engine-side — a failed pick probe or fill leaves the current session
-/// untouched, surfaced through `session-error`. Success yields a *new
-/// unsaved* project, so a fresh draft directory is created here and the
-/// filled project saved into it (the same bind `New` performs via its
-/// queued save — done inline so a failure never litters an empty draft).
-/// Media registration, projection republish, and the session-epoch bump
-/// mirror `open_project_and_publish`; the epoch bump also dismisses the
-/// launch screen.
-fn apply_template_and_publish(
+/// Fire-and-forget UI wrapper: errors are published exactly once.
+fn open_project_and_publish(engine: &mut Engine, path: PathBuf, ui: &UiSink) {
+    let result = open_project_core(engine, path);
+    let _ = complete_session_replacement(engine, Some(ui), result, true);
+}
+
+/// Acknowledged wrapper: success still updates the live UI, while errors are
+/// returned to the RPC caller and never duplicated through `session-error`.
+fn open_project_rpc_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    ui: Option<&UiSink>,
+) -> Result<OpenProjectRpcResult, String> {
+    let result = open_project_core(engine, path);
+    complete_session_replacement(engine, ui, result, false)
+}
+
+/// Transport-neutral fresh-session replacement. It intentionally remains
+/// unbound: the host owns app-draft creation and the subsequent queue-ordered
+/// acknowledged save.
+fn new_project_core(engine: &mut Engine) -> Result<NewProjectRpcResult, SessionReplacementError> {
+    engine.new_session();
+    info!("new session");
+    let path = engine.project_path().cloned();
+    Ok(NewProjectRpcResult {
+        requires_save_binding: path.is_none(),
+        path,
+        project_name: engine.project().name.clone(),
+        missing_media_count: count_missing_media(engine),
+    })
+}
+
+fn new_project_and_publish(engine: &mut Engine, ui: &UiSink) {
+    let result = new_project_core(engine);
+    let _ = complete_session_replacement(engine, Some(ui), result, true);
+}
+
+fn new_project_rpc_and_publish(
+    engine: &mut Engine,
+    ui: Option<&UiSink>,
+) -> Result<NewProjectRpcResult, String> {
+    let result = new_project_core(engine);
+    complete_session_replacement(engine, ui, result, false)
+}
+
+/// Transport-neutral template mutation and app-draft binding. The injected
+/// creator is the production draft allocator and a filesystem-failure seam for
+/// tests; it runs only after the engine atomically applied the template.
+fn apply_template_core(
     engine: &mut Engine,
     path: PathBuf,
     picks: Vec<TemplatePick>,
-    ui: &UiSink,
-) {
+    create_draft: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<ApplyTemplateRpcResult, SessionReplacementError> {
     match engine.apply(Command::Project(ProjectCommand::ApplyTemplate {
         path: path.clone(),
         picks,
@@ -3032,32 +4085,89 @@ fn apply_template_and_publish(
                 pool = engine.project().media_count(),
                 "applied template"
             );
-            match crate::drafts::create() {
-                Ok(draft) => save_project_and_publish(engine, Some(draft), ui),
-                Err(e) => {
-                    error!("couldn't create a draft for the filled template: {e}");
-                    publish_session_error(
-                        ui,
-                        format!(
-                            "The template was applied but a project draft couldn't be created: {e}"
-                        ),
-                    );
-                }
-            }
-            for media in engine.project().media_iter() {
-                if media.path().exists() {
-                    register_media_with_workers(media, ui);
-                }
-            }
-            publish_projection(engine, ui);
-            bump_session_epoch(ui);
         }
-        Ok(other) => error!(template = %path.display(), "unexpected apply outcome: {other:?}"),
+        Ok(other) => {
+            let message = format!(
+                "unexpected apply-template outcome for {}: {other:?}",
+                path.display()
+            );
+            error!("{message}");
+            return Err(SessionReplacementError::unchanged(
+                message,
+                format!("Couldn't use the template: unexpected engine outcome {other:?}"),
+            ));
+        }
         Err(e) => {
-            error!(template = %path.display(), "apply template failed: {e}");
-            publish_session_error(ui, format!("Couldn't use the template: {e}"));
+            let message = format!("apply template failed for {}: {e}", path.display());
+            error!("{message}");
+            return Err(SessionReplacementError::unchanged(
+                message,
+                format!("Couldn't use the template: {e}"),
+            ));
         }
     }
+
+    let draft = create_draft().map_err(|error| {
+        let message = format!(
+            "apply template outcome uncertain/partially committed: {} replaced the in-memory \
+             session, but creating an app-owned draft failed: {error}; the current session is \
+             unbound and has not been persisted",
+            path.display()
+        );
+        error!("{message}");
+        SessionReplacementError::after_replacement(
+            message,
+            format!("The template was applied but a project draft couldn't be created: {error}"),
+        )
+    })?;
+
+    let saved =
+        save_project_rpc_and_publish(engine, Some(draft.clone()), None).map_err(|error| {
+            let binding = engine
+                .project_path()
+                .map(|bound| bound.display().to_string())
+                .unwrap_or_else(|| "<unbound>".into());
+            let message = format!(
+                "apply template outcome uncertain/partially committed: {} replaced the in-memory \
+             session, but binding/persisting app-owned draft {} failed or could not be verified: \
+             {error}; current engine binding: {binding}",
+                path.display(),
+                draft.display()
+            );
+            error!("{message}");
+            SessionReplacementError::after_replacement(
+                message,
+                format!(
+                    "The template was applied but its project draft couldn't be saved: {error}"
+                ),
+            )
+        })?;
+
+    Ok(ApplyTemplateRpcResult {
+        path: saved.path,
+        project_name: engine.project().name.clone(),
+        missing_media_count: count_missing_media(engine),
+    })
+}
+
+fn apply_template_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    picks: Vec<TemplatePick>,
+    ui: &UiSink,
+) {
+    let result = apply_template_core(engine, path, picks, crate::drafts::create);
+    let _ = complete_session_replacement(engine, Some(ui), result, true);
+}
+
+fn apply_template_rpc_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    picks: Vec<TemplatePick>,
+    ui: Option<&UiSink>,
+) -> Result<ApplyTemplateRpcResult, String> {
+    let result = apply_template_core(engine, path, picks, crate::drafts::create);
+    complete_session_replacement(engine, ui, result, false)
 }
 
 /// Re-point a pool entry at a user-picked file (missing-media relink, M0).
@@ -3068,32 +4178,121 @@ fn apply_template_and_publish(
 /// the dialog's count. Failures (unreadable file, probe error) surface
 /// through `session-error` and leave the entry untouched.
 fn relink_media_and_publish(engine: &mut Engine, media: &str, path: &Path, ui: &UiSink) {
+    let _ = relink_media_rpc_and_publish(engine, media, path, Some(ui));
+}
+
+/// Shared single-media relink implementation for UI work and acknowledged
+/// RPCs. `ui` is `None` only in engine-level unit tests.
+fn relink_media_rpc_and_publish(
+    engine: &mut Engine,
+    media: &str,
+    path: &Path,
+    ui: Option<&UiSink>,
+) -> Result<RelinkMediaRpcResult, String> {
     let Some(media_id) = parse_raw_id(media).map(MediaId::from_raw) else {
-        error!(media, "relink ignored: unparsable media id");
-        return;
+        let message = format!("relink failed: unparsable media id `{media}`");
+        error!("{message}");
+        return Err(message);
     };
     match engine.apply(Command::Project(ProjectCommand::RelinkMedia {
         media: media_id,
         path: path.to_path_buf(),
     })) {
-        Ok(ApplyOutcome::Relinked { media }) => {
-            info!(?media, path = %path.display(), "relinked media");
-            if let Some(source) = engine.project().media(media) {
-                register_media_with_workers(source, ui);
+        Ok(ApplyOutcome::Relinked { media: relinked }) => {
+            if relinked != media_id {
+                let message = format!(
+                    "relink for media {} returned mismatched media {}",
+                    media_id.raw(),
+                    relinked.raw()
+                );
+                error!("{message}");
+                return Err(message);
             }
-            publish_projection(engine, ui);
+            info!(?relinked, path = %path.display(), "relinked media");
+            let current_path = engine
+                .project()
+                .media(relinked)
+                .map(|source| {
+                    if let Some(ui) = ui {
+                        register_media_with_workers(source, ui);
+                    }
+                    source.path().to_path_buf()
+                })
+                .ok_or_else(|| {
+                    format!(
+                        "relink succeeded but media {} is missing from the pool",
+                        relinked.raw()
+                    )
+                })?;
+            if let Some(ui) = ui {
+                publish_projection(engine, ui);
+            }
+            Ok(RelinkMediaRpcResult {
+                media_id: relinked.raw(),
+                path: current_path,
+            })
         }
-        Ok(other) => error!(path = %path.display(), "unexpected relink outcome: {other:?}"),
+        Ok(other) => {
+            let message = format!(
+                "unexpected relink outcome for media {} to {}: {other:?}",
+                media_id.raw(),
+                path.display()
+            );
+            error!("{message}");
+            Err(message)
+        }
         Err(e) => {
-            error!(path = %path.display(), "relink failed: {e}");
-            publish_session_error(ui, format!("Couldn't relink to {}: {e}", path.display()));
+            let message = format!(
+                "relink failed for media {} to {}: {e}",
+                media_id.raw(),
+                path.display()
+            );
+            error!("{message}");
+            if let Some(ui) = ui {
+                publish_session_error(ui, format!("Couldn't relink to {}: {e}", path.display()));
+            }
+            Err(message)
         }
     }
 }
 
 /// Try `folder/<filename>` for every missing pool entry; relink each match.
 fn relink_folder_and_publish(engine: &mut Engine, folder: PathBuf, ui: &UiSink) {
-    let candidates: Vec<(MediaId, PathBuf)> = engine
+    let result = relink_folder_rpc_and_publish(engine, folder, Some(ui));
+    report_relink_folder_error(&result, |message| publish_session_error(ui, message));
+}
+
+/// Invoke `report` exactly once for a failed UI folder relink and never for
+/// success. Keeping this decision outside the shared operation gives errors a
+/// single owner: fire-and-forget UI calls publish `session-error`, while RPC
+/// calls return the same string to their caller without a duplicate dialog.
+fn report_relink_folder_error(
+    result: &Result<RelinkFolderRpcResult, String>,
+    report: impl FnOnce(String),
+) {
+    if let Err(message) = result {
+        report(message.clone());
+    }
+}
+
+/// Shared folder-relink operation for UI work and acknowledged RPCs.
+///
+/// `RelinkMedia` is intentionally non-undoable, so an engine history group
+/// cannot make this operation atomic. Every candidate is canonicalized and
+/// probed before the first mutation. The engine then re-probes while applying
+/// each relink; a filesystem race can still make an individual apply fail.
+/// In that case all remaining candidates are attempted, successful relinks
+/// stay applied, the UI is published once, and the RPC returns an explicit
+/// partial-failure error naming the retained successes. Error reporting is
+/// deliberately transport-neutral: this function logs and returns errors but
+/// never publishes `session-error`. `ui` supplies success-side worker
+/// registration/projection effects and is `None` only in engine-level tests.
+fn relink_folder_rpc_and_publish(
+    engine: &mut Engine,
+    folder: PathBuf,
+    ui: Option<&UiSink>,
+) -> Result<RelinkFolderRpcResult, String> {
+    let mut candidates: Vec<(MediaId, PathBuf)> = engine
         .project()
         .media_iter()
         .filter(|media| !media.path().exists())
@@ -3105,40 +4304,115 @@ fn relink_folder_and_publish(engine: &mut Engine, folder: PathBuf, ui: &UiSink) 
         })
         .filter(|(_, candidate)| candidate.exists())
         .collect();
+    candidates.sort_by_key(|(media, _)| media.raw());
 
     if candidates.is_empty() {
-        publish_session_error(
-            ui,
-            format!(
-                "No missing media files were found in {}. \
-                 Pick individual files or choose a folder that contains them.",
-                folder.display()
-            ),
+        let message = format!(
+            "No missing media files were found in {}. \
+             Pick individual files or choose a folder that contains them.",
+            folder.display()
         );
-        return;
+        return Err(message);
     }
 
-    let mut relinked = 0usize;
+    // Validate every candidate before the first non-undoable mutation. This
+    // is the same native probe RelinkMedia performs after canonicalization.
+    for (media, path) in &mut candidates {
+        let canonical = path.canonicalize().map_err(|e| {
+            let message = format!(
+                "folder relink preflight failed for media {} at {}: {e}; no media was relinked",
+                media.raw(),
+                path.display()
+            );
+            error!("{message}");
+            message
+        })?;
+        cutlass_decoder::probe(&canonical).map_err(|e| {
+            let message = format!(
+                "folder relink preflight failed for media {} at {}: {e}; no media was relinked",
+                media.raw(),
+                canonical.display()
+            );
+            error!("{message}");
+            message
+        })?;
+        *path = canonical;
+    }
+
+    let mut relinked = Vec::with_capacity(candidates.len());
+    let mut failures = Vec::new();
     for (media_id, path) in candidates {
         match engine.apply(Command::Project(ProjectCommand::RelinkMedia {
             media: media_id,
             path: path.clone(),
         })) {
-            Ok(ApplyOutcome::Relinked { media }) => {
-                relinked += 1;
-                if let Some(source) = engine.project().media(media) {
-                    register_media_with_workers(source, ui);
+            Ok(ApplyOutcome::Relinked { media }) => match engine.project().media(media) {
+                Some(source) => {
+                    if let Some(ui) = ui {
+                        register_media_with_workers(source, ui);
+                    }
+                    relinked.push(RelinkMediaRpcResult {
+                        media_id: media.raw(),
+                        path: source.path().to_path_buf(),
+                    });
                 }
+                None => {
+                    let message = format!(
+                        "media {} disappeared after a successful relink to {}",
+                        media.raw(),
+                        path.display()
+                    );
+                    error!("{message}");
+                    failures.push(message);
+                }
+            },
+            Ok(other) => {
+                let message = format!(
+                    "unexpected folder relink outcome for media {} at {}: {other:?}",
+                    media_id.raw(),
+                    path.display()
+                );
+                error!("{message}");
+                failures.push(message);
             }
-            Ok(other) => error!(path = %path.display(), "unexpected relink outcome: {other:?}"),
-            Err(e) => error!(path = %path.display(), "folder relink failed: {e}"),
+            Err(e) => {
+                let message = format!(
+                    "folder relink failed for media {} at {}: {e}",
+                    media_id.raw(),
+                    path.display()
+                );
+                error!("{message}");
+                failures.push(message);
+            }
         }
     }
 
-    if relinked > 0 {
-        info!(count = relinked, folder = %folder.display(), "relinked media from folder");
-        publish_projection(engine, ui);
+    relinked.sort_by_key(|entry| entry.media_id);
+    if !relinked.is_empty() {
+        info!(count = relinked.len(), folder = %folder.display(), "relinked media from folder");
+        if let Some(ui) = ui {
+            publish_projection(engine, ui);
+        }
     }
+
+    if !failures.is_empty() {
+        let retained = relinked
+            .iter()
+            .map(|entry| entry.media_id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let partial = if relinked.is_empty() {
+            "no relinks succeeded".to_string()
+        } else {
+            format!("non-undoable successful relinks remain applied for media ids [{retained}]")
+        };
+        return Err(format!(
+            "folder relink completed with individual failures; {partial}; {}",
+            failures.join("; ")
+        ));
+    }
+
+    Ok(RelinkFolderRpcResult { relinked })
 }
 
 /// Delete a source from the media pool (Library bin). `force` false removes
@@ -3249,6 +4523,58 @@ fn register_media_with_workers(media: &cutlass_models::MediaSource, ui: &UiSink)
     }
 }
 
+/// One current media descriptor captured before proxy refresh mutates the
+/// engine's renderer state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProxyRefreshMedia {
+    id: MediaId,
+    path: PathBuf,
+    width: u32,
+    height: u32,
+    is_video: bool,
+}
+
+/// Snapshot the media catalog needed to clear and re-request proxy bindings.
+///
+/// Project media lives in a hash map, so sorting makes the refresh order
+/// deterministic without changing its semantics.
+fn plan_proxy_refresh(project: &Project) -> Vec<ProxyRefreshMedia> {
+    let mut media: Vec<_> = project
+        .media_iter()
+        .map(|source| ProxyRefreshMedia {
+            id: source.id,
+            path: source.path().to_path_buf(),
+            width: source.width,
+            height: source.height,
+            is_video: source.kind() == cutlass_models::MediaKind::Video,
+        })
+        .collect();
+    media.sort_unstable_by_key(|source| source.id.raw());
+    media
+}
+
+/// Rebind proxy-dependent runtime state after the proxy cache root moves.
+///
+/// This deliberately bypasses project commands: renderer substitutions,
+/// strip scratch state, and delivered preview frames are session caches, so
+/// refreshing them must not touch Project, history, or revision.
+fn refresh_proxies_after_maintenance(engine: &mut Engine, cache: &FrameCache, ui: &UiSink) {
+    // Collect every descriptor before the first mutable Engine call so no
+    // project borrow can overlap renderer mutation.
+    let media = plan_proxy_refresh(engine.project());
+
+    for source in &media {
+        engine.clear_media_proxy(source.id);
+    }
+    ui.strips.clear_proxies();
+    cache.clear();
+
+    for source in media.into_iter().filter(|source| source.is_video) {
+        ui.proxy
+            .request(source.id.raw(), source.path, source.width, source.height);
+    }
+}
+
 /// Bind a finished preview proxy to its pool media — only while the pool
 /// entry still names `source`, the file the job was keyed to (a relink or
 /// session swap in flight makes the id stale; the registries the engine
@@ -3276,16 +4602,6 @@ fn bind_media_proxy(
         Some(_) => info!(%media, "proxy ignored: media was relinked while it generated"),
         None => info!(%media, "proxy ignored: media left the pool while it generated"),
     }
-}
-
-/// Replace the session with a fresh, empty project (the launch screen's New,
-/// or New from the editor). The draft's `project.cutlass` is written by the
-/// `SaveProject { Some(path) }` main.rs sends right after.
-fn new_project_and_publish(engine: &mut Engine, ui: &UiSink) {
-    engine.new_session();
-    info!("new session");
-    publish_projection(engine, ui);
-    bump_session_epoch(ui);
 }
 
 /// Rename the current draft (title bar). Applied as one undoable edit so it
@@ -5092,8 +6408,6 @@ fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: E
                     }
                 }
                 Err(RenderError::Cancelled) => {
-                    // The half-written file is junk; don't leave it behind.
-                    let _ = std::fs::remove_file(&path);
                     info!(path = %path.display(), "export job cancelled");
                     ExportUiState {
                         failed: true,
@@ -5102,8 +6416,6 @@ fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: E
                     }
                 }
                 Err(e) => {
-                    // An errored output was never finalized — same junk.
-                    let _ = std::fs::remove_file(&path);
                     error!(path = %path.display(), "export job failed: {e}");
                     ExportUiState {
                         failed: true,
@@ -5282,162 +6594,26 @@ fn extract_audio_and_publish(engine: &mut Engine, clip: &str, ui: &UiSink) {
             publish_projection(engine, ui);
         }
         Err(e) => {
-            // Soft ignore for already-detached / wrong target; hard failures
-            // still republish so the UI stays consistent after a rolled-back
-            // group (extract_audio rolls back before returning Err).
-            if e.starts_with("ignored:") {
-                info!(%clip_id, "{e}");
-            } else {
-                error!(%clip_id, "extract audio failed: {e}");
-                publish_projection(engine, ui);
-            }
+            // Core extraction is strict and atomic; a repeated or ineligible
+            // UI gesture is therefore safe to surface as soft feedback.
+            info!(%clip_id, "extract audio ignored: {e}");
         }
     }
 }
 
-/// Core CapCut extract-audio sequence. Returns the new audio-lane clip id.
+/// Delegate the entire gesture to one atomic engine command.
 fn extract_audio(engine: &mut Engine, clip_id: ClipId) -> Result<ClipId, String> {
-    let (track_kind, already_detached, snapshot) = {
-        let project = engine.project();
-        let timeline = project.timeline();
-        let track_id = timeline
-            .track_of(clip_id)
-            .ok_or_else(|| format!("ignored: clip {clip_id} not on the timeline"))?;
-        let track = timeline
-            .track(track_id)
-            .ok_or_else(|| format!("ignored: unknown track for {clip_id}"))?;
-        let kind = track.kind;
-        let detached = timeline.detached_to_audio_lane(clip_id);
-        let snapshot = project
-            .clip(clip_id)
-            .cloned()
-            .ok_or_else(|| format!("ignored: clip {clip_id} missing"))?;
-        (kind, detached, snapshot)
-    };
-    if track_kind != TrackKind::Video {
-        return Err(format!("ignored: {clip_id} is not a video-lane clip"));
-    }
-    if already_detached {
-        return Err(format!("ignored: {clip_id} already detached"));
-    }
-    let ClipSource::Media { media, source } = snapshot.content else {
-        return Err(format!("ignored: {clip_id} is not a media clip"));
-    };
-    if !engine.project().media(media).is_some_and(|m| m.has_audio) {
-        return Err(format!("ignored: {clip_id} media has no audio stream"));
-    }
-
-    let rate = engine.project().timeline().frame_rate;
-    let s = snapshot.timeline.start.value;
-    let d = snapshot.timeline.duration.value;
-    let placed_len = resample(source.duration, rate).value.max(1);
-    let reserve = placed_len.max(d);
-    let range = TimeRange::at_rate(s, reserve, rate);
-
-    engine.begin_group();
-
-    let lane = match ensure_audio_host_lane(engine, range) {
-        Ok(id) => id,
-        Err(e) => {
-            engine.rollback_group();
-            return Err(format!("finding audio lane: {e}"));
-        }
-    };
-
-    let audio_clip = match engine.apply(Command::Edit(EditCommand::AddClip {
-        track: lane,
-        media,
-        source,
-        start: RationalTime::new(s, rate),
+    let audio_clip = match engine.apply(Command::Edit(EditCommand::ExtractAudio {
+        clip: clip_id,
+        to_track: None,
     })) {
         Ok(ApplyOutcome::Edited(EditOutcome::Created(id))) => id,
         Ok(other) => {
-            engine.rollback_group();
-            return Err(format!("unexpected AddClip outcome: {other:?}"));
+            return Err(format!("unexpected extract-audio outcome: {other:?}"));
         }
-        Err(e) => {
-            engine.rollback_group();
-            return Err(format!("AddClip failed: {e}"));
-        }
+        Err(e) => return Err(format!("ignored: {e}")),
     };
-
-    if snapshot.speed != Rational::new(1, 1) || snapshot.reversed {
-        if let Err(e) = apply_edit(
-            engine,
-            EditCommand::SetClipSpeed {
-                clip: audio_clip,
-                speed: snapshot.speed,
-                reversed: snapshot.reversed,
-            },
-        ) {
-            engine.rollback_group();
-            return Err(format!("SetClipSpeed failed: {e}"));
-        }
-    }
-
-    if let Err(e) = apply_edit(
-        engine,
-        EditCommand::LinkClips {
-            clips: vec![clip_id, audio_clip],
-        },
-    ) {
-        engine.rollback_group();
-        return Err(format!("LinkClips failed: {e}"));
-    }
-
-    if let Err(e) = apply_edit(
-        engine,
-        EditCommand::SetAudioRole {
-            clip: audio_clip,
-            role: Some(AudioRole::Extracted),
-        },
-    ) {
-        engine.rollback_group();
-        return Err(format!("SetAudioRole failed: {e}"));
-    }
-
-    engine.commit_group();
     Ok(audio_clip)
-}
-
-/// First unlocked audio lane that can host `range` without overlap, or a new
-/// audio lane appended at the stack floor (`index: None`).
-fn ensure_audio_host_lane(engine: &mut Engine, range: TimeRange) -> Result<TrackId, String> {
-    let (existing, count) = {
-        let timeline = engine.project().timeline();
-        let mut existing = None;
-        for track in timeline.tracks_ordered() {
-            if track.kind != TrackKind::Audio || track.locked {
-                continue;
-            }
-            match track.has_overlap(range, None) {
-                Ok(false) => {
-                    existing = Some(track.id);
-                    break;
-                }
-                Ok(true) => continue,
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        let count = timeline
-            .tracks_ordered()
-            .filter(|t| t.kind == TrackKind::Audio)
-            .count();
-        (existing, count)
-    };
-    if let Some(id) = existing {
-        return Ok(id);
-    }
-    match engine.apply(Command::Edit(EditCommand::AddTrack {
-        kind: TrackKind::Audio,
-        name: format!("{}{}", kind_prefix(TrackKind::Audio), count + 1),
-        index: None,
-        pinned: false,
-    })) {
-        Ok(ApplyOutcome::Edited(EditOutcome::CreatedTrack(id))) => Ok(id),
-        Ok(other) => Err(format!("unexpected add-track outcome: {other:?}")),
-        Err(e) => Err(e.to_string()),
-    }
 }
 
 /// Split a clip into two abutting clips at `at_tick`. The UI only offers the
@@ -6087,73 +7263,144 @@ fn nearest_boundary(track: &Track, tick: i64) -> i64 {
     best
 }
 
-/// Replay a rehearsed agent plan on the live engine as one history group,
-/// re-validated step by step, with sandbox-allocated ids remapped onto the
-/// ids the live engine hands out. `after_step` runs
+/// Replay a rehearsed agent plan on the live engine, re-validated step by
+/// step, with sandbox-allocated ids remapped onto the ids the live engine
+/// hands out. Each phase (see `PromptOutcome::phase_breaks`) commits as
+/// its own history group — one undo step per phase. `after_step` runs
 /// after every applied step (the worker publishes there, so the user
-/// watches the plan land) and after the rollback/commit. Any failure rolls
-/// the whole group back — the project changed mid-prompt is the only way
-/// a rehearsed step can fail here.
+/// watches the plan land) and after the final commit or a rollback. A
+/// failure rolls back the failing phase only and stops: earlier phases
+/// were valid and committed, so they stay, each independently undoable —
+/// the error says how many landed. Id maps persist across phases (a later
+/// phase may address a clip an earlier one created). Each phase also
+/// enforces the desktop's empty-lane invariant before it commits; a phase
+/// checkpoint therefore must leave a coherent timeline on its own.
 pub(crate) fn agent_replay(
     engine: &mut Engine,
-    steps: Vec<AgentPlanStep>,
+    phases: Vec<Vec<AgentPlanStep>>,
     mut after_step: impl FnMut(&mut Engine),
 ) -> Result<(), String> {
     use std::collections::HashMap as Map;
     let mut clip_map: Map<u64, u64> = Map::new();
     let mut track_map: Map<u64, u64> = Map::new();
     let mut marker_map: Map<u64, u64> = Map::new();
-
-    let total = steps.len();
-    engine.begin_group();
-    for (index, mut step) in steps.into_iter().enumerate() {
-        step.command.remap_ids(&clip_map, &track_map, &marker_map);
-        let outcome = cutlass_ai::validate(&step.command, engine.project())
-            .map_err(|r| r.message)
-            .and_then(|lowered| engine.apply(lowered).map_err(|e| e.to_string()));
-        match outcome {
-            Ok(ApplyOutcome::Edited(edited)) => {
-                match (step.created, &edited) {
-                    (Some(AgentCreated::Clip(sandbox)), EditOutcome::Created(live)) => {
-                        clip_map.insert(sandbox, live.raw());
+    let phase_count = phases.len();
+    let mut applied = 0usize;
+    for (phase_index, steps) in phases.into_iter().enumerate() {
+        let total = steps.len();
+        let mut cleanup_lanes = Vec::new();
+        engine.begin_group();
+        for (index, mut step) in steps.into_iter().enumerate() {
+            step.command.remap_ids(&clip_map, &track_map, &marker_map);
+            let cleanup_lane = agent_cleanup_source_lane(engine, &step.command);
+            let outcome = cutlass_ai::validate(&step.command, engine.project())
+                .map_err(|r| r.message)
+                .and_then(|lowered| engine.apply(lowered).map_err(|e| e.to_string()));
+            match outcome {
+                Ok(ApplyOutcome::Edited(edited)) => {
+                    if let Some(lane) = cleanup_lane {
+                        cleanup_lanes.push(lane);
                     }
-                    (Some(AgentCreated::Track(sandbox)), EditOutcome::CreatedTrack(live)) => {
-                        track_map.insert(sandbox, live.raw());
+                    match (step.created, &edited) {
+                        (Some(AgentCreated::Clip(sandbox)), EditOutcome::Created(live)) => {
+                            clip_map.insert(sandbox, live.raw());
+                        }
+                        (Some(AgentCreated::Track(sandbox)), EditOutcome::CreatedTrack(live)) => {
+                            track_map.insert(sandbox, live.raw());
+                        }
+                        (Some(AgentCreated::Marker(sandbox)), EditOutcome::CreatedMarker(live)) => {
+                            marker_map.insert(sandbox, live.raw());
+                        }
+                        _ => {}
                     }
-                    (Some(AgentCreated::Marker(sandbox)), EditOutcome::CreatedMarker(live)) => {
-                        marker_map.insert(sandbox, live.raw());
-                    }
-                    _ => {}
+                    after_step(engine);
                 }
-                after_step(engine);
-            }
-            Ok(other) => {
-                engine.rollback_group();
-                after_step(engine);
-                return Err(format!(
-                    "step {}/{total}: unexpected engine outcome {other:?}",
-                    index + 1
-                ));
-            }
-            Err(reason) => {
-                engine.rollback_group();
-                after_step(engine);
-                return Err(format!("step {}/{total}: {reason}", index + 1));
+                Ok(other) => {
+                    engine.rollback_group();
+                    after_step(engine);
+                    return Err(replay_failure(
+                        phase_index,
+                        phase_count,
+                        index,
+                        total,
+                        &format!("unexpected engine outcome {other:?}"),
+                    ));
+                }
+                Err(reason) => {
+                    engine.rollback_group();
+                    after_step(engine);
+                    return Err(replay_failure(
+                        phase_index,
+                        phase_count,
+                        index,
+                        total,
+                        &reason,
+                    ));
+                }
             }
         }
+        // Agent commands bypass the desktop gesture helpers, so mirror
+        // their CapCut lane policy at every commit boundary. A phase is an
+        // independently undoable state and must satisfy desktop invariants;
+        // if a plan wants to empty and refill a lane, those edits belong in
+        // the same phase.
+        cleanup_lanes.sort();
+        cleanup_lanes.dedup();
+        for lane in cleanup_lanes {
+            remove_track_if_empty(engine, lane);
+        }
+        engine.commit_group();
+        applied += total;
     }
-    engine.commit_group();
-    info!(steps = total, "agent plan applied");
+    info!(steps = applied, phases = phase_count, "agent plan applied");
     after_step(engine);
     Ok(())
 }
 
+/// Replay failures name the phase (when there are several), the failing
+/// step, and how much of the plan already landed — the transcript line
+/// must let the user judge what a failure left behind.
+fn replay_failure(
+    phase_index: usize,
+    phase_count: usize,
+    step_index: usize,
+    steps_in_phase: usize,
+    reason: &str,
+) -> String {
+    let step = format!("step {}/{}", step_index + 1, steps_in_phase);
+    let location = if phase_count > 1 {
+        format!("phase {}/{} {step}", phase_index + 1, phase_count)
+    } else {
+        step
+    };
+    let landed = match phase_index {
+        0 => "nothing was applied".to_string(),
+        1 => format!("phase 1 of {phase_count} was applied and stays undoable"),
+        n => format!("phases 1–{n} of {phase_count} were applied and stay undoable"),
+    };
+    format!("{location}: {reason} — {landed}")
+}
+
+/// Source lane that may become empty after an agent structural edit.
+fn agent_cleanup_source_lane(
+    engine: &Engine,
+    command: &cutlass_ai::WireCommand,
+) -> Option<TrackId> {
+    let clip = match command {
+        cutlass_ai::WireCommand::MoveClip(args) => args.clip,
+        cutlass_ai::WireCommand::RemoveClip(args) => args.clip,
+        cutlass_ai::WireCommand::RippleDelete(args) => args.clip,
+        _ => return None,
+    };
+    engine.project().timeline().track_of(ClipId::from_raw(clip))
+}
+
 fn agent_apply_and_publish(
     engine: &mut Engine,
-    steps: Vec<AgentPlanStep>,
+    phases: Vec<Vec<AgentPlanStep>>,
     ui: &UiSink,
 ) -> Result<(), String> {
-    agent_replay(engine, steps, |engine| publish_projection(engine, ui))
+    agent_replay(engine, phases, |engine| publish_projection(engine, ui))
 }
 
 /// Apply a single edit command, flattening the outcome — for compositions
@@ -6624,12 +7871,24 @@ struct FrameCache {
 }
 
 impl FrameCache {
+    fn stats(&self) -> PreviewCacheStats {
+        PreviewCacheStats {
+            entries: self.entries.borrow().len(),
+            // Every supported Rust target's `usize` fits in `u64`; the cast is
+            // exact and gives the cache registry a platform-stable unit.
+            bytes: self.bytes.get() as u64,
+        }
+    }
+
     /// Drop every delivered frame — for state changes the revision key
     /// doesn't cover (a proxy binding swaps decode sources without touching
-    /// the project).
-    fn clear(&self) {
+    /// the project). Returns the exact usage that was removed.
+    fn clear(&self) -> PreviewCacheStats {
+        let removed = self.stats();
         self.entries.borrow_mut().clear();
         self.bytes.set(0);
+        self.clock.set(0);
+        removed
     }
 
     fn get(&self, key: &FrameKey) -> Option<SharedPixelBuffer<Rgba8Pixel>> {
@@ -6901,7 +8160,1076 @@ fn deliver_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cutlass_models::Project;
+    use cutlass_models::AudioRole;
+    use cutlass_models::{Project, Template, TemplateMeta};
+
+    fn cache_key(tick: i64) -> FrameKey {
+        FrameKey {
+            tick,
+            revision: 1,
+            bound: Some((320, 180)),
+        }
+    }
+
+    fn cache_buffer(width: u32, height: u32) -> SharedPixelBuffer<Rgba8Pixel> {
+        SharedPixelBuffer::new(width, height)
+    }
+
+    fn image_fixture() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../crates/cutlass-decoder/tests/fixtures/halves.jpg")
+    }
+
+    fn copy_image_fixture(path: &Path) {
+        std::fs::copy(image_fixture(), path).expect("copy image fixture");
+    }
+
+    fn write_template_fixture(path: &Path, name: &str) {
+        let mut project = Project::new(name, Rational::FPS_24);
+        project.add_track(TrackKind::Video, "Main");
+        Template::from_project(project, TemplateMeta::new(name))
+            .save_to_file(path)
+            .expect("write template fixture");
+    }
+
+    #[test]
+    fn frame_cache_reports_exact_insert_and_replacement_accounting() {
+        let cache = FrameCache::default();
+        let first = cache_key(1);
+        let second = cache_key(2);
+
+        cache.insert(first, cache_buffer(2, 3));
+        assert_eq!(
+            cache.stats(),
+            PreviewCacheStats {
+                entries: 1,
+                bytes: 24,
+            }
+        );
+
+        cache.insert(second, cache_buffer(1, 4));
+        assert_eq!(
+            cache.stats(),
+            PreviewCacheStats {
+                entries: 2,
+                bytes: 40,
+            }
+        );
+
+        // Replacing a key subtracts the old allocation before adding the new
+        // one; cache hits only update LRU order.
+        cache.insert(first, cache_buffer(3, 3));
+        assert!(cache.get(&second).is_some());
+        assert_eq!(
+            cache.stats(),
+            PreviewCacheStats {
+                entries: 2,
+                bytes: 52,
+            }
+        );
+    }
+
+    #[test]
+    fn frame_cache_clear_returns_removed_usage_and_resets_all_state() {
+        let cache = FrameCache::default();
+        let key = cache_key(1);
+        cache.insert(key, cache_buffer(4, 2));
+        assert!(cache.get(&key).is_some());
+        assert!(cache.clock.get() > 1);
+
+        assert_eq!(
+            cache.clear(),
+            PreviewCacheStats {
+                entries: 1,
+                bytes: 32,
+            }
+        );
+        assert_eq!(cache.stats(), PreviewCacheStats::default());
+        assert!(cache.entries.borrow().is_empty());
+        assert_eq!(cache.bytes.get(), 0);
+        assert_eq!(cache.clock.get(), 0);
+
+        cache.insert(cache_key(2), cache_buffer(1, 1));
+        assert_eq!(cache.clock.get(), 1, "LRU order restarts after clear");
+    }
+
+    #[test]
+    fn project_rpc_reports_a_disconnected_worker_as_not_started() {
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let handle = WorkerHandle { tx };
+
+        assert_eq!(
+            handle
+                .import_media_rpc(PathBuf::from("/unused/disconnected.jpg"))
+                .unwrap_err(),
+            "import media request failed: preview worker is not running; not started"
+        );
+    }
+
+    #[test]
+    fn project_rpc_pre_cancel_does_not_enqueue() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            handle
+                .save_project_rpc_with_cancel(None, &cancel)
+                .unwrap_err(),
+            "save project request cancelled before worker claim; not started"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "pre-cancelled RPC must not enqueue a worker message"
+        );
+    }
+
+    #[test]
+    fn session_replacement_rpc_pre_cancel_does_not_enqueue() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            handle
+                .open_project_rpc_with_cancel(PathBuf::from("/unused/project.cutlass"), &cancel)
+                .unwrap_err(),
+            "open project request cancelled before worker claim; not started"
+        );
+        assert_eq!(
+            handle.new_project_rpc_with_cancel(&cancel).unwrap_err(),
+            "new project request cancelled before worker claim; not started"
+        );
+        assert_eq!(
+            handle
+                .apply_template_rpc_with_cancel(
+                    PathBuf::from("/unused/template.cutlasst"),
+                    Vec::new(),
+                    &cancel,
+                )
+                .unwrap_err(),
+            "apply template request cancelled before worker claim; not started"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "pre-cancelled session RPCs must not enqueue worker messages"
+        );
+    }
+
+    #[test]
+    fn project_rpc_cancellation_abandons_an_enqueued_pending_request() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let caller_cancel = Arc::clone(&cancel);
+        let (done_tx, done_rx) = bounded(1);
+        let caller = std::thread::spawn(move || {
+            let result = handle.import_media_rpc_with_cancel(
+                PathBuf::from("/unused/pending.jpg"),
+                caller_cancel.as_ref(),
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        let WorkerMsg::ImportMediaRpc {
+            reply, operation, ..
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected enqueued import RPC");
+        };
+        cancel.store(true, Ordering::Release);
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap_err(),
+            "import media request cancelled before worker claim; not started"
+        );
+        assert!(
+            !operation.claim(),
+            "cancellation must atomically abandon the pending operation"
+        );
+
+        let mut mutated = false;
+        serve_worker_rpc(reply, operation, || {
+            mutated = true;
+            Ok(ImportMediaRpcResult {
+                media_id: 1,
+                path: PathBuf::from("/unused/should-not-run.jpg"),
+            })
+        });
+        assert!(!mutated, "an abandoned handler must remain a no-op");
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn project_rpc_queue_timeout_prevents_worker_claim() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(false);
+
+        let result: Result<ImportMediaRpcResult, String> = handle.project_rpc(
+            "import media",
+            Duration::ZERO,
+            &cancel,
+            |reply, operation| WorkerMsg::ImportMediaRpc {
+                path: PathBuf::from("/unused/timeout.jpg"),
+                reply,
+                operation,
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "import media request timed out before worker claim; not started after 0 ms"
+        );
+        let WorkerMsg::ImportMediaRpc { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected queued import RPC");
+        };
+        assert!(
+            !operation.claim(),
+            "timed-out queued RPC must remain abandoned"
+        );
+    }
+
+    #[test]
+    fn project_rpc_post_claim_timeout_reports_outcome_unknown() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(false);
+
+        let result: Result<ImportMediaRpcResult, String> = handle.project_rpc(
+            "import media",
+            Duration::ZERO,
+            &cancel,
+            |reply, operation| {
+                assert!(operation.claim(), "simulate a worker claim before waiting");
+                WorkerMsg::ImportMediaRpc {
+                    path: PathBuf::from("/unused/claimed-timeout.jpg"),
+                    reply,
+                    operation,
+                }
+            },
+        );
+        assert_eq!(
+            result.unwrap_err(),
+            "import media request timed out after worker claim; outcome unknown after 0 ms"
+        );
+
+        let WorkerMsg::ImportMediaRpc { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected claimed import RPC");
+        };
+        assert!(!operation.abandon());
+    }
+
+    #[test]
+    fn project_rpc_claim_ignores_late_cancellation_and_delivers_result() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let caller_cancel = Arc::clone(&cancel);
+        let (done_tx, done_rx) = bounded(1);
+        let caller = std::thread::spawn(move || {
+            let result = handle.import_media_rpc_with_cancel(
+                PathBuf::from("/unused/claimed.jpg"),
+                caller_cancel.as_ref(),
+            );
+            done_tx.send(result).unwrap();
+        });
+
+        let WorkerMsg::ImportMediaRpc {
+            reply, operation, ..
+        } = rx.recv().unwrap()
+        else {
+            panic!("expected import RPC");
+        };
+        assert!(operation.claim());
+        cancel.store(true, Ordering::Release);
+        assert!(matches!(done_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        let expected = ImportMediaRpcResult {
+            media_id: 41,
+            path: PathBuf::from("/canonical/claimed.jpg"),
+        };
+        reply.send(Ok(expected.clone())).unwrap();
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        caller.join().unwrap();
+    }
+
+    #[test]
+    fn abandoned_project_rpc_handler_never_runs_mutation() {
+        let operation = Arc::new(WorkerRpcOperation::pending());
+        assert!(operation.abandon());
+        let (reply, response) = bounded(1);
+        let mut mutated = false;
+
+        serve_worker_rpc(reply, operation, || {
+            mutated = true;
+            Ok::<_, String>(())
+        });
+
+        assert!(!mutated);
+        assert!(matches!(
+            response.try_recv(),
+            Err(TryRecvError::Disconnected)
+        ));
+    }
+
+    #[test]
+    fn project_rpc_handler_delivers_helper_success_and_error_dtos() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        copy_image_fixture(&source);
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+
+        let (reply, response) = bounded(1);
+        serve_worker_rpc(reply, Arc::new(WorkerRpcOperation::pending()), || {
+            import_media_rpc_and_publish(&mut engine, &source, None)
+        });
+        let imported = response.recv().unwrap().expect("import DTO");
+        assert_eq!(imported.path, source.canonicalize().unwrap());
+
+        let (reply, response) = bounded(1);
+        serve_worker_rpc(reply, Arc::new(WorkerRpcOperation::pending()), || {
+            import_media_rpc_and_publish(&mut engine, &dir.path().join("missing.jpg"), None)
+        });
+        assert!(
+            response
+                .recv()
+                .unwrap()
+                .unwrap_err()
+                .contains("import failed")
+        );
+    }
+
+    #[test]
+    fn import_rpc_helper_returns_canonical_dto_and_preserves_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        copy_image_fixture(&source);
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+
+        let result =
+            import_media_rpc_and_publish(&mut engine, &source, None).expect("import result");
+        assert_eq!(result.path, source.canonicalize().unwrap());
+        assert_eq!(
+            engine
+                .project()
+                .media(MediaId::from_raw(result.media_id))
+                .unwrap()
+                .path(),
+            result.path
+        );
+
+        let count = engine.project().media_count();
+        let error =
+            import_media_rpc_and_publish(&mut engine, &dir.path().join("missing.jpg"), None)
+                .unwrap_err();
+        assert!(error.contains("import failed"));
+        assert_eq!(engine.project().media_count(), count);
+    }
+
+    #[test]
+    fn save_rpc_helper_returns_actual_clean_path_and_missing_path_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.jpg");
+        copy_image_fixture(&source);
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        import_media_rpc_and_publish(&mut engine, &source, None).expect("dirty engine");
+        assert!(engine.is_dirty());
+
+        let project_path = dir.path().join("project.cutlass");
+        let result = save_project_rpc_and_publish(&mut engine, Some(project_path.clone()), None)
+            .expect("save result");
+        assert_eq!(result.path, project_path);
+        assert!(!result.dirty);
+        assert!(!engine.is_dirty());
+
+        let mut unbound = Engine::new(EngineConfig::default()).expect("unbound engine");
+        assert_eq!(
+            save_project_rpc_and_publish(&mut unbound, None, None).unwrap_err(),
+            "save project failed: no current project path is bound"
+        );
+    }
+
+    #[test]
+    fn open_project_core_returns_bound_path_name_and_missing_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present.jpg");
+        copy_image_fixture(&present);
+        let missing = dir.path().join("missing.jpg");
+        let project_path = dir.path().join("opened.cutlass");
+
+        let mut project = Project::new("Acknowledged open", Rational::FPS_30);
+        project.add_media(cutlass_models::MediaSource::image(present, 32, 32));
+        project.add_media(cutlass_models::MediaSource::image(missing, 32, 32));
+        project.save_to_file(&project_path).expect("save fixture");
+
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        let outcome = open_project_core(&mut engine, project_path.clone());
+        assert!(
+            session_was_replaced(&outcome),
+            "successful open must publish and bump the session epoch"
+        );
+        let result = outcome.expect("open result");
+        assert_eq!(result.path, project_path);
+        assert_eq!(result.project_name, "Acknowledged open");
+        assert_eq!(result.missing_media_count, 1);
+        assert_eq!(engine.project_path(), Some(&result.path));
+    }
+
+    #[test]
+    fn rejected_open_and_template_do_not_request_epoch_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::with_project(
+            EngineConfig::default(),
+            Project::new("keep me", Rational::FPS_30),
+        )
+        .expect("engine");
+        let revision = engine.revision();
+
+        let open = open_project_core(&mut engine, dir.path().join("missing.cutlass"));
+        assert!(!session_was_replaced(&open));
+        assert!(
+            open.unwrap_err()
+                .rpc_message
+                .contains("open project failed")
+        );
+        assert_eq!(engine.project().name, "keep me");
+        assert_eq!(engine.revision(), revision);
+
+        let template = apply_template_core(
+            &mut engine,
+            dir.path().join("missing.cutlasst"),
+            Vec::new(),
+            || panic!("draft creation must not run after a rejected template"),
+        );
+        assert!(!session_was_replaced(&template));
+        assert!(
+            template
+                .unwrap_err()
+                .rpc_message
+                .contains("apply template failed")
+        );
+        assert_eq!(engine.project().name, "keep me");
+        assert_eq!(engine.revision(), revision);
+    }
+
+    #[test]
+    fn new_project_core_reports_unbound_followup_save_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.cutlass");
+        let mut engine = Engine::with_project(
+            EngineConfig::default(),
+            Project::new("old", Rational::FPS_30),
+        )
+        .expect("engine");
+        engine
+            .apply(Command::Project(ProjectCommand::Save {
+                path: old_path.clone(),
+            }))
+            .expect("bind old session");
+        assert_eq!(engine.project_path(), Some(&old_path));
+
+        let outcome = new_project_core(&mut engine);
+        assert!(session_was_replaced(&outcome));
+        let result = outcome.expect("new result");
+        assert_eq!(result.project_name, "untitled");
+        assert_eq!(result.path, None);
+        assert_eq!(result.missing_media_count, 0);
+        assert!(result.requires_save_binding);
+        assert!(engine.project_path().is_none());
+        assert!(engine.project().timeline().main_track().is_some());
+    }
+
+    #[test]
+    fn apply_template_core_returns_verified_bound_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let template_path = dir.path().join("simple.cutlasst");
+        write_template_fixture(&template_path, "Template result");
+        let draft_dir = dir.path().join("draft");
+        std::fs::create_dir(&draft_dir).unwrap();
+        let draft_path = draft_dir.join("project.cutlass");
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+
+        let outcome = apply_template_core(&mut engine, template_path, Vec::new(), || {
+            Ok(draft_path.clone())
+        });
+        assert!(session_was_replaced(&outcome));
+        let result = outcome.expect("template result");
+        assert_eq!(result.path, draft_path);
+        assert_eq!(result.project_name, "Template result");
+        assert_eq!(result.missing_media_count, 0);
+        assert_eq!(engine.project_path(), Some(&result.path));
+        assert!(!engine.is_dirty(), "acknowledged binding must be persisted");
+        assert!(result.path.is_file());
+    }
+
+    #[test]
+    fn template_binding_failure_reports_partially_committed_memory_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let template_path = dir.path().join("simple.cutlasst");
+        write_template_fixture(&template_path, "Applied in memory");
+        let invalid_draft_file = dir.path().join("directory-not-file");
+        std::fs::create_dir(&invalid_draft_file).unwrap();
+        let mut engine = Engine::with_project(
+            EngineConfig::default(),
+            Project::new("outgoing", Rational::FPS_30),
+        )
+        .expect("engine");
+
+        let outcome = apply_template_core(&mut engine, template_path, Vec::new(), || {
+            Ok(invalid_draft_file)
+        });
+        assert!(
+            session_was_replaced(&outcome),
+            "the applied in-memory session still needs publication and an epoch bump"
+        );
+        let error = outcome.unwrap_err();
+        assert!(error.session_replaced_in_memory);
+        assert!(error.rpc_message.contains("uncertain/partially committed"));
+        assert!(error.rpc_message.contains("binding/persisting"));
+        assert!(error.ui_message.contains("template was applied"));
+        assert_eq!(engine.project().name, "Applied in memory");
+        assert!(engine.project_path().is_none());
+        assert!(engine.is_dirty());
+    }
+
+    #[test]
+    fn relink_media_rpc_helper_returns_current_path_and_validation_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.jpg");
+        let target = dir.path().join("replacement.jpg");
+        copy_image_fixture(&target);
+        let mut project = Project::new("relink", Rational::FPS_30);
+        let media = project.add_media(cutlass_models::MediaSource::image(missing, 32, 32));
+        let mut engine =
+            Engine::with_project(EngineConfig::default(), project).expect("relink engine");
+
+        let result =
+            relink_media_rpc_and_publish(&mut engine, &media.raw().to_string(), &target, None)
+                .expect("relink result");
+        assert_eq!(result.media_id, media.raw());
+        assert_eq!(result.path, target.canonicalize().unwrap());
+        assert_eq!(
+            engine.project().media(media).unwrap().path(),
+            result.path.as_path()
+        );
+
+        assert!(
+            relink_media_rpc_and_publish(&mut engine, "not-an-id", &target, None)
+                .unwrap_err()
+                .contains("unparsable media id")
+        );
+        assert!(
+            relink_media_rpc_and_publish(&mut engine, "999999", &target, None)
+                .unwrap_err()
+                .contains("relink failed")
+        );
+    }
+
+    #[test]
+    fn relink_folder_rpc_helper_returns_sorted_results_and_no_candidate_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let originals = dir.path().join("originals");
+        let replacements = dir.path().join("replacements");
+        std::fs::create_dir(&replacements).unwrap();
+        copy_image_fixture(&replacements.join("z.jpg"));
+        copy_image_fixture(&replacements.join("a.jpg"));
+
+        let mut project = Project::new("folder relink", Rational::FPS_30);
+        let z = project.add_media(cutlass_models::MediaSource::image(
+            originals.join("z.jpg"),
+            32,
+            32,
+        ));
+        let a = project.add_media(cutlass_models::MediaSource::image(
+            originals.join("a.jpg"),
+            32,
+            32,
+        ));
+        let mut engine =
+            Engine::with_project(EngineConfig::default(), project).expect("folder engine");
+
+        let result = relink_folder_rpc_and_publish(&mut engine, replacements.clone(), None)
+            .expect("folder relink result");
+        let ids: Vec<u64> = result.relinked.iter().map(|entry| entry.media_id).collect();
+        assert_eq!(ids, {
+            let mut expected = vec![z.raw(), a.raw()];
+            expected.sort_unstable();
+            expected
+        });
+        assert!(
+            result
+                .relinked
+                .iter()
+                .all(|entry| entry.path.is_absolute() && entry.path.exists())
+        );
+
+        let error = relink_folder_rpc_and_publish(&mut engine, replacements, None).unwrap_err();
+        assert!(error.contains("No missing media files were found"));
+    }
+
+    #[test]
+    fn relink_folder_error_reporter_emits_each_error_once_without_rewriting() {
+        let messages = [
+            "No missing media files were found in /missing.",
+            "folder relink preflight failed; no media was relinked",
+            "folder relink completed with individual failures; non-undoable successful relinks \
+             remain applied for media ids [7]; media 8 failed",
+        ];
+        for expected in messages {
+            let result: Result<RelinkFolderRpcResult, String> = Err(expected.into());
+            let mut reported = Vec::new();
+            report_relink_folder_error(&result, |message| reported.push(message));
+            assert_eq!(reported.len(), 1);
+            assert_eq!(reported[0], expected);
+        }
+
+        let result = Ok(RelinkFolderRpcResult {
+            relinked: Vec::new(),
+        });
+        let mut reported = Vec::new();
+        report_relink_folder_error(&result, |message| reported.push(message));
+        assert!(reported.is_empty());
+    }
+
+    #[test]
+    fn relink_folder_rpc_preflight_failure_mutates_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let originals = dir.path().join("originals");
+        let replacements = dir.path().join("replacements");
+        std::fs::create_dir(&replacements).unwrap();
+        copy_image_fixture(&replacements.join("good.jpg"));
+        std::fs::write(replacements.join("bad.jpg"), b"not media").unwrap();
+
+        let mut project = Project::new("folder preflight", Rational::FPS_30);
+        let good_path = originals.join("good.jpg");
+        let bad_path = originals.join("bad.jpg");
+        let good = project.add_media(cutlass_models::MediaSource::image(
+            good_path.clone(),
+            32,
+            32,
+        ));
+        let bad = project.add_media(cutlass_models::MediaSource::image(bad_path.clone(), 32, 32));
+        let mut engine =
+            Engine::with_project(EngineConfig::default(), project).expect("preflight engine");
+
+        let error = relink_folder_rpc_and_publish(&mut engine, replacements, None).unwrap_err();
+        assert!(error.contains("preflight failed"));
+        assert!(error.contains("no media was relinked"));
+        assert_eq!(engine.project().media(good).unwrap().path(), good_path);
+        assert_eq!(engine.project().media(bad).unwrap().path(), bad_path);
+    }
+
+    #[test]
+    fn acknowledged_relinks_invalidate_preview_like_ui_relinks() {
+        let (media_reply, _) = bounded(1);
+        let (folder_reply, _) = bounded(1);
+        assert!(message_invalidates_preview(&WorkerMsg::RelinkMediaRpc {
+            media: "1".into(),
+            path: PathBuf::from("/unused/relink.jpg"),
+            reply: media_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+        assert!(message_invalidates_preview(&WorkerMsg::RelinkFolderRpc {
+            folder: PathBuf::from("/unused"),
+            reply: folder_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+    }
+
+    #[test]
+    fn acknowledged_session_replacements_invalidate_preview() {
+        let (open_reply, _) = bounded(1);
+        let (new_reply, _) = bounded(1);
+        let (template_reply, _) = bounded(1);
+        assert!(message_invalidates_preview(&WorkerMsg::OpenProjectRpc {
+            path: PathBuf::from("/unused/project.cutlass"),
+            reply: open_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+        assert!(message_invalidates_preview(&WorkerMsg::NewProjectRpc {
+            reply: new_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+        assert!(message_invalidates_preview(&WorkerMsg::ApplyTemplateRpc {
+            path: PathBuf::from("/unused/template.cutlasst"),
+            picks: Vec::new(),
+            reply: template_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+    }
+
+    #[test]
+    fn preview_cache_rpc_reports_a_disconnected_worker() {
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let handle = WorkerHandle { tx };
+
+        assert_eq!(
+            handle.preview_cache_stats().unwrap_err(),
+            "preview cache stats request failed: preview worker is not running"
+        );
+    }
+
+    #[test]
+    fn preview_cache_rpc_times_out_when_worker_does_not_reply() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(false);
+
+        let error = handle
+            .preview_cache_rpc(
+                "clear",
+                Duration::from_millis(1),
+                &cancel,
+                |reply, operation| WorkerMsg::ClearPreviewCache { reply, operation },
+            )
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "preview cache clear request timed out while still queued after 1 ms"
+        );
+        let WorkerMsg::ClearPreviewCache { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected queued clear request");
+        };
+        assert!(
+            !operation.claim(),
+            "a timed-out queued clear must remain a no-op"
+        );
+    }
+
+    #[test]
+    fn preview_cache_rpc_pre_cancel_does_not_enqueue() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            handle.clear_preview_cache_with_cancel(&cancel).unwrap_err(),
+            "preview cache clear request was cancelled"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "pre-cancelled cache RPC must not enqueue a worker message"
+        );
+    }
+
+    #[test]
+    fn project_maintenance_pre_cancel_does_not_enqueue() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(true);
+
+        let error =
+            match handle.begin_project_maintenance_with_timeout(&cancel, Duration::from_secs(1)) {
+                Ok(_) => panic!("cancelled maintenance request was granted"),
+                Err(error) => error,
+            };
+        assert_eq!(
+            error,
+            "project maintenance request was cancelled before worker claim"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "pre-cancelled maintenance must not enqueue a worker message"
+        );
+    }
+
+    #[test]
+    fn project_maintenance_claim_wins_a_cancellation_delivery_race() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let worker_cancel = Arc::clone(&cancel);
+        let worker = std::thread::spawn(move || {
+            let WorkerMsg::BeginProjectMaintenance {
+                reply,
+                resume,
+                operation,
+            } = rx.recv().unwrap()
+            else {
+                panic!("expected maintenance request");
+            };
+            assert!(operation.claim());
+            worker_cancel.store(true, Ordering::Release);
+            reply
+                .send(Ok(Project::new("claimed", Rational::FPS_30)))
+                .unwrap();
+            assert_eq!(
+                resume.recv_timeout(Duration::from_secs(1)).unwrap(),
+                ProjectMaintenanceResumeAction::Resume
+            );
+        });
+
+        let guard = handle
+            .begin_project_maintenance_with_timeout(cancel.as_ref(), Duration::from_secs(1))
+            .expect("a claim that beat cancellation must deliver its guard");
+        assert_eq!(guard.project().name, "claimed");
+        drop(guard);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn project_maintenance_guard_ordinary_drop_resumes_queued_work_and_is_send() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let (resumed_tx, resumed_rx) = bounded(1);
+        let (processed_tx, processed_rx) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            let WorkerMsg::BeginProjectMaintenance {
+                reply,
+                resume,
+                operation,
+            } = rx.recv().unwrap()
+            else {
+                panic!("expected maintenance request");
+            };
+            let project = Project::new("live snapshot", Rational::FPS_30);
+            let action = serve_project_maintenance(&project, reply, resume, operation);
+            resumed_tx.send(action).unwrap();
+
+            let WorkerMsg::RenameProject { name } = rx.recv().unwrap() else {
+                panic!("expected work queued behind maintenance");
+            };
+            processed_tx.send(name).unwrap();
+        });
+
+        let guard = handle
+            .begin_project_maintenance_with_timeout(&AtomicBool::new(false), Duration::from_secs(1))
+            .expect("maintenance guard");
+        assert_eq!(guard.project().name, "live snapshot");
+        handle.rename_project("after maintenance".into());
+        assert!(matches!(processed_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // Moving the guard into this background holder is also a compile-time
+        // assertion that ProjectMaintenanceGuard is Send.
+        std::thread::spawn(move || drop(guard)).join().unwrap();
+        assert_eq!(
+            resumed_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("guard drop must resume worker"),
+            ProjectMaintenanceResumeAction::Resume
+        );
+        assert_eq!(
+            processed_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "after maintenance"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn project_maintenance_guard_can_request_proxy_refresh_on_drop() {
+        let (resume, wait_for_resume) = bounded(1);
+        let mut guard = ProjectMaintenanceGuard {
+            project: Project::new("refresh", Rational::FPS_30),
+            resume: Some(resume),
+            resume_action: ProjectMaintenanceResumeAction::Resume,
+        };
+
+        guard.refresh_proxies_on_resume();
+        drop(guard);
+
+        assert_eq!(
+            wait_for_resume
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            ProjectMaintenanceResumeAction::RefreshProxies
+        );
+    }
+
+    #[test]
+    fn disconnected_maintenance_resume_defaults_to_ordinary_action() {
+        let project = Project::new("disconnected resume", Rational::FPS_30);
+        let (reply, response) = bounded(1);
+        let (resume, wait_for_resume) = bounded(1);
+        drop(resume);
+
+        assert_eq!(
+            serve_project_maintenance(
+                &project,
+                reply,
+                wait_for_resume,
+                Arc::new(WorkerRpcOperation::pending()),
+            ),
+            ProjectMaintenanceResumeAction::Resume
+        );
+        assert_eq!(
+            response.recv().unwrap().unwrap().name,
+            "disconnected resume"
+        );
+    }
+
+    #[test]
+    fn proxy_refresh_plan_captures_all_media_and_requests_only_videos() {
+        let mut project = Project::new("proxy refresh", Rational::FPS_30);
+        let video = project.add_media(cutlass_models::MediaSource::new(
+            "/media/video.mov",
+            3840,
+            2160,
+            Rational::FPS_30,
+            300,
+            true,
+        ));
+        let audio = project.add_media(cutlass_models::MediaSource::new(
+            "/media/audio.wav",
+            0,
+            0,
+            Rational::FPS_30,
+            300,
+            true,
+        ));
+        let image = project.add_media(cutlass_models::MediaSource::image(
+            "/media/still.png",
+            1600,
+            900,
+        ));
+
+        let plan = plan_proxy_refresh(&project);
+        assert_eq!(plan.len(), 3);
+        assert!(
+            plan.windows(2)
+                .all(|pair| pair[0].id.raw() < pair[1].id.raw())
+        );
+
+        let video = plan.iter().find(|source| source.id == video).unwrap();
+        assert_eq!(video.path, PathBuf::from("/media/video.mov"));
+        assert_eq!((video.width, video.height), (3840, 2160));
+        assert!(video.is_video);
+        assert!(
+            !plan
+                .iter()
+                .find(|source| source.id == audio)
+                .unwrap()
+                .is_video
+        );
+        assert!(
+            !plan
+                .iter()
+                .find(|source| source.id == image)
+                .unwrap()
+                .is_video
+        );
+        assert_eq!(plan.iter().filter(|source| source.is_video).count(), 1);
+    }
+
+    #[test]
+    fn project_maintenance_acquisition_timeout_is_finite() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let (done_tx, done_rx) = bounded(1);
+        let caller = std::thread::spawn(move || {
+            let cancel = AtomicBool::new(false);
+            let result =
+                handle.begin_project_maintenance_with_timeout(&cancel, Duration::from_millis(5));
+            assert!(done_tx.send(result).is_ok());
+        });
+
+        let result = done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("maintenance acquisition must have a finite timeout");
+        let error = match result {
+            Ok(_) => panic!("unserviced maintenance request was granted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "project maintenance request timed out while still queued after 5 ms"
+        );
+        caller.join().unwrap();
+
+        let WorkerMsg::BeginProjectMaintenance { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected timed-out maintenance request");
+        };
+        assert!(!operation.claim());
+    }
+
+    #[test]
+    fn abandoned_project_maintenance_request_cannot_freeze_worker_later() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(false);
+        let result =
+            handle.begin_project_maintenance_with_timeout(&cancel, Duration::from_millis(1));
+        assert!(result.is_err());
+        handle.rename_project("still runs".into());
+
+        let (done_tx, done_rx) = bounded(1);
+        let worker = std::thread::spawn(move || {
+            let WorkerMsg::BeginProjectMaintenance {
+                reply,
+                resume,
+                operation,
+            } = rx.recv().unwrap()
+            else {
+                panic!("expected abandoned maintenance request");
+            };
+            let project = Project::new("late", Rational::FPS_30);
+            serve_project_maintenance(&project, reply, resume, operation);
+
+            let WorkerMsg::RenameProject { name } = rx.recv().unwrap() else {
+                panic!("abandoned maintenance froze later queue work");
+            };
+            done_tx.send(name).unwrap();
+        });
+
+        assert_eq!(
+            done_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            "still runs"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn project_maintenance_reports_worker_refusal_separately() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let worker = std::thread::spawn(move || {
+            let WorkerMsg::BeginProjectMaintenance {
+                reply, operation, ..
+            } = rx.recv().unwrap()
+            else {
+                panic!("expected maintenance request");
+            };
+            assert!(operation.claim());
+            reply.send(Err(())).unwrap();
+        });
+
+        let error = match handle
+            .begin_project_maintenance_with_timeout(&AtomicBool::new(false), Duration::from_secs(1))
+        {
+            Ok(_) => panic!("refused maintenance request was granted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "project maintenance request was refused by preview worker"
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn project_maintenance_reports_a_disconnected_queue() {
+        let (tx, rx) = unbounded();
+        drop(rx);
+        let handle = WorkerHandle { tx };
+
+        let error = match handle.begin_project_maintenance_with_cancel(&AtomicBool::new(false)) {
+            Ok(_) => panic!("disconnected worker granted maintenance"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "project maintenance request failed: preview worker is not running"
+        );
+    }
 
     /// The ladder drops on one slow render but climbs back only on
     /// sustained, uniformly fast evidence: dwell elapsed, enough samples,

@@ -8,6 +8,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+base64 = "0.22"
 cutlass-commands = { path = "../cutlass-commands" }
 cutlass-models = { path = "../cutlass-models" }
 schemars = "1"

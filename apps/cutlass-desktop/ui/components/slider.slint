@@ -152,6 +152,11 @@ export component CutlassSlider {
                 return;
             }
 
+            // Move focus before changing the value. This lets a neighboring
+            // deferred text field commit/cancel its draft before the slider's
+            // first `changed` callback republishes a formatted readout.
+            focus-scope.focus();
+
             // Pressing the rail jumps to the pointer; pressing the cap
             // keeps the current value. Either way the drag that follows is
             // relative to the press point.
@@ -160,7 +165,6 @@ export component CutlassSlider {
                     : root.size-to-value(root.height - touch-area.mouse-y, root.height)) + root.minimum);
             }
             self.pressed-value = root.value;
-            focus-scope.focus();
             root.handle-pressed = true;
         }
 

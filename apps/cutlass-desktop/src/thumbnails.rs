@@ -268,6 +268,53 @@ thread_local! {
     static THUMBS: RefCell<HashMap<u64, Image>> = RefCell::new(HashMap::new());
 }
 
+/// Memory attributed to the UI-thread thumbnail image registry.
+///
+/// The byte count estimates an RGBA8 backing store from each image's intrinsic
+/// pixel dimensions. It does not include map, renderer, or GPU overhead.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ThumbnailCacheStats {
+    pub(crate) entry_count: usize,
+    pub(crate) estimated_rgba_bytes: u64,
+}
+
+fn estimated_rgba_bytes(image: &Image) -> u64 {
+    let size = image.size();
+    u64::from(size.width)
+        .saturating_mul(u64::from(size.height))
+        .saturating_mul(4)
+}
+
+fn stats_for(thumbs: &HashMap<u64, Image>) -> ThumbnailCacheStats {
+    ThumbnailCacheStats {
+        entry_count: thumbs.len(),
+        estimated_rgba_bytes: thumbs.values().fold(0, |total, image| {
+            total.saturating_add(estimated_rgba_bytes(image))
+        }),
+    }
+}
+
+/// Snapshot the thumbnail cache (Slint UI thread only).
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+pub(crate) fn cache_stats() -> ThumbnailCacheStats {
+    THUMBS.with(|thumbs| stats_for(&thumbs.borrow()))
+}
+
+/// Clear every cached thumbnail and return the pre-clear snapshot.
+///
+/// This only touches the calling thread's `THUMBS` registry. It performs no
+/// filesystem or worker work and must be called on the Slint UI thread.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+pub(crate) fn clear_all() -> ThumbnailCacheStats {
+    THUMBS.with(|thumbs| {
+        let mut thumbs = thumbs.borrow_mut();
+        let stats = stats_for(&thumbs);
+        thumbs.clear();
+        stats
+    })
+}
+
 /// The generated thumbnail for `media_id`, if it's ready (UI thread only).
 pub fn thumbnail_for(media_id: u64) -> Option<Image> {
     THUMBS.with(|thumbs| thumbs.borrow().get(&media_id).cloned())
@@ -322,6 +369,44 @@ fn render_waveform(peaks: &[f32], width: u32, height: u32) -> (u32, u32, Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct ThumbnailCacheCleanup;
+
+    impl Drop for ThumbnailCacheCleanup {
+        fn drop(&mut self) {
+            clear_all();
+        }
+    }
+
+    fn test_image(width: u32, height: u32) -> Image {
+        let rgba = vec![0; width as usize * height as usize * 4];
+        Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+            &rgba, width, height,
+        ))
+    }
+
+    #[test]
+    fn thumbnail_cache_stats_and_clear_are_exact_and_idempotent() {
+        clear_all();
+        let _cleanup = ThumbnailCacheCleanup;
+
+        THUMBS.with(|thumbs| {
+            let mut thumbs = thumbs.borrow_mut();
+            thumbs.insert(11, test_image(3, 5));
+            thumbs.insert(22, test_image(7, 2));
+        });
+
+        let expected = ThumbnailCacheStats {
+            entry_count: 2,
+            estimated_rgba_bytes: 3 * 5 * 4 + 7 * 2 * 4,
+        };
+        assert_eq!(cache_stats(), expected);
+        assert_eq!(clear_all(), expected);
+        assert_eq!(cache_stats(), ThumbnailCacheStats::default());
+        assert_eq!(clear_all(), ThumbnailCacheStats::default());
+        assert!(thumbnail_for(11).is_none());
+        assert!(thumbnail_for(22).is_none());
+    }
 
     #[test]
     fn waveform_paints_bars_on_background() {

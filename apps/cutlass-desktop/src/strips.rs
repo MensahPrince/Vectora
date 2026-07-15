@@ -228,6 +228,25 @@ struct CacheEntry {
     last_used: u64,
 }
 
+/// Memory attributed to one UI-thread strip image registry.
+///
+/// The byte count estimates an RGBA8 backing store from each image's intrinsic
+/// pixel dimensions. It does not include map, renderer, or GPU overhead.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StripImageCacheStats {
+    pub(crate) entry_count: usize,
+    pub(crate) estimated_rgba_bytes: u64,
+}
+
+/// Separate snapshots for the filmstrip-frame and waveform-tile registries.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct StripCacheStats {
+    pub(crate) filmstrips: StripImageCacheStats,
+    pub(crate) waves: StripImageCacheStats,
+}
+
 thread_local! {
     /// Decoded filmstrip frames, keyed by (media id, media time µs on the
     /// power-of-two grid). Frame images are zoom-independent.
@@ -242,6 +261,85 @@ thread_local! {
     static PENDING_WAVES: RefCell<HashSet<(u64, i64, i32)>> = RefCell::new(HashSet::new());
     /// Monotonic touch counter for LRU eviction.
     static USE_TICK: Cell<u64> = const { Cell::new(0) };
+}
+
+fn estimated_rgba_bytes(image: &Image) -> u64 {
+    let size = image.size();
+    u64::from(size.width)
+        .saturating_mul(u64::from(size.height))
+        .saturating_mul(4)
+}
+
+fn image_cache_stats<'a>(images: impl Iterator<Item = &'a Image>) -> StripImageCacheStats {
+    images.fold(StripImageCacheStats::default(), |mut stats, image| {
+        stats.entry_count = stats.entry_count.saturating_add(1);
+        stats.estimated_rgba_bytes = stats
+            .estimated_rgba_bytes
+            .saturating_add(estimated_rgba_bytes(image));
+        stats
+    })
+}
+
+/// Snapshot both strip image caches (Slint UI thread only).
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+pub(crate) fn cache_stats() -> StripCacheStats {
+    let filmstrips = FILMSTRIPS.with(|cache| {
+        let cache = cache.borrow();
+        image_cache_stats(cache.values().map(|entry| &entry.image))
+    });
+    let waves = WAVES.with(|cache| {
+        let cache = cache.borrow();
+        image_cache_stats(cache.values().map(|entry| &entry.image))
+    });
+    StripCacheStats { filmstrips, waves }
+}
+
+/// Clear all UI-thread strip caches and return their pre-clear image stats.
+///
+/// Pending keys are cleared with the images so in-flight requests cannot leave
+/// future misses permanently suppressed. Worker media maps, peak files, and
+/// renderers are deliberately retained.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+pub(crate) fn clear_all_caches() -> StripCacheStats {
+    let filmstrips = clear_filmstrips();
+    let waves = clear_waveforms();
+    StripCacheStats { filmstrips, waves }
+}
+
+/// Clear only filmstrip images and their pending-request suppression.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+pub(crate) fn clear_filmstrips() -> StripImageCacheStats {
+    let filmstrips = FILMSTRIPS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let stats = image_cache_stats(cache.values().map(|entry| &entry.image));
+        cache.clear();
+        stats
+    });
+    PENDING_FRAMES.with(|pending| pending.borrow_mut().clear());
+    reset_use_tick_if_empty();
+    filmstrips
+}
+
+/// Clear only waveform images and their pending-request suppression.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+pub(crate) fn clear_waveforms() -> StripImageCacheStats {
+    let waves = WAVES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let stats = image_cache_stats(cache.values().map(|entry| &entry.image));
+        cache.clear();
+        stats
+    });
+    PENDING_WAVES.with(|pending| pending.borrow_mut().clear());
+    reset_use_tick_if_empty();
+    waves
+}
+
+fn reset_use_tick_if_empty() {
+    let empty = FILMSTRIPS.with(|cache| cache.borrow().is_empty())
+        && WAVES.with(|cache| cache.borrow().is_empty());
+    if empty {
+        USE_TICK.with(|tick| tick.set(0));
+    }
 }
 
 fn next_use_tick() -> u64 {
@@ -424,6 +522,10 @@ enum StripMsg {
     /// frames* from this smaller short-GOP file instead of the original.
     /// Waveforms are untouched — proxies carry no audio.
     Proxy { media_id: u64, path: PathBuf },
+    /// Proxy cache storage moved: return every future filmstrip decode to its
+    /// registered original and discard scratch projects/decoder cursors that
+    /// may still hold an old proxy path. Waveform state remains warm.
+    ClearProxies,
     /// Decode the frames at `times_us` (media time, grid-aligned).
     Filmstrip { media_id: u64, times_us: Vec<i64> },
     /// Rasterize the waveform tiles starting at `times_us`, each spanning
@@ -450,6 +552,13 @@ impl StripHandle {
     /// Point future filmstrip decodes for `media_id` at its preview proxy.
     pub fn register_proxy(&self, media_id: u64, path: PathBuf) {
         let _ = self.tx.send(StripMsg::Proxy { media_id, path });
+    }
+
+    /// Remove every preview-proxy substitution and its scratch decode state.
+    ///
+    /// Original media registrations and waveform peak files are preserved.
+    pub fn clear_proxies(&self) {
+        let _ = self.tx.send(StripMsg::ClearProxies);
     }
 
     fn request_filmstrip(&self, media_id: u64, times_us: Vec<i64>) {
@@ -500,6 +609,7 @@ struct ScratchClip {
     duration_frames: i64,
 }
 
+#[derive(Default)]
 struct WorkerState {
     paths: HashMap<u64, PathBuf>,
     /// Preview-proxy overrides for *frame* decode: when present, the scratch
@@ -531,15 +641,7 @@ fn worker_loop(
     backend: &slint::Weak<StripBackend<'static>>,
     gate: &InteractionGate,
 ) {
-    let mut state = WorkerState {
-        paths: HashMap::new(),
-        proxies: HashMap::new(),
-        renderer: None,
-        scratch: HashMap::new(),
-        frames_failed: HashSet::new(),
-        peaks: HashMap::new(),
-        peaks_failed: HashSet::new(),
-    };
+    let mut state = WorkerState::default();
     let mut backlog: Vec<StripMsg> = Vec::new();
 
     loop {
@@ -575,7 +677,7 @@ fn worker_loop(
                 } => {
                     process_waveform(&mut state, media_id, k, &times_us, backend);
                 }
-                StripMsg::Register { .. } | StripMsg::Proxy { .. } => {
+                StripMsg::Register { .. } | StripMsg::Proxy { .. } | StripMsg::ClearProxies => {
                     unreachable!("registrations apply in triage")
                 }
             }
@@ -609,8 +711,26 @@ fn triage(msg: StripMsg, state: &mut WorkerState, backlog: &mut Vec<StripMsg>) {
                 state.proxies.insert(media_id, path);
             }
         }
+        StripMsg::ClearProxies => clear_proxy_substitutions(state),
         work => backlog.push(work),
     }
+}
+
+/// Return filmstrip decoding to registered originals after proxy storage moves.
+///
+/// Scratch projects and the private renderer are both discarded: either can
+/// retain decoder state opened on a proxy path. Audio always reads `paths`, so
+/// its peak files and failure latch deliberately survive this reset.
+fn clear_proxy_substitutions(state: &mut WorkerState) {
+    let proxy_count = state.proxies.len();
+    state.proxies.clear();
+    state.renderer = None;
+    state.scratch.clear();
+    state.frames_failed.clear();
+    info!(
+        proxy_count,
+        "strip worker cleared proxy substitutions and scratch decode state"
+    );
 }
 
 fn process_filmstrip(
@@ -939,6 +1059,204 @@ fn render_wave_tile(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct StripCacheCleanup;
+
+    impl Drop for StripCacheCleanup {
+        fn drop(&mut self) {
+            clear_all_caches();
+        }
+    }
+
+    fn test_image(width: u32, height: u32) -> Image {
+        let rgba = vec![0; width as usize * height as usize * 4];
+        Image::from_rgba8(SharedPixelBuffer::<Rgba8Pixel>::clone_from_slice(
+            &rgba, width, height,
+        ))
+    }
+
+    #[test]
+    fn strip_cache_stats_and_clear_are_exact_and_idempotent() {
+        clear_all_caches();
+        let _cleanup = StripCacheCleanup;
+
+        FILMSTRIPS.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.insert(
+                (1, 0),
+                CacheEntry {
+                    image: test_image(2, 3),
+                    last_used: 1,
+                },
+            );
+            cache.insert(
+                (1, 1_000_000),
+                CacheEntry {
+                    image: test_image(4, 5),
+                    last_used: 2,
+                },
+            );
+        });
+        WAVES.with(|cache| {
+            cache.borrow_mut().insert(
+                (2, 0, -1),
+                CacheEntry {
+                    image: test_image(7, 2),
+                    last_used: 3,
+                },
+            );
+        });
+
+        let expected = StripCacheStats {
+            filmstrips: StripImageCacheStats {
+                entry_count: 2,
+                estimated_rgba_bytes: 2 * 3 * 4 + 4 * 5 * 4,
+            },
+            waves: StripImageCacheStats {
+                entry_count: 1,
+                estimated_rgba_bytes: 7 * 2 * 4,
+            },
+        };
+        assert_eq!(cache_stats(), expected);
+        assert_eq!(clear_all_caches(), expected);
+        assert_eq!(cache_stats(), StripCacheStats::default());
+        assert_eq!(clear_all_caches(), StripCacheStats::default());
+    }
+
+    #[test]
+    fn strip_proxy_clear_is_idempotent_and_preserves_original_and_waveform_state() {
+        let media_id = 17;
+        let original = PathBuf::from("/media/original.mov");
+        let mut state = WorkerState::default();
+        state.paths.insert(media_id, original.clone());
+        state
+            .proxies
+            .insert(media_id, PathBuf::from("/old-proxies/proxy.mp4"));
+        state.scratch.insert(
+            media_id,
+            ScratchClip {
+                project: Project::new("scratch", Rational::FPS_30),
+                rate: Rational::FPS_30,
+                duration_frames: 30,
+            },
+        );
+        state.frames_failed.insert(media_id);
+        state.peaks.insert(
+            media_id,
+            AudioPeaks {
+                per_second: 100.0,
+                peaks: vec![0.25, 0.5],
+            },
+        );
+        state.peaks_failed.insert(99);
+
+        let (tx, rx) = unbounded();
+        let handle = StripHandle { tx };
+        let mut backlog = Vec::new();
+        handle.clear_proxies();
+        triage(rx.recv().unwrap(), &mut state, &mut backlog);
+
+        assert_eq!(state.paths.get(&media_id), Some(&original));
+        assert!(state.proxies.is_empty());
+        assert!(state.scratch.is_empty());
+        assert!(state.frames_failed.is_empty());
+        assert!(state.renderer.is_none());
+        assert_eq!(state.peaks[&media_id].peaks, vec![0.25, 0.5]);
+        assert!(state.peaks_failed.contains(&99));
+        assert!(backlog.is_empty());
+
+        handle.clear_proxies();
+        triage(rx.recv().unwrap(), &mut state, &mut backlog);
+        assert_eq!(state.paths.get(&media_id), Some(&original));
+        assert!(state.proxies.is_empty());
+        assert!(state.scratch.is_empty());
+        assert_eq!(state.peaks[&media_id].peaks, vec![0.25, 0.5]);
+        assert!(state.peaks_failed.contains(&99));
+        assert!(backlog.is_empty());
+    }
+
+    #[test]
+    fn clearing_strip_caches_resets_pending_request_suppression() {
+        clear_all_caches();
+        let _cleanup = StripCacheCleanup;
+        let frame_key = (41, 2_000_000);
+        let wave_key = (42, 3_000_000, 1);
+
+        PENDING_FRAMES.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            assert!(pending.insert(frame_key));
+            assert!(!pending.insert(frame_key), "duplicate frame is suppressed");
+        });
+        PENDING_WAVES.with(|pending| {
+            let mut pending = pending.borrow_mut();
+            assert!(pending.insert(wave_key));
+            assert!(!pending.insert(wave_key), "duplicate wave is suppressed");
+        });
+        USE_TICK.with(|tick| tick.set(99));
+
+        assert_eq!(clear_all_caches(), StripCacheStats::default());
+        assert_eq!(USE_TICK.with(Cell::get), 0);
+        PENDING_FRAMES.with(|pending| {
+            assert!(
+                pending.borrow_mut().insert(frame_key),
+                "frame can be requested again after clear"
+            );
+        });
+        PENDING_WAVES.with(|pending| {
+            assert!(
+                pending.borrow_mut().insert(wave_key),
+                "wave can be requested again after clear"
+            );
+        });
+    }
+
+    #[test]
+    fn strip_cache_kinds_can_be_cleared_independently() {
+        clear_all_caches();
+        let _cleanup = StripCacheCleanup;
+        FILMSTRIPS.with(|cache| {
+            cache.borrow_mut().insert(
+                (1, 0),
+                CacheEntry {
+                    image: test_image(2, 2),
+                    last_used: 1,
+                },
+            );
+        });
+        WAVES.with(|cache| {
+            cache.borrow_mut().insert(
+                (2, 0, 0),
+                CacheEntry {
+                    image: test_image(3, 2),
+                    last_used: 2,
+                },
+            );
+        });
+        PENDING_FRAMES.with(|pending| {
+            pending.borrow_mut().insert((1, 0));
+        });
+        PENDING_WAVES.with(|pending| {
+            pending.borrow_mut().insert((2, 0, 0));
+        });
+        USE_TICK.with(|tick| tick.set(7));
+
+        assert_eq!(
+            clear_filmstrips(),
+            StripImageCacheStats {
+                entry_count: 1,
+                estimated_rgba_bytes: 16,
+            }
+        );
+        assert_eq!(cache_stats().filmstrips, StripImageCacheStats::default());
+        assert_eq!(cache_stats().waves.entry_count, 1);
+        assert!(PENDING_FRAMES.with(|pending| pending.borrow().is_empty()));
+        assert_eq!(PENDING_WAVES.with(|pending| pending.borrow().len()), 1);
+        assert_eq!(USE_TICK.with(Cell::get), 7);
+
+        assert_eq!(clear_waveforms().entry_count, 1);
+        assert!(PENDING_WAVES.with(|pending| pending.borrow().is_empty()));
+        assert_eq!(USE_TICK.with(Cell::get), 0);
+    }
 
     #[test]
     fn choose_k_picks_smallest_interval_at_least_min_px() {

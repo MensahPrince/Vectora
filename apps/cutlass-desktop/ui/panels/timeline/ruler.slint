@@ -33,12 +33,11 @@
 //   "clip").
 
 import { AppStore, TimelineStore, EditorStore, TimelineActions } from "../../store/index.slint";
-import { CutlassText } from "../../components/index.slint";
+import { CutlassLineInput, CutlassText } from "../../components/index.slint";
 import { TimelineViewState } from "state.slint";
 import { RulerBackend, RulerTick } from "../../lib/ruler-backend.slint";
 import { DragBackend } from "../../lib/drag-backend.slint";
 import { AppState } from "../../state.slint";
-import { LineTextInput } from "../inspector/inspector-widgets.slint";
 
 component MarkerColorSwatch inherits Rectangle {
     in property <string> color-name;
@@ -101,6 +100,18 @@ export component Ruler inherits Rectangle {
     function scrub-to(mx: length) {
         TimelineStore.playhead-tick = TimelineActions.clamp-playhead(
             self.snap-tick(max(0, round((mx - scroll-x) / 1px / zoom))));
+    }
+
+    function submit-marker-edit() {
+        if (root.marker-edit-id != "") {
+            TimelineActions.set-marker(
+                root.marker-edit-id,
+                root.marker-edit-tick,
+                root.marker-edit-name,
+                root.marker-edit-color);
+        }
+        marker-editor.close();
+        AppState.refocus-shortcuts();
     }
 
     private property <length> range-in-x:
@@ -286,6 +297,7 @@ export component Ruler inherits Rectangle {
         x: playhead-x;
         y: parent.height + 4px;
         close-policy: PopupClosePolicy.close-on-click-outside;
+        forward-focus: marker-name-input;
 
         Rectangle {
             width: 220px;
@@ -301,8 +313,18 @@ export component Ruler inherits Rectangle {
                 style: AppStore.theme.typography.label;
             }
 
-            LineTextInput {
+            marker-name-input := CutlassLineInput {
                 text <=> marker-edit-name;
+                accessibility-label: "Marker name";
+                revert-on-escape: true;
+                select-all-on-focus: true;
+                accepted(_) => {
+                    root.submit-marker-edit();
+                }
+                cancelled => {
+                    marker-editor.close();
+                    AppState.refocus-shortcuts();
+                }
             }
 
             HorizontalLayout {
@@ -369,14 +391,7 @@ export component Ruler inherits Rectangle {
                 }
                 TouchArea {
                     clicked => {
-                        if (marker-edit-id != "") {
-                            TimelineActions.set-marker(
-                                marker-edit-id,
-                                marker-edit-tick,
-                                marker-edit-name,
-                                marker-edit-color);
-                        }
-                        marker-editor.close();
+                        root.submit-marker-edit();
                     }
                 }
             }

@@ -50,6 +50,7 @@ export {
     EditorStore,
     ProjectSummary,
     TimelineStore,
+    TimelineActions,
     PreviewStore,
 }from "store/index.slint";
 export { TimelineViewState }from "panels/timeline/index.slint";
@@ -269,10 +270,11 @@ export component AppWindow inherits Window {
             // else is swallowed.
             if (AppState.settings-open) {
                 if (event.text == Key.Escape) {
-                    // Esc dismisses; persist first so a theme/field change
-                    // made just before closing isn't lost (same as Done/✕).
-                    SettingsBackend.save();
-                    AppState.settings-open = false;
+                    // Esc follows Done/✕: persist first, and keep the dialog
+                    // open when validation or persistence fails.
+                    if (SettingsBackend.save()) {
+                        AppState.settings-open = false;
+                    }
                 }
                 return accept;
             }
@@ -520,14 +522,35 @@ export component AppWindow inherits Window {
                     horizontal-stretch: 1;
                     spacing: AppStore.theme.metrics.spacing.none;
 
-                    LibraryPanel {
-                        width: root.left-pane-width;
+                    // Slint 1.16 can initialize a conditional component while
+                    // its parent layout cache is being evaluated. Panels that
+                    // read geometry from init/changed handlers then re-enter
+                    // that cache and panic with "Recursion detected". Keep the
+                    // layout children unconditional and put each conditional
+                    // component behind a fixed-size Rectangle boundary.
+                    Rectangle {
+                        width: AppState.library-panel-open ? root.left-pane-width : 0px;
+                        horizontal-stretch: 0;
                         vertical-stretch: 1;
+
+                        if AppState.library-panel-open: LibraryPanel {
+                            width: 100%;
+                            height: 100%;
+                        }
                     }
 
-                    HSplitGripLead {
-                        pane-width <=> root.left-pane-width;
+                    Rectangle {
+                        width: AppState.library-panel-open
+                            ? AppStore.theme.metrics.layout.split-grip
+                            : 0px;
+                        horizontal-stretch: 0;
                         vertical-stretch: 1;
+
+                        if AppState.library-panel-open: HSplitGripLead {
+                            width: 100%;
+                            height: 100%;
+                            pane-width <=> root.left-pane-width;
+                        }
                     }
 
                     PreviewPanel {
@@ -535,34 +558,80 @@ export component AppWindow inherits Window {
                         horizontal-stretch: 1;
                     }
 
-                    HSplitGripTrail {
-                        pane-width <=> root.right-pane-width;
+                    Rectangle {
+                        width: AppState.inspector-panel-open
+                            ? AppStore.theme.metrics.layout.split-grip
+                            : 0px;
+                        horizontal-stretch: 0;
                         vertical-stretch: 1;
+
+                        if AppState.inspector-panel-open: HSplitGripTrail {
+                            width: 100%;
+                            height: 100%;
+                            pane-width <=> root.right-pane-width;
+                        }
                     }
 
-                    InspectorPanel {
-                        width: root.right-pane-width;
+                    Rectangle {
+                        width: AppState.inspector-panel-open ? root.right-pane-width : 0px;
+                        horizontal-stretch: 0;
                         vertical-stretch: 1;
+
+                        if AppState.inspector-panel-open: InspectorPanel {
+                            width: 100%;
+                            height: 100%;
+                        }
                     }
 
-                    if AppState.agent-panel-open: HSplitGripTrail {
-                        pane-width <=> root.agent-pane-width;
+                    Rectangle {
+                        width: AppState.agent-panel-open
+                            ? AppStore.theme.metrics.layout.split-grip
+                            : 0px;
+                        horizontal-stretch: 0;
                         vertical-stretch: 1;
+
+                        if AppState.agent-panel-open: HSplitGripTrail {
+                            width: 100%;
+                            height: 100%;
+                            pane-width <=> root.agent-pane-width;
+                        }
                     }
 
-                    if AppState.agent-panel-open: AgentPanel {
-                        width: root.agent-pane-width;
+                    Rectangle {
+                        width: AppState.agent-panel-open ? root.agent-pane-width : 0px;
+                        horizontal-stretch: 0;
                         vertical-stretch: 1;
+
+                        if AppState.agent-panel-open: AgentPanel {
+                            width: 100%;
+                            height: 100%;
+                        }
                     }
                 }
 
-                VSplitGripTimeline {
-                    timeline-height <=> root.timeline-height;
-                }
-
-                TimelinePanel {
-                    height: root.timeline-height;
+                Rectangle {
+                    height: AppState.timeline-panel-open
+                        ? AppStore.theme.metrics.layout.split-grip
+                        : 0px;
                     horizontal-stretch: 1;
+                    vertical-stretch: 0;
+
+                    if AppState.timeline-panel-open: VSplitGripTimeline {
+                        width: 100%;
+                        height: 100%;
+                        timeline-height <=> root.timeline-height;
+                    }
+                }
+
+                Rectangle {
+                    height: AppState.timeline-panel-open ? root.timeline-height : 0px;
+                    horizontal-stretch: 1;
+                    vertical-stretch: 0;
+
+                    if AppState.timeline-panel-open: TimelinePanel {
+                        width: 100%;
+                        height: 100%;
+                    }
                 }
             }
         }

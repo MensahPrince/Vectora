@@ -18,14 +18,14 @@ use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::cache::{DEFAULT_QUOTA_BYTES, DownloadCache};
-use cutlass_cloud::dto::{StockItem, StockKind};
+use cutlass_cloud::cache::DownloadCache;
+use cutlass_cloud::dto::{StockItem, StockKind, StockSearchResponse};
 use cutlass_cloud::stock::{BackendStockProvider, DirectStockProvider, StockProvider};
 use cutlass_cloud::{CloudClient, download};
+use cutlass_storage::{CacheId, SharedStorageLayout, StorageLayoutLease};
 use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffer, VecModel};
 use tracing::{info, warn};
 
-use crate::paths;
 use crate::preview_worker::WorkerHandle;
 use crate::{CloudBackend, StockTile};
 
@@ -73,12 +73,14 @@ impl CloudWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+        storage_layout: SharedStorageLayout,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-cloud".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, import_handle);
+                let mut worker = Worker::new(backend_weak, import_handle, cache, storage_layout);
                 // Thumbnail fetches interleave with commands: commands take
                 // priority (a queued import shouldn't wait for a page of
                 // thumbnails), thumbs drain in the gaps.
@@ -115,11 +117,17 @@ impl CloudWorker {
     }
 }
 
+enum SearchProvider {
+    Backend { base_url: String },
+    Direct(DirectStockProvider),
+}
+
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     import_handle: WorkerHandle,
-    provider: Box<dyn StockProvider>,
-    cache: DownloadCache,
+    provider: SearchProvider,
+    cache: Arc<DownloadCache>,
+    storage_layout: SharedStorageLayout,
     /// The worker-side mirror of the published tile list.
     items: Vec<StockItem>,
     query: String,
@@ -128,7 +136,12 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, import_handle: WorkerHandle) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+        storage_layout: SharedStorageLayout,
+    ) -> Self {
         // The BYOK-first routing rule: stock keys from the `[providers.*]`
         // settings registry (env vars still work as a fallback) route search
         // straight to the providers; otherwise anonymous search goes through
@@ -144,24 +157,20 @@ impl Worker {
         };
         let pexels = key_for("pexels", "PEXELS_API_KEY");
         let pixabay = key_for("pixabay", "PIXABAY_API_KEY");
-        let provider: Box<dyn StockProvider> = if pexels.is_some() || pixabay.is_some() {
+        let provider = if pexels.is_some() || pixabay.is_some() {
             info!("stock search: using BYOK provider keys");
-            Box::new(DirectStockProvider::new(pexels, pixabay))
+            SearchProvider::Direct(DirectStockProvider::new(pexels, pixabay))
         } else {
-            let cache_dir = paths::data_dir().join("catalog-cache");
-            Box::new(BackendStockProvider::new(CloudClient::new(
-                &crate::account::base_url(),
-                Some(cache_dir),
-            )))
+            SearchProvider::Backend {
+                base_url: crate::account::base_url(),
+            }
         };
         Self {
             backend_weak,
             import_handle,
             provider,
-            cache: DownloadCache::new(
-                paths::data_dir().join("download-cache"),
-                DEFAULT_QUOTA_BYTES,
-            ),
+            cache,
+            storage_layout,
             items: Vec::new(),
             query: String::new(),
             kind: StockKind::Video,
@@ -177,7 +186,7 @@ impl Worker {
                 self.kind = kind;
                 self.page = 1;
                 self.set_status("searching", "");
-                match self.provider.search(&self.query, self.kind, 1) {
+                match self.search_page(&self.query, self.kind, 1) {
                     Ok(response) => {
                         self.items = response.items;
                         let status = if self.items.is_empty() {
@@ -199,7 +208,7 @@ impl Worker {
             Command::LoadMore => {
                 let next = self.page + 1;
                 self.set_loading_more(true);
-                match self.provider.search(&self.query, self.kind, next) {
+                match self.search_page(&self.query, self.kind, next) {
                     Ok(response) => {
                         self.page = next;
                         let first_new = self.items.len();
@@ -217,6 +226,27 @@ impl Worker {
                 }
             }
             Command::Import { index } => self.import(index),
+        }
+    }
+
+    fn search_page(
+        &self,
+        query: &str,
+        kind: StockKind,
+        page: u32,
+    ) -> Result<StockSearchResponse, cutlass_cloud::CloudError> {
+        match &self.provider {
+            SearchProvider::Direct(provider) => provider.search(query, kind, page),
+            SearchProvider::Backend { base_url } => {
+                // Direct providers never touch this cache. Backend requests
+                // hold the catalog lease until the client call returns.
+                let layout_lease = self.storage_layout.lease();
+                let client =
+                    catalog_client(&layout_lease, base_url).map_err(std::io::Error::other)?;
+                let result = BackendStockProvider::new(client).search(query, kind, page);
+                drop(layout_lease);
+                result
+            }
         }
     }
 
@@ -310,21 +340,25 @@ impl Worker {
             return;
         }
         let key = tile_key(item);
-        let path = match self.cache.path_for(&format!("stock-thumbs/{key}.img")) {
-            Ok(path) => path,
+        let lease = match self.cache.lease(&format!("stock-thumbs/{key}.img")) {
+            Ok(lease) => lease,
             Err(e) => {
                 warn!("thumb cache path failed: {e}");
                 return;
             }
         };
-        if !path.is_file() {
+        if !std::fs::symlink_metadata(lease.path())
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
             let cancel = Arc::new(AtomicBool::new(false));
-            if let Err(e) = download::download_to(&item.thumbnail_url, &path, &cancel, |_| {}) {
+            if let Err(e) =
+                download::download_to(&item.thumbnail_url, lease.path(), &cancel, |_| {})
+            {
                 warn!("stock thumbnail download failed: {e}");
                 return;
             }
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = std::fs::read(lease.path()) else {
             return;
         };
         let Ok(decoded) = cutlass_decoder::decode_image_bytes(&bytes) else {
@@ -355,20 +389,28 @@ impl Worker {
             extension(&item, &file.content_type, &file.url)
         );
 
-        // Cache hit: straight to import, no download UI.
-        if let Some(path) = self.cache.hit(&cache_key) {
-            self.import_handle.import(path);
-            self.patch_row(index, key, |tile| tile.state = "imported".into());
-            return;
-        }
-
-        let dest = match self.cache.path_for(&cache_key) {
-            Ok(dest) => dest,
+        let lease = match self.cache.lease(&cache_key) {
+            Ok(lease) => lease,
             Err(e) => {
                 warn!("stock cache path failed: {e}");
                 return;
             }
         };
+
+        // Cache hit: straight to import, no download UI.
+        if std::fs::symlink_metadata(lease.path())
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            if let Err(error) = self.cache.protect_path(lease.path()) {
+                warn!("stock import could not protect its source: {error}");
+                self.patch_row(index, key, |tile| tile.state = "failed".into());
+                return;
+            }
+            self.import_handle.import(lease.path().to_path_buf());
+            self.patch_row(index, key, |tile| tile.state = "imported".into());
+            return;
+        }
+
         self.patch_row(index, key.clone(), |tile| {
             tile.state = "downloading".into();
             tile.progress = 0.0;
@@ -378,7 +420,7 @@ impl Worker {
         let mut last_published = 0.0_f32;
         let progress_key = key.clone();
         let url = file.url.clone();
-        let result = download::download_to(&url, &dest, &cancel, |p| {
+        let result = download::download_to(&url, lease.path(), &cancel, |p| {
             if p.total_bytes == 0 {
                 return;
             }
@@ -395,9 +437,15 @@ impl Worker {
 
         match result {
             Ok(()) => {
-                info!("stock import: {} -> {}", url, dest.display());
-                self.import_handle.import(dest);
+                info!("stock import: {} -> {}", url, lease.path().display());
+                if let Err(error) = self.cache.protect_path(lease.path()) {
+                    warn!("stock import could not protect its source: {error}");
+                    self.patch_row(index, key, |tile| tile.state = "failed".into());
+                    return;
+                }
+                self.import_handle.import(lease.path().to_path_buf());
                 self.patch_row(index, key, |tile| tile.state = "imported".into());
+                drop(lease);
                 self.cache.enforce_quota();
             }
             Err(e) => {
@@ -406,6 +454,16 @@ impl Worker {
             }
         }
     }
+}
+
+fn catalog_client(
+    lease: &StorageLayoutLease<'_>,
+    base_url: &str,
+) -> Result<CloudClient, &'static str> {
+    let root = lease
+        .resolve(CacheId::Catalog)
+        .ok_or("catalog cache has no disk path")?;
+    Ok(CloudClient::new(base_url, Some(root)))
 }
 
 /// Send-safe snapshot of a `StockItem`'s tile fields (built worker-side;
@@ -490,6 +548,7 @@ fn user_message(e: &cutlass_cloud::CloudError) -> String {
 mod tests {
     use super::*;
     use cutlass_cloud::dto::StockProviderId;
+    use cutlass_storage::StorageLayout;
 
     fn item(kind: StockKind, duration: Option<f64>) -> StockItem {
         StockItem {
@@ -527,5 +586,36 @@ mod tests {
         assert_eq!(extension(&i, "", "https://c/x"), "mp4");
         let p = item(StockKind::Photo, None);
         assert_eq!(extension(&p, "", "https://c/x"), "jpg");
+    }
+
+    #[test]
+    fn backend_client_uses_override_then_picks_up_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("catalog-a");
+        let second_root = dir.path().join("catalog-b");
+
+        let mut first = StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first.set_override(CacheId::Catalog, &first_root).unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_lease = layout.lease();
+        let first_generation = first_lease.generation();
+        let first_client = catalog_client(&first_lease, "https://example.invalid").unwrap();
+        assert_eq!(first_client.cache_dir(), Some(first_root.as_path()));
+
+        let mut second = StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second.set_override(CacheId::Catalog, &second_root).unwrap();
+        drop(first_lease);
+        layout.replace(first_generation, second).unwrap();
+
+        assert_eq!(first_client.cache_dir(), Some(first_root.as_path()));
+        let second_lease = layout.lease();
+        assert_eq!(second_lease.generation(), first_generation + 1);
+        assert_eq!(
+            catalog_client(&second_lease, "https://example.invalid")
+                .unwrap()
+                .cache_dir(),
+            Some(second_root.as_path())
+        );
     }
 }

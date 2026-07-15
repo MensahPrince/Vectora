@@ -85,10 +85,12 @@ fn export_job_completes_with_progress() {
 }
 
 #[test]
-fn export_job_cancel_stops_and_removes_the_file() {
+fn export_job_cancel_preserves_the_previous_destination() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cancelled.mp4");
     let path_str = path.to_str().unwrap();
+    let previous = b"previous export";
+    std::fs::write(&path, previous).expect("seed previous destination");
 
     // Long enough that cancel lands mid-flight.
     let session = solid_session(60); // 1800 frames
@@ -99,7 +101,10 @@ fn export_job_cancel_stops_and_removes_the_file() {
     unsafe { cutlass_export_cancel(job) };
     let verdict = join_verdict(job);
     assert_eq!(verdict["err"]["kind"], "cancelled", "unexpected: {verdict}");
-    assert!(!path.exists(), "cancelled export must clean up its file");
+    assert_eq!(
+        std::fs::read(&path).expect("read preserved destination"),
+        previous
+    );
 
     unsafe {
         cutlass_export_free(job);

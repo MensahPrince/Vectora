@@ -1,8 +1,8 @@
 //! Lottie stickers: the Rust half of `LottieBackend`.
 //!
 //! The worker fetches the anonymous Lottie catalog (`/v1/assets/lottie`),
-//! downloads the small `.json` files into the app-data asset cache (eager —
-//! every published tile is immediately droppable offline), probes each
+//! downloads the small `.json` files into the configured Lottie cache
+//! (eager — every published tile is immediately droppable offline), probes each
 //! composition with the real decoder, rasterizes frame 0 as the tile
 //! thumbnail, and fills a shared registry the timeline drop resolver reads
 //! to place file-backed `Generator::Lottie` clips. Files that fail to
@@ -16,10 +16,10 @@ use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
 use cutlass_cloud::CloudClient;
+use cutlass_storage::{CacheId, SharedStorageLayout, StorageLayoutLease};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tracing::warn;
 
-use crate::paths;
 use crate::{LottieBackend, LottieTile};
 
 /// A downloaded, droppable Lottie asset: what a `lottie:<id>` drop places.
@@ -60,12 +60,13 @@ impl LottieWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         registry: LottieRegistry,
+        storage_layout: SharedStorageLayout,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-lottie".into())
             .spawn(move || {
-                let worker = Worker::new(backend_weak, registry);
+                let worker = Worker::new(backend_weak, registry, storage_layout);
                 while let Ok(Command::Refresh) = rx.recv() {
                     worker.refresh();
                 }
@@ -86,24 +87,38 @@ impl LottieWorker {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     registry: LottieRegistry,
-    client: CloudClient,
+    storage_layout: SharedStorageLayout,
+    base_url: String,
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, registry: LottieRegistry) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        registry: LottieRegistry,
+        storage_layout: SharedStorageLayout,
+    ) -> Self {
         Self {
             backend_weak,
             registry,
-            client: CloudClient::new(
-                &crate::account::base_url(),
-                Some(paths::data_dir().join("catalog-cache")),
-            ),
+            storage_layout,
+            base_url: crate::account::base_url(),
         }
     }
 
     fn refresh(&self) {
+        // Pin catalog metadata and downloaded animations until parsing,
+        // thumbnail rendering, and registry/UI publication all finish.
+        let layout_lease = self.storage_layout.lease();
+        let roots = match refresh_roots(&layout_lease) {
+            Ok(roots) => roots,
+            Err(message) => {
+                self.set_status("error", message);
+                return;
+            }
+        };
         self.set_status("loading", "");
-        let entries = match self.client.lottie() {
+        let client = CloudClient::new(&self.base_url, Some(roots.catalog));
+        let entries = match client.lottie() {
             Ok(catalog) => catalog.entries,
             Err(e) => {
                 self.set_status("error", &user_message(&e));
@@ -113,11 +128,10 @@ impl Worker {
 
         // Download missing files and probe each with the real decoder;
         // failures skip the entry, never the section.
-        let dir = paths::data_dir().join("lottie");
         let mut seeds: Vec<TileSeed> = Vec::new();
         let mut assets: HashMap<String, LottieAsset> = HashMap::new();
         for entry in &entries {
-            let dest = dir.join(format!("{}.json", entry.id));
+            let dest = roots.lottie.join(format!("{}.json", entry.id));
             if !dest.is_file() {
                 let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 if let Err(e) =
@@ -191,6 +205,7 @@ impl Worker {
             backend.set_status(status.as_str().into());
             backend.set_error("".into());
         });
+        drop(layout_lease);
     }
 
     fn set_status(&self, status: &str, error: &str) {
@@ -212,6 +227,23 @@ impl Worker {
             warn!("lottie UI update failed: {e}");
         }
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RefreshRoots {
+    catalog: PathBuf,
+    lottie: PathBuf,
+}
+
+fn refresh_roots(lease: &StorageLayoutLease<'_>) -> Result<RefreshRoots, &'static str> {
+    Ok(RefreshRoots {
+        catalog: lease
+            .resolve(CacheId::Catalog)
+            .ok_or("catalog cache has no disk path")?,
+        lottie: lease
+            .resolve(CacheId::Lottie)
+            .ok_or("Lottie cache has no disk path")?,
+    })
 }
 
 /// Send-safe snapshot of a tile (Slint images must be built on the UI
@@ -239,5 +271,65 @@ fn user_message(e: &cutlass_cloud::CloudError) -> String {
         }
         CloudError::Protocol(_) => "The animation catalog sent an unexpected response.".into(),
         CloudError::Io(_) | CloudError::Cancelled => "The catalog fetch was interrupted.".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cutlass_storage::StorageLayout;
+
+    #[test]
+    fn refresh_uses_coherent_overrides_then_picks_up_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_catalog = dir.path().join("catalog-a");
+        let first_lottie = dir.path().join("lottie-a");
+        let second_catalog = dir.path().join("catalog-b");
+        let second_lottie = dir.path().join("lottie-b");
+
+        let mut first = StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first
+            .set_override(CacheId::Catalog, &first_catalog)
+            .unwrap();
+        first.set_override(CacheId::Lottie, &first_lottie).unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_lease = layout.lease();
+        let first_generation = first_lease.generation();
+        let first_refresh = refresh_roots(&first_lease).unwrap();
+        assert_eq!(
+            first_refresh,
+            RefreshRoots {
+                catalog: first_catalog.clone(),
+                lottie: first_lottie.clone(),
+            }
+        );
+
+        let mut second = StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second
+            .set_override(CacheId::Catalog, &second_catalog)
+            .unwrap();
+        second
+            .set_override(CacheId::Lottie, &second_lottie)
+            .unwrap();
+        drop(first_lease);
+        layout.replace(first_generation, second).unwrap();
+
+        assert_eq!(
+            first_refresh,
+            RefreshRoots {
+                catalog: first_catalog,
+                lottie: first_lottie,
+            }
+        );
+        let second_lease = layout.lease();
+        assert_eq!(second_lease.generation(), first_generation + 1);
+        assert_eq!(
+            refresh_roots(&second_lease).unwrap(),
+            RefreshRoots {
+                catalog: second_catalog,
+                lottie: second_lottie,
+            }
+        );
     }
 }

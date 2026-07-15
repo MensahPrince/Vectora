@@ -12,13 +12,13 @@ use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::cache::{DEFAULT_QUOTA_BYTES, DownloadCache};
+use cutlass_cloud::cache::DownloadCache;
 use cutlass_cloud::dto::CatalogEntry;
 use cutlass_cloud::{CloudClient, download};
+use cutlass_storage::{CacheId, SharedStorageLayout, StorageLayoutLease};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use tracing::{info, warn};
 
-use crate::paths;
 use crate::preview_worker::WorkerHandle;
 use crate::{SfxBackend, SfxTile};
 
@@ -52,12 +52,14 @@ impl SfxWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+        storage_layout: SharedStorageLayout,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-sfx".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, import_handle);
+                let mut worker = Worker::new(backend_weak, import_handle, cache, storage_layout);
                 while let Ok(command) = rx.recv() {
                     match command {
                         Command::Refresh => worker.refresh(),
@@ -81,32 +83,42 @@ impl SfxWorker {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     import_handle: WorkerHandle,
-    client: CloudClient,
-    cache: DownloadCache,
+    cache: Arc<DownloadCache>,
+    storage_layout: SharedStorageLayout,
+    base_url: String,
     /// The worker-side mirror of the published tile list.
     entries: Vec<CatalogEntry>,
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, import_handle: WorkerHandle) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+        storage_layout: SharedStorageLayout,
+    ) -> Self {
         Self {
             backend_weak,
             import_handle,
-            client: CloudClient::new(
-                &crate::account::base_url(),
-                Some(paths::data_dir().join("catalog-cache")),
-            ),
-            cache: DownloadCache::new(
-                paths::data_dir().join("download-cache"),
-                DEFAULT_QUOTA_BYTES,
-            ),
+            cache,
+            storage_layout,
+            base_url: crate::account::base_url(),
             entries: Vec::new(),
         }
     }
 
     fn refresh(&mut self) {
+        let layout_lease = self.storage_layout.lease();
+        let catalog_root = match catalog_root(&layout_lease) {
+            Ok(root) => root,
+            Err(message) => {
+                self.set_status("error", message);
+                return;
+            }
+        };
         self.set_status("loading", "");
-        let entries = match self.client.sfx() {
+        let client = CloudClient::new(&self.base_url, Some(catalog_root));
+        let entries = match client.sfx() {
             Ok(catalog) => catalog.entries,
             Err(e) => {
                 self.set_status("error", &user_message(&e));
@@ -134,6 +146,7 @@ impl Worker {
             backend.set_status(status.as_str().into());
             backend.set_error("".into());
         });
+        drop(layout_lease);
     }
 
     fn import(&self, index: usize) {
@@ -143,23 +156,30 @@ impl Worker {
         let key = entry.id.clone();
         let cache_key = format!("sfx/{}.{}", entry.id, extension(&entry.file_url));
 
-        // Cache hit with a valid checksum: straight to import, no download UI.
-        if let Some(path) = self.cache.hit(&cache_key) {
-            if checksum_ok(&path, &entry.checksum_sha256) {
-                self.import_handle.import(path);
-                self.patch_row(index, key, |tile| tile.state = "imported".into());
-                return;
-            }
-            let _ = std::fs::remove_file(&path);
-        }
-
-        let dest = match self.cache.path_for(&cache_key) {
-            Ok(dest) => dest,
+        let lease = match self.cache.lease(&cache_key) {
+            Ok(lease) => lease,
             Err(e) => {
                 warn!("sfx cache path failed: {e}");
                 return;
             }
         };
+
+        // Cache hit with a valid checksum: straight to import, no download UI.
+        if std::fs::symlink_metadata(lease.path())
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            if checksum_ok(lease.path(), &entry.checksum_sha256) {
+                if let Err(error) = self.cache.protect_path(lease.path()) {
+                    warn!("sfx import could not protect its source: {error}");
+                    self.patch_row(index, key, |tile| tile.state = "failed".into());
+                    return;
+                }
+                self.import_handle.import(lease.path().to_path_buf());
+                self.patch_row(index, key, |tile| tile.state = "imported".into());
+                return;
+            }
+            let _ = std::fs::remove_file(lease.path());
+        }
         self.patch_row(index, key.clone(), |tile| {
             tile.state = "downloading".into();
             tile.progress = 0.0;
@@ -168,7 +188,7 @@ impl Worker {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut last_published = 0.0_f32;
         let progress_key = key.clone();
-        let result = download::download_to(&entry.file_url, &dest, &cancel, |p| {
+        let result = download::download_to(&entry.file_url, lease.path(), &cancel, |p| {
             if p.total_bytes == 0 {
                 return;
             }
@@ -183,15 +203,25 @@ impl Worker {
         });
 
         match result {
-            Ok(()) if checksum_ok(&dest, &entry.checksum_sha256) => {
-                info!("sfx import: {} -> {}", entry.file_url, dest.display());
-                self.import_handle.import(dest);
+            Ok(()) if checksum_ok(lease.path(), &entry.checksum_sha256) => {
+                info!(
+                    "sfx import: {} -> {}",
+                    entry.file_url,
+                    lease.path().display()
+                );
+                if let Err(error) = self.cache.protect_path(lease.path()) {
+                    warn!("sfx import could not protect its source: {error}");
+                    self.patch_row(index, key, |tile| tile.state = "failed".into());
+                    return;
+                }
+                self.import_handle.import(lease.path().to_path_buf());
                 self.patch_row(index, key, |tile| tile.state = "imported".into());
+                drop(lease);
                 self.cache.enforce_quota();
             }
             Ok(()) => {
                 warn!(asset = %entry.id, "sfx checksum mismatch");
-                let _ = std::fs::remove_file(&dest);
+                let _ = std::fs::remove_file(lease.path());
                 self.patch_row(index, key, |tile| tile.state = "failed".into());
             }
             Err(e) => {
@@ -236,6 +266,12 @@ impl Worker {
             warn!("sfx UI update failed: {e}");
         }
     }
+}
+
+fn catalog_root(lease: &StorageLayoutLease<'_>) -> Result<std::path::PathBuf, &'static str> {
+    lease
+        .resolve(CacheId::Catalog)
+        .ok_or("catalog cache has no disk path")
 }
 
 /// Send-safe snapshot of a tile (built worker-side).
@@ -322,6 +358,7 @@ fn user_message(e: &cutlass_cloud::CloudError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cutlass_storage::StorageLayout;
 
     #[test]
     fn duration_chip_formats_minutes_seconds() {
@@ -358,5 +395,31 @@ mod tests {
         assert_eq!(extension("https://c/x.WAV?dl=1"), "wav");
         assert_eq!(extension("https://c/x.mp3"), "mp3");
         assert_eq!(extension("https://c/x"), "wav");
+    }
+
+    #[test]
+    fn refresh_uses_catalog_override_then_picks_up_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("catalog-a");
+        let second_root = dir.path().join("catalog-b");
+
+        let mut first = StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first.set_override(CacheId::Catalog, &first_root).unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_lease = layout.lease();
+        let first_generation = first_lease.generation();
+        let first_refresh = catalog_root(&first_lease).unwrap();
+        assert_eq!(first_refresh, first_root);
+
+        let mut second = StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second.set_override(CacheId::Catalog, &second_root).unwrap();
+        drop(first_lease);
+        layout.replace(first_generation, second).unwrap();
+
+        assert_eq!(first_refresh, first_root);
+        let second_lease = layout.lease();
+        assert_eq!(second_lease.generation(), first_generation + 1);
+        assert_eq!(catalog_root(&second_lease).unwrap(), second_root);
     }
 }

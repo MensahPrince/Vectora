@@ -1,0 +1,17 @@
+[package]
+name = "cutlass-analysis"
+description = "Deterministic, dependency-light audio analysis primitives for Cutlass"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.40.1", features = ["bundled", "limits"], optional = true }
+
+[features]
+sqlite = ["dep:rusqlite"]
+
+[dev-dependencies]
+tempfile = "3.27.0"

@@ -1,4 +1,5 @@
 import {
+    CutlassLineInput,
     CutlassScrollView,
     CutlassSlider,
     CutlassText,
@@ -24,7 +25,6 @@ import {
     InspectorTabHeader,
     SectionHeader,
     LabelCell,
-    LineTextInput,
     SliderRow,
 } from "inspector-widgets.slint";
 import { AnimationInspector } from "animation-inspector.slint";
@@ -83,18 +83,30 @@ component FakeField inherits Rectangle {
 component MultilineTextInput inherits Rectangle {
     in-out property <string> text;
     in property <string> placeholder-text;
+    in property <string> accessibility-label: root.placeholder-text;
+    in property <bool> enabled: true;
+    in property <bool> read-only: false;
+    out property <bool> has-focus: input.has-focus;
 
     callback edited(text: string);
     callback commit(text: string);
+    callback cancelled();
 
     private property <length> pad: AppStore.theme.metrics.spacing.md;
+    private property <string> focus-entry-text: root.text;
 
     height: 96px;
+    min-width: 96px;
     horizontal-stretch: 1;
     border-radius: AppStore.theme.metrics.radius.md;
-    border-width: input.has-focus ? 1px : 0px;
-    border-color: AppStore.theme.accent.primary;
-    background: input.has-focus ? #202020 : #1a1a1a;
+    border-width: 1px;
+    border-color: input.has-focus ? AppStore.theme.accent.primary : #ffffff14;
+    background: input.has-focus
+        ? #202020
+        : focus-area.has-hover && root.enabled
+        ? #1e1e1e
+        : #1a1a1a;
+    opacity: root.enabled ? 1.0 : 0.55;
     clip: true;
     forward-focus: input;
 
@@ -102,14 +114,15 @@ component MultilineTextInput inherits Rectangle {
         duration: 120ms;
         easing: ease-out;
     }
-    animate border-width {
+    animate border-color {
         duration: 120ms;
         easing: ease-out;
     }
 
     // Clicking the padding ring around the editor focuses it instead of
     // falling through to the panel's blur catcher.
-    TouchArea {
+    focus-area := TouchArea {
+        enabled: root.enabled;
         mouse-cursor: MouseCursor.text;
         clicked => {
             input.focus();
@@ -130,6 +143,8 @@ component MultilineTextInput inherits Rectangle {
             width: editor-scroll.width;
             height: max(editor-scroll.height, self.preferred-height);
             text <=> root.text;
+            enabled: root.enabled;
+            read-only: root.read-only;
             single-line: false;
             wrap: word-wrap;
             color: AppStore.theme.text.primary;
@@ -138,16 +153,29 @@ component MultilineTextInput inherits Rectangle {
             selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
             selection-foreground-color: AppStore.theme.text.primary;
             page-height: editor-scroll.height;
-            accessible-role: none;
+            accessible-label: root.accessibility-label;
+            accessible-placeholder-text: root.placeholder-text;
 
             changed has-focus => {
-                if (!self.has-focus) {
+                if (self.has-focus) {
+                    root.focus-entry-text = root.text;
+                } else if (root.text != root.focus-entry-text) {
                     root.commit(self.text);
+                    root.focus-entry-text = root.text;
                 }
             }
 
             edited => {
                 root.edited(self.text);
+            }
+
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    root.text = root.focus-entry-text;
+                    root.cancelled();
+                    return accept;
+                }
+                reject
             }
 
             cursor-position-changed(cpos) => {
@@ -270,6 +298,7 @@ component DisabledPropertyRow inherits HorizontalLayout {
 component NumberBox inherits Rectangle {
     in property <string> prefix;
     in property <float> value;
+    in property <string> accessibility-label: root.prefix + " value";
     callback commit(value: float);
 
     width: 92px;
@@ -277,15 +306,21 @@ component NumberBox inherits Rectangle {
     vertical-stretch: 0;
 
     changed value => {
-        field.text = Math.round(root.value) + "";
+        if !field.has-focus {
+            field.text = Math.round(root.value) + "";
+        }
     }
 
-    field := LineTextInput {
+    field := CutlassLineInput {
         width: 100%;
+        minimum-field-width: 92px;
         height: parent.height;
         text-padding-left: 24px;
         text-padding-right: AppStore.theme.metrics.spacing.xs;
         horizontal-alignment: TextHorizontalAlignment.right;
+        accessibility-label: root.accessibility-label;
+        commit-on-blur: true;
+        revert-on-escape: true;
         text: Math.round(root.value) + "";
 
         accepted(entered) => {
@@ -293,6 +328,18 @@ component NumberBox inherits Rectangle {
                 root.commit(entered.to-float());
             }
             self.text = Math.round(root.value) + "";
+        }
+        enter-accepted(_) => {
+            AppState.refocus-shortcuts();
+        }
+        blurred(_, changed) => {
+            if !changed {
+                self.text = Math.round(root.value) + "";
+            }
+        }
+        cancelled => {
+            self.text = Math.round(root.value) + "";
+            AppState.refocus-shortcuts();
         }
     }
 
@@ -331,6 +378,7 @@ component PositionRow inherits HorizontalLayout {
 
     NumberBox {
         prefix: "X";
+        accessibility-label: root.label + " X";
         value: root.x-value;
         commit(v) => {
             root.commit-x(v);
@@ -339,6 +387,7 @@ component PositionRow inherits HorizontalLayout {
 
     NumberBox {
         prefix: "Y";
+        accessibility-label: root.label + " Y";
         value: root.y-value;
         commit(v) => {
             root.commit-y(v);
@@ -626,6 +675,7 @@ export component TextInspector inherits VerticalLayout {
             MultilineTextInput {
                 text: root.edit-text;
                 placeholder-text: "Default text";
+                accessibility-label: "Text content";
 
                 // Typing only updates the local field; the engine edit (one undoable
                 // history entry) commits on blur so undo isn't spammed per keystroke
@@ -638,6 +688,11 @@ export component TextInspector inherits VerticalLayout {
                     root.edit-text = new-text;
                     root.begin-edit();
                     root.commit-style();
+                }
+                cancelled => {
+                    self.text = model.text-content;
+                    root.edit-text = model.text-content;
+                    AppState.refocus-shortcuts();
                 }
             }
 
@@ -661,8 +716,15 @@ export component TextInspector inherits VerticalLayout {
                 }
             }
 
-            HorizontalLayout {
+            font-size-row := HorizontalLayout {
+                property <float> model-size: model.text-style.size;
                 spacing: AppStore.theme.metrics.spacing.md;
+
+                changed model-size => {
+                    if !size-num.has-focus {
+                        size-num.text = Math.round(self.model-size) + "";
+                    }
+                }
 
                 LabelCell {
                     label: "Font size";
@@ -692,11 +754,15 @@ export component TextInspector inherits VerticalLayout {
                     }
                 }
 
-                size-num := LineTextInput {
+                size-num := CutlassLineInput {
                     width: 56px;
+                    minimum-field-width: 56px;
                     height: 28px;
                     vertical-stretch: 0;
                     horizontal-alignment: TextHorizontalAlignment.right;
+                    accessibility-label: "Font size";
+                    commit-on-blur: true;
+                    revert-on-escape: true;
                     text: Math.round(model.text-style.size) + "";
                     accepted(entered) => {
                         if (entered.is-float()) {
@@ -705,6 +771,18 @@ export component TextInspector inherits VerticalLayout {
                             root.commit-style();
                         }
                         self.text = Math.round(model.text-style.size) + "";
+                    }
+                    enter-accepted(_) => {
+                        AppState.refocus-shortcuts();
+                    }
+                    blurred(_, changed) => {
+                        if !changed {
+                            self.text = Math.round(model.text-style.size) + "";
+                        }
+                    }
+                    cancelled => {
+                        self.text = Math.round(model.text-style.size) + "";
+                        AppState.refocus-shortcuts();
                     }
                 }
             }
@@ -829,6 +907,7 @@ export component TextInspector inherits VerticalLayout {
 
                 NumberBox {
                     prefix: "C";
+                    accessibility-label: "Character spacing";
                     value: model.text-style.letter-spacing;
                     commit(v) => {
                         root.begin-edit();
@@ -839,6 +918,7 @@ export component TextInspector inherits VerticalLayout {
 
                 NumberBox {
                     prefix: "L";
+                    accessibility-label: "Line spacing percent";
                     value: model.text-style.line-spacing * 100;
                     commit(v) => {
                         root.begin-edit();

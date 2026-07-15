@@ -151,6 +151,35 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::ExtractAudio { clip, to_track } => {
+            let (id, inverse) = edit::extract_audio::execute(ctx, clip, to_track)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::DuplicateClip {
+            clip,
+            to_track,
+            start,
+        } => {
+            let guard = transitions_guard(ctx);
+            let (id, primary) = edit::duplicate_clip::execute(ctx, clip, to_track, start)?;
+            let inverse = finalize_structural(ctx, guard, primary);
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
+        }
+        EditCommand::FreezeFrame { clip, at, duration } => {
+            let guard = transitions_guard(ctx);
+            let (id, primary) = edit::freeze_frame::execute(ctx, clip, at, duration)?;
+            let inverse = finalize_structural(ctx, guard, primary);
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
+        }
         EditCommand::AddGenerated {
             track,
             generator,
@@ -365,6 +394,17 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::MoveEffect {
+            clip,
+            from_index,
+            to_index,
+        } => {
+            let inverse = edit::set_effect::move_effect(ctx, clip, from_index, to_index)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
+            ))
+        }
         EditCommand::SetEffectParam {
             clip,
             index,
@@ -539,13 +579,30 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::UnlinkClips { clips } => {
+            let first = clips
+                .first()
+                .copied()
+                .ok_or_else(|| EngineError::from(cutlass_models::ModelError::InvalidRange))?;
+            let inverse = edit::link_clips::unlink(ctx, &clips)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(first)),
+                Some(inverse),
+            ))
+        }
         EditCommand::DuckLanes { .. } => Err(EngineError::Unsupported(
             "audio ducking needs the decoder's audio reader (deferred on mobile-support)".into(),
         )),
-        EditCommand::DetectBeats { .. } | EditCommand::ClearBeats { .. } => {
-            Err(EngineError::Unsupported(
-                "beat detection needs the decoder's audio reader (deferred on mobile-support)"
-                    .into(),
+        EditCommand::DetectBeats { .. } => Err(EngineError::Unsupported(
+            "beat detection must run as an async decode/analysis background job outside pure \
+             dispatch, then apply its result in a follow-up edit"
+                .into(),
+        )),
+        EditCommand::ClearBeats { clip } => {
+            let inverse = edit::clip_beats::clear(ctx, clip)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
             ))
         }
         EditCommand::AddMarker { at, name, color } => {

@@ -8,6 +8,8 @@
 //! engine remains the authority (overlaps, source bounds, rate math) and
 //! re-validates everything on apply.
 
+use std::collections::HashSet;
+
 use cutlass_commands::{Command, EditCommand};
 use cutlass_models::{
     AnimationRef, AnimationSlot, AudioRole, CanvasAspect, ChromaKey, Clip, ClipId, ClipParam,
@@ -17,9 +19,9 @@ use cutlass_models::{
 };
 
 use crate::wire::{
-    WireAnimationSlot, WireAudioRole, WireCanvasAspect, WireChromaKey, WireClipParam, WireCommand,
-    WireEasing, WireGenerator, WireMarkerColor, WireMask, WireMaskKind, WireShape,
-    WireStabilizeLevel, WireTrackKind,
+    MAX_MULTI_CLIP_REFS, WireAnimationSlot, WireAudioRole, WireCanvasAspect, WireChromaKey,
+    WireClipParam, WireCommand, WireEasing, WireGenerator, WireMarkerColor, WireMask, WireMaskKind,
+    WireShape, WireStabilizeLevel, WireTrackKind,
 };
 
 /// A wire command the project as it stands cannot accept. The message is
@@ -70,6 +72,149 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                 track: track.id,
                 media: media.id,
                 source,
+                start,
+            }
+        }
+        WireCommand::ExtractAudio(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            let timeline = project.timeline();
+            let source_track_id = timeline.track_of(clip.id).ok_or_else(|| {
+                Rejection::new(format!("clip {} is not on the timeline", args.clip))
+            })?;
+            let source_track = timeline.track(source_track_id).ok_or_else(|| {
+                Rejection::new(format!(
+                    "clip {} refers to missing track {}",
+                    args.clip,
+                    source_track_id.raw()
+                ))
+            })?;
+            let cutlass_models::ClipSource::Media { media, .. } = &clip.content else {
+                return Err(Rejection::new(format!(
+                    "clip {} is generated; extract_audio requires a media-backed video clip",
+                    args.clip
+                )));
+            };
+            if source_track.kind != TrackKind::Video {
+                return Err(Rejection::new(format!(
+                    "clip {} is on a {} track; extract_audio requires a video-track clip",
+                    args.clip,
+                    kind_name(source_track.kind)
+                )));
+            }
+            if source_track.locked {
+                return Err(Rejection::new(format!(
+                    "video track {} is locked; unlock it before extracting clip {}'s audio",
+                    source_track_id.raw(),
+                    args.clip
+                )));
+            }
+            let media = media_ref(project, media.raw())?;
+            if media.kind() != cutlass_models::MediaKind::Video {
+                return Err(Rejection::new(format!(
+                    "clip {} does not reference video media; extract_audio requires a video file",
+                    args.clip
+                )));
+            }
+            if !media.has_audio {
+                return Err(Rejection::new(format!(
+                    "clip {} uses media {} with no audio stream to extract",
+                    args.clip,
+                    media.id.raw()
+                )));
+            }
+            if timeline.detached_to_audio_lane(clip.id) {
+                return Err(Rejection::new(format!(
+                    "clip {} already has extracted audio; use its linked audio-lane companion",
+                    args.clip
+                )));
+            }
+            if let Some(link) = clip.link {
+                let other_members: Vec<u64> = timeline
+                    .tracks_ordered()
+                    .flat_map(|track| track.clips())
+                    .filter(|candidate| candidate.id != clip.id && candidate.link == Some(link))
+                    .map(|candidate| candidate.id.raw())
+                    .collect();
+                if !other_members.is_empty() {
+                    return Err(Rejection::new(format!(
+                        "clip {} is already linked to clips {}; call unlink_clips first, then \
+                         retry extract_audio",
+                        args.clip,
+                        list_ids(other_members)
+                    )));
+                }
+            }
+
+            let target = track_ref(project, args.track)?;
+            if target.kind != TrackKind::Audio {
+                return Err(Rejection::new(format!(
+                    "track {} is a {} track; extract_audio needs an audio track",
+                    args.track,
+                    kind_name(target.kind)
+                )));
+            }
+            if target.locked {
+                return Err(Rejection::new(format!(
+                    "audio track {} is locked; unlock it or choose another audio track",
+                    args.track
+                )));
+            }
+            if target
+                .has_overlap(clip.timeline, None)
+                .map_err(|error| Rejection::new(error.to_string()))?
+            {
+                return Err(Rejection::new(format!(
+                    "audio track {} already has a clip overlapping clip {}'s exact timeline \
+                     range; choose or add a free audio track",
+                    args.track, args.clip
+                )));
+            }
+            EditCommand::ExtractAudio {
+                clip: clip.id,
+                to_track: Some(target.id),
+            }
+        }
+        WireCommand::DuplicateClip(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            let target = track_ref(project, args.to_track)?;
+            if !target.kind.accepts_content(&clip.content) {
+                return Err(Rejection::new(format!(
+                    "clip {} cannot be duplicated onto track {} ({} lane); choose a track \
+                     compatible with the source clip's content",
+                    args.clip,
+                    args.to_track,
+                    kind_name(target.kind),
+                )));
+            }
+            if target.locked {
+                return Err(Rejection::new(format!(
+                    "destination track {} is locked; unlock it or choose another compatible track",
+                    args.to_track
+                )));
+            }
+            let start = timeline_time(project, args.start, "start")?;
+            require_non_negative(args.start, "start")?;
+            let mut destination = clip.timeline;
+            destination.start = start;
+            if target
+                .has_overlap(destination, None)
+                .map_err(|error| Rejection::new(error.to_string()))?
+            {
+                let rate = timeline_rate(project);
+                return Err(Rejection::new(format!(
+                    "track {} has a clip overlapping duplicate of clip {} in the exact \
+                     destination range {:.3}s to {:.3}s; choose another target track or a start \
+                     with {:.3}s of free space — duplicate_clip does not ripple or search for space",
+                    args.to_track,
+                    args.clip,
+                    ticks_to_seconds(destination.start.value, rate),
+                    ticks_to_seconds(destination.end_tick(), rate),
+                    ticks_to_seconds(destination.duration.value, rate),
+                )));
+            }
+            EditCommand::DuplicateClip {
+                clip: clip.id,
+                to_track: target.id,
                 start,
             }
         }
@@ -197,6 +342,23 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
             EditCommand::RemoveEffect {
                 clip: clip.id,
                 index,
+            }
+        }
+        WireCommand::MoveEffect(args) => {
+            let clip = clip_ref(project, args.clip)?;
+            let from_index = effect_index(clip, args.from_index, args.clip)?;
+            let to_index = effect_index(clip, args.to_index, args.clip)?;
+            if from_index == to_index {
+                return Err(Rejection::new(format!(
+                    "effect {from_index} on clip {} is already at index {to_index}; \
+                     move_effect would make no change",
+                    args.clip
+                )));
+            }
+            EditCommand::MoveEffect {
+                clip: clip.id,
+                from_index,
+                to_index,
             }
         }
         WireCommand::SetEffectParam(args) => {
@@ -766,11 +928,52 @@ pub fn validate(command: &WireCommand, project: &Project) -> Result<Command, Rej
                     "link_clips needs at least two clip ids".to_string(),
                 ));
             }
+            if args.clips.len() > MAX_MULTI_CLIP_REFS {
+                return Err(Rejection::new(format!(
+                    "link_clips accepts at most {MAX_MULTI_CLIP_REFS} clip ids (got {})",
+                    args.clips.len()
+                )));
+            }
             let mut clips = Vec::with_capacity(args.clips.len());
             for &raw in &args.clips {
                 clips.push(clip_ref(project, raw)?.id);
             }
             EditCommand::LinkClips { clips }
+        }
+        WireCommand::UnlinkClips(args) => {
+            if args.clips.is_empty() {
+                return Err(Rejection::new(
+                    "unlink_clips needs at least one clip id".to_string(),
+                ));
+            }
+            if args.clips.len() > MAX_MULTI_CLIP_REFS {
+                return Err(Rejection::new(format!(
+                    "unlink_clips accepts at most {MAX_MULTI_CLIP_REFS} clip ids (got {})",
+                    args.clips.len()
+                )));
+            }
+            let mut seen = HashSet::with_capacity(args.clips.len());
+            for &raw in &args.clips {
+                if !seen.insert(raw) {
+                    return Err(Rejection::new(format!(
+                        "unlink_clips contains duplicate clip id {raw}; list each clip once"
+                    )));
+                }
+            }
+
+            let mut clips = Vec::with_capacity(args.clips.len());
+            let mut any_linked = false;
+            for &raw in &args.clips {
+                let clip = clip_ref(project, raw)?;
+                any_linked |= clip.link.is_some();
+                clips.push(clip.id);
+            }
+            if !any_linked {
+                return Err(Rejection::new(
+                    "unlink_clips found no linked clips; all referenced clips are already unlinked",
+                ));
+            }
+            EditCommand::UnlinkClips { clips }
         }
         WireCommand::AddMarker(args) => {
             require_non_negative(args.at, "at")?;
@@ -1008,10 +1211,15 @@ fn require_transition(project: &Project, clip: &Clip, raw_clip: u64) -> Result<(
 /// Resolve a wire effect-chain index against a clip, rejecting out-of-range
 /// indices with the clip's current chain length.
 fn effect_index(clip: &Clip, index: u32, raw_clip: u64) -> Result<usize, Rejection> {
-    let index = index as usize;
+    let index = usize::try_from(index).map_err(|_| {
+        Rejection::new(format!(
+            "clip {raw_clip} has no effect at index {index} (chain length {})",
+            clip.effects.len()
+        ))
+    })?;
     if index >= clip.effects.len() {
         return Err(Rejection::new(format!(
-            "clip {raw_clip} has no effect at index {index} ({} on the chain)",
+            "clip {raw_clip} has no effect at index {index} (chain length {})",
             clip.effects.len()
         )));
     }
@@ -1953,6 +2161,57 @@ mod tests {
     }
 
     #[test]
+    fn move_effect_lowers_and_reports_invalid_requests() {
+        let (mut project, _, _, _, clip, _) = fixture();
+        let clip_id = ClipId::from_raw(clip);
+        for effect in ["gaussian_blur", "glitch", "vignette"] {
+            project.add_effect(clip_id, effect).unwrap();
+        }
+
+        assert_eq!(
+            lower(
+                &project,
+                WireCommand::MoveEffect(wire::MoveEffect {
+                    clip,
+                    from_index: 0,
+                    to_index: 2,
+                }),
+            ),
+            EditCommand::MoveEffect {
+                clip: clip_id,
+                from_index: 0,
+                to_index: 2,
+            }
+        );
+
+        for command in [
+            wire::MoveEffect {
+                clip,
+                from_index: 3,
+                to_index: 0,
+            },
+            wire::MoveEffect {
+                clip,
+                from_index: 0,
+                to_index: 3,
+            },
+        ] {
+            let msg = reject(&project, WireCommand::MoveEffect(command));
+            assert!(msg.contains("chain length 3"), "{msg}");
+        }
+
+        let msg = reject(
+            &project,
+            WireCommand::MoveEffect(wire::MoveEffect {
+                clip,
+                from_index: 1,
+                to_index: 1,
+            }),
+        );
+        assert!(msg.contains("would make no change"), "{msg}");
+    }
+
+    #[test]
     fn clip_speed_lowers_to_exact_rationals() {
         let (project, _, _, _, clip, title) = fixture();
 
@@ -2109,6 +2368,299 @@ mod tests {
             }),
         );
         assert!(msg.contains("generated clip"), "{msg}");
+    }
+
+    #[test]
+    fn extract_audio_lowers_to_explicit_target_and_preflights_failures() {
+        let (mut project, media, video_track, _text, video_clip, title) = fixture();
+        let audio = project.add_track(TrackKind::Audio, "A1");
+        let edit = lower(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: video_clip,
+                track: audio.raw(),
+            }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::ExtractAudio {
+                clip: ClipId::from_raw(video_clip),
+                to_track: Some(audio),
+            }
+        );
+
+        let msg = reject(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: title,
+                track: audio.raw(),
+            }),
+        );
+        assert!(msg.contains("generated"), "{msg}");
+
+        project
+            .timeline_mut()
+            .track_mut(TrackId::from_raw(video_track))
+            .unwrap()
+            .locked = true;
+        let msg = reject(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: video_clip,
+                track: audio.raw(),
+            }),
+        );
+        assert!(msg.contains("video track"), "{msg}");
+        assert!(msg.contains("locked"), "{msg}");
+        project
+            .timeline_mut()
+            .track_mut(TrackId::from_raw(video_track))
+            .unwrap()
+            .locked = false;
+
+        project.timeline_mut().track_mut(audio).unwrap().locked = true;
+        let msg = reject(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: video_clip,
+                track: audio.raw(),
+            }),
+        );
+        assert!(msg.contains("locked"), "{msg}");
+        project.timeline_mut().track_mut(audio).unwrap().locked = false;
+
+        project
+            .add_clip(
+                audio,
+                cutlass_models::MediaId::from_raw(media),
+                TimeRange::at_rate(0, 240, R24),
+                RationalTime::new(0, R24),
+            )
+            .unwrap();
+        let msg = reject(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: video_clip,
+                track: audio.raw(),
+            }),
+        );
+        assert!(msg.contains("exact timeline range"), "{msg}");
+        assert!(msg.contains("choose or add a free audio track"), "{msg}");
+    }
+
+    #[test]
+    fn duplicate_clip_lowers_at_timeline_rate_without_mutating() {
+        let (mut project, _, _, _, clip, _) = fixture();
+        let destination = project.add_track(TrackKind::Video, "V2");
+        let before = serde_json::to_value(&project).unwrap();
+
+        let edit = lower(
+            &project,
+            WireCommand::DuplicateClip(wire::DuplicateClip {
+                clip,
+                to_track: destination.raw(),
+                start: 12.25,
+            }),
+        );
+
+        assert_eq!(
+            edit,
+            EditCommand::DuplicateClip {
+                clip: ClipId::from_raw(clip),
+                to_track: destination,
+                start: RationalTime::new(294, R24),
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(&project).unwrap(),
+            before,
+            "validation must not mutate the project"
+        );
+    }
+
+    #[test]
+    fn duplicate_clip_rejects_unknown_ids_and_invalid_starts() {
+        let (project, _, video, _, clip, _) = fixture();
+
+        let msg = reject(
+            &project,
+            WireCommand::DuplicateClip(wire::DuplicateClip {
+                clip: 999,
+                to_track: video,
+                start: 12.0,
+            }),
+        );
+        assert!(msg.contains("clip 999 does not exist"), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::DuplicateClip(wire::DuplicateClip {
+                clip,
+                to_track: 999,
+                start: 12.0,
+            }),
+        );
+        assert!(msg.contains("track 999 does not exist"), "{msg}");
+
+        for start in [f64::NAN, f64::INFINITY] {
+            let msg = reject(
+                &project,
+                WireCommand::DuplicateClip(wire::DuplicateClip {
+                    clip,
+                    to_track: video,
+                    start,
+                }),
+            );
+            assert!(msg.contains("start must be a finite number"), "{msg}");
+        }
+
+        let msg = reject(
+            &project,
+            WireCommand::DuplicateClip(wire::DuplicateClip {
+                clip,
+                to_track: video,
+                start: -0.5,
+            }),
+        );
+        assert!(msg.contains("start must not be negative"), "{msg}");
+    }
+
+    #[test]
+    fn duplicate_clip_rejects_incompatible_locked_and_overlapping_destinations() {
+        let (mut project, media, _, text, clip, _) = fixture();
+
+        let msg = reject(
+            &project,
+            WireCommand::DuplicateClip(wire::DuplicateClip {
+                clip,
+                to_track: text,
+                start: 12.0,
+            }),
+        );
+        assert!(msg.contains("cannot be duplicated"), "{msg}");
+        assert!(msg.contains("text lane"), "{msg}");
+
+        let destination = project.add_track(TrackKind::Video, "V2");
+        project
+            .timeline_mut()
+            .track_mut(destination)
+            .unwrap()
+            .locked = true;
+        let msg = reject(
+            &project,
+            WireCommand::DuplicateClip(wire::DuplicateClip {
+                clip,
+                to_track: destination.raw(),
+                start: 12.0,
+            }),
+        );
+        assert!(msg.contains("destination track"), "{msg}");
+        assert!(msg.contains("locked"), "{msg}");
+        assert!(msg.contains("unlock it or choose another"), "{msg}");
+
+        project
+            .timeline_mut()
+            .track_mut(destination)
+            .unwrap()
+            .locked = false;
+        project
+            .add_clip(
+                destination,
+                MediaId::from_raw(media),
+                TimeRange::at_rate(0, 24, R24),
+                RationalTime::new(480, R24),
+            )
+            .unwrap();
+        let msg = reject(
+            &project,
+            WireCommand::DuplicateClip(wire::DuplicateClip {
+                clip,
+                to_track: destination.raw(),
+                start: 12.0,
+            }),
+        );
+        assert!(
+            msg.contains("exact destination range 12.000s to 22.000s"),
+            "{msg}"
+        );
+        assert!(msg.contains("10.000s of free space"), "{msg}");
+        assert!(msg.contains("does not ripple or search for space"), "{msg}");
+    }
+
+    #[test]
+    fn extract_audio_rejections_tell_the_model_how_to_recover() {
+        let (mut project, _media, _video, _text, video_clip, title) = fixture();
+        let audio = project.add_track(TrackKind::Audio, "A1");
+        let link = cutlass_models::LinkId::next();
+        for raw in [video_clip, title] {
+            project
+                .timeline_mut()
+                .clip_mut(ClipId::from_raw(raw))
+                .unwrap()
+                .link = Some(link);
+        }
+        let msg = reject(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: video_clip,
+                track: audio.raw(),
+            }),
+        );
+        assert!(msg.contains("unlink_clips first"), "{msg}");
+        assert!(msg.contains(&title.to_string()), "{msg}");
+
+        let (mut project, media, _video, _text, video_clip, _) = fixture();
+        let audio = project.add_track(TrackKind::Audio, "A1");
+        let companion = project
+            .add_clip(
+                audio,
+                cutlass_models::MediaId::from_raw(media),
+                TimeRange::at_rate(0, 240, R24),
+                RationalTime::new(0, R24),
+            )
+            .unwrap();
+        let link = cutlass_models::LinkId::next();
+        for id in [ClipId::from_raw(video_clip), companion] {
+            project.timeline_mut().clip_mut(id).unwrap().link = Some(link);
+        }
+        let msg = reject(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: video_clip,
+                track: audio.raw(),
+            }),
+        );
+        assert!(msg.contains("already has extracted audio"), "{msg}");
+
+        let (mut project, media, _video, _text, video_clip, _) = fixture();
+        project
+            .media_mut(cutlass_models::MediaId::from_raw(media))
+            .unwrap()
+            .is_image = true;
+        let audio = project.add_track(TrackKind::Audio, "A1");
+        let msg = reject(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: video_clip,
+                track: audio.raw(),
+            }),
+        );
+        assert!(msg.contains("video media"), "{msg}");
+
+        let (mut project, media, _video, _text, video_clip, _) = fixture();
+        project
+            .media_mut(cutlass_models::MediaId::from_raw(media))
+            .unwrap()
+            .has_audio = false;
+        let audio = project.add_track(TrackKind::Audio, "A1");
+        let msg = reject(
+            &project,
+            WireCommand::ExtractAudio(wire::ExtractAudio {
+                clip: video_clip,
+                track: audio.raw(),
+            }),
+        );
+        assert!(msg.contains("no audio stream"), "{msg}");
     }
 
     #[test]
@@ -2351,7 +2903,7 @@ mod tests {
     }
 
     #[test]
-    fn shift_rejects_sub_frame_delta_and_link_needs_two() {
+    fn shift_rejects_sub_frame_delta_and_link_lists_are_bounded() {
         let (project, _, video, _, clip, _) = fixture();
         let msg = reject(
             &project,
@@ -2368,6 +2920,96 @@ mod tests {
             WireCommand::LinkClips(wire::LinkClips { clips: vec![clip] }),
         );
         assert!(msg.contains("at least two"), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::LinkClips(wire::LinkClips {
+                clips: vec![clip; MAX_MULTI_CLIP_REFS + 1],
+            }),
+        );
+        assert!(msg.contains("at most 64"), "{msg}");
+    }
+
+    #[test]
+    fn unlink_one_member_lowers_to_the_complete_group_command() {
+        let (mut project, _, _, _, clip, title) = fixture();
+        let link = cutlass_models::LinkId::next();
+        for id in [clip, title] {
+            project
+                .timeline_mut()
+                .clip_mut(ClipId::from_raw(id))
+                .unwrap()
+                .link = Some(link);
+        }
+
+        let edit = lower(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips { clips: vec![title] }),
+        );
+        assert_eq!(
+            edit,
+            EditCommand::UnlinkClips {
+                clips: vec![ClipId::from_raw(title)]
+            }
+        );
+        assert_eq!(
+            project.clip(ClipId::from_raw(clip)).unwrap().link,
+            Some(link)
+        );
+        assert_eq!(
+            project.clip(ClipId::from_raw(title)).unwrap().link,
+            Some(link)
+        );
+    }
+
+    #[test]
+    fn unlink_rejects_invalid_lists_before_mutation() {
+        let (project, _, _, _, clip, title) = fixture();
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips { clips: vec![] }),
+        );
+        assert!(msg.contains("at least one"), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips {
+                clips: vec![clip, clip],
+            }),
+        );
+        assert!(msg.contains("duplicate clip id"), "{msg}");
+        assert!(msg.contains(&clip.to_string()), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips {
+                clips: vec![clip, 999],
+            }),
+        );
+        assert!(msg.contains("clip 999 does not exist"), "{msg}");
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips {
+                clips: vec![clip, title],
+            }),
+        );
+        assert!(
+            msg.contains("all referenced clips are already unlinked"),
+            "{msg}"
+        );
+
+        let msg = reject(
+            &project,
+            WireCommand::UnlinkClips(wire::UnlinkClips {
+                clips: vec![clip; MAX_MULTI_CLIP_REFS + 1],
+            }),
+        );
+        assert!(msg.contains("at most 64"), "{msg}");
+
+        assert_eq!(project.clip(ClipId::from_raw(clip)).unwrap().link, None);
+        assert_eq!(project.clip(ClipId::from_raw(title)).unwrap().link, None);
     }
 
     #[test]

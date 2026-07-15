@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::cache::{DEFAULT_QUOTA_BYTES, DownloadCache};
+use cutlass_cloud::cache::DownloadCache;
 use cutlass_cloud::dto::{GenerateRequest, JobStatus};
 use cutlass_cloud::generate::{
     FalGenerationProvider, GenerationKind, GenerationProvider, ManagedGenerationProvider,
@@ -28,7 +28,7 @@ use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffe
 use tracing::{info, warn};
 
 use crate::preview_worker::WorkerHandle;
-use crate::{AiBackend, AiItemTile, paths};
+use crate::{AiBackend, AiItemTile};
 
 /// Generation can take minutes (video); poll at a human pace.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -68,12 +68,13 @@ impl AiMediaWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-ai-media".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, import_handle);
+                let mut worker = Worker::new(backend_weak, import_handle, cache);
                 worker.publish_route();
                 while let Ok(command) = rx.recv() {
                     worker.run(command);
@@ -110,20 +111,21 @@ enum Route {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     import_handle: WorkerHandle,
-    cache: DownloadCache,
+    cache: Arc<DownloadCache>,
     media_entries: Vec<Entry>,
     tts_entries: Vec<Entry>,
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, import_handle: WorkerHandle) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+    ) -> Self {
         Self {
             backend_weak,
             import_handle,
-            cache: DownloadCache::new(
-                paths::data_dir().join("download-cache"),
-                DEFAULT_QUOTA_BYTES,
-            ),
+            cache,
             media_entries: Vec::new(),
             tts_entries: Vec::new(),
         }
@@ -337,29 +339,39 @@ impl Worker {
         let Some(url) = url else { return };
 
         let cache_key = format!("ai/{}.{}", stable_key(&url), extension_of(kind, &url));
-        let dest = match self.cache.hit(&cache_key) {
-            Some(path) => path,
-            None => {
-                let dest = match self.cache.path_for(&cache_key) {
-                    Ok(dest) => dest,
-                    Err(e) => {
-                        warn!("ai cache path failed: {e}");
-                        return;
-                    }
-                };
-                let cancel = Arc::new(AtomicBool::new(false));
-                if let Err(e) = download::download_to(&url, &dest, &cancel, |_| {}) {
-                    warn!("ai result download failed: {e}");
-                    let message = "Download failed — the result may have expired; regenerate.";
-                    self.on_ui(move |b| b.set_error(message.into()));
-                    return;
-                }
-                self.cache.enforce_quota();
-                dest
+        let lease = match self.cache.lease(&cache_key) {
+            Ok(lease) => lease,
+            Err(e) => {
+                warn!("ai cache path failed: {e}");
+                return;
             }
         };
+        let dest = lease.path().to_path_buf();
+        let downloaded = if self.cache.hit(&cache_key).is_some() {
+            false
+        } else {
+            let cancel = Arc::new(AtomicBool::new(false));
+            if let Err(e) = download::download_to(&url, &dest, &cancel, |_| {}) {
+                warn!("ai result download failed: {e}");
+                let message = "Download failed — the result may have expired; regenerate.";
+                self.on_ui(move |b| b.set_error(message.into()));
+                return;
+            }
+            true
+        };
         info!("importing AI result \"{prompt}\" from {}", dest.display());
+        if let Err(error) = self.cache.protect_path(&dest) {
+            warn!("AI import could not protect its source: {error}");
+            self.on_ui(|backend| {
+                backend.set_error("The downloaded result could not be imported safely.".into());
+            });
+            return;
+        }
         self.import_handle.import(dest);
+        drop(lease);
+        if downloaded {
+            self.cache.enforce_quota();
+        }
         self.patch(kind, index, |tile| tile.state = "imported".into());
     }
 
@@ -372,19 +384,21 @@ impl Worker {
             return;
         }
         let cache_key = format!("ai-thumbs/{}.img", stable_key(url));
-        let path = match self.cache.path_for(&cache_key) {
-            Ok(path) => path,
+        let lease = match self.cache.lease(&cache_key) {
+            Ok(lease) => lease,
             Err(_) => return,
         };
+        let path = lease.path();
         if !path.is_file() {
             let cancel = Arc::new(AtomicBool::new(false));
-            if download::download_to(url, &path, &cancel, |_| {}).is_err() {
+            if download::download_to(url, path, &cancel, |_| {}).is_err() {
                 return;
             }
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = std::fs::read(path) else {
             return;
         };
+        drop(lease);
         let Ok(decoded) = cutlass_decoder::decode_image_bytes(&bytes) else {
             return;
         };

@@ -98,6 +98,20 @@ fn edit_samples() -> Vec<EditCommand> {
             source: tr(0, 90),
             start: t(30),
         },
+        EditCommand::ExtractAudio {
+            clip: clip(4),
+            to_track: Some(track(2)),
+        },
+        EditCommand::DuplicateClip {
+            clip: clip(4),
+            to_track: track(2),
+            start: t(120),
+        },
+        EditCommand::FreezeFrame {
+            clip: clip(4),
+            at: t(45),
+            duration: t(30),
+        },
         EditCommand::AddGenerated {
             track: track(1),
             generator: Generator::SolidColor {
@@ -248,6 +262,11 @@ fn edit_samples() -> Vec<EditCommand> {
             clip: clip(4),
             index: 0,
         },
+        EditCommand::MoveEffect {
+            clip: clip(4),
+            from_index: 0,
+            to_index: 2,
+        },
         EditCommand::SetEffectParam {
             clip: clip(4),
             index: 0,
@@ -278,6 +297,14 @@ fn edit_samples() -> Vec<EditCommand> {
         },
         EditCommand::RemoveClip { clip: clip(4) },
         EditCommand::RemoveTrack { track: track(2) },
+        EditCommand::MoveTrack {
+            track: track(2),
+            index: 1,
+        },
+        EditCommand::SetTrackName {
+            track: track(2),
+            name: "Dialogue".into(),
+        },
         EditCommand::SetTrackEnabled {
             track: track(2),
             enabled: false,
@@ -307,6 +334,9 @@ fn edit_samples() -> Vec<EditCommand> {
             at: t(60),
         },
         EditCommand::LinkClips {
+            clips: vec![clip(4), clip(5)],
+        },
+        EditCommand::UnlinkClips {
             clips: vec![clip(4), clip(5)],
         },
         EditCommand::DuckLanes {
@@ -363,6 +393,9 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
     match cmd {
         EditCommand::AddTrack { .. } => "AddTrack",
         EditCommand::AddClip { .. } => "AddClip",
+        EditCommand::ExtractAudio { .. } => "ExtractAudio",
+        EditCommand::DuplicateClip { .. } => "DuplicateClip",
+        EditCommand::FreezeFrame { .. } => "FreezeFrame",
         EditCommand::AddGenerated { .. } => "AddGenerated",
         EditCommand::SetGenerator { .. } => "SetGenerator",
         EditCommand::SetClipMedia { .. } => "SetClipMedia",
@@ -388,6 +421,7 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
         EditCommand::SetAudioRole { .. } => "SetAudioRole",
         EditCommand::AddEffect { .. } => "AddEffect",
         EditCommand::RemoveEffect { .. } => "RemoveEffect",
+        EditCommand::MoveEffect { .. } => "MoveEffect",
         EditCommand::SetEffectParam { .. } => "SetEffectParam",
         EditCommand::AddTransition { .. } => "AddTransition",
         EditCommand::RemoveTransition { .. } => "RemoveTransition",
@@ -407,6 +441,7 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
         EditCommand::ShiftClips { .. } => "ShiftClips",
         EditCommand::RippleInsert { .. } => "RippleInsert",
         EditCommand::LinkClips { .. } => "LinkClips",
+        EditCommand::UnlinkClips { .. } => "UnlinkClips",
         EditCommand::DuckLanes { .. } => "DuckLanes",
         EditCommand::DetectBeats { .. } => "DetectBeats",
         EditCommand::ClearBeats { .. } => "ClearBeats",
@@ -419,6 +454,12 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
 }
 
 // --- roundtrips -------------------------------------------------------------
+
+#[test]
+fn command_variant_counts_are_locked() {
+    assert_eq!(project_samples().len(), 9);
+    assert_eq!(edit_samples().len(), 59);
+}
 
 #[test]
 fn every_project_command_roundtrips_through_command() {
@@ -492,6 +533,63 @@ fn golden_add_clip() {
 }
 
 #[test]
+fn golden_extract_audio() {
+    let explicit = Command::Edit(EditCommand::ExtractAudio {
+        clip: clip(4),
+        to_track: Some(track(2)),
+    });
+    assert_eq!(
+        serde_json::to_value(&explicit).unwrap(),
+        json!({"type": "ExtractAudio", "clip": 4, "to_track": 2})
+    );
+
+    let automatic = Command::Edit(EditCommand::ExtractAudio {
+        clip: clip(4),
+        to_track: None,
+    });
+    assert_eq!(
+        serde_json::to_value(&automatic).unwrap(),
+        json!({"type": "ExtractAudio", "clip": 4, "to_track": null})
+    );
+}
+
+#[test]
+fn golden_duplicate_clip() {
+    let cmd = Command::Edit(EditCommand::DuplicateClip {
+        clip: clip(4),
+        to_track: track(2),
+        start: t(120),
+    });
+    assert_eq!(
+        serde_json::to_value(&cmd).unwrap(),
+        json!({
+            "type": "DuplicateClip",
+            "clip": 4,
+            "to_track": 2,
+            "start": {"value": 120, "rate": {"num": 30, "den": 1}},
+        })
+    );
+}
+
+#[test]
+fn golden_freeze_frame() {
+    let cmd = Command::Edit(EditCommand::FreezeFrame {
+        clip: clip(4),
+        at: t(45),
+        duration: t(30),
+    });
+    assert_eq!(
+        serde_json::to_value(&cmd).unwrap(),
+        json!({
+            "type": "FreezeFrame",
+            "clip": 4,
+            "at": {"value": 45, "rate": {"num": 30, "den": 1}},
+            "duration": {"value": 30, "rate": {"num": 30, "den": 1}},
+        })
+    );
+}
+
+#[test]
 fn golden_split_clip() {
     let cmd = Command::Edit(EditCommand::SplitClip {
         clip: clip(4),
@@ -504,6 +602,30 @@ fn golden_split_clip() {
             "clip": 4,
             "at": {"value": 45, "rate": {"num": 30, "den": 1}},
         })
+    );
+}
+
+#[test]
+fn golden_unlink_clips() {
+    let cmd = Command::Edit(EditCommand::UnlinkClips {
+        clips: vec![clip(4), clip(5)],
+    });
+    assert_eq!(
+        serde_json::to_value(&cmd).unwrap(),
+        json!({"type": "UnlinkClips", "clips": [4, 5]})
+    );
+}
+
+#[test]
+fn golden_move_effect() {
+    let cmd = Command::Edit(EditCommand::MoveEffect {
+        clip: clip(4),
+        from_index: 0,
+        to_index: 2,
+    });
+    assert_eq!(
+        serde_json::to_value(&cmd).unwrap(),
+        json!({"type": "MoveEffect", "clip": 4, "from_index": 0, "to_index": 2})
     );
 }
 

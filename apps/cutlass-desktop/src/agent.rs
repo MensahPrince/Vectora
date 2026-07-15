@@ -15,24 +15,31 @@
 //! With the dry-run toggle on (the default), the plan is parked here and
 //! the chat panel shows an Apply / Discard card instead of auto-applying.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
+use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use cutlass_ai::providers::openai_compat::OpenAiCompatProvider;
 use cutlass_ai::{
-    AgentConfig, AgentEvent, AgentExtensions, EditorContext, EngineBridge, Message, ProjectSummary,
-    PromptStatus, WireCommand, compose_rules, expand_slash_command, load_agent_dir, merge_skills,
-    run_prompt, summarize, validate,
+    AgentConfig, AgentEvent, AgentExtensions, EditorContext, EngineBridge, HostToolSpec, Message,
+    ProjectSummary, PromptStatus, ToolHost, ToolOutput, ToolTier, WireCommand, compose_rules,
+    expand_slash_command, load_agent_dir, merge_skills, run_prompt_with_host, summarize, validate,
 };
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
+use cutlass_jobs::JobManager;
+use cutlass_settings::Autonomy;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use tracing::{error, info, warn};
 
+use crate::agent_senses::AgentSenses;
+use crate::agent_session::{AgentSession, TranscriptEntry};
+use crate::cache_registry::CacheRegistry;
 use crate::preview_worker::WorkerHandle;
-use crate::{AgentEntry, AgentStore};
+use crate::{AgentEntry, AgentStore, AppWindow};
 
 /// An entity id the sandbox allocated while rehearsing a command. Replay
 /// maps it onto the id the live engine allocates for the same step.
@@ -60,15 +67,31 @@ enum AgentRequest {
     },
     ApplyPlan,
     DiscardPlan,
-    /// Forget the conversation so far (the project was replaced wholesale —
-    /// open / new / restore — and prior turns name clips that are gone).
-    ResetHistory,
+    /// Persist the outgoing draft's conversation and restore the incoming
+    /// draft. A missing path means no app-owned project is active.
+    SwitchProject {
+        path: Option<PathBuf>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalChoice {
+    Approve,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApprovalDecision {
+    request_id: u64,
+    choice: ApprovalChoice,
 }
 
 #[derive(Clone)]
 pub struct AgentHandle {
     tx: Sender<AgentRequest>,
     cancel: Arc<AtomicBool>,
+    approval_tx: Sender<ApprovalDecision>,
+    pending_approval_id: Arc<AtomicU64>,
 }
 
 impl AgentHandle {
@@ -88,16 +111,37 @@ impl AgentHandle {
         let _ = self.tx.send(AgentRequest::DiscardPlan);
     }
 
-    /// Drop the multi-turn conversation memory; the next prompt starts a
-    /// fresh dialogue. Fired when the project is replaced wholesale.
-    pub fn reset_history(&self) {
-        let _ = self.tx.send(AgentRequest::ResetHistory);
+    /// Persist the outgoing session and restore the incoming draft's
+    /// conversation. Fired after the worker publishes a new project path.
+    pub fn switch_project(&self, path: Option<PathBuf>) {
+        let _ = self.tx.send(AgentRequest::SwitchProject { path });
     }
 
     /// Cooperative cancel: the provider checks this flag between stream
     /// chunks, so a running prompt aborts within one network read.
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Approve only the System-tier call that is pending right now. The id
+    /// travels with the decision so a delayed duplicate click can never
+    /// authorize a later call.
+    pub fn approve_system_tool(&self) {
+        self.decide_system_tool(ApprovalChoice::Approve);
+    }
+
+    /// Decline only the System-tier call that is pending right now.
+    pub fn deny_system_tool(&self) {
+        self.decide_system_tool(ApprovalChoice::Deny);
+    }
+
+    fn decide_system_tool(&self, choice: ApprovalChoice) {
+        let request_id = self.pending_approval_id.load(Ordering::Acquire);
+        if request_id != 0 {
+            let _ = self
+                .approval_tx
+                .send(ApprovalDecision { request_id, choice });
+        }
     }
 }
 
@@ -106,20 +150,54 @@ pub struct AgentWorker {
     _join: JoinHandle<()>,
 }
 
+struct AgentRuntimeHandles {
+    store: slint::Weak<AgentStore<'static>>,
+    app: slint::Weak<AppWindow>,
+    cache_registry: CacheRegistry,
+    job_manager: JobManager,
+}
+
 impl AgentWorker {
     pub fn spawn(
         worker: WorkerHandle,
         store: slint::Weak<AgentStore<'static>>,
+        app: slint::Weak<AppWindow>,
+        cache_registry: CacheRegistry,
+        job_manager: JobManager,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded();
+        let (approval_tx, approval_rx) = unbounded();
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
+        let pending_approval_id = Arc::new(AtomicU64::new(0));
+        let thread_pending_approval_id = pending_approval_id.clone();
+        let approval_id_allocator = Arc::new(AtomicU64::new(0));
         let join = std::thread::Builder::new()
             .name("cutlass-agent".into())
-            .spawn(move || agent_main(worker, store, rx, thread_cancel))
+            .spawn(move || {
+                agent_main(
+                    worker,
+                    AgentRuntimeHandles {
+                        store,
+                        app,
+                        cache_registry,
+                        job_manager,
+                    },
+                    rx,
+                    thread_cancel,
+                    approval_rx,
+                    thread_pending_approval_id,
+                    approval_id_allocator,
+                )
+            })
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            handle: AgentHandle { tx, cancel },
+            handle: AgentHandle {
+                tx,
+                cancel,
+                approval_tx,
+                pending_approval_id,
+            },
             _join: join,
         })
     }
@@ -133,6 +211,8 @@ fn entry(kind: &str, text: impl Into<SharedString>) -> AgentEntry {
     AgentEntry {
         kind: kind.into(),
         text: text.into(),
+        image: Default::default(),
+        image_aspect: 0.0,
     }
 }
 
@@ -153,6 +233,87 @@ fn with_transcript(
 
 fn push_entry(store: &slint::Weak<AgentStore<'static>>, kind: &'static str, text: String) {
     with_transcript(store, move |model| model.push(entry(kind, text)));
+}
+
+fn push_image_entry(store: &slint::Weak<AgentStore<'static>>, image: cutlass_ai::ImagePart) {
+    let label = transcript_image_label(&image.label);
+    let frame = match decode_transcript_image(&image) {
+        Ok(frame) => frame,
+        Err(error) => {
+            push_entry(
+                store,
+                "status",
+                format!("Could not display image '{label}': {error}"),
+            );
+            return;
+        }
+    };
+    let aspect = frame.width as f32 / frame.height as f32;
+    let (width, height, pixels) = (frame.width, frame.height, frame.pixels);
+    with_transcript(store, move |model| {
+        let buffer =
+            slint::SharedPixelBuffer::<slint::Rgba8Pixel>::clone_from_slice(&pixels, width, height);
+        model.push(AgentEntry {
+            kind: "image".into(),
+            text: label.into(),
+            image: slint::Image::from_rgba8(buffer),
+            image_aspect: aspect,
+        });
+    });
+}
+
+fn decode_transcript_image(
+    image: &cutlass_ai::ImagePart,
+) -> Result<cutlass_render::RgbaImage, String> {
+    const MAX_EDGE: u32 = 2_048;
+    const MAX_PIXELS: u64 = 4 * 1024 * 1024;
+
+    let frame = match image.media_type.as_str() {
+        "image/png" => {
+            cutlass_render::decode_png(image.data.as_slice()).map_err(|error| error.to_string())?
+        }
+        "image/jpeg" => cutlass_decoder::decode_image_bytes(image.data.as_slice())
+            .map_err(|error| error.to_string())?,
+        media_type => return Err(format!("unsupported transcript image type '{media_type}'")),
+    };
+    let pixels = u64::from(frame.width)
+        .checked_mul(u64::from(frame.height))
+        .ok_or_else(|| "transcript image dimensions overflow".to_string())?;
+    if frame.width == 0
+        || frame.height == 0
+        || frame.width > MAX_EDGE
+        || frame.height > MAX_EDGE
+        || pixels > MAX_PIXELS
+    {
+        return Err(format!(
+            "transcript image dimensions {}x{} exceed the display bound",
+            frame.width, frame.height
+        ));
+    }
+    if !frame.is_well_formed() {
+        return Err("transcript image has a malformed RGBA buffer".into());
+    }
+    Ok(frame)
+}
+
+fn transcript_image_label(label: &str) -> String {
+    const MAX_CHARS: usize = 160;
+    let mut safe = String::with_capacity(label.len().min(MAX_CHARS));
+    for character in label.chars().take(MAX_CHARS) {
+        safe.push(if character.is_control() {
+            '\u{fffd}'
+        } else {
+            character
+        });
+    }
+    if label.chars().count() > MAX_CHARS {
+        safe.push('…');
+    }
+    if safe.trim().is_empty() {
+        "Agent image".to_string()
+    } else {
+        safe
+    }
 }
 
 fn append_assistant_text(store: &slint::Weak<AgentStore<'static>>, delta: String) {
@@ -181,19 +342,184 @@ fn with_store(
     });
 }
 
+/// Snapshot the visible transcript on the Slint thread. Calls are made only
+/// from the dedicated agent worker; the timeout prevents shutdown from
+/// hanging if the event loop has already stopped.
+fn transcript_snapshot(
+    store: &slint::Weak<AgentStore<'static>>,
+) -> Result<Vec<TranscriptEntry>, String> {
+    let (tx, rx) = bounded(1);
+    let store = store.clone();
+    slint::invoke_from_event_loop(move || {
+        let rows = store
+            .upgrade()
+            .map(|store| {
+                let model = store.get_transcript();
+                (0..model.row_count())
+                    .filter_map(|index| model.row_data(index))
+                    .map(|row| TranscriptEntry {
+                        kind: row.kind.to_string(),
+                        text: row.text.to_string(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let _ = tx.send(rows);
+    })
+    .map_err(|error| format!("failed to schedule agent transcript snapshot: {error}"))?;
+    rx.recv_timeout(Duration::from_secs(2))
+        .map_err(|error| format!("agent transcript snapshot timed out: {error}"))
+}
+
+fn replace_transcript(
+    store: &slint::Weak<AgentStore<'static>>,
+    mut transcript: Vec<TranscriptEntry>,
+    restore_error: Option<String>,
+) {
+    if let Some(error) = restore_error {
+        warn!(error, "agent session could not be restored");
+        transcript.push(TranscriptEntry {
+            kind: "error".into(),
+            text: "The previous agent conversation could not be restored.".into(),
+        });
+    }
+    with_store(store, move |store| {
+        // Build Slint image-bearing rows on the UI thread: `slint::Image`
+        // is intentionally not Send even when it is empty.
+        let rows: Vec<AgentEntry> = transcript
+            .into_iter()
+            .map(|saved| {
+                if saved.kind == "image" {
+                    let caption = if saved.text.is_empty() {
+                        "Image attachment from the previous session.".to_string()
+                    } else {
+                        format!("Image attachment from the previous session: {}", saved.text)
+                    };
+                    entry("status", caption)
+                } else {
+                    entry(&saved.kind, saved.text)
+                }
+            })
+            .collect();
+        store.set_transcript(ModelRc::new(VecModel::from(rows)));
+    });
+}
+
+fn persist_session(
+    path: Option<&Path>,
+    history: &[Message],
+    store: &slint::Weak<AgentStore<'static>>,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    let transcript = match transcript_snapshot(store) {
+        Ok(transcript) => transcript,
+        Err(error) => {
+            warn!(error, "agent session transcript was not captured");
+            return;
+        }
+    };
+    let session = AgentSession {
+        history: history.to_vec(),
+        transcript,
+    };
+    if let Err(error) = crate::agent_session::save(path, &session) {
+        warn!(error, project = %path.display(), "agent session was not saved");
+    }
+}
+
 fn sandbox_engine() -> Result<Engine, String> {
     Engine::new(EngineConfig::default())
         .map_err(|e| format!("agent sandbox engine failed to start: {e}"))
 }
 
-struct SandboxBridge<'a> {
-    engine: &'a mut Engine,
-    plan: &'a mut Vec<AgentPlanStep>,
+trait ProjectSnapshotSource {
+    fn snapshot_project(&self) -> Option<cutlass_models::Project>;
 }
 
-impl EngineBridge for SandboxBridge<'_> {
+impl ProjectSnapshotSource for WorkerHandle {
+    fn snapshot_project(&self) -> Option<cutlass_models::Project> {
+        WorkerHandle::snapshot_project(self)
+    }
+}
+
+struct SandboxBridge<'a, W: ProjectSnapshotSource + ?Sized> {
+    worker: &'a W,
+    engine: &'a mut Engine,
+    plan: &'a mut Vec<AgentPlanStep>,
+    senses: &'a mut AgentSenses,
+    default_playhead_seconds: f64,
+}
+
+impl<W: ProjectSnapshotSource + ?Sized> EngineBridge for SandboxBridge<'_, W> {
     fn summary(&mut self) -> ProjectSummary {
         summarize(self.engine.project())
+    }
+
+    fn sense_tools(&self) -> Vec<HostToolSpec> {
+        AgentSenses::specs()
+    }
+
+    fn sense(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        cancel: &AtomicBool,
+    ) -> Result<ToolOutput, String> {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled before the media sense could run".into());
+        }
+        let output = self.senses.call(
+            self.engine.project(),
+            self.default_playhead_seconds,
+            name,
+            arguments,
+        )?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err("cancelled while the media sense was running".into());
+        }
+        Ok(output)
+    }
+
+    fn before_host_call(
+        &mut self,
+        name: &str,
+        _arguments: &serde_json::Value,
+    ) -> Result<(), String> {
+        if crate::agent_project::mutates_live_project(name) && !self.plan.is_empty() {
+            return Err(format!(
+                "{name} cannot run while timeline edits are staged; project operations must \
+                 happen before staged edits, or after the user applies or discards the pending \
+                 plan"
+            ));
+        }
+        Ok(())
+    }
+
+    fn after_host_call(
+        &mut self,
+        name: &str,
+        _arguments: &serde_json::Value,
+        _result: Result<&ToolOutput, &str>,
+    ) -> Result<(), String> {
+        if !crate::agent_project::mutates_live_project(name) {
+            return Ok(());
+        }
+
+        let snapshot = self.worker.snapshot_project().ok_or_else(|| {
+            format!(
+                "could not reconcile the agent sandbox after project host call '{name}': \
+                 the editor engine did not reply with a live project snapshot"
+            )
+        })?;
+        self.plan.clear();
+        self.engine.reset_project(snapshot);
+        // `reset_project` clears history, including the prompt's pending
+        // group. Reopen it immediately so any later staged edit is still
+        // covered by the core loop's normal abort rollback.
+        self.engine.begin_group();
+        Ok(())
     }
 
     fn apply(&mut self, command: &WireCommand) -> Result<EditOutcome, String> {
@@ -236,9 +562,469 @@ impl EngineBridge for SandboxBridge<'_> {
     }
 }
 
+const APPROVAL_WAIT_SLICE: Duration = Duration::from_millis(50);
+const APPROVAL_CARD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
+const APPROVAL_DETAIL_MAX_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalWaitOutcome {
+    Approved,
+    Declined,
+    Cancelled,
+    ChannelClosed,
+}
+
+/// Wait for one exact approval generation. Decisions for earlier requests
+/// are consumed and ignored, so they cannot leak into a later authorization.
+fn wait_for_system_tool_approval(
+    approval_rx: &Receiver<ApprovalDecision>,
+    request_id: u64,
+    cancel: &AtomicBool,
+    wait_slice: Duration,
+) -> ApprovalWaitOutcome {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return ApprovalWaitOutcome::Cancelled;
+        }
+        match approval_rx.recv_timeout(wait_slice) {
+            Ok(decision) if decision.request_id != request_id => continue,
+            Ok(decision) => {
+                // Stop wins if it raced with a click that was already queued.
+                if cancel.load(Ordering::Acquire) {
+                    return ApprovalWaitOutcome::Cancelled;
+                }
+                return match decision.choice {
+                    ApprovalChoice::Approve => ApprovalWaitOutcome::Approved,
+                    ApprovalChoice::Deny => ApprovalWaitOutcome::Declined,
+                };
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return ApprovalWaitOutcome::ChannelClosed;
+            }
+        }
+    }
+}
+
+fn allocate_approval_request_id(allocator: &AtomicU64) -> Result<u64, String> {
+    allocator
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| "system tool approval request id space is exhausted".into())
+}
+
+fn publish_approval_card(
+    store: &slint::Weak<AgentStore<'static>>,
+    name: &str,
+    arguments: &serde_json::Value,
+    cache_registry: Option<&CacheRegistry>,
+    validated_import: Option<&crate::agent_project::ValidatedImportMedia>,
+) -> Result<(), String> {
+    let title = approval_title(name);
+    let detail = approval_detail(name, arguments, cache_registry, validated_import);
+    let (published_tx, published_rx) = bounded(1);
+    let store = store.clone();
+    slint::invoke_from_event_loop(move || {
+        let published = store.upgrade().is_some_and(|store| {
+            store.set_approval_title(title.into());
+            store.set_approval_detail(detail.into());
+            store.set_approval_pending(true);
+            true
+        });
+        let _ = published_tx.send(published);
+    })
+    .map_err(|error| format!("could not show system tool approval: {error}"))?;
+    match published_rx.recv_timeout(APPROVAL_CARD_PUBLISH_TIMEOUT) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("could not show system tool approval because the UI is closed".into()),
+        Err(RecvTimeoutError::Timeout) => {
+            Err("timed out while showing the system tool approval".into())
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("system tool approval UI closed before it could be shown".into())
+        }
+    }
+}
+
+fn approval_title(name: &str) -> String {
+    match name {
+        "project_open" => "Open this project draft?".into(),
+        "project_import_media" => "Import this media file?".into(),
+        "system_cache_list" => "Let the assistant inspect cache usage?".into(),
+        "system_cache_clear" => "Clear this cache?".into(),
+        "system_cache_relocate" => "Move this cache?".into(),
+        "system_reveal" => "Reveal this path?".into(),
+        "system_open_external" => "Open this outside Cutlass?".into(),
+        "app_close" => "Close Cutlass?".into(),
+        _ => format!("Run {name}?"),
+    }
+}
+
+fn approval_detail(
+    name: &str,
+    arguments: &serde_json::Value,
+    cache_registry: Option<&CacheRegistry>,
+    validated_import: Option<&crate::agent_project::ValidatedImportMedia>,
+) -> String {
+    if name == "project_open" {
+        let draft_id = arguments
+            .get("draft_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|draft_id| {
+                !draft_id.is_empty()
+                    && draft_id.chars().count() <= crate::agent_project::MAX_DRAFT_ID_CHARS
+                    && draft_id.bytes().all(|byte| {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b'-'
+                    })
+            })
+            .unwrap_or("<invalid draft ID>");
+        return bound_approval_detail(format!(
+            "Draft ID: {draft_id}\n\nOpening this draft replaces the current session and may discard unsaved work."
+        ));
+    }
+
+    if name == crate::agent_project::PROJECT_IMPORT_MEDIA {
+        // Normal authorization supplies an opaque validated token retained
+        // for dispatch. If a future caller bypasses that flow, validate the
+        // raw arguments here rather than copying hostile text into the card.
+        let revalidated = crate::agent_project::validated_import_media(arguments).ok();
+        let display_path = validated_import
+            .or(revalidated.as_ref())
+            .map(crate::agent_project::ValidatedImportMedia::canonical_path);
+        let path = display_path
+            .and_then(crate::agent_project::import_path_approval_display)
+            .unwrap_or_else(|| "<invalid media path>".into());
+        return bound_approval_detail(format!(
+            "Canonical file: {path}\n\nCutlass adds a reference to this file rather than copying the source. Moving or deleting it can make the media missing."
+        ));
+    }
+
+    if name == "system_cache_clear"
+        && let Some(id) = arguments
+            .get("cache_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| cutlass_storage::CacheId::parse(id).ok())
+        && let Some(registry) = cache_registry
+    {
+        return bound_approval_detail(registry.clear_approval_detail(id));
+    }
+
+    if name == "system_cache_relocate"
+        && let Some(id) = arguments
+            .get("cache_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| cutlass_storage::CacheId::parse(id).ok())
+        && let Some(destination) = arguments
+            .get("destination")
+            .and_then(serde_json::Value::as_str)
+        && let Some(registry) = cache_registry
+        && let Ok(current_path) = registry.cache_path(id)
+    {
+        return bound_approval_detail(format_cache_relocation_approval_detail(
+            id,
+            &current_path,
+            Path::new(destination),
+        ));
+    }
+
+    let detail = match arguments.as_object() {
+        Some(arguments) if arguments.is_empty() => "No arguments.".to_string(),
+        _ => serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string()),
+    };
+    bound_approval_detail(detail)
+}
+
+fn bound_approval_detail(detail: String) -> String {
+    let mut bounded: String = detail.chars().take(APPROVAL_DETAIL_MAX_CHARS).collect();
+    if detail.chars().count() > APPROVAL_DETAIL_MAX_CHARS {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn format_cache_relocation_approval_detail(
+    id: cutlass_storage::CacheId,
+    current_path: &Path,
+    destination: &Path,
+) -> String {
+    format!(
+        "Cache: {}\nCurrent path: {}\nRequested destination: {}\n\nThe move may be refused when projects reference cache-owned files.",
+        id.descriptor().label,
+        current_path.display(),
+        destination.display()
+    )
+}
+
+fn clear_approval_card(store: &slint::Weak<AgentStore<'static>>) {
+    with_store(store, |store| {
+        store.set_approval_pending(false);
+        store.set_approval_title(SharedString::default());
+        store.set_approval_detail(SharedString::default());
+    });
+}
+
+#[derive(Clone)]
+struct DesktopToolHandles {
+    store: slint::Weak<AgentStore<'static>>,
+    app: slint::Weak<AppWindow>,
+    cache_registry: Option<CacheRegistry>,
+    job_manager: JobManager,
+    worker: Option<WorkerHandle>,
+}
+
+impl DesktopToolHandles {
+    fn from_runtime(runtime: &AgentRuntimeHandles, worker: &WorkerHandle) -> Self {
+        Self {
+            store: runtime.store.clone(),
+            app: runtime.app.clone(),
+            cache_registry: Some(runtime.cache_registry.clone()),
+            job_manager: runtime.job_manager.clone(),
+            worker: Some(worker.clone()),
+        }
+    }
+}
+
+struct ApprovedProjectImport {
+    arguments: serde_json::Value,
+    validated: crate::agent_project::ValidatedImportMedia,
+}
+
+/// The desktop host-tool surface: app and job controls plus the approval
+/// broker that gates every System-tier call.
+pub struct DesktopToolHost {
+    autonomy: Autonomy,
+    runtime: DesktopToolHandles,
+    approval_rx: Receiver<ApprovalDecision>,
+    pending_approval_id: Arc<AtomicU64>,
+    approval_id_allocator: Arc<AtomicU64>,
+    ordinary_host_call_attempted: bool,
+    approved_project_import: Option<ApprovedProjectImport>,
+}
+
+impl DesktopToolHost {
+    fn new(
+        autonomy: Autonomy,
+        runtime: DesktopToolHandles,
+        approval_rx: Receiver<ApprovalDecision>,
+        pending_approval_id: Arc<AtomicU64>,
+        approval_id_allocator: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            autonomy,
+            runtime,
+            approval_rx,
+            pending_approval_id,
+            approval_id_allocator,
+            ordinary_host_call_attempted: false,
+            approved_project_import: None,
+        }
+    }
+
+    fn ordinary_host_call_attempted(&self) -> bool {
+        self.ordinary_host_call_attempted
+    }
+}
+
+impl ToolHost for DesktopToolHost {
+    fn tools(&self) -> Vec<HostToolSpec> {
+        let mut specs = crate::agent_app_control::specs();
+        specs.extend(crate::agent_project::specs());
+        specs.extend(crate::agent_jobs::specs());
+        specs.extend(crate::agent_system::specs());
+        specs
+    }
+
+    fn authorize(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        tier: ToolTier,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        // Authorization and dispatch are synchronous in the agent loop. Clear
+        // any stale binding before considering a new call.
+        self.approved_project_import = None;
+        if tier != ToolTier::System || self.autonomy == Autonomy::Full {
+            return Ok(());
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err("cancelled before the system tool could run".into());
+        }
+        let validated_import = match cutlass_ai::namespace(name) {
+            "project" => {
+                crate::agent_project::validate_request(name, arguments)?;
+                if name == crate::agent_project::PROJECT_IMPORT_MEDIA {
+                    Some(crate::agent_project::validated_import_media(arguments)?)
+                } else {
+                    None
+                }
+            }
+            "system" => {
+                crate::agent_system::validate_request(name, arguments)?;
+                None
+            }
+            _ => None,
+        };
+        if cancel.load(Ordering::Acquire) {
+            return Err("cancelled before the system tool could run".into());
+        }
+
+        let request_id = allocate_approval_request_id(&self.approval_id_allocator)?;
+        self.pending_approval_id
+            .compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "another system tool approval is already pending".to_string())?;
+        if let Err(error) = publish_approval_card(
+            &self.runtime.store,
+            name,
+            arguments,
+            self.runtime.cache_registry.as_ref(),
+            validated_import.as_ref(),
+        ) {
+            let _ = self.pending_approval_id.compare_exchange(
+                request_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            clear_approval_card(&self.runtime.store);
+            return Err(error);
+        }
+
+        let outcome = wait_for_system_tool_approval(
+            &self.approval_rx,
+            request_id,
+            cancel,
+            APPROVAL_WAIT_SLICE,
+        );
+        let _ = self.pending_approval_id.compare_exchange(
+            request_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        clear_approval_card(&self.runtime.store);
+
+        match outcome {
+            ApprovalWaitOutcome::Approved if cancel.load(Ordering::Acquire) => {
+                Err("cancelled before the system tool could run".into())
+            }
+            ApprovalWaitOutcome::Approved => {
+                if let Some(validated) = validated_import {
+                    self.approved_project_import = Some(ApprovedProjectImport {
+                        arguments: arguments.clone(),
+                        validated,
+                    });
+                }
+                Ok(())
+            }
+            ApprovalWaitOutcome::Declined => Err(format!(
+                "the user declined system tool '{name}'; the tool was not run"
+            )),
+            ApprovalWaitOutcome::Cancelled => {
+                Err("cancelled while waiting for system tool approval; the tool was not run".into())
+            }
+            ApprovalWaitOutcome::ChannelClosed => {
+                Err("system tool approval closed; the tool was not run".into())
+            }
+        }
+    }
+
+    fn call(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        cancel: &AtomicBool,
+    ) -> Result<ToolOutput, String> {
+        let namespace = cutlass_ai::namespace(name);
+        if matches!(namespace, "app" | "system")
+            || name == "job_cancel"
+            || crate::agent_project::mutates_live_project(name)
+        {
+            // Set this before dispatch: an error can still follow a partial
+            // host-side effect, so abort messaging must be conservative.
+            self.ordinary_host_call_attempted = true;
+        }
+        let approved_import = if name == crate::agent_project::PROJECT_IMPORT_MEDIA
+            && self.autonomy == Autonomy::Ask
+        {
+            let approval = self.approved_project_import.take().ok_or_else(|| {
+                "project_import_media approval could not be confirmed; not started".to_string()
+            })?;
+            if approval.arguments != *arguments {
+                error!("project media-import arguments changed after approval");
+                return Err(
+                    "project_import_media approval did not match this request; not started".into(),
+                );
+            }
+            Some(approval.validated)
+        } else {
+            self.approved_project_import = None;
+            None
+        };
+        match namespace {
+            "app" => {
+                crate::agent_app_control::call(self.runtime.app.clone(), name, arguments, cancel)
+            }
+            "project" => match approved_import.as_ref() {
+                Some(approved) => crate::agent_project::call_with_approved_import(
+                    self.runtime.worker.as_ref(),
+                    name,
+                    arguments,
+                    Some(approved),
+                    cancel,
+                ),
+                None => crate::agent_project::call(
+                    self.runtime.worker.as_ref(),
+                    name,
+                    arguments,
+                    cancel,
+                ),
+            },
+            "job" => crate::agent_jobs::call(&self.runtime.job_manager, name, arguments, cancel),
+            "system" => crate::agent_system::call(
+                self.runtime.cache_registry.as_ref(),
+                name,
+                arguments,
+                cancel,
+            ),
+            other => Err(format!("unsupported desktop tool namespace '{other}'")),
+        }
+    }
+}
+
+fn abort_status_message(reason: &str, ordinary_host_call_attempted: bool) -> String {
+    if !ordinary_host_call_attempted {
+        return if reason == "cancelled" {
+            "Stopped — nothing was applied.".to_string()
+        } else if reason.contains("402") {
+            // The managed proxy's out-of-credits answer.
+            "Out of Cutlass credits — buy a pack in Settings > Account. \
+             Nothing was applied."
+                .to_string()
+        } else {
+            format!("{reason} — nothing was applied.")
+        };
+    }
+
+    let effect_notice = "Timeline edits staged by this prompt were rolled back and were not \
+                         applied; any host actions that already completed remain in effect.";
+    if reason == "cancelled" {
+        format!("Stopped — {effect_notice}")
+    } else if reason.contains("402") {
+        format!("Out of Cutlass credits — buy a pack in Settings > Account. {effect_notice}")
+    } else {
+        format!("{reason} — {effect_notice}")
+    }
+}
+
 #[derive(Default)]
 struct Preview {
     plan: Vec<AgentPlanStep>,
+    /// Phase boundaries within `plan` (exclusive step indices) from
+    /// `commit_progress` — live replay commits one undo group per phase.
+    phase_breaks: Vec<usize>,
     descriptions: Vec<SharedString>,
     history_restore: Option<Vec<Message>>,
 }
@@ -250,6 +1036,7 @@ impl Preview {
 
     fn clear(&mut self) {
         self.plan.clear();
+        self.phase_breaks.clear();
         self.descriptions.clear();
         self.history_restore = None;
     }
@@ -257,13 +1044,19 @@ impl Preview {
 
 fn agent_main(
     worker: WorkerHandle,
-    store: slint::Weak<AgentStore<'static>>,
+    runtime: AgentRuntimeHandles,
     rx: Receiver<AgentRequest>,
     cancel: Arc<AtomicBool>,
+    approval_rx: Receiver<ApprovalDecision>,
+    pending_approval_id: Arc<AtomicU64>,
+    approval_id_allocator: Arc<AtomicU64>,
 ) {
+    let store = runtime.store.clone();
     let mut sandbox: Option<Engine> = None;
+    let mut senses = AgentSenses::new();
     let mut preview = Preview::default();
     let mut history: Vec<Message> = Vec::new();
+    let mut current_project: Option<PathBuf> = None;
 
     let config_path = cutlass_settings::default_config_path();
     let configured = cutlass_settings::load(&config_path)
@@ -321,8 +1114,9 @@ fn agent_main(
 
                 run_one_prompt(
                     &worker,
-                    &store,
+                    &runtime,
                     &mut sandbox,
+                    &mut senses,
                     &mut preview,
                     &mut history,
                     &sent,
@@ -330,18 +1124,24 @@ fn agent_main(
                     agent_dir,
                     dry_run,
                     &cancel,
+                    &approval_rx,
+                    &pending_approval_id,
+                    &approval_id_allocator,
                 );
 
                 with_store(&store, |s| s.set_running(false));
+                persist_session(current_project.as_deref(), &history, &store);
             }
             AgentRequest::ApplyPlan => {
                 let plan = std::mem::take(&mut preview.plan);
+                let phase_breaks = std::mem::take(&mut preview.phase_breaks);
                 preview.clear();
                 with_store(&store, |s| s.set_plan_pending(false));
                 if plan.is_empty() {
                     continue;
                 }
-                apply_plan_live(&worker, &store, plan);
+                apply_plan_live(&worker, &store, plan, &phase_breaks);
+                persist_session(current_project.as_deref(), &history, &store);
             }
             AgentRequest::DiscardPlan => {
                 if preview.is_pending() {
@@ -356,10 +1156,28 @@ fn agent_main(
                     );
                 }
                 with_store(&store, |s| s.set_plan_pending(false));
+                persist_session(current_project.as_deref(), &history, &store);
             }
-            AgentRequest::ResetHistory => {
-                history.clear();
+            AgentRequest::SwitchProject { path } => {
+                // A parked dry-run conversation names edits that never
+                // landed. Restore the history checkpoint before persisting
+                // the draft we are leaving.
+                if let Some(saved) = preview.history_restore.take() {
+                    history = saved;
+                }
                 preview.clear();
+                persist_session(current_project.as_deref(), &history, &store);
+
+                let (session, restore_error) = match path.as_deref() {
+                    Some(project) => match crate::agent_session::load(project) {
+                        Ok(session) => (session, None),
+                        Err(error) => (AgentSession::default(), Some(error)),
+                    },
+                    None => (AgentSession::default(), None),
+                };
+                history = session.history;
+                replace_transcript(&store, session.transcript, restore_error);
+                current_project = path;
             }
         }
     }
@@ -368,8 +1186,9 @@ fn agent_main(
 #[allow(clippy::too_many_arguments)]
 fn run_one_prompt(
     worker: &WorkerHandle,
-    store: &slint::Weak<AgentStore<'static>>,
+    runtime: &AgentRuntimeHandles,
     sandbox: &mut Option<Engine>,
+    senses: &mut AgentSenses,
     preview: &mut Preview,
     history: &mut Vec<Message>,
     prompt: &str,
@@ -377,7 +1196,11 @@ fn run_one_prompt(
     agent_dir: cutlass_ai::AgentDir,
     dry_run: bool,
     cancel: &AtomicBool,
+    approval_rx: &Receiver<ApprovalDecision>,
+    pending_approval_id: &Arc<AtomicU64>,
+    approval_id_allocator: &Arc<AtomicU64>,
 ) {
+    let store = &runtime.store;
     let config_path = cutlass_settings::default_config_path();
     let section = match cutlass_settings::load(&config_path) {
         Ok(settings) => settings.ai,
@@ -455,6 +1278,7 @@ fn run_one_prompt(
         };
         engine.reset_project(snapshot);
         preview.plan.clear();
+        preview.phase_breaks.clear();
         preview.descriptions.clear();
     }
 
@@ -484,21 +1308,39 @@ fn run_one_prompt(
         skills: merge_skills(agent_dir.skills),
     };
 
+    // A continued preview accumulates steps; the outcome's phase breaks
+    // index this prompt's actions only, so offset them into the plan.
+    let plan_base = preview.plan.len();
     let mut plan: Vec<AgentPlanStep> = preview.plan.clone();
     let mut bridge = SandboxBridge {
+        worker,
         engine,
         plan: &mut plan,
+        senses,
+        default_playhead_seconds: context.playhead_seconds,
     };
+    let mut tool_host = DesktopToolHost::new(
+        section.autonomy,
+        DesktopToolHandles::from_runtime(runtime, worker),
+        approval_rx.clone(),
+        pending_approval_id.clone(),
+        approval_id_allocator.clone(),
+    );
     let event_store = store.clone();
     let mut on_event = move |event: AgentEvent| match event {
         AgentEvent::TextDelta(delta) => append_assistant_text(&event_store, delta),
         AgentEvent::Action(action) => push_entry(&event_store, "action", action.description),
+        AgentEvent::HostAction { name, summary } => {
+            push_entry(&event_store, "action", format!("{name}: {summary}"))
+        }
+        AgentEvent::Image(image) => push_image_entry(&event_store, image),
     };
 
     info!(prompt, dry_run, "agent prompt started");
-    let outcome = run_prompt(
+    let outcome = run_prompt_with_host(
         &provider,
         &mut bridge,
+        &mut tool_host,
         &context,
         &extensions,
         history,
@@ -507,6 +1349,7 @@ fn run_one_prompt(
         cancel,
         &mut on_event,
     );
+    let ordinary_host_call_attempted = tool_host.ordinary_host_call_attempted();
 
     match outcome.status {
         PromptStatus::Aborted(reason) => {
@@ -514,16 +1357,7 @@ fn run_one_prompt(
             push_entry(
                 store,
                 "error",
-                if reason == "cancelled" {
-                    "Stopped — nothing was applied.".to_string()
-                } else if reason.contains("402") {
-                    // The managed proxy's out-of-credits answer.
-                    "Out of Cutlass credits — buy a pack in Settings > Account. \
-                     Nothing was applied."
-                        .to_string()
-                } else {
-                    format!("{reason} — nothing was applied.")
-                },
+                abort_status_message(&reason, ordinary_host_call_attempted),
             );
         }
         PromptStatus::Completed | PromptStatus::DryRun => {
@@ -532,6 +1366,9 @@ fn run_one_prompt(
             trim_history(history);
             if dry_run {
                 preview.plan = plan;
+                preview
+                    .phase_breaks
+                    .extend(outcome.phase_breaks.iter().map(|b| plan_base + b));
                 preview.descriptions.extend(
                     outcome
                         .actions
@@ -539,7 +1376,9 @@ fn run_one_prompt(
                         .map(|a| SharedString::from(a.description.clone())),
                 );
             } else if !plan.is_empty() {
-                apply_plan_live(worker, store, plan);
+                // Auto-apply never extends a parked preview (any pending one
+                // was discarded above), so the breaks are plan-relative.
+                apply_plan_live(worker, store, plan, &outcome.phase_breaks);
             }
         }
     }
@@ -554,31 +1393,52 @@ fn run_one_prompt(
     });
 }
 
+/// Split a rehearsed plan at its phase breaks (exclusive step indices,
+/// strictly increasing). The remainder past the last break is the final
+/// phase; a break flush with the plan's end leaves no empty group behind.
+fn split_plan_phases(mut plan: Vec<AgentPlanStep>, breaks: &[usize]) -> Vec<Vec<AgentPlanStep>> {
+    let mut phases = Vec::with_capacity(breaks.len() + 1);
+    for &at in breaks.iter().rev() {
+        if at < plan.len() {
+            phases.push(plan.split_off(at));
+        }
+    }
+    if !plan.is_empty() {
+        phases.push(plan);
+    }
+    phases.reverse();
+    phases
+}
+
 fn apply_plan_live(
     worker: &WorkerHandle,
     store: &slint::Weak<AgentStore<'static>>,
     plan: Vec<AgentPlanStep>,
+    phase_breaks: &[usize],
 ) {
     let count = plan.len();
-    match worker.agent_apply_plan(plan) {
+    let phases = split_plan_phases(plan, phase_breaks);
+    let phase_count = phases.len();
+    match worker.agent_apply_plan(phases) {
         Some(Ok(())) => {
             push_entry(
                 store,
                 "applied",
-                format!(
-                    "Applied {count} edit{} as one undo step.",
-                    if count == 1 { "" } else { "s" }
-                ),
+                if phase_count > 1 {
+                    format!("Applied {count} edits in {phase_count} undo steps.")
+                } else {
+                    format!(
+                        "Applied {count} edit{} as one undo step.",
+                        if count == 1 { "" } else { "s" }
+                    )
+                },
             );
             with_store(store, |s| s.set_undo_offered(true));
         }
         Some(Err(e)) => {
             error!(error = e, "agent plan replay failed");
-            push_entry(
-                store,
-                "error",
-                format!("Could not apply the plan: {e}. Nothing was changed."),
-            );
+            // The replay error already says how much (if anything) landed.
+            push_entry(store, "error", format!("Could not apply the plan: {e}."));
         }
         None => push_entry(
             store,
@@ -613,7 +1473,13 @@ fn history_chars(history: &[Message]) -> usize {
 
 fn message_chars(m: &Message) -> usize {
     match m {
-        Message::System { content } | Message::User { content } => content.len(),
+        Message::System { content } => content.len(),
+        // History is text-only (turns strip images to labeled placeholders
+        // before they land here), but count any payload that does appear so
+        // the budget can never be blown by raw image bytes.
+        Message::User { content, images } => {
+            content.len() + images.iter().map(|i| i.data.len()).sum::<usize>()
+        }
         Message::Assistant {
             content,
             tool_calls,
@@ -624,7 +1490,9 @@ fn message_chars(m: &Message) -> usize {
                     .map(|c| c.name.len() + c.arguments.to_string().len())
                     .sum::<usize>()
         }
-        Message::ToolResult { content, .. } => content.len(),
+        Message::ToolResult {
+            content, images, ..
+        } => content.len() + images.iter().map(|i| i.data.len()).sum::<usize>(),
     }
 }
 
@@ -633,7 +1501,670 @@ mod tests {
     use super::*;
     use crate::preview_worker::agent_replay;
     use cutlass_ai::wire;
-    use cutlass_models::{MediaSource, Project, Rational};
+    use cutlass_models::{
+        Generator, MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind,
+    };
+    use std::cell::{Cell, RefCell};
+    use std::collections::VecDeque;
+
+    const TEST_APPROVAL_WAIT: Duration = Duration::from_millis(10);
+
+    fn decision(request_id: u64, choice: ApprovalChoice) -> ApprovalDecision {
+        ApprovalDecision { request_id, choice }
+    }
+
+    fn test_tool_handles(job_manager: JobManager) -> DesktopToolHandles {
+        DesktopToolHandles {
+            store: slint::Weak::default(),
+            app: slint::Weak::default(),
+            cache_registry: None,
+            job_manager,
+            worker: None,
+        }
+    }
+
+    #[test]
+    fn ask_approval_accepts_the_matching_run_decision() {
+        let (tx, rx) = unbounded();
+        tx.send(decision(7, ApprovalChoice::Approve)).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 7, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::Approved
+        );
+    }
+
+    #[test]
+    fn ask_approval_returns_the_matching_decline_decision() {
+        let (tx, rx) = unbounded();
+        tx.send(decision(11, ApprovalChoice::Deny)).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 11, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::Declined
+        );
+    }
+
+    #[test]
+    fn ask_approval_cancellation_wins_over_a_queued_run_decision() {
+        let (tx, rx) = unbounded();
+        tx.send(decision(19, ApprovalChoice::Approve)).unwrap();
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 19, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn stale_run_decision_cannot_approve_a_later_request() {
+        let (tx, rx) = unbounded();
+        // Request 23 has already finished. Its delayed Run click must be
+        // consumed but ignored while request 24 waits for its own answer.
+        tx.send(decision(23, ApprovalChoice::Approve)).unwrap();
+        tx.send(decision(24, ApprovalChoice::Deny)).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 24, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::Declined
+        );
+    }
+
+    #[test]
+    fn approval_wait_reports_channel_closure() {
+        let (tx, rx) = unbounded();
+        drop(tx);
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 1, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::ChannelClosed
+        );
+    }
+
+    #[test]
+    fn approval_request_ids_are_monotonic_and_never_zero() {
+        let allocator = AtomicU64::new(0);
+
+        assert_eq!(allocate_approval_request_id(&allocator).unwrap(), 1);
+        assert_eq!(allocate_approval_request_id(&allocator).unwrap(), 2);
+
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert!(allocate_approval_request_id(&exhausted).is_err());
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn approval_detail_is_bounded_and_handles_empty_arguments() {
+        assert_eq!(approval_title("project_open"), "Open this project draft?");
+        assert_eq!(
+            approval_title("project_import_media"),
+            "Import this media file?"
+        );
+        assert_eq!(approval_title("system_cache_clear"), "Clear this cache?");
+        assert_eq!(approval_title("system_cache_relocate"), "Move this cache?");
+        assert_eq!(approval_title("future_tool"), "Run future_tool?");
+        assert_eq!(
+            approval_detail("system_cache_list", &serde_json::json!({}), None, None),
+            "No arguments."
+        );
+
+        let detail = approval_detail(
+            "python_run",
+            &serde_json::json!({
+                "script": "x".repeat(APPROVAL_DETAIL_MAX_CHARS + 100)
+            }),
+            None,
+            None,
+        );
+        assert_eq!(detail.chars().count(), APPROVAL_DETAIL_MAX_CHARS + 1);
+        assert!(detail.ends_with('…'));
+        assert!(detail.starts_with("{\n  \"script\": \""));
+
+        let project_detail = approval_detail(
+            "project_open",
+            &serde_json::json!({"draft_id": "abcdef-12"}),
+            None,
+            None,
+        );
+        assert_eq!(
+            project_detail,
+            "Draft ID: abcdef-12\n\nOpening this draft replaces the current session and may discard unsaved work."
+        );
+        assert!(!project_detail.contains("project.cutlass"));
+        assert!(
+            project_detail.chars().count() <= APPROVAL_DETAIL_MAX_CHARS,
+            "{project_detail}"
+        );
+
+        let unsafe_project_detail = approval_detail(
+            "project_open",
+            &serde_json::json!({
+                "draft_id": "/private/agent-secret/project.cutlass"
+            }),
+            None,
+            None,
+        );
+        assert!(unsafe_project_detail.contains("<invalid draft ID>"));
+        assert!(!unsafe_project_detail.contains("/private"));
+        assert!(!unsafe_project_detail.contains("agent-secret"));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let media = temp.path().join("approval clip.mp4");
+        std::fs::write(&media, b"media").expect("write media");
+        let import_arguments = serde_json::json!({"path": media});
+        let validated = crate::agent_project::validated_import_media(&import_arguments)
+            .expect("validated approval media");
+        let canonical = validated.canonical_path().to_path_buf();
+        let import_detail = approval_detail(
+            "project_import_media",
+            &import_arguments,
+            None,
+            Some(&validated),
+        );
+        assert_eq!(
+            import_detail,
+            format!(
+                "Canonical file: {}\n\nCutlass adds a reference to this file rather than copying the source. Moving or deleting it can make the media missing.",
+                canonical.display()
+            )
+        );
+        assert!(import_detail.contains("rather than copying the source"));
+        assert!(import_detail.contains("Moving or deleting it"));
+        assert!(import_detail.chars().count() <= APPROVAL_DETAIL_MAX_CHARS);
+
+        let hostile_import_detail = approval_detail(
+            "project_import_media",
+            &serde_json::json!({"path": "../../agent-secret\nclip.mp4"}),
+            None,
+            None,
+        );
+        assert!(hostile_import_detail.contains("<invalid media path>"));
+        assert!(!hostile_import_detail.contains("agent-secret"));
+        assert!(!hostile_import_detail.contains("clip.mp4"));
+
+        let relocation_detail = format_cache_relocation_approval_detail(
+            cutlass_storage::CacheId::Download,
+            Path::new("/current/download-cache"),
+            Path::new("/requested/download-cache"),
+        );
+        assert!(relocation_detail.contains("Cache: Downloads"));
+        assert!(relocation_detail.contains("Current path: /current/download-cache"));
+        assert!(relocation_detail.contains("Requested destination: /requested/download-cache"));
+        assert!(relocation_detail.contains("projects reference cache-owned files"));
+    }
+
+    #[test]
+    fn full_autonomy_bypasses_the_approval_channel() {
+        let (tx, rx) = unbounded();
+        drop(tx);
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Full,
+            test_tool_handles(JobManager::new()),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            host.authorize(
+                "system_cache_clear",
+                &serde_json::json!({ "cache_id": "download" }),
+                ToolTier::System,
+                &cancel,
+            ),
+            Ok(())
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            host.authorize(
+                "system_cache_relocate",
+                &serde_json::json!({
+                    "cache_id": "download",
+                    "destination": temp.path().join("new-download-cache")
+                }),
+                ToolTier::System,
+                &cancel,
+            ),
+            Ok(())
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+
+        let private_path = "/private/agent-secret/project.cutlass";
+        assert_eq!(
+            host.authorize(
+                "project_open",
+                &serde_json::json!({ "draft_id": private_path }),
+                ToolTier::System,
+                &cancel,
+            ),
+            Ok(())
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+        let dispatch_error = host
+            .call(
+                "project_open",
+                &serde_json::json!({ "draft_id": private_path }),
+                &cancel,
+            )
+            .expect_err("dispatch must still validate under full autonomy");
+        assert!(dispatch_error.contains("canonical app-owned draft ID"));
+        assert!(!dispatch_error.contains("/private"));
+        assert!(!dispatch_error.contains("agent-secret"));
+
+        assert_eq!(
+            host.authorize(
+                "project_import_media",
+                &serde_json::json!({ "path": "relative/clip.mp4" }),
+                ToolTier::System,
+                &cancel,
+            ),
+            Ok(())
+        );
+        let import_dispatch_error = host
+            .call(
+                "project_import_media",
+                &serde_json::json!({ "path": "relative/clip.mp4" }),
+                &cancel,
+            )
+            .expect_err("full-autonomy dispatch must still validate import paths");
+        assert_eq!(
+            import_dispatch_error,
+            "project_import_media argument 'path' must be absolute"
+        );
+
+        assert_eq!(
+            host.authorize(
+                "media_preview_frame",
+                &serde_json::json!({}),
+                ToolTier::ReadOnly,
+                &cancel,
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn malformed_relocation_is_rejected_before_approval_side_effects() {
+        let (_tx, rx) = unbounded();
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Ask,
+            test_tool_handles(JobManager::new()),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        let error = host
+            .authorize(
+                "system_cache_relocate",
+                &serde_json::json!({
+                    "cache_id": "download",
+                    "destination": "relative/cache"
+                }),
+                ToolTier::System,
+                &cancel,
+            )
+            .expect_err("relative relocation must fail before approval");
+        assert!(error.contains("must be absolute"));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn project_open_preflight_rejects_invalid_ids_before_approval_side_effects() {
+        let (_tx, rx) = unbounded();
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Ask,
+            test_tool_handles(JobManager::new()),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        let private_path = "/private/agent-secret/project.cutlass";
+        let malformed = host
+            .authorize(
+                "project_open",
+                &serde_json::json!({ "draft_id": private_path }),
+                ToolTier::System,
+                &cancel,
+            )
+            .expect_err("filesystem path must fail before approval");
+        assert!(malformed.contains("canonical app-owned draft ID"));
+        assert!(!malformed.contains("/private"));
+        assert!(!malformed.contains("agent-secret"));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time after epoch")
+            .as_nanos();
+        let missing_id = format!("{nanos:x}-ffffffffffffffff");
+        let missing = host
+            .authorize(
+                "project_open",
+                &serde_json::json!({ "draft_id": missing_id }),
+                ToolTier::System,
+                &cancel,
+            )
+            .expect_err("missing draft must fail before approval");
+        assert!(missing.starts_with("project_open failed:"), "{missing}");
+        assert!(
+            !missing.contains(crate::drafts::root_dir().to_string_lossy().as_ref()),
+            "{missing}"
+        );
+        assert!(!missing.contains("project.cutlass"), "{missing}");
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn project_import_preflight_rejects_paths_before_approval_side_effects() {
+        let (_tx, rx) = unbounded();
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Ask,
+            test_tool_handles(JobManager::new()),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("agent-secret-missing.mp4");
+
+        for arguments in [
+            serde_json::json!({"path": "relative/clip.mp4"}),
+            serde_json::json!({"path": missing}),
+            serde_json::json!({"path": format!("{}\0clip.mp4", temp.path().display())}),
+            serde_json::json!({"path": temp.path().join(".").join("clip.mp4")}),
+        ] {
+            let error = host
+                .authorize(
+                    "project_import_media",
+                    &arguments,
+                    ToolTier::System,
+                    &cancel,
+                )
+                .expect_err("unsafe import path must fail before approval");
+            assert!(!error.contains("agent-secret"), "{error}");
+            assert!(
+                !error.contains(temp.path().to_string_lossy().as_ref()),
+                "{error}"
+            );
+            assert_eq!(pending.load(Ordering::Acquire), 0);
+            assert_eq!(allocator.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
+    fn desktop_host_registers_app_project_job_and_system_tools_by_tier() {
+        let (_tx, rx) = unbounded();
+        let host = DesktopToolHost::new(
+            Autonomy::Ask,
+            test_tool_handles(JobManager::new()),
+            rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let specs = host.tools();
+        assert_eq!(specs.len(), 24);
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.name == "app_state")
+                .map(|spec| spec.tier),
+            Some(ToolTier::ReadOnly)
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.name == "app_close")
+                .map(|spec| spec.tier),
+            Some(ToolTier::System)
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.name.starts_with("project_"))
+                .map(|spec| (spec.name.as_str(), spec.tier))
+                .collect::<Vec<_>>(),
+            vec![
+                ("project_list_drafts", ToolTier::ReadOnly),
+                ("project_save", ToolTier::Workspace),
+                ("project_open", ToolTier::System),
+                ("project_import_media", ToolTier::System),
+            ]
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.name.starts_with("job_"))
+                .map(|spec| (spec.name.as_str(), spec.tier))
+                .collect::<Vec<_>>(),
+            vec![
+                ("job_list", ToolTier::ReadOnly),
+                ("job_status", ToolTier::ReadOnly),
+                ("job_cancel", ToolTier::Workspace),
+            ]
+        );
+        assert!(
+            specs
+                .iter()
+                .filter(|spec| spec.name.starts_with("system_"))
+                .all(|spec| spec.tier == ToolTier::System)
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.tier == ToolTier::System)
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "app_close",
+                "project_open",
+                "project_import_media",
+                "system_reveal",
+                "system_open_external",
+                "system_cache_list",
+                "system_cache_clear",
+                "system_cache_relocate",
+            ]
+        );
+    }
+
+    #[test]
+    fn non_system_project_tools_never_enter_the_system_approval_flow() {
+        let (tx, rx) = unbounded();
+        drop(tx);
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Ask,
+            test_tool_handles(JobManager::new()),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        for (name, tier) in [
+            ("project_list_drafts", ToolTier::ReadOnly),
+            ("project_save", ToolTier::Workspace),
+        ] {
+            host.authorize(name, &serde_json::json!({}), tier, &cancel)
+                .expect("project tools do not require approval");
+        }
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn desktop_host_dispatches_jobs_and_tracks_cancel_but_not_reads() {
+        let (_tx, rx) = unbounded();
+        let jobs = JobManager::new();
+        let mut host = DesktopToolHost::new(
+            Autonomy::Full,
+            test_tool_handles(jobs),
+            rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let cancel = AtomicBool::new(false);
+
+        assert!(!host.ordinary_host_call_attempted());
+        let list = host
+            .call("job_list", &serde_json::json!({}), &cancel)
+            .expect("job namespace must dispatch");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&list.text).unwrap()["status"],
+            "ok"
+        );
+        assert!(!host.ordinary_host_call_attempted());
+
+        let status_error = host
+            .call("job_status", &serde_json::json!({ "job_id": 1 }), &cancel)
+            .expect_err("unknown job status");
+        assert!(status_error.contains("unknown or has been pruned"));
+        assert!(!host.ordinary_host_call_attempted());
+
+        let cancel_error = host
+            .call("job_cancel", &serde_json::json!({ "job_id": 1 }), &cancel)
+            .expect_err("unknown job cancellation");
+        assert!(cancel_error.contains("unknown or has been pruned"));
+        assert!(host.ordinary_host_call_attempted());
+    }
+
+    #[test]
+    fn desktop_host_dispatches_project_tools_and_tracks_mutations_as_effects() {
+        let (_tx, rx) = unbounded();
+        let mut host = DesktopToolHost::new(
+            Autonomy::Full,
+            test_tool_handles(JobManager::new()),
+            rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let cancel = AtomicBool::new(false);
+
+        assert!(!host.ordinary_host_call_attempted());
+        let list_error = host
+            .call(
+                "project_list_drafts",
+                &serde_json::json!({"limit": 0}),
+                &cancel,
+            )
+            .expect_err("malformed draft listing must dispatch to its strict parser");
+        assert!(list_error.contains("integer from 1 through 100"));
+        assert!(
+            !host.ordinary_host_call_attempted(),
+            "a read-only project query is not an ordinary host effect"
+        );
+
+        let private_path = "/private/agent-secret/project.cutlass";
+        let open_error = host
+            .call(
+                "project_open",
+                &serde_json::json!({ "draft_id": private_path }),
+                &cancel,
+            )
+            .expect_err("malformed project open must dispatch to strict validation");
+        assert!(open_error.contains("canonical app-owned draft ID"));
+        assert!(!open_error.contains("/private"));
+        assert!(host.ordinary_host_call_attempted());
+
+        let error = host
+            .call("project_save", &serde_json::json!({}), &cancel)
+            .expect_err("test fixture has no worker");
+        assert!(error.contains("editor worker is unavailable"));
+        assert!(host.ordinary_host_call_attempted());
+    }
+
+    #[test]
+    fn abort_status_distinguishes_sandbox_only_from_host_effects() {
+        assert_eq!(
+            abort_status_message("cancelled", false),
+            "Stopped — nothing was applied."
+        );
+        assert_eq!(
+            abort_status_message("provider failed", false),
+            "provider failed — nothing was applied."
+        );
+
+        let cancelled_after_host = abort_status_message("cancelled", true);
+        assert!(cancelled_after_host.starts_with("Stopped —"));
+        assert!(
+            cancelled_after_host.contains("Timeline edits staged by this prompt were rolled back"),
+            "{cancelled_after_host}"
+        );
+        assert!(
+            cancelled_after_host.contains("host actions that already completed remain in effect"),
+            "{cancelled_after_host}"
+        );
+        assert!(
+            !cancelled_after_host.contains("nothing was applied"),
+            "{cancelled_after_host}"
+        );
+
+        let credits_after_host = abort_status_message("HTTP 402", true);
+        assert!(credits_after_host.contains("Out of Cutlass credits"));
+        assert!(
+            credits_after_host.contains("Timeline edits staged by this prompt were rolled back")
+        );
+        assert!(credits_after_host.contains("remain in effect"));
+    }
+
+    #[test]
+    fn transcript_images_decode_through_the_bounded_rgba_boundary() {
+        let expected = cutlass_render::RgbaImage::new(2, 1, vec![1, 2, 3, 255, 4, 5, 6, 128]);
+        let image = cutlass_ai::ImagePart::png(
+            cutlass_render::encode_png(&expected).expect("encode fixture"),
+            "fixture",
+        );
+        assert_eq!(decode_transcript_image(&image).expect("decode"), expected);
+
+        let unsupported = cutlass_ai::ImagePart {
+            media_type: "image/gif".into(),
+            data: Arc::new(vec![1, 2, 3]),
+            label: "animated".into(),
+        };
+        assert!(
+            decode_transcript_image(&unsupported)
+                .expect_err("unsupported type")
+                .contains("unsupported")
+        );
+    }
+
+    #[test]
+    fn transcript_image_labels_are_safe_and_bounded() {
+        assert_eq!(transcript_image_label(""), "Agent image");
+        assert_eq!(transcript_image_label("bad\nlabel"), "bad\u{fffd}label");
+        let long = "x".repeat(200);
+        let label = transcript_image_label(&long);
+        assert_eq!(label.chars().count(), 161);
+        assert!(label.ends_with('…'));
+    }
 
     fn fixture_project() -> (Project, u64) {
         let mut project = Project::new("agent-ui-fixture", Rational::FPS_24);
@@ -654,6 +2185,281 @@ mod tests {
         Engine::with_project(EngineConfig::default(), project).expect("engine")
     }
 
+    struct UnexpectedProjectSnapshot;
+
+    impl ProjectSnapshotSource for UnexpectedProjectSnapshot {
+        fn snapshot_project(&self) -> Option<Project> {
+            panic!("this test must not request a live project snapshot")
+        }
+    }
+
+    static UNEXPECTED_PROJECT_SNAPSHOT: UnexpectedProjectSnapshot = UnexpectedProjectSnapshot;
+
+    struct ScriptedProjectSnapshots {
+        snapshots: RefCell<VecDeque<Option<Project>>>,
+        calls: Cell<usize>,
+    }
+
+    impl ScriptedProjectSnapshots {
+        fn new(snapshots: impl IntoIterator<Item = Option<Project>>) -> Self {
+            Self {
+                snapshots: RefCell::new(snapshots.into_iter().collect()),
+                calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl ProjectSnapshotSource for ScriptedProjectSnapshots {
+        fn snapshot_project(&self) -> Option<Project> {
+            self.calls.set(self.calls.get() + 1);
+            self.snapshots
+                .borrow_mut()
+                .pop_front()
+                .expect("scripted project snapshot")
+        }
+    }
+
+    #[test]
+    fn sandbox_bridge_exposes_read_only_senses_of_its_project() {
+        let (project, _) = fixture_project();
+        let mut sandbox = temp_engine(project);
+        let mut plan = Vec::new();
+        let mut senses = AgentSenses::new();
+        let cancel = AtomicBool::new(false);
+        let output = {
+            let mut bridge = SandboxBridge {
+                worker: &UNEXPECTED_PROJECT_SNAPSHOT,
+                engine: &mut sandbox,
+                plan: &mut plan,
+                senses: &mut senses,
+                default_playhead_seconds: 1.25,
+            };
+            assert_eq!(bridge.sense_tools().len(), 4);
+            bridge
+                .sense(
+                    "media_timeline_map",
+                    &serde_json::json!({"playhead_seconds": 1.25}),
+                    &cancel,
+                )
+                .expect("timeline sense")
+        };
+
+        assert!(plan.is_empty(), "a sense never adds an edit step");
+        assert_eq!(output.images.len(), 1);
+        assert_eq!(output.images[0].media_type, "image/png");
+        assert!(output.text.contains("playhead 1.25s"));
+    }
+
+    #[test]
+    fn project_host_pre_hook_rejects_an_existing_staged_plan() {
+        let (project, _) = fixture_project();
+        let mut sandbox = temp_engine(project);
+        let mut plan = vec![AgentPlanStep {
+            command: WireCommand::AddMarker(wire::AddMarker {
+                at: 1.0,
+                name: Some("pending".into()),
+                color: None,
+            }),
+            created: None,
+        }];
+        let mut senses = AgentSenses::new();
+        let mut bridge = SandboxBridge {
+            worker: &UNEXPECTED_PROJECT_SNAPSHOT,
+            engine: &mut sandbox,
+            plan: &mut plan,
+            senses: &mut senses,
+            default_playhead_seconds: 0.0,
+        };
+
+        let error = bridge
+            .before_host_call("project_save", &serde_json::json!({}))
+            .expect_err("project mutation must not invalidate a staged plan");
+        assert!(error.contains("before staged edits"), "{error}");
+        assert!(
+            error.contains("applies or discards the pending plan"),
+            "{error}"
+        );
+        assert_eq!(
+            bridge.before_host_call("project_list_drafts", &serde_json::json!({ "limit": 10 })),
+            Ok(()),
+            "read-only project tools remain available with staged edits"
+        );
+        assert_eq!(
+            bridge.before_host_call("app_state", &serde_json::json!({})),
+            Ok(()),
+            "non-project host tools are unchanged"
+        );
+    }
+
+    #[test]
+    fn project_post_hook_refreshes_after_host_success_and_failure_and_reopens_group() {
+        fn live_snapshot(name: &str) -> Project {
+            let mut project = Project::new(name, Rational::FPS_24);
+            project.add_track(TrackKind::Video, "Live Main");
+            project
+        }
+
+        let success_snapshot = live_snapshot("after-success");
+        let failure_snapshot = live_snapshot("after-failure");
+        let snapshots = ScriptedProjectSnapshots::new([
+            Some(success_snapshot.clone()),
+            Some(failure_snapshot.clone()),
+        ]);
+
+        let mut success_sandbox = temp_engine(live_snapshot("stale-success"));
+        let mut success_plan = Vec::new();
+        let mut success_senses = AgentSenses::new();
+        {
+            let mut bridge = SandboxBridge {
+                worker: &snapshots,
+                engine: &mut success_sandbox,
+                plan: &mut success_plan,
+                senses: &mut success_senses,
+                default_playhead_seconds: 0.0,
+            };
+            bridge.begin_group();
+            let output = ToolOutput::text(r#"{"media_id":42}"#);
+            bridge
+                .after_host_call("project_save", &serde_json::json!({}), Ok(&output))
+                .expect("successful project call reconciliation");
+            assert_eq!(bridge.engine.project().name, "after-success");
+            assert!(bridge.plan.is_empty());
+
+            bridge
+                .apply(&WireCommand::AddMarker(wire::AddMarker {
+                    at: 1.0,
+                    name: Some("later edit".into()),
+                    color: None,
+                }))
+                .expect("edit after reconciliation");
+            assert_eq!(bridge.engine.project().timeline().marker_count(), 1);
+            bridge.rollback_group();
+        }
+        assert_eq!(success_sandbox.project().name, "after-success");
+        assert_eq!(
+            success_sandbox.project().timeline().marker_count(),
+            success_snapshot.timeline().marker_count(),
+            "abort rollback restores the reconciled live snapshot"
+        );
+        assert!(
+            !success_sandbox.undo(),
+            "the reopened group did not leak an undo entry"
+        );
+
+        let mut failure_sandbox = temp_engine(live_snapshot("stale-failure"));
+        let mut failure_plan = Vec::new();
+        let mut failure_senses = AgentSenses::new();
+        {
+            let mut bridge = SandboxBridge {
+                worker: &snapshots,
+                engine: &mut failure_sandbox,
+                plan: &mut failure_plan,
+                senses: &mut failure_senses,
+                default_playhead_seconds: 0.0,
+            };
+            bridge.begin_group();
+            bridge
+                .after_host_call(
+                    "project_save",
+                    &serde_json::json!({}),
+                    Err("import failed after dispatch"),
+                )
+                .expect("failed host result still reconciles");
+            assert_eq!(bridge.engine.project().name, "after-failure");
+            assert!(bridge.plan.is_empty());
+            bridge.rollback_group();
+        }
+        assert_eq!(failure_sandbox.project().name, "after-failure");
+        assert_eq!(
+            snapshots.calls.get(),
+            2,
+            "one ordered snapshot per dispatch"
+        );
+        assert!(
+            snapshots.snapshots.borrow().is_empty(),
+            "snapshots were consumed in queue order"
+        );
+    }
+
+    #[test]
+    fn project_post_hook_fails_hard_when_the_worker_cannot_reply() {
+        let snapshots = ScriptedProjectSnapshots::new([None]);
+        let (project, _) = fixture_project();
+        let mut sandbox = temp_engine(project);
+        let mut plan = Vec::new();
+        let mut senses = AgentSenses::new();
+        let mut bridge = SandboxBridge {
+            worker: &snapshots,
+            engine: &mut sandbox,
+            plan: &mut plan,
+            senses: &mut senses,
+            default_playhead_seconds: 0.0,
+        };
+        bridge.begin_group();
+
+        let error = bridge
+            .after_host_call(
+                "project_save",
+                &serde_json::json!({}),
+                Err("host result is immaterial"),
+            )
+            .expect_err("a missing live snapshot must abort reconciliation");
+        assert!(error.contains("could not reconcile"), "{error}");
+        assert!(error.contains("did not reply"), "{error}");
+        bridge.rollback_group();
+    }
+
+    #[test]
+    fn read_only_project_and_non_project_hooks_do_not_snapshot_or_reset_the_sandbox() {
+        let snapshots =
+            ScriptedProjectSnapshots::new([Some(Project::new("unused", Rational::FPS_24))]);
+        let (project, _) = fixture_project();
+        let mut sandbox = temp_engine(project);
+        let revision = sandbox.revision();
+        let mut plan = vec![AgentPlanStep {
+            command: WireCommand::AddMarker(wire::AddMarker {
+                at: 1.0,
+                name: None,
+                color: None,
+            }),
+            created: None,
+        }];
+        let mut senses = AgentSenses::new();
+        let mut bridge = SandboxBridge {
+            worker: &snapshots,
+            engine: &mut sandbox,
+            plan: &mut plan,
+            senses: &mut senses,
+            default_playhead_seconds: 0.0,
+        };
+        let output = ToolOutput::text("ok");
+
+        assert_eq!(
+            bridge.before_host_call("project_list_drafts", &serde_json::json!({ "limit": 5 })),
+            Ok(())
+        );
+        assert_eq!(
+            bridge.after_host_call(
+                "project_list_drafts",
+                &serde_json::json!({ "limit": 5 }),
+                Ok(&output)
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            bridge.before_host_call("app_state", &serde_json::json!({})),
+            Ok(())
+        );
+        assert_eq!(
+            bridge.after_host_call("app_state", &serde_json::json!({}), Ok(&output)),
+            Ok(())
+        );
+        assert_eq!(snapshots.calls.get(), 0);
+        assert_eq!(bridge.engine.revision(), revision);
+        assert_eq!(bridge.engine.project().name, "agent-ui-fixture");
+        assert_eq!(bridge.plan.len(), 1);
+    }
+
     #[test]
     fn rehearsed_plan_replays_with_id_remapping_and_single_undo() {
         let (project, media) = fixture_project();
@@ -661,9 +2467,13 @@ mod tests {
         let mut live = temp_engine(project);
 
         let mut plan: Vec<AgentPlanStep> = Vec::new();
+        let mut senses = AgentSenses::new();
         let mut bridge = SandboxBridge {
+            worker: &UNEXPECTED_PROJECT_SNAPSHOT,
             engine: &mut sandbox,
             plan: &mut plan,
+            senses: &mut senses,
+            default_playhead_seconds: 0.0,
         };
         bridge.begin_group();
         let track = match bridge
@@ -710,7 +2520,7 @@ mod tests {
         bridge.end_group();
         assert_eq!(plan.len(), 4);
 
-        agent_replay(&mut live, plan, |_| {}).expect("replay");
+        agent_replay(&mut live, vec![plan], |_| {}).expect("replay");
 
         let timeline = live.project().timeline();
         assert_eq!(timeline.track_count(), 1);
@@ -734,8 +2544,306 @@ mod tests {
             }),
             created: None,
         }];
-        let err = agent_replay(&mut live, plan, |_| {}).expect_err("stale plan must fail");
+        let err = agent_replay(&mut live, vec![plan], |_| {}).expect_err("stale plan must fail");
         assert!(err.contains("step 1/1"), "names the failing step: {err}");
+        assert!(err.contains("nothing was applied"), "{err}");
         assert!(!live.undo(), "rollback leaves no history entry");
+    }
+
+    #[test]
+    fn removing_last_sticker_clip_also_removes_its_lane() {
+        let mut project = Project::new("agent-sticker-removal", Rational::FPS_24);
+        let main = project.add_track(TrackKind::Video, "V1");
+        let stickers = project.add_track(TrackKind::Sticker, "Stickers");
+        let sticker = project
+            .add_generated(
+                stickers,
+                Generator::sticker(""),
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+            )
+            .expect("sticker");
+        let mut live = temp_engine(project);
+
+        let plan = vec![AgentPlanStep {
+            command: WireCommand::RemoveClip(wire::RemoveClip {
+                clip: sticker.raw(),
+            }),
+            created: None,
+        }];
+        agent_replay(&mut live, vec![plan], |_| {}).expect("replay");
+
+        let timeline = live.project().timeline();
+        assert!(timeline.track(main).is_some(), "main lane remains");
+        assert!(
+            timeline.track(stickers).is_none(),
+            "empty sticker lane is removed"
+        );
+        assert!(timeline.clip(sticker).is_none());
+
+        assert!(live.undo(), "clip removal and lane cleanup share one undo");
+        let timeline = live.project().timeline();
+        assert!(timeline.track(stickers).is_some());
+        assert!(timeline.clip(sticker).is_some());
+    }
+
+    #[test]
+    fn split_plan_phases_keeps_breaks_and_drops_an_empty_tail() {
+        let step = || AgentPlanStep {
+            command: WireCommand::SplitClip(wire::SplitClip { clip: 1, at: 1.0 }),
+            created: None,
+        };
+        let plan: Vec<AgentPlanStep> = (0..4).map(|_| step()).collect();
+        let phases = split_plan_phases(plan, &[2]);
+        assert_eq!(phases.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2]);
+
+        // A commit flush with the plan's end must not leave an empty phase.
+        let plan: Vec<AgentPlanStep> = (0..3).map(|_| step()).collect();
+        let phases = split_plan_phases(plan, &[3]);
+        assert_eq!(phases.iter().map(Vec::len).collect::<Vec<_>>(), vec![3]);
+
+        let plan: Vec<AgentPlanStep> = (0..3).map(|_| step()).collect();
+        let phases = split_plan_phases(plan, &[]);
+        assert_eq!(phases.iter().map(Vec::len).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn phased_plan_replays_as_separate_undo_steps_with_remapping() {
+        let mut project = Project::new("agent-phase-fixture", Rational::FPS_24);
+        let media = project.add_media(MediaSource::new(
+            "/tmp/agent-phase-fixture.mp4",
+            1920,
+            1080,
+            Rational::FPS_24,
+            60 * 24,
+            false,
+        ));
+        // The sandbox rehearses against a snapshot taken before the live
+        // project grew an extra lane and clip: live allocations diverge
+        // from sandbox ids, so the remap must do real work — including
+        // across the phase boundary.
+        let sandbox_project = project.clone();
+        let existing = project.add_track(TrackKind::Video, "Existing");
+        let seed_clip = project
+            .add_clip(
+                existing,
+                media,
+                TimeRange::at_rate(0, 24, Rational::FPS_24),
+                RationalTime::new(0, Rational::FPS_24),
+            )
+            .expect("seed clip");
+        let mut sandbox = temp_engine(sandbox_project);
+        let mut live = temp_engine(project);
+
+        let mut plan: Vec<AgentPlanStep> = Vec::new();
+        let mut senses = AgentSenses::new();
+        let mut bridge = SandboxBridge {
+            worker: &UNEXPECTED_PROJECT_SNAPSHOT,
+            engine: &mut sandbox,
+            plan: &mut plan,
+            senses: &mut senses,
+            default_playhead_seconds: 0.0,
+        };
+        bridge.begin_group();
+        let track = match bridge
+            .apply(&WireCommand::AddTrack(wire::AddTrack {
+                kind: wire::WireTrackKind::Video,
+                name: "V1".into(),
+                index: None,
+            }))
+            .expect("add track")
+        {
+            EditOutcome::CreatedTrack(id) => id.raw(),
+            other => panic!("expected created track, got {other:?}"),
+        };
+        let head = match bridge
+            .apply(&WireCommand::AddClip(wire::AddClip {
+                track,
+                media: media.raw(),
+                source_start: 0.0,
+                source_duration: 10.0,
+                start: 0.0,
+            }))
+            .expect("add clip")
+        {
+            EditOutcome::Created(id) => id.raw(),
+            other => panic!("expected created clip, got {other:?}"),
+        };
+        // Phase 2 splits the clip phase 1 created — the cross-phase remap.
+        let right = match bridge
+            .apply(&WireCommand::SplitClip(wire::SplitClip {
+                clip: head,
+                at: 4.0,
+            }))
+            .expect("split clip")
+        {
+            EditOutcome::Created(id) => id.raw(),
+            other => panic!("expected created clip, got {other:?}"),
+        };
+        bridge
+            .apply(&WireCommand::TrimClip(wire::TrimClip {
+                clip: right,
+                start: 4.0,
+                duration: 2.0,
+            }))
+            .expect("trim clip");
+        bridge.end_group();
+        assert_eq!(plan.len(), 4);
+
+        let phases = split_plan_phases(plan, &[2]);
+        agent_replay(&mut live, phases, |_| {}).expect("replay");
+
+        let summary = summarize(live.project());
+        let v1 = summary
+            .tracks
+            .iter()
+            .find(|t| t.name == "V1")
+            .expect("replayed lane");
+        assert_ne!(v1.id, track, "live allocated fresh ids — the remap is real");
+        assert_eq!(v1.clips.len(), 2);
+        assert_eq!(
+            (v1.clips[0].start_seconds, v1.clips[0].duration_seconds),
+            (0.0, 4.0)
+        );
+        assert_eq!(
+            (v1.clips[1].start_seconds, v1.clips[1].duration_seconds),
+            (4.0, 2.0)
+        );
+        // Without the remap, the split would have hit the seed clip
+        // (which reuses the sandbox's head id on the live engine).
+        let seed = live.project().timeline().clip(seed_clip).expect("seed");
+        assert_eq!(seed.timeline, TimeRange::at_rate(0, 24, Rational::FPS_24));
+
+        // Two phases ⇒ two undo steps: first undo removes only phase 2.
+        assert!(live.undo(), "undo phase 2");
+        let summary = summarize(live.project());
+        let v1 = summary
+            .tracks
+            .iter()
+            .find(|t| t.name == "V1")
+            .expect("phase 1 remains");
+        assert_eq!(v1.clips.len(), 1, "the split and trim are undone");
+        assert_eq!(v1.clips[0].duration_seconds, 10.0);
+
+        assert!(live.undo(), "undo phase 1");
+        let summary = summarize(live.project());
+        assert!(summary.tracks.iter().all(|t| t.name != "V1"));
+        assert!(
+            live.project().timeline().clip(seed_clip).is_some(),
+            "the pre-existing timeline is untouched"
+        );
+        assert!(!live.undo(), "nothing left to undo");
+    }
+
+    #[test]
+    fn mid_phase_failure_keeps_earlier_phases_and_names_the_boundary() {
+        let (project, media) = fixture_project();
+        let mut sandbox = temp_engine(project.clone());
+        let mut live = temp_engine(project);
+
+        let mut plan: Vec<AgentPlanStep> = Vec::new();
+        let mut senses = AgentSenses::new();
+        let mut bridge = SandboxBridge {
+            worker: &UNEXPECTED_PROJECT_SNAPSHOT,
+            engine: &mut sandbox,
+            plan: &mut plan,
+            senses: &mut senses,
+            default_playhead_seconds: 0.0,
+        };
+        bridge.begin_group();
+        let track = match bridge
+            .apply(&WireCommand::AddTrack(wire::AddTrack {
+                kind: wire::WireTrackKind::Video,
+                name: "V1".into(),
+                index: None,
+            }))
+            .expect("add track")
+        {
+            EditOutcome::CreatedTrack(id) => id.raw(),
+            other => panic!("expected created track, got {other:?}"),
+        };
+        bridge
+            .apply(&WireCommand::AddClip(wire::AddClip {
+                track,
+                media,
+                source_start: 0.0,
+                source_duration: 10.0,
+                start: 0.0,
+            }))
+            .expect("add clip");
+        bridge.end_group();
+        // Phase 2 goes stale before replay (as if the user deleted the
+        // clip it targets mid-prompt).
+        plan.push(AgentPlanStep {
+            command: WireCommand::TrimClip(wire::TrimClip {
+                clip: 999_999,
+                start: 0.0,
+                duration: 1.0,
+            }),
+            created: None,
+        });
+
+        let phases = split_plan_phases(plan, &[2]);
+        let err = agent_replay(&mut live, phases, |_| {}).expect_err("phase 2 must fail");
+        assert!(err.contains("phase 2/2"), "names the boundary: {err}");
+        assert!(err.contains("step 1/1"), "{err}");
+        assert!(
+            err.contains("phase 1 of 2 was applied and stays undoable"),
+            "{err}"
+        );
+
+        // Phase 1 landed; the failing phase 2 left no trace.
+        let timeline = live.project().timeline();
+        assert_eq!(timeline.track_count(), 1);
+        assert_eq!(timeline.clip_count(), 1);
+
+        assert!(live.undo(), "phase 1 is its own undo step");
+        assert_eq!(live.project().timeline().track_count(), 0);
+        assert!(!live.undo(), "the rolled-back phase 2 left no history");
+    }
+
+    #[test]
+    fn committed_phase_enforces_empty_lane_cleanup_before_a_later_failure() {
+        let mut project = Project::new("agent-phase-cleanup", Rational::FPS_24);
+        let main = project.add_track(TrackKind::Video, "V1");
+        let stickers = project.add_track(TrackKind::Sticker, "Stickers");
+        let sticker = project
+            .add_generated(
+                stickers,
+                Generator::sticker(""),
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+            )
+            .expect("sticker");
+        let mut live = temp_engine(project);
+
+        let phases = vec![
+            vec![AgentPlanStep {
+                command: WireCommand::RemoveClip(wire::RemoveClip {
+                    clip: sticker.raw(),
+                }),
+                created: None,
+            }],
+            vec![AgentPlanStep {
+                command: WireCommand::TrimClip(wire::TrimClip {
+                    clip: 999_999,
+                    start: 0.0,
+                    duration: 1.0,
+                }),
+                created: None,
+            }],
+        ];
+        agent_replay(&mut live, phases, |_| {}).expect_err("phase 2 must fail");
+
+        let timeline = live.project().timeline();
+        assert!(timeline.track(main).is_some(), "main lane remains");
+        assert!(
+            timeline.track(stickers).is_none(),
+            "phase 1 commits a coherent desktop timeline"
+        );
+        assert!(timeline.clip(sticker).is_none());
+
+        assert!(live.undo(), "phase 1 cleanup is in its undo step");
+        let timeline = live.project().timeline();
+        assert!(timeline.track(stickers).is_some());
+        assert!(timeline.clip(sticker).is_some());
     }
 }

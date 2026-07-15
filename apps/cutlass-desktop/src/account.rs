@@ -419,17 +419,9 @@ fn version_is_newer(remote: &str, local: &str) -> bool {
 /// always one of ours or one the backend vouched for (authorize URL,
 /// checkout URL, download page).
 fn open_in_browser(url: &str) {
-    let spawn = |program: &str, args: &[&str]| {
-        if let Err(e) = std::process::Command::new(program).args(args).spawn() {
-            warn!("failed to open browser: {e}");
-        }
-    };
-    #[cfg(target_os = "macos")]
-    spawn("open", &[url]);
-    #[cfg(target_os = "windows")]
-    spawn("cmd", &["/C", "start", "", url]);
-    #[cfg(all(unix, not(target_os = "macos")))]
-    spawn("xdg-open", &[url]);
+    if let Err(error) = crate::external::open_web_url(url) {
+        warn!("failed to open browser: {error}");
+    }
 }
 
 #[cfg(test)]

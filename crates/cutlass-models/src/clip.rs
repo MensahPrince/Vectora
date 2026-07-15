@@ -4,7 +4,7 @@ use crate::effects::EffectInstance;
 use crate::error::ModelError;
 use crate::ids::{ClipId, LinkId, MediaId};
 use crate::param::{Easing, Keyframe, Param};
-use crate::time::{Rational, RationalTime, TimeRange, resample, time_sub};
+use crate::time::{Rational, RationalTime, TimeRange, check_same_rate, resample, time_sub};
 
 /// What a clip draws. Either a trimmed range of imported media, or synthetic
 /// content rendered by the engine (text, shapes, solids, ...).
@@ -623,6 +623,39 @@ impl Generator {
                 )),
             },
         }
+    }
+
+    /// Rebase every clip-relative keyframe carried by generated content.
+    ///
+    /// Most generators are time-invariant data. Shape geometry is the one
+    /// generated source that currently owns ordinary timeline-domain
+    /// [`Param`]s; the normalized speed ramp is deliberately handled
+    /// separately by clip-splitting code.
+    fn shift_timeline_params(&mut self, delta: i64) -> Result<(), ModelError> {
+        let Generator::Shape {
+            shape,
+            rgba,
+            width,
+            height,
+            corner_radius,
+            stroke,
+        } = self
+        else {
+            return Ok(());
+        };
+
+        rgba.shift_ticks(delta)?;
+        width.shift_ticks(delta)?;
+        height.shift_ticks(delta)?;
+        corner_radius.shift_ticks(delta)?;
+        if let Shape::Star { inner_ratio, .. } = shape {
+            inner_ratio.shift_ticks(delta)?;
+        }
+        if let Some(stroke) = stroke {
+            stroke.rgba.shift_ticks(delta)?;
+            stroke.width.shift_ticks(delta)?;
+        }
+        Ok(())
     }
 }
 
@@ -1448,6 +1481,16 @@ impl AnimatedTransform {
         Ok(())
     }
 
+    /// Shift every transform keyframe by `delta` clip-relative ticks.
+    fn shift_ticks(&mut self, delta: i64) -> Result<(), ModelError> {
+        self.position.shift_ticks(delta)?;
+        self.anchor_point.shift_ticks(delta)?;
+        self.scale.shift_ticks(delta)?;
+        self.rotation.shift_ticks(delta)?;
+        self.opacity.shift_ticks(delta)?;
+        Ok(())
+    }
+
     /// `Ok` iff every stored value (constants and keyframes) passes the
     /// per-property rules [`ClipTransform::validate`] enforces, and every
     /// keyframed param is structurally sound (sorted, non-empty, valid
@@ -1620,6 +1663,12 @@ pub struct Clip {
     pub id: ClipId,
     pub content: ClipSource,
     pub timeline: TimeRange,
+    /// A media-backed still made from one resolved video frame. The source
+    /// window is exactly one native frame while `timeline` may have any
+    /// positive duration. Frozen clips never own media audio and cannot be
+    /// retimed. Absent from saves for ordinary clips.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub freeze_frame: bool,
     /// Link group (CapCut linkage): clips sharing a `LinkId` are selected,
     /// moved, and trimmed together — e.g. the video+audio pair created by
     /// dropping media with an audio stream. `None` ⇔ unlinked.
@@ -1799,6 +1848,23 @@ pub const MAX_CLIP_VOLUME: f32 = 10.0;
 /// base-speed changes that re-derive the clip's timeline duration.
 pub const SPEED_CURVE_SCALE: i64 = 1000;
 
+/// Default entrance/exit look-animation window (~0.5 seconds), shortened to
+/// half the clip for short placements. Kept in the model so structural edits
+/// and the renderer use exactly the same timing rule.
+pub fn look_animation_window_ticks(duration: i64, rate: Rational) -> i64 {
+    const DEFAULT_ANIMATION_SECONDS: f64 = 0.5;
+    let from_seconds = (DEFAULT_ANIMATION_SECONDS / rate.seconds_per_unit()).ceil() as i64;
+    from_seconds.max(1).min((duration / 2).max(1))
+}
+
+/// Loop period for combo/presence look animations (~1 second).
+pub fn look_animation_combo_period_ticks(rate: Rational) -> i64 {
+    const COMBO_PERIOD_SECONDS: f64 = 1.0;
+    (COMBO_PERIOD_SECONDS / rate.seconds_per_unit())
+        .round()
+        .max(1.0) as i64
+}
+
 /// Slowest instantaneous speed multiplier a ramp keyframe may hold (matches
 /// the agent's `set_clip_speed` floor). A positive floor keeps the curve's
 /// average — and thus the derived duration — finite.
@@ -1905,6 +1971,7 @@ impl Clip {
             id: ClipId::next(),
             content: ClipSource::Media { media, source },
             timeline,
+            freeze_frame: false,
             link: None,
             transform: AnimatedTransform::identity(),
             speed: unit_speed(),
@@ -1935,12 +2002,125 @@ impl Clip {
         }
     }
 
+    /// Build the audio-lane companion for CapCut-style audio extraction.
+    ///
+    /// This is deliberately placement- and linkage-free: the engine owns lane
+    /// selection, atomic insertion, and the shared [`LinkId`]. Only properties
+    /// that affect audio playback ride across. Every visual, look, animation,
+    /// and template field starts from the ordinary media-clip defaults.
+    pub fn extracted_audio_companion(&self) -> Result<Self, ModelError> {
+        let ClipSource::Media { media, source } = &self.content else {
+            return Err(ModelError::InvalidParam(
+                "audio extraction requires a media-backed clip".into(),
+            ));
+        };
+        if self.freeze_frame {
+            return Err(ModelError::InvalidParam(
+                "freeze-frame clips are silent".into(),
+            ));
+        }
+
+        let mut companion = Self::from_media(*media, *source, self.timeline);
+        companion.speed = self.speed;
+        // Reversed audio is not decoded yet by the forward-only mixers, but
+        // preserving the flag keeps the detached half semantically exact for
+        // future reverse-audio support and for undo/redo.
+        companion.reversed = self.reversed;
+        companion.speed_curve = self.speed_curve.clone();
+        companion.preserve_pitch = self.preserve_pitch;
+        companion.volume = self.volume.clone();
+        companion.fade_in = self.fade_in;
+        companion.fade_out = self.fade_out;
+        companion.denoise = self.denoise;
+        companion.beats = self.beats.clone();
+        companion.audio_role = Some(crate::look::AudioRole::Extracted);
+        Ok(companion)
+    }
+
+    /// Derive a silent still clip from this media clip at an already-resolved
+    /// native source timestamp.
+    ///
+    /// `timeline.start` is also the absolute timeline position whose ordinary
+    /// transform/effect animation state is baked into constants. The returned
+    /// clip has a fresh unlinked identity, a one-frame source window, neutral
+    /// retiming/audio/template state, and no edge/combo look animations.
+    pub fn frozen_frame(
+        &self,
+        source_time: RationalTime,
+        timeline: TimeRange,
+    ) -> Result<Self, ModelError> {
+        let ClipSource::Media { media, source } = &self.content else {
+            return Err(ModelError::InvalidParam(
+                "freeze frame requires a media-backed clip".into(),
+            ));
+        };
+        if self.freeze_frame {
+            return Err(ModelError::InvalidParam(
+                "clip is already a freeze frame".into(),
+            ));
+        }
+        check_same_rate(source_time.rate, source.start.rate)?;
+        check_same_rate(timeline.start.rate, self.timeline.start.rate)?;
+        check_same_rate(timeline.duration.rate, timeline.start.rate)?;
+        let source_end = source.end()?;
+        if !source_time.rate.is_valid()
+            || !timeline.start.rate.is_valid()
+            || timeline.is_empty()
+            || source_time.value < source.start.value
+            || source_time.value >= source_end.value
+        {
+            return Err(ModelError::InvalidRange);
+        }
+        // Validate the arbitrary hold's exclusive end without unchecked
+        // `TimeRange::end_tick` arithmetic.
+        timeline.end()?;
+
+        let animation_tick = self.animation_tick(timeline.start.value);
+        let held_transform = self.transform.sample(animation_tick);
+        let mut frozen = self.clone();
+        frozen.id = ClipId::next();
+        frozen.content = ClipSource::Media {
+            media: *media,
+            source: TimeRange::at_rate(source_time.value, 1, source_time.rate),
+        };
+        frozen.timeline = timeline;
+        frozen.freeze_frame = true;
+        frozen.link = None;
+
+        frozen.transform.set_constant(held_transform);
+        for effect in &mut frozen.effects {
+            for param in effect.params.values_mut() {
+                let held = param.sample(animation_tick);
+                param.set_constant(held);
+            }
+        }
+
+        frozen.speed = unit_speed();
+        frozen.reversed = false;
+        frozen.speed_curve = default_speed_curve();
+        frozen.preserve_pitch = default_preserve_pitch();
+        frozen.volume = default_volume();
+        frozen.fade_in = 0;
+        frozen.fade_out = 0;
+        frozen.denoise = false;
+        frozen.beats.clear();
+        frozen.audio_role = None;
+
+        frozen.animation_in = None;
+        frozen.animation_out = None;
+        frozen.animation_combo = None;
+        frozen.replaceable = None;
+        frozen.text_editable = false;
+        Ok(frozen)
+    }
+
     /// A generated clip (text, shape, solid, ...).
     pub fn generated(generator: Generator, timeline: TimeRange) -> Self {
         Self {
             id: ClipId::next(),
             content: ClipSource::Generated(generator),
             timeline,
+            freeze_frame: false,
             link: None,
             transform: AnimatedTransform::identity(),
             speed: unit_speed(),
@@ -1969,6 +2149,23 @@ impl Clip {
             replaceable: None,
             text_editable: false,
         }
+    }
+
+    /// Rebase every ordinary clip-relative animation curve by `delta` ticks.
+    ///
+    /// This intentionally excludes [`Self::speed_curve`]: that curve lives on
+    /// the normalized [`SPEED_CURVE_SCALE`] domain and must be segmented,
+    /// rather than shifted, when a media clip is split.
+    pub(crate) fn shift_timeline_params(&mut self, delta: i64) -> Result<(), ModelError> {
+        self.transform.shift_ticks(delta)?;
+        self.volume.shift_ticks(delta)?;
+        for effect in &mut self.effects {
+            effect.shift_param_ticks(delta)?;
+        }
+        if let ClipSource::Generated(generator) = &mut self.content {
+            generator.shift_timeline_params(delta)?;
+        }
+        Ok(())
     }
 
     /// True iff the clip's framing differs from the default (full frame,
@@ -1989,11 +2186,12 @@ impl Clip {
         self.volume.is_animated()
     }
 
-    /// True iff the clip is inaudible: a constant gain of `0` (or below). A
-    /// keyframed envelope is never treated as silent — it may be non-zero
-    /// elsewhere — so the mixers keep it and sample per sample-frame.
+    /// True iff the clip is inaudible: a freeze frame or a constant gain of
+    /// `0` (or below). A keyframed envelope on an ordinary clip is never
+    /// treated as silent — it may be non-zero elsewhere — so the mixers keep
+    /// it and sample per sample-frame.
     pub fn is_silent(&self) -> bool {
-        matches!(self.volume.constant(), Some(v) if v <= 0.0)
+        self.freeze_frame || matches!(self.volume.constant(), Some(v) if v <= 0.0)
     }
 
     /// True iff the clip carries detected beat markers (M8 Phase 6).
@@ -2155,6 +2353,9 @@ impl Clip {
         }
         match &self.content {
             ClipSource::Media { source, .. } => {
+                if self.freeze_frame {
+                    return Ok(Some(source.start));
+                }
                 let offset_tl = time_sub(&timeline_pos, &self.timeline.start)?;
                 let first = source.start.value;
                 let last = first + (source.duration.value - 1).max(0);
@@ -2253,6 +2454,121 @@ pub fn speed_curve_source_fraction(curve: &Param<f32>, p: f64) -> f64 {
     } else {
         p.clamp(0.0, 1.0)
     }
+}
+
+/// Divide a normalized speed curve at timeline fraction `split`, stretching
+/// each restricted domain back onto `0..=`[`SPEED_CURVE_SCALE`].
+///
+/// The values are instantaneous rates, so preserving the original function on
+/// each subdomain preserves its cumulative integral (and therefore
+/// [`Clip::source_time_at`]) after the source window is divided at the same
+/// point. Boundary easings are subdivided exactly; the fixed integer domain
+/// can still make an original keyframe unrepresentable when it lands less than
+/// one normalized tick from the cut, in which case splitting fails closed.
+pub(crate) fn split_speed_curve(
+    curve: &Param<f32>,
+    split: f64,
+) -> Result<(Param<f32>, Param<f32>), ModelError> {
+    if !split.is_finite() || !(0.0..1.0).contains(&split) {
+        return Err(ModelError::InvalidParam(
+            "speed-ramp split must lie strictly inside the clip".into(),
+        ));
+    }
+    match curve {
+        Param::Constant(value) => Ok((Param::Constant(*value), Param::Constant(*value))),
+        Param::Keyframed { .. } => Ok((
+            speed_curve_subsegment(curve, 0.0, split)?,
+            speed_curve_subsegment(curve, split, 1.0)?,
+        )),
+    }
+}
+
+fn speed_curve_subsegment(
+    curve: &Param<f32>,
+    start: f64,
+    end: f64,
+) -> Result<Param<f32>, ModelError> {
+    let scale = SPEED_CURVE_SCALE as f64;
+    let start_tick = start * scale;
+    let end_tick = end * scale;
+    let mut positions = Vec::with_capacity(curve.keyframes().len() + 2);
+    positions.push(start_tick);
+    positions.extend(
+        curve
+            .keyframes()
+            .iter()
+            .map(|kf| kf.tick as f64)
+            .filter(|tick| *tick > start_tick && *tick < end_tick),
+    );
+    positions.push(end_tick);
+
+    let mut keyframes = Vec::with_capacity(positions.len());
+    for (index, &position) in positions.iter().enumerate() {
+        let tick = if index == 0 {
+            0
+        } else if index + 1 == positions.len() {
+            SPEED_CURVE_SCALE
+        } else {
+            (((position - start_tick) / (end_tick - start_tick)) * scale).round() as i64
+        };
+        if keyframes
+            .last()
+            .is_some_and(|previous: &Keyframe<f32>| previous.tick >= tick)
+        {
+            return Err(ModelError::InvalidParam(
+                "speed-ramp keyframe is too close to the split boundary".into(),
+            ));
+        }
+        let easing = positions
+            .get(index + 1)
+            .map_or(Ok(Easing::Linear), |&next| {
+                speed_curve_interval_easing(curve, position, next)
+            })?;
+        keyframes.push(Keyframe {
+            tick,
+            value: curve.sample_at(position),
+            easing,
+        });
+    }
+
+    let result = Param::Keyframed { keyframes };
+    validate_speed_curve(&result)?;
+    Ok(result)
+}
+
+/// Easing for one interval that is wholly inside an original curve segment
+/// (all original keyframe positions were inserted into the interval list).
+fn speed_curve_interval_easing(
+    curve: &Param<f32>,
+    from: f64,
+    to: f64,
+) -> Result<Easing, ModelError> {
+    let keyframes = curve.keyframes();
+    let first = &keyframes[0];
+    let last = &keyframes[keyframes.len() - 1];
+    if from < first.tick as f64 || from >= last.tick as f64 {
+        return Ok(Easing::Linear);
+    }
+
+    let upper = keyframes.partition_point(|kf| kf.tick as f64 <= from);
+    let lower = upper.saturating_sub(1);
+    let Some(next) = keyframes.get(lower + 1) else {
+        return Ok(Easing::Linear);
+    };
+    let current = &keyframes[lower];
+    if current.value == next.value {
+        return Ok(Easing::Linear);
+    }
+    if to > next.tick as f64 + f64::EPSILON {
+        return Err(ModelError::InvalidParam(
+            "speed-ramp split crossed an untracked keyframe".into(),
+        ));
+    }
+
+    let span = (next.tick - current.tick) as f64;
+    let local_from = ((from - current.tick as f64) / span).clamp(0.0, 1.0) as f32;
+    let local_to = ((to - current.tick as f64) / span).clamp(0.0, 1.0) as f32;
+    current.easing.subsegment(local_from, local_to)
 }
 
 /// Validate a speed ramp (M2 speed curves) before it is stored: a structurally
@@ -2418,6 +2734,83 @@ mod tests {
 
     fn media_clip(media: MediaId, source: TimeRange, timeline: TimeRange) -> Clip {
         Clip::from_media(media, source, timeline)
+    }
+
+    #[test]
+    fn extracted_audio_companion_copies_only_audio_and_retime_state() {
+        let media = MediaId::from_raw(41);
+        let source_range = tr(12, 120, R24);
+        let timeline = tr(36, 80, R24);
+        let mut source = Clip::from_media(media, source_range, timeline);
+
+        source.link = Some(LinkId::from_raw(9));
+        source.speed = Rational::new(3, 2);
+        source.reversed = true;
+        source.speed_curve = speed_preset("hero").unwrap();
+        source.preserve_pitch = false;
+        source.volume = Param::Keyframed {
+            keyframes: vec![
+                Keyframe {
+                    tick: 0,
+                    value: 0.25,
+                    easing: Easing::EaseIn,
+                },
+                Keyframe {
+                    tick: 79,
+                    value: 0.8,
+                    easing: Easing::Linear,
+                },
+            ],
+        };
+        source.fade_in = 7;
+        source.fade_out = 11;
+        source.denoise = true;
+        source.beats = vec![12, 36, 72];
+
+        // Non-audio state is intentionally noisy: none of it may leak to the
+        // audio-lane companion.
+        source.transform = ClipTransform {
+            position: [0.2, -0.3],
+            anchor_point: [0.1, 0.9],
+            scale: 1.5,
+            rotation: 20.0,
+            opacity: 0.6,
+        }
+        .into();
+        source.crop = CropRect {
+            x: 0.1,
+            y: 0.2,
+            w: 0.7,
+            h: 0.6,
+        };
+        source.flip_h = true;
+        source.filter = Some(crate::look::Filter {
+            id: "vivid".into(),
+            intensity: 0.4,
+        });
+        source.animation_in = Some(crate::look::AnimationRef::new("fade_in"));
+        source.replaceable = Some(Replaceable::new(3));
+        source.text_editable = true;
+
+        let companion = source.extracted_audio_companion().unwrap();
+        let mut expected = Clip::from_media(media, source_range, timeline);
+        expected.id = companion.id;
+        expected.speed = source.speed;
+        expected.reversed = source.reversed;
+        expected.speed_curve = source.speed_curve.clone();
+        expected.preserve_pitch = source.preserve_pitch;
+        expected.volume = source.volume.clone();
+        expected.fade_in = source.fade_in;
+        expected.fade_out = source.fade_out;
+        expected.denoise = source.denoise;
+        expected.beats = source.beats.clone();
+        expected.audio_role = Some(crate::look::AudioRole::Extracted);
+
+        assert_eq!(companion, expected);
+        assert_ne!(companion.id, source.id);
+        assert_eq!(companion.timeline, source.timeline);
+        assert_eq!(companion.content, source.content);
+        assert_eq!(companion.link, None);
     }
 
     // --- generator serde compat -------------------------------------------

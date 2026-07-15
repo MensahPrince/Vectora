@@ -183,6 +183,7 @@ fn exports_a_timeline_to_a_decodable_mp4() {
     let project = test_project();
     let mut renderer = Renderer::new_headless().expect("headless renderer");
     let path = temp_mp4();
+    std::fs::write(&path, b"previous export").expect("seed existing destination");
     let frames = export_to_file(&mut renderer, &project, &path).expect("export mp4");
     assert_eq!(frames, 3);
 
@@ -231,12 +232,18 @@ fn cancelled_export_returns_cancelled() {
     let project = test_project();
     let mut renderer = Renderer::new_headless().expect("headless renderer");
     let path = temp_mp4();
+    let previous = b"previous export";
+    std::fs::write(&path, previous).expect("seed existing destination");
 
     let settings = ExportSettings::for_project(&project);
     let result = export_to_file_observed(&mut renderer, &project, &path, settings, &mut |d, _| {
         d < 1 // stop after the first frame is in
     });
     assert!(matches!(result, Err(RenderError::Cancelled)));
+    assert_eq!(
+        std::fs::read(&path).expect("read preserved destination"),
+        previous
+    );
 
     let _ = std::fs::remove_file(&path);
 }

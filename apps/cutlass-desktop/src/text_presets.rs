@@ -16,16 +16,17 @@
 //! visible warning** here — documented fallback, never a silent surprise.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
 use cutlass_cloud::CloudClient;
 use cutlass_cloud::dto::{TextPreset, TextPresetCatalog};
+use cutlass_storage::{CacheId, SharedStorageLayout, StorageLayoutLease};
 use slint::{ComponentHandle, ModelRc, VecModel};
 use tracing::warn;
 
-use crate::paths;
 use crate::{TextPresetTile, TextPresetsBackend};
 
 /// Font families every Cutlass install resolves identically (OFL faces
@@ -62,12 +63,13 @@ impl TextPresetsWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         registry: PresetRegistry,
+        storage_layout: SharedStorageLayout,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-text-presets".into())
             .spawn(move || {
-                let worker = Worker::new(backend_weak, registry);
+                let worker = Worker::new(backend_weak, registry, storage_layout);
                 while let Ok(Command::Refresh) = rx.recv() {
                     worker.refresh();
                 }
@@ -88,24 +90,38 @@ impl TextPresetsWorker {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     registry: PresetRegistry,
-    client: CloudClient,
+    storage_layout: SharedStorageLayout,
+    base_url: String,
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, registry: PresetRegistry) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        registry: PresetRegistry,
+        storage_layout: SharedStorageLayout,
+    ) -> Self {
         Self {
             backend_weak,
             registry,
-            client: CloudClient::new(
-                &crate::account::base_url(),
-                Some(paths::data_dir().join("catalog-cache")),
-            ),
+            storage_layout,
+            base_url: crate::account::base_url(),
         }
     }
 
     fn refresh(&self) {
+        // Keep the catalog response and every downloaded/parsed pack pinned
+        // through registry and UI publication.
+        let layout_lease = self.storage_layout.lease();
+        let catalog_root = match catalog_root(&layout_lease) {
+            Ok(root) => root,
+            Err(message) => {
+                self.set_status("error", message);
+                return;
+            }
+        };
         self.set_status("loading", "");
-        let entries = match self.client.text_presets() {
+        let client = CloudClient::new(&self.base_url, Some(catalog_root.clone()));
+        let entries = match client.text_presets() {
             Ok(catalog) => catalog.entries,
             Err(e) => {
                 self.set_status("error", &user_message(&e));
@@ -117,7 +133,7 @@ impl Worker {
         // JSON; a bad pack skips (a served file must not brick the section).
         let mut presets: Vec<TextPreset> = Vec::new();
         for entry in &entries {
-            match self.fetch_pack(&entry.file_url) {
+            match self.fetch_pack(&entry.file_url, &catalog_root) {
                 Ok(pack) => presets.extend(pack.presets),
                 Err(e) => warn!(pack = %entry.id, "text preset pack skipped: {e}"),
             }
@@ -157,13 +173,14 @@ impl Worker {
             backend.set_status(status.as_str().into());
             backend.set_error("".into());
         });
+        drop(layout_lease);
     }
 
     /// Download a pack file (small JSON, cold path) and parse it. Fetched
     /// fresh on every refresh — packs are tiny and the catalog decides
     /// freshness, not the client.
-    fn fetch_pack(&self, url: &str) -> Result<TextPresetCatalog, String> {
-        let dest = paths::data_dir().join("catalog-cache/text-preset-pack.json");
+    fn fetch_pack(&self, url: &str, catalog_root: &Path) -> Result<TextPresetCatalog, String> {
+        let dest = catalog_root.join("text-preset-pack.json");
         let _ = std::fs::remove_file(&dest);
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         cutlass_cloud::download::download_to(url, &dest, &cancel, |_| {})
@@ -191,6 +208,12 @@ impl Worker {
             warn!("text presets UI update failed: {e}");
         }
     }
+}
+
+fn catalog_root(lease: &StorageLayoutLease<'_>) -> Result<PathBuf, &'static str> {
+    lease
+        .resolve(CacheId::Catalog)
+        .ok_or("catalog cache has no disk path")
 }
 
 /// The bundled-OFL-fonts-only policy: a family outside [`BUNDLED_FONTS`]
@@ -293,6 +316,7 @@ fn user_message(e: &cutlass_cloud::CloudError) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cutlass_storage::StorageLayout;
 
     fn preset() -> TextPreset {
         TextPreset {
@@ -336,5 +360,31 @@ mod tests {
         p.font_family = "Comic Sans MS".into();
         enforce_bundled_fonts(&mut p);
         assert!(p.font_family.is_empty());
+    }
+
+    #[test]
+    fn refresh_uses_catalog_override_then_picks_up_the_next_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let first_root = dir.path().join("catalog-a");
+        let second_root = dir.path().join("catalog-b");
+
+        let mut first = StorageLayout::new(dir.path().join("default-a")).unwrap();
+        first.set_override(CacheId::Catalog, &first_root).unwrap();
+        let layout = SharedStorageLayout::new(first);
+
+        let first_lease = layout.lease();
+        let first_generation = first_lease.generation();
+        let first_refresh = catalog_root(&first_lease).unwrap();
+        assert_eq!(first_refresh, first_root);
+
+        let mut second = StorageLayout::new(dir.path().join("default-b")).unwrap();
+        second.set_override(CacheId::Catalog, &second_root).unwrap();
+        drop(first_lease);
+        layout.replace(first_generation, second).unwrap();
+
+        assert_eq!(first_refresh, first_root);
+        let second_lease = layout.lease();
+        assert_eq!(second_lease.generation(), first_generation + 1);
+        assert_eq!(catalog_root(&second_lease).unwrap(), second_root);
     }
 }

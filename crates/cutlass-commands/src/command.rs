@@ -101,6 +101,36 @@ pub enum EditCommand {
         source: TimeRange,
         start: RationalTime,
     },
+    /// Detach a video clip's embedded sound onto an audio-lane companion.
+    ///
+    /// `to_track: Some` targets that unlocked audio lane exactly; `None`
+    /// chooses the first unlocked lane without an overlap and creates an
+    /// unpinned `A{n}` lane when none fits. The companion reuses the media and
+    /// source window, copies only audio/retime properties, and is linked back
+    /// to the source. One command is one atomic undo entry.
+    ExtractAudio {
+        clip: ClipId,
+        to_track: Option<TrackId>,
+    },
+    /// Deep-copy one clip to an explicit track/start. The copy receives a
+    /// fresh id and is unlinked; every other clip property and keyframe is
+    /// preserved. This is a pure placement edit: no search, ripple, transition
+    /// copy, or batch/link policy.
+    DuplicateClip {
+        clip: ClipId,
+        to_track: TrackId,
+        start: RationalTime,
+    },
+    /// Hold one resolved frame from a video clip for `duration`, opening a
+    /// same-track hole at `at`. `at` may be either edge or an interior tick;
+    /// interior insertion splits the source first. The created clip remains
+    /// media-backed but is silent and cannot be retimed. One command is one
+    /// atomic undo entry.
+    FreezeFrame {
+        clip: ClipId,
+        at: RationalTime,
+        duration: RationalTime,
+    },
     /// Place a generated clip (text, solid, shape, …) on a track.
     AddGenerated {
         track: TrackId,
@@ -296,6 +326,14 @@ pub enum EditCommand {
     /// Remove the effect at `index` from a clip's chain. The inverse restores
     /// it (clip snapshot).
     RemoveEffect { clip: ClipId, index: usize },
+    /// Move an effect within a clip's chain. Both indices address the pre-move
+    /// chain; `to_index` is the effect's final index after the move. The
+    /// inverse restores the previous clip state.
+    MoveEffect {
+        clip: ClipId,
+        from_index: usize,
+        to_index: usize,
+    },
     /// Set one effect parameter to a constant (the non-animated quick edit;
     /// animated edits go through `SetParamKeyframe` with `ClipParam::Effect`).
     /// `param` is the catalog slot index. The inverse restores the previous
@@ -368,6 +406,9 @@ pub enum EditCommand {
     /// select, move, and trim together. Any previous links on the clips are
     /// replaced; the inverse restores them.
     LinkClips { clips: Vec<ClipId> },
+    /// Dissolve every link group touched by `clips`. Passing any member clears
+    /// the link from the complete group; the inverse restores every group.
+    UnlinkClips { clips: Vec<ClipId> },
     /// Sidechain-duck the `music` clips under the `voice` clips (CapCut audio
     /// ducking, M8 Phase 4): analyze speech-band energy on the voice clips and
     /// write volume keyframes that dip each music clip while the voice is

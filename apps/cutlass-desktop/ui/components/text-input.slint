@@ -1,0 +1,210 @@
+// Shared single-line text entry for Cutlass chrome.
+//
+// The raw Slint TextInput intentionally owns text editing, selection, IME,
+// clipboard, and caret placement. This wrapper adds the behavior every
+// Cutlass field needs around it: a usable layout floor, full-field focus hit
+// target, consistent focus chrome, horizontal caret tracking, optional
+// commit-on-blur, and Escape-to-revert for deferred editor values.
+
+import { CutlassText } from "text.slint";
+import { AppStore } from "../store/index.slint";
+
+export component CutlassLineInput inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder-text: "";
+    in property <string> accessibility-label: root.placeholder-text;
+    in property <TextHorizontalAlignment> horizontal-alignment: TextHorizontalAlignment.left;
+    in property <length> text-padding-left: AppStore.theme.metrics.spacing.sm;
+    in property <length> text-padding-right: AppStore.theme.metrics.spacing.sm;
+    in property <length> minimum-field-width: 96px;
+    in property <bool> read-only: false;
+    in property <bool> enabled: true;
+    in property <bool> mono: false;
+    in property <InputType> input-type: InputType.text;
+    in property <bool> select-all-on-focus: false;
+    // Deferred inspector/title values commit on blur. Search/settings fields
+    // leave this false because they bind live or submit only on Enter.
+    in property <bool> commit-on-blur: false;
+    // Deferred values restore the focus-entry snapshot on Escape. The caller
+    // decides where focus goes next in `cancelled`.
+    in property <bool> revert-on-escape: false;
+
+    out property <bool> has-focus: input.has-focus;
+    out property <bool> dirty: root.text != root.focus-entry-text;
+
+    callback accepted(text: string);
+    // Fired after `accepted` only for an Enter submission, never for a blur
+    // commit. Deferred fields use this to release focus without stealing it
+    // back from a control the user clicked.
+    callback enter-accepted(text: string);
+    callback edited(text: string);
+    callback cancelled();
+    callback focused();
+    callback blurred(text: string, changed: bool);
+
+    private property <string> focus-entry-text: root.text;
+    private property <length> inner-width: max(
+        0px,
+        root.width - root.text-padding-left - root.text-padding-right,
+    );
+
+    public function focus-input() {
+        input.focus();
+    }
+
+    public function select-all() {
+        input.select-all();
+    }
+
+    public function mark-clean() {
+        root.focus-entry-text = root.text;
+    }
+
+    height: 28px;
+    min-width: root.minimum-field-width;
+    horizontal-stretch: 1;
+    border-radius: AppStore.theme.metrics.radius.sm;
+    border-width: 1px;
+    border-color: input.has-focus ? AppStore.theme.accent.primary : #ffffff14;
+    background: input.has-focus
+        ? #202020
+        : focus-area.has-hover && root.enabled
+        ? #1e1e1e
+        : #1a1a1a;
+    opacity: root.enabled ? 1.0 : 0.55;
+    clip: true;
+    forward-focus: input;
+
+    animate background {
+        duration: 120ms;
+        easing: ease-out;
+    }
+    animate border-color {
+        duration: 120ms;
+        easing: ease-out;
+    }
+
+    // Sits behind the real TextInput: clicks inside the text viewport still
+    // place the caret precisely, while padding clicks focus the field.
+    focus-area := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: MouseCursor.text;
+        clicked => {
+            input.focus();
+        }
+    }
+
+    // Clip long single-line values to the padded viewport. The TextInput is
+    // widened to its preferred width and shifted as the caret moves, matching
+    // Slint's std LineEdit behavior instead of letting the caret disappear.
+    text-viewport := Rectangle {
+        x: root.text-padding-left;
+        width: root.inner-width;
+        height: root.height;
+        clip: true;
+
+        input := TextInput {
+            property <length> scroll-x: 0px;
+
+            x: min(
+                0px,
+                max(parent.width - self.width - self.text-cursor-width, self.scroll-x),
+            );
+            width: max(
+                max(0px, parent.width - self.text-cursor-width),
+                self.preferred-width,
+            );
+            height: parent.height;
+            text <=> root.text;
+            enabled: root.enabled;
+            read-only: root.read-only;
+            input-type: root.input-type;
+            single-line: true;
+            horizontal-alignment: root.horizontal-alignment;
+            vertical-alignment: TextVerticalAlignment.center;
+            color: AppStore.theme.text.primary;
+            font-family: root.mono
+                ? AppStore.theme.typography.font-family-mono
+                : AppStore.theme.typography.font-family;
+            font-size: AppStore.theme.typography.body.size;
+            font-weight: AppStore.theme.typography.body.weight;
+            selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
+            selection-foreground-color: AppStore.theme.text.primary;
+            accessible-label: root.accessibility-label;
+            accessible-placeholder-text: root.placeholder-text;
+
+            changed has-focus => {
+                if (self.has-focus) {
+                    root.focus-entry-text = root.text;
+                    if root.select-all-on-focus {
+                        self.select-all();
+                    }
+                    root.focused();
+                } else {
+                    let changed = root.text != root.focus-entry-text;
+                    let blurred-text = root.text;
+                    root.blurred(blurred-text, changed);
+                    if (root.commit-on-blur && changed) {
+                        root.accepted(blurred-text);
+                    }
+                    root.focus-entry-text = root.text;
+                    self.scroll-x = 0px;
+                }
+            }
+
+            accepted => {
+                // Mark the current draft clean before invoking the callback:
+                // callers may synchronously move focus, and that blur must not
+                // submit the same value a second time.
+                root.focus-entry-text = root.text;
+                root.accepted(root.text);
+                // The callback may normalize or clear the value.
+                root.focus-entry-text = root.text;
+                root.enter-accepted(root.text);
+            }
+
+            edited => {
+                root.edited(root.text);
+            }
+
+            key-pressed(event) => {
+                if (event.text == Key.Escape && root.revert-on-escape) {
+                    root.text = root.focus-entry-text;
+                    self.scroll-x = 0px;
+                    root.cancelled();
+                    return accept;
+                }
+                reject
+            }
+
+            cursor-position-changed(cursor-position) => {
+                if (cursor-position.x + self.x < 0px) {
+                    self.scroll-x = -cursor-position.x;
+                } else if (
+                    cursor-position.x + self.x
+                        > parent.width - self.text-cursor-width
+                ) {
+                    self.scroll-x =
+                        parent.width - cursor-position.x - self.text-cursor-width;
+                }
+            }
+        }
+    }
+
+    placeholder := CutlassText {
+        x: root.text-padding-left;
+        width: root.inner-width;
+        height: root.height;
+        text: (root.text == "" && input.preedit-text == "")
+            ? root.placeholder-text
+            : "";
+        style: AppStore.theme.typography.body;
+        mono: root.mono;
+        foreground: AppStore.theme.text.muted;
+        horizontal-alignment: root.horizontal-alignment;
+        vertical-alignment: TextVerticalAlignment.center;
+        overflow: TextOverflow.elide;
+        // The real TextInput carries the accessible placeholder.
+        accessible-role: none;
+    }
+}

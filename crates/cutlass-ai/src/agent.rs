@@ -8,14 +8,25 @@
 //! rolls back only when the prompt aborts (cancellation, provider error,
 //! cap exceeded). In dry-run mode nothing is applied; the validated plan
 //! comes back for the UI's preview card.
+//!
+//! Beyond edits, the embedder can wire a [`ToolHost`] of app tools, while
+//! the bridge can expose strictly read-only senses of its exact project
+//! state. The latter is what lets a model inspect edits inside rehearsal
+//! without accidentally looking at the untouched live project. Both are
+//! dispatched by exact name and charged against the host-call cap. The
+//! built-in `commit_progress` tool records phase breaks so a long task's
+//! live replay can land as several undo steps
+//! ([`PromptOutcome::phase_breaks`]).
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
 use cutlass_commands::EditOutcome;
 
 use crate::describe::{EditorContext, ProjectSummary};
 use crate::extend::AgentExtensions;
-use crate::provider::{ChatProvider, ChatRequest, FinishReason, Message, ProviderError};
+use crate::provider::{ChatProvider, ChatRequest, FinishReason, ImagePart, Message, ProviderError};
+use crate::tools::{HostToolSpec, ToolHost, is_host_tool_name};
 use crate::wire::{self, WireCommand};
 
 /// The loop's only view of the engine. The UI implements this over a
@@ -24,6 +35,58 @@ use crate::wire::{self, WireCommand};
 pub trait EngineBridge {
     /// Fresh summary of the project as it stands.
     fn summary(&mut self) -> ProjectSummary;
+    /// Read-only tools that inspect this exact engine state. Unlike ordinary
+    /// host tools, these travel with the sandbox bridge so a screenshot taken
+    /// after an edit observes the rehearsed project, not the live project.
+    ///
+    /// The loop accepts only [`crate::tools::ToolTier::ReadOnly`] specs here.
+    fn sense_tools(&self) -> Vec<HostToolSpec> {
+        Vec::new()
+    }
+    /// Execute one tool previously returned by [`EngineBridge::sense_tools`].
+    /// Implementations must not mutate project state.
+    fn sense(
+        &mut self,
+        name: &str,
+        _arguments: &serde_json::Value,
+        _cancel: &AtomicBool,
+    ) -> Result<crate::tools::ToolOutput, String> {
+        Err(format!("unknown engine sense '{name}'"))
+    }
+    /// Prepare for an ordinary registered [`ToolHost`] call.
+    ///
+    /// The loop invokes this after charging the host-call cap, but before
+    /// authorization or dispatch. Returning `Err` rejects the call without
+    /// invoking either [`ToolHost::authorize`], [`ToolHost::call`], or
+    /// [`EngineBridge::after_host_call`]. Bridge-owned read-only senses do
+    /// not pass through this hook.
+    fn before_host_call(
+        &mut self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+    /// Reconcile bridge state after an ordinary host dispatch was attempted.
+    ///
+    /// The loop invokes this exactly once after [`ToolHost::call`] returns,
+    /// for both success and failure, and before exposing that result to the
+    /// model. Authorization failures and pre-call rejections do not invoke
+    /// it. `result` borrows the host result so implementations can inspect
+    /// success or failure without cloning [`crate::tools::ToolOutput`].
+    ///
+    /// Host calls may have partial side effects even when they return `Err`.
+    /// This hook is therefore the bridge's reconciliation boundary. A hook
+    /// failure aborts the prompt and rolls back its sandbox edit group, but
+    /// cannot promise to undo effects the host already performed.
+    fn after_host_call(
+        &mut self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _result: Result<&crate::tools::ToolOutput, &str>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
     /// Validate + apply one wire command. `Err` is a model-readable reason
     /// (validation rejection or engine error); state is unchanged on `Err`.
     fn apply(&mut self, command: &WireCommand) -> Result<EditOutcome, String>;
@@ -39,8 +102,19 @@ pub trait EngineBridge {
 pub struct AgentConfig {
     /// Hard cap on edit-tool calls per prompt (the runaway-loop fuse).
     pub max_tool_calls: usize,
+    /// Hard cap on host-tool calls per prompt. A separate fuse: senses
+    /// and app control must not starve editing, nor the reverse.
+    pub max_host_calls: usize,
     /// Hard cap on provider turns per prompt.
     pub max_turns: usize,
+    /// Hard cap on images carried by one request, newest kept. Screenshot
+    /// tools bound each image's dimensions, so count × bounded size caps
+    /// the whole vision payload.
+    pub max_images: usize,
+    /// Hard cap on total encoded image bytes carried by one request. This
+    /// protects the provider boundary even when an extensible host tool does
+    /// not honor the normal screenshot dimension limits.
+    pub max_image_bytes: usize,
     /// Validate and collect the plan without applying anything.
     pub dry_run: bool,
 }
@@ -49,7 +123,10 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_tool_calls: 32,
+            max_host_calls: 24,
             max_turns: 16,
+            max_images: 8,
+            max_image_bytes: 24 * 1024 * 1024,
             dry_run: false,
         }
     }
@@ -71,6 +148,12 @@ pub enum AgentEvent {
     TextDelta(String),
     /// An edit was applied (or validated, in dry-run).
     Action(ActionLogEntry),
+    /// A host tool ran; `summary` is the first line of its output.
+    HostAction { name: String, summary: String },
+    /// One image returned by a successful host/sense tool, after runtime
+    /// payload limits. Embedders can render it inline while the same encoded
+    /// bytes continue to the model.
+    Image(ImagePart),
 }
 
 /// How the prompt ended.
@@ -80,7 +163,9 @@ pub enum PromptStatus {
     Completed,
     /// Dry-run: the plan in `actions` validated but nothing was applied.
     DryRun,
-    /// Rolled back; nothing from this prompt remains. The string says why.
+    /// This prompt's sandbox edits rolled back. Ordinary host effects may
+    /// remain when a host dispatch was attempted; the string says why the
+    /// prompt stopped.
     Aborted(String),
 }
 
@@ -89,11 +174,18 @@ pub struct PromptOutcome {
     /// The model's final text answer (empty if it only edited).
     pub text: String,
     pub actions: Vec<ActionLogEntry>,
+    /// Indices into `actions` where a committed phase ends (exclusive),
+    /// from `commit_progress`. The tail past the last break is the final,
+    /// implicit phase — never listed; empty means one phase. Callers group
+    /// live replay by these; rehearsal and rollback stay one group per
+    /// prompt.
+    pub phase_breaks: Vec<usize>,
     pub status: PromptStatus,
     /// This turn's conversation, ready to append to the session history so
     /// the next prompt remembers it: the user message, every assistant
     /// turn and tool result the loop produced, and the final text answer.
-    /// Empty when the prompt aborted (nothing applied → no memory trace).
+    /// Empty when the prompt aborted (no conversational memory trace is
+    /// retained, even though an already-dispatched host effect may remain).
     /// `describe_project` results are collapsed to a short placeholder —
     /// they're large and the fresh system snapshot supersedes them.
     pub turn_messages: Vec<Message>,
@@ -181,14 +273,51 @@ pub fn system_prompt(
     )
 }
 
-/// Run one prompt to completion against `bridge`.
+/// Appended to the system message only when the embedder wires host
+/// tools; `system_prompt` itself stays host-agnostic (its signature and
+/// output are relied on by other callers and tests).
+const HOST_TOOLS_RULES: &str = "\n\nHost tools: tools named {namespace}_{tool} (app_…, media_…, python_…) \
+     reach the surrounding application rather than the timeline. Read-only \
+     and workspace tools run immediately. Tools with system-wide effects may \
+     pause for the user's confirmation and can be declined. Treat a decline \
+     as an instruction to change course, not an error to retry.";
+
+fn engine_sense_rules(specs: &[HostToolSpec]) -> String {
+    let names = specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n\nRehearsal senses ({names}) inspect the current sandbox, including edits already \
+         completed in this prompt. Before finalizing visual or timing work, use the cheapest \
+         relevant sense to verify it: prefer a schematic timeline map for placement and timing, \
+         and a composited preview frame only when appearance or layering matters. Inspect source \
+         assets when their content is uncertain. Never claim a check succeeded if a sense failed."
+    )
+}
+
+/// The phase marker (a loop concern, not a wire command): lets a long
+/// task land as several undo steps instead of one monolith.
+fn commit_progress_spec() -> wire::ToolSpec {
+    wire::ToolSpec {
+        name: "commit_progress".into(),
+        description: "Mark the edits so far as one completed phase so they land as \
+                      their own undo step. Call this between logical stages of a \
+                      long task; costs nothing."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {},
+        }),
+    }
+}
+
+/// Run one prompt with only the validated edit vocabulary.
 ///
-/// `context` is the send-time editor snapshot (selection, playhead);
-/// `history` is the prior conversation in this session (the caller's
-/// accumulated `turn_messages`, with no system message — a fresh one is
-/// regenerated here so the current project state always wins); `on_event`
-/// receives streamed text and applied actions for the UI. The returned
-/// [`PromptOutcome::turn_messages`] is this turn's contribution to append.
+/// Kept as the compatibility/default entry point for embedders that do not
+/// expose application tools. Use [`run_prompt_with_host`] to add senses,
+/// app control, jobs, or other namespaced capabilities.
 #[allow(clippy::too_many_arguments)]
 pub fn run_prompt(
     provider: &dyn ChatProvider,
@@ -201,27 +330,108 @@ pub fn run_prompt(
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(AgentEvent),
 ) -> PromptOutcome {
+    run_prompt_with_host(
+        provider,
+        bridge,
+        &mut crate::tools::NullToolHost,
+        context,
+        extensions,
+        history,
+        prompt,
+        config,
+        cancel,
+        on_event,
+    )
+}
+
+/// Run one prompt to completion against `bridge` and `host`.
+///
+/// `context` is the send-time editor snapshot (selection, playhead);
+/// `history` is the prior conversation in this session (the caller's
+/// accumulated `turn_messages`, with no system message — a fresh one is
+/// regenerated here so the current project state always wins); `host` is
+/// the embedder's tool surface (pass [`crate::tools::NullToolHost`] when
+/// there is none); `on_event` receives streamed text and applied actions
+/// for the UI. The returned [`PromptOutcome::turn_messages`] is this
+/// turn's contribution to append.
+#[allow(clippy::too_many_arguments)]
+pub fn run_prompt_with_host(
+    provider: &dyn ChatProvider,
+    bridge: &mut dyn EngineBridge,
+    host: &mut dyn ToolHost,
+    context: &EditorContext,
+    extensions: &AgentExtensions,
+    history: &[Message],
+    prompt: &str,
+    config: &AgentConfig,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(AgentEvent),
+) -> PromptOutcome {
     let summary = bridge.summary();
-    let mut messages = Vec::with_capacity(history.len() + 2);
-    messages.push(Message::System {
-        content: system_prompt(&summary, context, extensions),
-    });
-    messages.extend_from_slice(history);
-    // This turn's own messages start here (the user prompt and everything
-    // the loop appends), kept so we can hand them back as `turn_messages`.
-    let turn_start = messages.len();
-    messages.push(Message::User {
-        content: prompt.to_string(),
-    });
     let mut tools = wire::tool_specs();
     tools.push(wire::describe_project_spec());
     if !extensions.skills.is_empty() {
         tools.push(crate::extend::read_skill_spec());
     }
+    tools.push(commit_progress_spec());
+    // Built-in names always win: a colliding host spec is dropped here —
+    // never sent, never dispatched — so a host can neither shadow the edit
+    // vocabulary nor the loop's own tools. (`read_skill` stays reserved
+    // even when no skills are loaded.)
+    let mut seen_sense_names = HashSet::new();
+    let sense_specs: Vec<HostToolSpec> = bridge
+        .sense_tools()
+        .into_iter()
+        .filter(|spec| {
+            is_host_tool_name(&spec.name) && spec.tier == crate::tools::ToolTier::ReadOnly
+        })
+        .filter(|spec| spec.name != "read_skill" && tools.iter().all(|t| t.name != spec.name))
+        .filter(|spec| seen_sense_names.insert(spec.name.clone()))
+        .collect();
+    tools.extend(sense_specs.iter().map(|spec| wire::ToolSpec {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        parameters: spec.parameters.clone(),
+    }));
+
+    let mut seen_host_names = HashSet::new();
+    let host_specs: Vec<HostToolSpec> = host
+        .tools()
+        .into_iter()
+        .filter(|spec| is_host_tool_name(&spec.name))
+        .filter(|spec| tools.iter().all(|tool| tool.name != spec.name))
+        .filter(|spec| seen_host_names.insert(spec.name.clone()))
+        .collect();
+    tools.extend(host_specs.iter().map(|spec| wire::ToolSpec {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        parameters: spec.parameters.clone(),
+    }));
+
+    let mut system = system_prompt(&summary, context, extensions);
+    if !sense_specs.is_empty() || !host_specs.is_empty() {
+        system.push_str(HOST_TOOLS_RULES);
+    }
+    if !sense_specs.is_empty() {
+        system.push_str(&engine_sense_rules(&sense_specs));
+    }
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    messages.push(Message::System { content: system });
+    messages.extend_from_slice(history);
+    // This turn's own messages start here (the user prompt and everything
+    // the loop appends), kept so we can hand them back as `turn_messages`.
+    let turn_start = messages.len();
+    messages.push(Message::user(prompt));
 
     let mut actions: Vec<ActionLogEntry> = Vec::new();
+    let mut phase_breaks: Vec<usize> = Vec::new();
     let mut edit_calls = 0usize;
+    let mut host_calls = 0usize;
     let mut final_text = String::new();
+    // The first image-bearing tool result is appended after the current user
+    // message. Images are surfaced only after the whole request budget has run,
+    // immediately before those exact attachments are sent to the provider.
+    let mut image_event_cursor = messages.len();
     // Call ids of `describe_project` results, collapsed in `turn_messages`
     // so the session history never carries a full stale project blob.
     let mut describe_call_ids: Vec<String> = Vec::new();
@@ -236,12 +446,23 @@ pub fn run_prompt(
         PromptOutcome {
             text: String::new(),
             actions,
+            // Rolled back ⇒ no phases survive to group.
+            phase_breaks: Vec::new(),
             status: PromptStatus::Aborted(reason),
             turn_messages: Vec::new(),
         }
     };
 
     for _turn in 0..config.max_turns {
+        enforce_image_budget(&mut messages, config.max_images, config.max_image_bytes);
+        for message in messages.iter().skip(image_event_cursor) {
+            if let Message::ToolResult { images, .. } = message {
+                for image in images {
+                    on_event(AgentEvent::Image(image.clone()));
+                }
+            }
+        }
+        image_event_cursor = messages.len();
         let turn = {
             let mut forward = |delta: &str| on_event(AgentEvent::TextDelta(delta.to_string()));
             match provider.chat(
@@ -279,6 +500,8 @@ pub fn run_prompt(
         });
 
         for call in tool_calls {
+            // Only host successes attach images; every other path is text.
+            let mut images: Vec<ImagePart> = Vec::new();
             let result: String = if call.name == "describe_project" {
                 describe_call_ids.push(call.id.clone());
                 let state = serde_json::json!({
@@ -290,6 +513,121 @@ pub fn run_prompt(
                 // Read-only like describe_project: answered from the
                 // preloaded skill set, no dispatch, no edit-cap charge.
                 read_skill_result(&extensions.skills, &call.arguments)
+            } else if call.name == "commit_progress" {
+                // Free (charges neither cap): marking a phase must never
+                // compete with the work it delimits.
+                let committed = phase_breaks.last().copied().unwrap_or(0);
+                if actions.len() > committed {
+                    phase_breaks.push(actions.len());
+                    format!(
+                        "ok: committed phase {} ({} edits)",
+                        phase_breaks.len(),
+                        actions.len() - committed
+                    )
+                } else {
+                    // No break recorded — an empty phase would replay as an
+                    // empty undo group.
+                    "nothing new to commit — make edits first".to_string()
+                }
+            } else if sense_specs.iter().any(|spec| spec.name == call.name) {
+                host_calls += 1;
+                if host_calls > config.max_host_calls {
+                    return abort(
+                        bridge,
+                        actions,
+                        format!(
+                            "exceeded the {}-host-call cap for one prompt",
+                            config.max_host_calls
+                        ),
+                    );
+                }
+                match bridge.sense(&call.name, &call.arguments, cancel) {
+                    Err(reason) => format!("rejected: {reason}"),
+                    Ok(output) => {
+                        let mut content = if output.text.is_empty() {
+                            "ok".to_string()
+                        } else {
+                            output.text
+                        };
+                        images = output.images;
+                        enforce_tool_output_image_budget(
+                            &mut content,
+                            &mut images,
+                            config.max_images,
+                            config.max_image_bytes,
+                        );
+                        on_event(AgentEvent::HostAction {
+                            name: call.name.clone(),
+                            summary: host_action_summary(&content),
+                        });
+                        content
+                    }
+                }
+            } else if let Some(spec) = host_specs.iter().find(|spec| spec.name == call.name) {
+                host_calls += 1;
+                if host_calls > config.max_host_calls {
+                    return abort(
+                        bridge,
+                        actions,
+                        format!(
+                            "exceeded the {}-host-call cap for one prompt",
+                            config.max_host_calls
+                        ),
+                    );
+                }
+                match bridge.before_host_call(&call.name, &call.arguments) {
+                    Err(reason) => format!("rejected: {reason}"),
+                    Ok(()) => {
+                        match host.authorize(&call.name, &call.arguments, spec.tier, cancel) {
+                            Err(reason) => format!("rejected: {reason}"),
+                            Ok(()) => {
+                                let host_result = host.call(&call.name, &call.arguments, cancel);
+                                let borrowed_result = match &host_result {
+                                    Ok(output) => Ok(output),
+                                    Err(reason) => Err(reason.as_str()),
+                                };
+                                if let Err(reason) = bridge.after_host_call(
+                                    &call.name,
+                                    &call.arguments,
+                                    borrowed_result,
+                                ) {
+                                    return abort(
+                                        bridge,
+                                        actions,
+                                        format!(
+                                            "host tool '{}' was dispatched, but reconciliation \
+                                             failed: {reason}; host effects may already have \
+                                             occurred",
+                                            call.name
+                                        ),
+                                    );
+                                }
+                                match host_result {
+                                    Err(reason) => format!("rejected: {reason}"),
+                                    Ok(output) => {
+                                        let mut content = if output.text.is_empty() {
+                                            "ok".to_string()
+                                        } else {
+                                            output.text
+                                        };
+                                        images = output.images;
+                                        enforce_tool_output_image_budget(
+                                            &mut content,
+                                            &mut images,
+                                            config.max_images,
+                                            config.max_image_bytes,
+                                        );
+                                        on_event(AgentEvent::HostAction {
+                                            name: call.name.clone(),
+                                            summary: host_action_summary(&content),
+                                        });
+                                        content
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             } else {
                 edit_calls += 1;
                 if edit_calls > config.max_tool_calls {
@@ -333,6 +671,7 @@ pub fn run_prompt(
             messages.push(Message::ToolResult {
                 call_id: call.id,
                 content: result,
+                images,
             });
         }
 
@@ -351,6 +690,7 @@ pub fn run_prompt(
         return PromptOutcome {
             text: final_text,
             actions,
+            phase_breaks,
             status: PromptStatus::DryRun,
             turn_messages,
         };
@@ -359,9 +699,22 @@ pub fn run_prompt(
     PromptOutcome {
         text: final_text,
         actions,
+        phase_breaks,
         status: PromptStatus::Completed,
         turn_messages,
     }
+}
+
+/// Transcript line for one host call: the first line of its output,
+/// capped so the panel never renders a wall of tool text.
+fn host_action_summary(text: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let line = text.lines().next().unwrap_or("").trim();
+    let mut summary: String = line.chars().take(MAX_CHARS).collect();
+    if line.chars().count() > MAX_CHARS {
+        summary.push('…');
+    }
+    summary
 }
 
 /// Answer a `read_skill` call from the preloaded skill set. Unknown ids
@@ -381,11 +734,112 @@ fn read_skill_result(skills: &[crate::extend::Skill], arguments: &serde_json::Va
     }
 }
 
+/// Bound a single extensible tool result before it reaches either the
+/// transcript or the request history. Count and encoded-byte limits both keep
+/// the newest attachments, matching the whole-request policy below.
+fn enforce_tool_output_image_budget(
+    content: &mut String,
+    images: &mut Vec<ImagePart>,
+    max_images: usize,
+    max_bytes: usize,
+) {
+    let mut count = images.len();
+    let mut bytes = images
+        .iter()
+        .map(|image| image.data.len())
+        .fold(0usize, usize::saturating_add);
+    let mut drop_count = 0usize;
+    for image in images.iter() {
+        if count <= max_images && bytes <= max_bytes {
+            break;
+        }
+        count = count.saturating_sub(1);
+        bytes = bytes.saturating_sub(image.data.len());
+        drop_count += 1;
+    }
+    for dropped in images.drain(..drop_count) {
+        content.push_str(&format!(
+            "\n[image not attached because it exceeded the request budget: {}]",
+            dropped.label
+        ));
+    }
+}
+
+/// Keep only the newest `max_images` images across the request; older
+/// ones are dropped in place and noted with a text placeholder carrying
+/// the label, so the model knows what it saw and can re-request it.
+/// Newest-wins matches how the agent works with vision: screenshot, look,
+/// act — a stale frame is cheaper to re-take than to carry.
+fn enforce_image_budget(messages: &mut [Message], max_images: usize, max_bytes: usize) {
+    let mut image_total: usize = messages.iter().map(image_count).sum();
+    let mut byte_total: usize = messages
+        .iter()
+        .flat_map(message_images)
+        .map(|image| image.data.len())
+        .fold(0usize, usize::saturating_add);
+    if image_total <= max_images && byte_total <= max_bytes {
+        return;
+    }
+
+    // Oldest first. Count how much of each image vector to drain before
+    // mutating it, keeping this O(number of images) rather than repeatedly
+    // removing index zero.
+    for message in messages.iter_mut() {
+        if image_total <= max_images && byte_total <= max_bytes {
+            break;
+        }
+        let (content, images) = match message {
+            Message::User { content, images } => (content, images),
+            Message::ToolResult {
+                content, images, ..
+            } => (content, images),
+            _ => continue,
+        };
+        let mut drop_count = 0usize;
+        for image in images.iter() {
+            if image_total <= max_images && byte_total <= max_bytes {
+                break;
+            }
+            image_total = image_total.saturating_sub(1);
+            byte_total = byte_total.saturating_sub(image.data.len());
+            drop_count += 1;
+        }
+        for dropped in images.drain(..drop_count) {
+            content.push_str(&format!("\n[image no longer attached: {}]", dropped.label));
+        }
+    }
+}
+
+fn image_count(message: &Message) -> usize {
+    match message {
+        Message::User { images, .. } | Message::ToolResult { images, .. } => images.len(),
+        _ => 0,
+    }
+}
+
+fn message_images(message: &Message) -> &[ImagePart] {
+    match message {
+        Message::User { images, .. } | Message::ToolResult { images, .. } => images,
+        _ => &[],
+    }
+}
+
+/// Session history is text-only: raw image bytes would bloat every later
+/// request and the persisted session file for no benefit — the agent can
+/// always re-screenshot the *current* state. A labeled placeholder keeps
+/// the narrative ("looked at the timeline here") without the payload.
+fn strip_images(content: &mut String, images: &mut Vec<ImagePart>) {
+    for image in images.drain(..) {
+        content.push_str(&format!("\n[image: {}]", image.label));
+    }
+}
+
 /// This turn's slice of the conversation (`messages[turn_start..]`: the
 /// user prompt plus every assistant/tool message the loop appended), with
-/// the final text answer added (it isn't pushed during the loop) and
-/// `describe_project` results collapsed to a placeholder. This is what the
-/// session appends to its history so the next prompt remembers the turn.
+/// the final text answer added (it isn't pushed during the loop),
+/// `describe_project` results collapsed to a placeholder, and images
+/// stripped to labels (history is text-only). This is what the session
+/// appends to its history so the next prompt remembers the turn.
 fn collect_turn_messages(
     messages: Vec<Message>,
     turn_start: usize,
@@ -394,11 +848,21 @@ fn collect_turn_messages(
 ) -> Vec<Message> {
     let mut turn: Vec<Message> = messages.into_iter().skip(turn_start).collect();
     for message in &mut turn {
-        if let Message::ToolResult { call_id, content } = message {
-            if describe_call_ids.iter().any(|id| id == call_id) {
-                *content = "(project state omitted — see the current state in the system message)"
-                    .to_string();
+        match message {
+            Message::ToolResult {
+                call_id,
+                content,
+                images,
+            } => {
+                if describe_call_ids.iter().any(|id| id == call_id) {
+                    *content =
+                        "(project state omitted — see the current state in the system message)"
+                            .to_string();
+                }
+                strip_images(content, images);
             }
+            Message::User { content, images } => strip_images(content, images),
+            _ => {}
         }
     }
     if !final_text.is_empty() {
@@ -488,6 +952,18 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
             secs(a.source_start + a.source_duration),
             secs(a.start),
             a.track,
+        ),
+        WireCommand::ExtractAudio(a) => {
+            format!(
+                "extracted audio from clip {} onto track {}",
+                a.clip, a.track
+            )
+        }
+        WireCommand::DuplicateClip(a) => format!(
+            "duplicated clip {} onto track {} at {}",
+            a.clip,
+            a.to_track,
+            secs(a.start),
         ),
         WireCommand::AddGenerated(a) => format!(
             "added {} at {} for {} on track {}",
@@ -715,6 +1191,10 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
         WireCommand::RemoveEffect(a) => {
             format!("removed effect {} from clip {}", a.index, a.clip)
         }
+        WireCommand::MoveEffect(a) => format!(
+            "moved effect {} to {} on clip {}",
+            a.from_index, a.to_index, a.clip
+        ),
         WireCommand::SetEffectParam(a) => {
             format!(
                 "set clip {} effect {} {} = {}",
@@ -788,6 +1268,14 @@ pub fn describe_action(command: &WireCommand, outcome: Option<&EditOutcome>) -> 
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
+        WireCommand::UnlinkClips(a) => format!(
+            "unlinked complete groups touched by clips {}",
+            a.clips
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         WireCommand::AddMarker(a) => {
             let name = match &a.name {
                 Some(name) if !name.is_empty() => format!(" '{name}'"),
@@ -850,6 +1338,35 @@ mod tests {
         assert_eq!(
             describe_action(&split, Some(&EditOutcome::Created(ClipId::from_raw(21)))),
             "split clip 7 at 12.40s (new clip 21)"
+        );
+
+        let move_effect = WireCommand::MoveEffect(wire::MoveEffect {
+            clip: 7,
+            from_index: 0,
+            to_index: 2,
+        });
+        assert_eq!(
+            describe_action(&move_effect, None),
+            "moved effect 0 to 2 on clip 7"
+        );
+
+        let extract = WireCommand::ExtractAudio(wire::ExtractAudio { clip: 7, track: 3 });
+        assert_eq!(
+            describe_action(&extract, Some(&EditOutcome::Created(ClipId::from_raw(22)))),
+            "extracted audio from clip 7 onto track 3 (new clip 22)"
+        );
+
+        let duplicate = WireCommand::DuplicateClip(wire::DuplicateClip {
+            clip: 7,
+            to_track: 3,
+            start: 12.5,
+        });
+        assert_eq!(
+            describe_action(
+                &duplicate,
+                Some(&EditOutcome::Created(ClipId::from_raw(23)))
+            ),
+            "duplicated clip 7 onto track 3 at 12.50s (new clip 23)"
         );
 
         let trim = WireCommand::TrimClip(wire::TrimClip {
@@ -941,6 +1458,181 @@ mod tests {
         assert!(prompt.contains("podcast-cleanup (Podcast cleanup): Clean up a talk recording."));
         // Only the index enters the prompt — bodies load through read_skill.
         assert!(!prompt.contains("SECRET BODY"));
+    }
+
+    #[test]
+    fn image_budget_drops_oldest_and_leaves_labeled_placeholders() {
+        let mut messages = vec![
+            Message::system("s"),
+            Message::User {
+                content: "look at these".into(),
+                images: vec![
+                    ImagePart::png(vec![1], "timeline at 2.00s"),
+                    ImagePart::png(vec![2], "timeline at 5.00s"),
+                ],
+            },
+            Message::ToolResult {
+                call_id: "call_1".into(),
+                content: "screenshot taken".into(),
+                images: vec![ImagePart::jpeg(vec![3], "preview at 8.00s")],
+            },
+        ];
+
+        enforce_image_budget(&mut messages, 1, usize::MAX);
+
+        match &messages[1] {
+            Message::User { content, images } => {
+                assert!(images.is_empty(), "both older images dropped");
+                assert!(content.contains("no longer attached: timeline at 2.00s"));
+                assert!(content.contains("no longer attached: timeline at 5.00s"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &messages[2] {
+            Message::ToolResult {
+                content, images, ..
+            } => {
+                assert_eq!(images.len(), 1, "the newest image survives");
+                assert_eq!(images[0].label, "preview at 8.00s");
+                assert!(!content.contains("no longer attached"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Under budget: untouched.
+        let mut under = vec![Message::User {
+            content: "one".into(),
+            images: vec![ImagePart::png(vec![1], "a")],
+        }];
+        enforce_image_budget(&mut under, 8, usize::MAX);
+        assert_eq!(image_count(&under[0]), 1);
+    }
+
+    #[test]
+    fn image_byte_budget_keeps_the_newest_payload_that_fits() {
+        let mut messages = vec![
+            Message::User {
+                content: "old".into(),
+                images: vec![ImagePart::png(vec![1; 6], "old six bytes")],
+            },
+            Message::ToolResult {
+                call_id: "call_1".into(),
+                content: "new".into(),
+                images: vec![
+                    ImagePart::png(vec![2; 4], "new four bytes"),
+                    ImagePart::png(vec![3; 5], "newest five bytes"),
+                ],
+            },
+        ];
+
+        enforce_image_budget(&mut messages, 8, 9);
+
+        let Message::User { content, images } = &messages[0] else {
+            panic!("user message");
+        };
+        assert!(images.is_empty());
+        assert!(content.contains("old six bytes"));
+        let Message::ToolResult {
+            content, images, ..
+        } = &messages[1]
+        else {
+            panic!("tool result");
+        };
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["new four bytes", "newest five bytes"]
+        );
+        assert!(!content.contains("no longer attached"));
+
+        enforce_image_budget(&mut messages, 8, 3);
+        let Message::ToolResult {
+            content, images, ..
+        } = &messages[1]
+        else {
+            panic!("tool result");
+        };
+        assert!(
+            images.is_empty(),
+            "an individually oversized newest image drops"
+        );
+        assert!(content.contains("new four bytes"));
+        assert!(content.contains("newest five bytes"));
+    }
+
+    #[test]
+    fn tool_output_budget_drops_before_transcript_delivery() {
+        let mut content = "frames ready".to_string();
+        let mut images = vec![
+            ImagePart::png(vec![1; 5], "old"),
+            ImagePart::png(vec![2; 4], "middle"),
+            ImagePart::png(vec![3; 3], "new"),
+        ];
+
+        enforce_tool_output_image_budget(&mut content, &mut images, 2, 7);
+
+        assert_eq!(
+            images
+                .iter()
+                .map(|image| image.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["middle", "new"]
+        );
+        assert!(content.contains("request budget: old"), "{content}");
+    }
+
+    #[test]
+    fn turn_messages_strip_images_to_labels() {
+        let messages = vec![
+            Message::system("s"),
+            Message::User {
+                content: "what's here?".into(),
+                images: vec![ImagePart::png(vec![1], "frame at 0.00s")],
+            },
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: Vec::new(),
+            },
+            Message::ToolResult {
+                call_id: "call_1".into(),
+                content: "took the shot".into(),
+                images: vec![ImagePart::jpeg(vec![2], "preview at 3.00s")],
+            },
+        ];
+
+        let turn = collect_turn_messages(messages, 1, &[], "done");
+
+        for message in &turn {
+            assert_eq!(image_count(message), 0, "history is text-only: {message:?}");
+        }
+        match &turn[0] {
+            Message::User { content, .. } => {
+                assert!(content.contains("[image: frame at 0.00s]"), "{content}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &turn[2] {
+            Message::ToolResult { content, .. } => {
+                assert!(content.contains("[image: preview at 3.00s]"), "{content}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            turn.last(),
+            Some(&Message::assistant_text("done")),
+            "the final answer is appended"
+        );
+    }
+
+    #[test]
+    fn host_action_summary_keeps_the_first_line_capped() {
+        assert_eq!(host_action_summary("saved\ndetails follow"), "saved");
+        let long = "x".repeat(200);
+        let summary = host_action_summary(&long);
+        assert_eq!(summary.chars().count(), 121, "120 chars + ellipsis");
+        assert!(summary.ends_with('…'));
     }
 
     #[test]
