@@ -66,6 +66,9 @@ pub use probe::{MediaProbe, probe};
 mod peaks;
 pub use peaks::{AudioPeaks, audio_peaks, audio_peaks_per_second};
 
+mod pcm;
+pub use pcm::{ReadMonoPcmError, read_mono_pcm_with_cancel};
+
 pub mod image;
 #[cfg(target_vendor = "apple")]
 mod image_apple;
