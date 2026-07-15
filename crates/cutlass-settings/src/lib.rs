@@ -36,6 +36,7 @@
 //!
 //! [storage.paths]
 //! proxies = "/Volumes/Scratch/Cutlass/proxies"
+//! # analysis = "/Volumes/Scratch/Cutlass/analysis"
 //! # download = "/Volumes/Scratch/Cutlass/download"
 //! # catalog = "/Volumes/Scratch/Cutlass/catalog"
 //! # luts = "/Volumes/Scratch/Cutlass/luts"
@@ -275,6 +276,8 @@ pub const MAX_DOWNLOAD_QUOTA_MIB: u64 = 1_048_576;
 pub struct StoragePathOverrides {
     /// Generated media proxies.
     pub proxies: Option<PathBuf>,
+    /// Regenerable media-analysis state.
+    pub analysis: Option<PathBuf>,
     /// Downloaded stock and generated assets.
     pub download: Option<PathBuf>,
     /// Cached asset-catalog responses and metadata.
@@ -295,6 +298,7 @@ impl StoragePathOverrides {
     pub fn get(&self, key: &str) -> Option<&Path> {
         match key {
             "proxies" => self.proxies.as_deref(),
+            "analysis" => self.analysis.as_deref(),
             "download" => self.download.as_deref(),
             "catalog" => self.catalog.as_deref(),
             "luts" => self.luts.as_deref(),
@@ -767,6 +771,7 @@ impl Settings {
 
             if let Some(paths) = t.get("paths").and_then(Item::as_table) {
                 s.storage.paths.proxies = absolute_path_at(paths, "proxies");
+                s.storage.paths.analysis = absolute_path_at(paths, "analysis");
                 s.storage.paths.download = absolute_path_at(paths, "download");
                 s.storage.paths.catalog = absolute_path_at(paths, "catalog");
                 s.storage.paths.luts = absolute_path_at(paths, "luts");
@@ -813,6 +818,10 @@ impl Settings {
             (
                 "proxies",
                 storage_path_for_save(self.storage.paths.proxies.as_deref(), "paths.proxies")?,
+            ),
+            (
+                "analysis",
+                storage_path_for_save(self.storage.paths.analysis.as_deref(), "paths.analysis")?,
             ),
             (
                 "download",
@@ -1141,6 +1150,7 @@ mod tests {
         s.storage.download_quota_mib = 4_096;
         s.storage.paths = StoragePathOverrides {
             proxies: Some(dir.path().join("proxies")),
+            analysis: Some(dir.path().join("analysis")),
             download: Some(dir.path().join("download")),
             catalog: Some(dir.path().join("catalog")),
             luts: Some(dir.path().join("luts")),
@@ -1155,6 +1165,7 @@ mod tests {
         assert!(raw.contains("[storage.paths]"), "{raw}");
         for key in [
             "proxies",
+            "analysis",
             "download",
             "catalog",
             "luts",
@@ -1168,6 +1179,7 @@ mod tests {
         assert_eq!(loaded.storage, s.storage);
         for key in [
             "proxies",
+            "analysis",
             "download",
             "catalog",
             "luts",
@@ -1191,6 +1203,7 @@ mod tests {
                  root = \"relative/root\"\n\
                  [storage.paths]\n\
                  proxies = \"relative/proxies\"\n\
+                 analysis = \"relative/analysis\"\n\
                  download = {:?}\n\
                  catalog = 3\n\
                  luts = \"\"\n",
@@ -1202,6 +1215,7 @@ mod tests {
         let mut s = load(&path).unwrap();
         assert_eq!(s.storage.root, None);
         assert_eq!(s.storage.paths.proxies, None);
+        assert_eq!(s.storage.paths.analysis, None);
         assert_eq!(
             s.storage.paths.download.as_deref(),
             Some(absolute_download.as_path())
@@ -1217,6 +1231,17 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             original,
             "failed validation must not rewrite the file"
+        );
+        assert_no_transaction_artifacts(dir.path());
+
+        s.storage.root = None;
+        s.storage.paths.analysis = Some(PathBuf::from("relative/analysis"));
+        let error = save(&path, &s).unwrap_err();
+        assert!(error.contains("paths.analysis"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "failed analysis-path validation must not rewrite the file"
         );
         assert_no_transaction_artifacts(dir.path());
     }
@@ -1296,6 +1321,7 @@ mod tests {
                  future_policy = \"keep\" # future policy comment\n\
                  [storage.paths]\n\
                  proxies = {absolute:?}\n\
+                 analysis = {absolute:?}\n\
                  download = {absolute:?}\n\
                  catalog = {absolute:?}\n\
                  luts = {absolute:?}\n\
@@ -1322,6 +1348,7 @@ mod tests {
         let paths = storage.get("paths").and_then(Item::as_table).unwrap();
         for key in [
             "proxies",
+            "analysis",
             "download",
             "catalog",
             "luts",
@@ -1355,6 +1382,7 @@ mod tests {
                  future_policy = \"keep\" # storage unknown\n\
                  [storage.paths]\n\
                  proxies = {absolute:?} # proxy comment\n\
+                 analysis = {absolute:?} # analysis comment\n\
                  future_cache = {absolute:?} # paths unknown\n\
                  [plugins]\n\
                  enabled = true # unrelated\n"
@@ -1373,6 +1401,7 @@ mod tests {
             "# quota comment",
             "# storage unknown",
             "# proxy comment",
+            "# analysis comment",
             "# paths unknown",
             "# unrelated",
         ] {
