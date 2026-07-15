@@ -22,9 +22,9 @@ use std::thread::JoinHandle;
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use cutlass_ai::providers::openai_compat::OpenAiCompatProvider;
 use cutlass_ai::{
-    AgentConfig, AgentEvent, AgentExtensions, EditorContext, EngineBridge, Message, ProjectSummary,
-    PromptStatus, WireCommand, compose_rules, expand_slash_command, load_agent_dir, merge_skills,
-    run_prompt, summarize, validate,
+    AgentConfig, AgentEvent, AgentExtensions, EditorContext, EngineBridge, HostToolSpec, Message,
+    ProjectSummary, PromptStatus, ToolHost, ToolOutput, WireCommand, compose_rules,
+    expand_slash_command, load_agent_dir, merge_skills, run_prompt_with_host, summarize, validate,
 };
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
@@ -238,9 +238,32 @@ impl EngineBridge for SandboxBridge<'_> {
     }
 }
 
+/// The desktop's host-tool surface. Empty for now — screenshots, app
+/// control, cache management, and analysis tools land here in later
+/// phases; the loop already routes their calls, results, and events.
+pub struct DesktopToolHost;
+
+impl ToolHost for DesktopToolHost {
+    fn tools(&self) -> Vec<HostToolSpec> {
+        Vec::new()
+    }
+
+    fn call(
+        &mut self,
+        _name: &str,
+        _arguments: &serde_json::Value,
+        _cancel: &AtomicBool,
+    ) -> Result<ToolOutput, String> {
+        Err("no host tools are wired up yet".into())
+    }
+}
+
 #[derive(Default)]
 struct Preview {
     plan: Vec<AgentPlanStep>,
+    /// Phase boundaries within `plan` (exclusive step indices) from
+    /// `commit_progress` — live replay commits one undo group per phase.
+    phase_breaks: Vec<usize>,
     descriptions: Vec<SharedString>,
     history_restore: Option<Vec<Message>>,
 }
@@ -252,6 +275,7 @@ impl Preview {
 
     fn clear(&mut self) {
         self.plan.clear();
+        self.phase_breaks.clear();
         self.descriptions.clear();
         self.history_restore = None;
     }
@@ -338,12 +362,13 @@ fn agent_main(
             }
             AgentRequest::ApplyPlan => {
                 let plan = std::mem::take(&mut preview.plan);
+                let phase_breaks = std::mem::take(&mut preview.phase_breaks);
                 preview.clear();
                 with_store(&store, |s| s.set_plan_pending(false));
                 if plan.is_empty() {
                     continue;
                 }
-                apply_plan_live(&worker, &store, plan);
+                apply_plan_live(&worker, &store, plan, &phase_breaks);
             }
             AgentRequest::DiscardPlan => {
                 if preview.is_pending() {
@@ -457,6 +482,7 @@ fn run_one_prompt(
         };
         engine.reset_project(snapshot);
         preview.plan.clear();
+        preview.phase_breaks.clear();
         preview.descriptions.clear();
     }
 
@@ -486,11 +512,15 @@ fn run_one_prompt(
         skills: merge_skills(agent_dir.skills),
     };
 
+    // A continued preview accumulates steps; the outcome's phase breaks
+    // index this prompt's actions only, so offset them into the plan.
+    let plan_base = preview.plan.len();
     let mut plan: Vec<AgentPlanStep> = preview.plan.clone();
     let mut bridge = SandboxBridge {
         engine,
         plan: &mut plan,
     };
+    let mut tool_host = DesktopToolHost;
     let event_store = store.clone();
     let mut on_event = move |event: AgentEvent| match event {
         AgentEvent::TextDelta(delta) => append_assistant_text(&event_store, delta),
@@ -501,9 +531,10 @@ fn run_one_prompt(
     };
 
     info!(prompt, dry_run, "agent prompt started");
-    let outcome = run_prompt(
+    let outcome = run_prompt_with_host(
         &provider,
         &mut bridge,
+        &mut tool_host,
         &context,
         &extensions,
         history,
@@ -537,6 +568,9 @@ fn run_one_prompt(
             trim_history(history);
             if dry_run {
                 preview.plan = plan;
+                preview
+                    .phase_breaks
+                    .extend(outcome.phase_breaks.iter().map(|b| plan_base + b));
                 preview.descriptions.extend(
                     outcome
                         .actions
@@ -544,7 +578,9 @@ fn run_one_prompt(
                         .map(|a| SharedString::from(a.description.clone())),
                 );
             } else if !plan.is_empty() {
-                apply_plan_live(worker, store, plan);
+                // Auto-apply never extends a parked preview (any pending one
+                // was discarded above), so the breaks are plan-relative.
+                apply_plan_live(worker, store, plan, &outcome.phase_breaks);
             }
         }
     }
@@ -559,31 +595,52 @@ fn run_one_prompt(
     });
 }
 
+/// Split a rehearsed plan at its phase breaks (exclusive step indices,
+/// strictly increasing). The remainder past the last break is the final
+/// phase; a break flush with the plan's end leaves no empty group behind.
+fn split_plan_phases(mut plan: Vec<AgentPlanStep>, breaks: &[usize]) -> Vec<Vec<AgentPlanStep>> {
+    let mut phases = Vec::with_capacity(breaks.len() + 1);
+    for &at in breaks.iter().rev() {
+        if at < plan.len() {
+            phases.push(plan.split_off(at));
+        }
+    }
+    if !plan.is_empty() {
+        phases.push(plan);
+    }
+    phases.reverse();
+    phases
+}
+
 fn apply_plan_live(
     worker: &WorkerHandle,
     store: &slint::Weak<AgentStore<'static>>,
     plan: Vec<AgentPlanStep>,
+    phase_breaks: &[usize],
 ) {
     let count = plan.len();
-    match worker.agent_apply_plan(plan) {
+    let phases = split_plan_phases(plan, phase_breaks);
+    let phase_count = phases.len();
+    match worker.agent_apply_plan(phases) {
         Some(Ok(())) => {
             push_entry(
                 store,
                 "applied",
-                format!(
-                    "Applied {count} edit{} as one undo step.",
-                    if count == 1 { "" } else { "s" }
-                ),
+                if phase_count > 1 {
+                    format!("Applied {count} edits in {phase_count} undo steps.")
+                } else {
+                    format!(
+                        "Applied {count} edit{} as one undo step.",
+                        if count == 1 { "" } else { "s" }
+                    )
+                },
             );
             with_store(store, |s| s.set_undo_offered(true));
         }
         Some(Err(e)) => {
             error!(error = e, "agent plan replay failed");
-            push_entry(
-                store,
-                "error",
-                format!("Could not apply the plan: {e}. Nothing was changed."),
-            );
+            // The replay error already says how much (if anything) landed.
+            push_entry(store, "error", format!("Could not apply the plan: {e}."));
         }
         None => push_entry(
             store,
@@ -646,7 +703,9 @@ mod tests {
     use super::*;
     use crate::preview_worker::agent_replay;
     use cutlass_ai::wire;
-    use cutlass_models::{Generator, MediaSource, Project, Rational, TimeRange, TrackKind};
+    use cutlass_models::{
+        Generator, MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind,
+    };
 
     fn fixture_project() -> (Project, u64) {
         let mut project = Project::new("agent-ui-fixture", Rational::FPS_24);
@@ -723,7 +782,7 @@ mod tests {
         bridge.end_group();
         assert_eq!(plan.len(), 4);
 
-        agent_replay(&mut live, plan, |_| {}).expect("replay");
+        agent_replay(&mut live, vec![plan], |_| {}).expect("replay");
 
         let timeline = live.project().timeline();
         assert_eq!(timeline.track_count(), 1);
@@ -747,8 +806,9 @@ mod tests {
             }),
             created: None,
         }];
-        let err = agent_replay(&mut live, plan, |_| {}).expect_err("stale plan must fail");
+        let err = agent_replay(&mut live, vec![plan], |_| {}).expect_err("stale plan must fail");
         assert!(err.contains("step 1/1"), "names the failing step: {err}");
+        assert!(err.contains("nothing was applied"), "{err}");
         assert!(!live.undo(), "rollback leaves no history entry");
     }
 
@@ -772,7 +832,7 @@ mod tests {
             }),
             created: None,
         }];
-        agent_replay(&mut live, plan, |_| {}).expect("replay");
+        agent_replay(&mut live, vec![plan], |_| {}).expect("replay");
 
         let timeline = live.project().timeline();
         assert!(timeline.track(main).is_some(), "main lane remains");
@@ -783,6 +843,259 @@ mod tests {
         assert!(timeline.clip(sticker).is_none());
 
         assert!(live.undo(), "clip removal and lane cleanup share one undo");
+        let timeline = live.project().timeline();
+        assert!(timeline.track(stickers).is_some());
+        assert!(timeline.clip(sticker).is_some());
+    }
+
+    #[test]
+    fn split_plan_phases_keeps_breaks_and_drops_an_empty_tail() {
+        let step = || AgentPlanStep {
+            command: WireCommand::SplitClip(wire::SplitClip { clip: 1, at: 1.0 }),
+            created: None,
+        };
+        let plan: Vec<AgentPlanStep> = (0..4).map(|_| step()).collect();
+        let phases = split_plan_phases(plan, &[2]);
+        assert_eq!(phases.iter().map(Vec::len).collect::<Vec<_>>(), vec![2, 2]);
+
+        // A commit flush with the plan's end must not leave an empty phase.
+        let plan: Vec<AgentPlanStep> = (0..3).map(|_| step()).collect();
+        let phases = split_plan_phases(plan, &[3]);
+        assert_eq!(phases.iter().map(Vec::len).collect::<Vec<_>>(), vec![3]);
+
+        let plan: Vec<AgentPlanStep> = (0..3).map(|_| step()).collect();
+        let phases = split_plan_phases(plan, &[]);
+        assert_eq!(phases.iter().map(Vec::len).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn phased_plan_replays_as_separate_undo_steps_with_remapping() {
+        let mut project = Project::new("agent-phase-fixture", Rational::FPS_24);
+        let media = project.add_media(MediaSource::new(
+            "/tmp/agent-phase-fixture.mp4",
+            1920,
+            1080,
+            Rational::FPS_24,
+            60 * 24,
+            false,
+        ));
+        // The sandbox rehearses against a snapshot taken before the live
+        // project grew an extra lane and clip: live allocations diverge
+        // from sandbox ids, so the remap must do real work — including
+        // across the phase boundary.
+        let sandbox_project = project.clone();
+        let existing = project.add_track(TrackKind::Video, "Existing");
+        let seed_clip = project
+            .add_clip(
+                existing,
+                media,
+                TimeRange::at_rate(0, 24, Rational::FPS_24),
+                RationalTime::new(0, Rational::FPS_24),
+            )
+            .expect("seed clip");
+        let mut sandbox = temp_engine(sandbox_project);
+        let mut live = temp_engine(project);
+
+        let mut plan: Vec<AgentPlanStep> = Vec::new();
+        let mut bridge = SandboxBridge {
+            engine: &mut sandbox,
+            plan: &mut plan,
+        };
+        bridge.begin_group();
+        let track = match bridge
+            .apply(&WireCommand::AddTrack(wire::AddTrack {
+                kind: wire::WireTrackKind::Video,
+                name: "V1".into(),
+                index: None,
+            }))
+            .expect("add track")
+        {
+            EditOutcome::CreatedTrack(id) => id.raw(),
+            other => panic!("expected created track, got {other:?}"),
+        };
+        let head = match bridge
+            .apply(&WireCommand::AddClip(wire::AddClip {
+                track,
+                media: media.raw(),
+                source_start: 0.0,
+                source_duration: 10.0,
+                start: 0.0,
+            }))
+            .expect("add clip")
+        {
+            EditOutcome::Created(id) => id.raw(),
+            other => panic!("expected created clip, got {other:?}"),
+        };
+        // Phase 2 splits the clip phase 1 created — the cross-phase remap.
+        let right = match bridge
+            .apply(&WireCommand::SplitClip(wire::SplitClip {
+                clip: head,
+                at: 4.0,
+            }))
+            .expect("split clip")
+        {
+            EditOutcome::Created(id) => id.raw(),
+            other => panic!("expected created clip, got {other:?}"),
+        };
+        bridge
+            .apply(&WireCommand::TrimClip(wire::TrimClip {
+                clip: right,
+                start: 4.0,
+                duration: 2.0,
+            }))
+            .expect("trim clip");
+        bridge.end_group();
+        assert_eq!(plan.len(), 4);
+
+        let phases = split_plan_phases(plan, &[2]);
+        agent_replay(&mut live, phases, |_| {}).expect("replay");
+
+        let summary = summarize(live.project());
+        let v1 = summary
+            .tracks
+            .iter()
+            .find(|t| t.name == "V1")
+            .expect("replayed lane");
+        assert_ne!(v1.id, track, "live allocated fresh ids — the remap is real");
+        assert_eq!(v1.clips.len(), 2);
+        assert_eq!(
+            (v1.clips[0].start_seconds, v1.clips[0].duration_seconds),
+            (0.0, 4.0)
+        );
+        assert_eq!(
+            (v1.clips[1].start_seconds, v1.clips[1].duration_seconds),
+            (4.0, 2.0)
+        );
+        // Without the remap, the split would have hit the seed clip
+        // (which reuses the sandbox's head id on the live engine).
+        let seed = live.project().timeline().clip(seed_clip).expect("seed");
+        assert_eq!(seed.timeline, TimeRange::at_rate(0, 24, Rational::FPS_24));
+
+        // Two phases ⇒ two undo steps: first undo removes only phase 2.
+        assert!(live.undo(), "undo phase 2");
+        let summary = summarize(live.project());
+        let v1 = summary
+            .tracks
+            .iter()
+            .find(|t| t.name == "V1")
+            .expect("phase 1 remains");
+        assert_eq!(v1.clips.len(), 1, "the split and trim are undone");
+        assert_eq!(v1.clips[0].duration_seconds, 10.0);
+
+        assert!(live.undo(), "undo phase 1");
+        let summary = summarize(live.project());
+        assert!(summary.tracks.iter().all(|t| t.name != "V1"));
+        assert!(
+            live.project().timeline().clip(seed_clip).is_some(),
+            "the pre-existing timeline is untouched"
+        );
+        assert!(!live.undo(), "nothing left to undo");
+    }
+
+    #[test]
+    fn mid_phase_failure_keeps_earlier_phases_and_names_the_boundary() {
+        let (project, media) = fixture_project();
+        let mut sandbox = temp_engine(project.clone());
+        let mut live = temp_engine(project);
+
+        let mut plan: Vec<AgentPlanStep> = Vec::new();
+        let mut bridge = SandboxBridge {
+            engine: &mut sandbox,
+            plan: &mut plan,
+        };
+        bridge.begin_group();
+        let track = match bridge
+            .apply(&WireCommand::AddTrack(wire::AddTrack {
+                kind: wire::WireTrackKind::Video,
+                name: "V1".into(),
+                index: None,
+            }))
+            .expect("add track")
+        {
+            EditOutcome::CreatedTrack(id) => id.raw(),
+            other => panic!("expected created track, got {other:?}"),
+        };
+        bridge
+            .apply(&WireCommand::AddClip(wire::AddClip {
+                track,
+                media,
+                source_start: 0.0,
+                source_duration: 10.0,
+                start: 0.0,
+            }))
+            .expect("add clip");
+        bridge.end_group();
+        // Phase 2 goes stale before replay (as if the user deleted the
+        // clip it targets mid-prompt).
+        plan.push(AgentPlanStep {
+            command: WireCommand::TrimClip(wire::TrimClip {
+                clip: 999_999,
+                start: 0.0,
+                duration: 1.0,
+            }),
+            created: None,
+        });
+
+        let phases = split_plan_phases(plan, &[2]);
+        let err = agent_replay(&mut live, phases, |_| {}).expect_err("phase 2 must fail");
+        assert!(err.contains("phase 2/2"), "names the boundary: {err}");
+        assert!(err.contains("step 1/1"), "{err}");
+        assert!(
+            err.contains("phase 1 of 2 was applied and stays undoable"),
+            "{err}"
+        );
+
+        // Phase 1 landed; the failing phase 2 left no trace.
+        let timeline = live.project().timeline();
+        assert_eq!(timeline.track_count(), 1);
+        assert_eq!(timeline.clip_count(), 1);
+
+        assert!(live.undo(), "phase 1 is its own undo step");
+        assert_eq!(live.project().timeline().track_count(), 0);
+        assert!(!live.undo(), "the rolled-back phase 2 left no history");
+    }
+
+    #[test]
+    fn committed_phase_enforces_empty_lane_cleanup_before_a_later_failure() {
+        let mut project = Project::new("agent-phase-cleanup", Rational::FPS_24);
+        let main = project.add_track(TrackKind::Video, "V1");
+        let stickers = project.add_track(TrackKind::Sticker, "Stickers");
+        let sticker = project
+            .add_generated(
+                stickers,
+                Generator::sticker(""),
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+            )
+            .expect("sticker");
+        let mut live = temp_engine(project);
+
+        let phases = vec![
+            vec![AgentPlanStep {
+                command: WireCommand::RemoveClip(wire::RemoveClip {
+                    clip: sticker.raw(),
+                }),
+                created: None,
+            }],
+            vec![AgentPlanStep {
+                command: WireCommand::TrimClip(wire::TrimClip {
+                    clip: 999_999,
+                    start: 0.0,
+                    duration: 1.0,
+                }),
+                created: None,
+            }],
+        ];
+        agent_replay(&mut live, phases, |_| {}).expect_err("phase 2 must fail");
+
+        let timeline = live.project().timeline();
+        assert!(timeline.track(main).is_some(), "main lane remains");
+        assert!(
+            timeline.track(stickers).is_none(),
+            "phase 1 commits a coherent desktop timeline"
+        );
+        assert!(timeline.clip(sticker).is_none());
+
+        assert!(live.undo(), "phase 1 cleanup is in its undo step");
         let timeline = live.project().timeline();
         assert!(timeline.track(stickers).is_some());
         assert!(timeline.clip(sticker).is_some());
