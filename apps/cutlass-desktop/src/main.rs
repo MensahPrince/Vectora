@@ -9,6 +9,7 @@ mod ai_media;
 mod audio;
 mod cache_registry;
 mod cloud;
+mod download_safety;
 mod drafts;
 mod external;
 mod inspector;
@@ -281,7 +282,32 @@ enum SessionChange {
 /// Flush the outgoing draft (a no-op when nothing is bound yet), then replace
 /// the session. The flush and the swap are ordered on the worker's single
 /// message queue, so the flush always captures the draft we're leaving.
-fn change_session(handle: &preview_worker::WorkerHandle, change: SessionChange) {
+fn protect_draft_downloads(
+    cache: &cutlass_cloud::cache::DownloadCache,
+    project_path: &std::path::Path,
+) {
+    let Ok(project) = cutlass_models::Project::load_from_file(project_path) else {
+        cache.block_destructive_operations();
+        tracing::warn!(
+            "download cache maintenance blocked: target project could not be inventoried"
+        );
+        return;
+    };
+    let counts = download_safety::protect_project_downloads(cache, &project);
+    if counts.rejected != 0 {
+        cache.block_destructive_operations();
+        tracing::warn!(
+            rejected = counts.rejected,
+            "download cache maintenance blocked: target project protection was incomplete"
+        );
+    }
+}
+
+fn change_session(
+    handle: &preview_worker::WorkerHandle,
+    download_cache: &Arc<cutlass_cloud::cache::DownloadCache>,
+    change: SessionChange,
+) {
     match change {
         SessionChange::New => match drafts::create() {
             Ok(path) => {
@@ -292,15 +318,18 @@ fn change_session(handle: &preview_worker::WorkerHandle, change: SessionChange) 
             Err(e) => tracing::error!("couldn't create a new project: {e}"),
         },
         SessionChange::OpenDraft(path) => {
+            protect_draft_downloads(download_cache, &path);
             handle.save_project(None);
             handle.open_project(path);
         }
         SessionChange::Import => {
             let handle = handle.clone();
+            let download_cache = Arc::clone(download_cache);
             let task = slint::spawn_local(async move {
                 if let Some(source) = pick_open_path().await {
                     match drafts::import_external(&source) {
                         Ok(path) => {
+                            protect_draft_downloads(&download_cache, &path);
                             handle.save_project(None);
                             handle.open_project(path);
                         }
@@ -810,9 +839,28 @@ fn main() -> Result<(), slint::PlatformError> {
         download_quota_bytes,
     ));
     // Legacy drafts may still reference cache-owned source files directly.
-    // Keep eviction and clearing fail-closed until the bounded draft inventory
-    // below is integrated and can explicitly protect every such path.
+    // Inventory them before any worker can evict or clear downloaded media.
     download_cache.block_destructive_operations();
+    let download_inventory =
+        download_safety::protect_saved_draft_downloads(&download_cache, &drafts::root_dir());
+    if download_inventory.is_complete() {
+        download_cache.allow_destructive_operations();
+        tracing::info!(
+            drafts = download_inventory.projects_loaded,
+            protected_media = download_inventory.media.protected,
+            "download cache project inventory complete"
+        );
+    } else {
+        tracing::warn!(
+            entries = download_inventory.draft_entries_examined,
+            loaded = download_inventory.projects_loaded,
+            skipped = download_inventory.skipped_or_errored,
+            rejected_media = download_inventory.media.rejected,
+            draft_limit = download_inventory.draft_limit_reached,
+            byte_limit = download_inventory.byte_limit_reached,
+            "download cache maintenance remains blocked because project inventory was incomplete"
+        );
+    }
     // Keep this owner in main for the upcoming Settings wiring; the agent
     // receives a clone of the same registry and operation gate.
     let cache_registry = cache_registry::CacheRegistry::new(
@@ -1560,20 +1608,24 @@ fn main() -> Result<(), slint::PlatformError> {
     // `.cutlass` into a new draft. New (New card / Cmd+N / File ▸ New): a
     // fresh draft. Both flush the outgoing draft before swapping.
     let open_handle = preview_worker.handle();
+    let open_download_cache = Arc::clone(&download_cache);
     editor.on_on_open_requested(move || {
-        change_session(&open_handle, SessionChange::Import);
+        change_session(&open_handle, &open_download_cache, SessionChange::Import);
     });
 
     let new_handle = preview_worker.handle();
+    let new_download_cache = Arc::clone(&download_cache);
     editor.on_on_new_requested(move || {
-        change_session(&new_handle, SessionChange::New);
+        change_session(&new_handle, &new_download_cache, SessionChange::New);
     });
 
     // Launch gallery card → open that draft by its project path.
     let open_draft_handle = preview_worker.handle();
+    let open_draft_download_cache = Arc::clone(&download_cache);
     editor.on_on_open_project_requested(move |path| {
         change_session(
             &open_draft_handle,
+            &open_draft_download_cache,
             SessionChange::OpenDraft(std::path::PathBuf::from(path.as_str())),
         );
     });
@@ -1992,6 +2044,7 @@ fn main() -> Result<(), slint::PlatformError> {
         let app_weak = app.as_weak();
         let config_path = config_path.clone();
         let download_cache = Arc::clone(&download_cache);
+        let preview = preview_worker.handle();
         settings_backend.on_save(move || {
             let Some(app) = app_weak.upgrade() else {
                 return false;
@@ -2035,7 +2088,20 @@ fn main() -> Result<(), slint::PlatformError> {
 
             download_cache.set_quota_bytes(quota.bytes);
             let quota_cache = Arc::clone(&download_cache);
+            let quota_preview = preview.clone();
             if let Err(error) = spawn_short_lived_worker("cutlass-cache-quota", move || {
+                let Some(project) = quota_preview.snapshot_project() else {
+                    tracing::warn!("download quota enforcement skipped: project unavailable");
+                    return;
+                };
+                let protected = download_safety::protect_project_downloads(&quota_cache, &project);
+                if protected.rejected != 0 {
+                    tracing::warn!(
+                        rejected = protected.rejected,
+                        "download quota enforcement skipped: project media protection incomplete"
+                    );
+                    return;
+                }
                 quota_cache.enforce_quota();
             }) {
                 // Persistence and the live quota update are already committed;
@@ -3190,10 +3256,7 @@ mod settings_cache_tests {
         );
         assert_eq!(rows[1].size_label.as_str(), "1.5 KiB");
         assert_eq!(rows[1].item_count_label.as_str(), "1 file");
-        assert!(
-            !rows[1].clearable,
-            "downloads stay protected until imported media is durable"
-        );
+        assert!(!rows[1].clearable);
         assert!(!rows[1].relocatable);
 
         assert!(
