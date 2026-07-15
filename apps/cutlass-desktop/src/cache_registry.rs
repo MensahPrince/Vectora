@@ -461,43 +461,44 @@ impl CacheRegistry {
         layout: &StorageLayout,
         cancel: &AtomicBool,
     ) -> Result<CacheUsage, String> {
-        ensure_not_cancelled(cancel, "cancelled before protecting project downloads")?;
-        let saved = crate::cache_references::scan_saved_draft_references(
-            &crate::drafts::root_dir(),
-            layout,
-        );
-        if !saved.is_complete() {
-            self.download_cache.block_destructive_operations();
-            return Err(
-                "saved project media inventory is incomplete; download clear was refused".into(),
+        // `clear` already holds the registry operation gate and storage-layout
+        // lease. This atomic marker acquires no DownloadCache maintenance lock:
+        // the remaining lock order is project maintenance, then the exact
+        // DownloadCache maintenance acquired by `DownloadCache::clear`.
+        self.download_cache.block_destructive_operations();
+        let project_guard = self
+            .preview
+            .begin_project_maintenance_with_cancel(cancel)
+            .map_err(|error| {
+                bounded_error(
+                    "project maintenance could not begin; download clear was refused",
+                    &error,
+                )
+            })?;
+
+        let result = (|| {
+            ensure_not_cancelled(cancel, "cancelled before inventorying project downloads")?;
+            let saved = crate::cache_references::scan_saved_draft_references(
+                &crate::drafts::root_dir(),
+                layout,
             );
-        }
-        protect_download_references(
-            self.download_cache.as_ref(),
-            &saved.references.by_cache[&CacheId::Download],
-        )?;
-        let project = self.preview.snapshot_project().ok_or_else(|| {
-            "current project is unavailable; download clear was refused".to_string()
-        })?;
-        let live = crate::cache_references::analyze_project_references(&project, layout);
-        if !live.is_complete() {
-            return Err(
-                "current project media could not be protected; download clear was refused".into(),
+            ensure_not_cancelled(cancel, "cancelled while inventorying project downloads")?;
+            let live = crate::cache_references::analyze_project_references(
+                project_guard.project(),
+                layout,
             );
-        }
-        protect_download_references(
-            self.download_cache.as_ref(),
-            &live.by_cache[&CacheId::Download],
-        )?;
-        ensure_not_cancelled(cancel, "cancelled before clearing downloads")?;
-        let report = self.download_cache.clear().map_err(|error| {
-            bounded_error("download cache could not be cleared", &error.to_string())
-        })?;
-        Ok(CacheUsage {
-            bytes: report.removed_bytes,
-            entries: 0,
-            files: report.removed_files,
-        })
+            clear_download_cache_from_inventories(
+                self.download_cache.as_ref(),
+                &saved,
+                &live,
+                cancel,
+            )
+        })();
+
+        // Resume preview only after DownloadCache::clear has released its
+        // maintenance guard, including every error and cancellation path.
+        drop(project_guard);
+        result
     }
 
     fn snapshot_all_locked(
@@ -1004,11 +1005,74 @@ fn cache_requires_reference_migration(id: CacheId) -> bool {
     matches!(id, CacheId::Luts | CacheId::Lottie | CacheId::Templates)
 }
 
+fn clear_download_cache_from_inventories(
+    cache: &DownloadCache,
+    saved: &DraftReferenceReport,
+    live: &CacheReferenceReport,
+    cancel: &AtomicBool,
+) -> Result<CacheUsage, String> {
+    prepare_download_cache_clear(cache, saved, live, cancel)?;
+    if cancel.load(Ordering::Acquire) {
+        cache.block_destructive_operations();
+        return Err("cancelled before clearing downloads".into());
+    }
+    let report = cache.clear().map_err(|error| {
+        bounded_error("download cache could not be cleared", &error.to_string())
+    })?;
+    Ok(CacheUsage {
+        bytes: report.removed_bytes,
+        entries: 0,
+        files: report.removed_files,
+    })
+}
+
+fn prepare_download_cache_clear(
+    cache: &DownloadCache,
+    saved: &DraftReferenceReport,
+    live: &CacheReferenceReport,
+    cancel: &AtomicBool,
+) -> Result<(), String> {
+    // Every attempt starts fail closed. A complete inventory is the only path
+    // that deliberately heals a block left by startup or an earlier failure.
+    cache.block_destructive_operations();
+    ensure_not_cancelled(cancel, "cancelled before protecting project downloads")?;
+    if !saved.is_complete() {
+        return Err(
+            "saved project media inventory is incomplete; download clear was refused".into(),
+        );
+    }
+    if !live.is_complete() {
+        return Err(
+            "current project media inventory is incomplete; download clear was refused".into(),
+        );
+    }
+    let saved_paths = saved
+        .references
+        .by_cache
+        .get(&CacheId::Download)
+        .ok_or_else(|| {
+            "saved project media inventory omitted the download cache; download clear was refused"
+                .to_string()
+        })?;
+    let live_paths = live.by_cache.get(&CacheId::Download).ok_or_else(|| {
+        "current project media inventory omitted the download cache; download clear was refused"
+            .to_string()
+    })?;
+
+    protect_download_references(cache, saved_paths, cancel)?;
+    protect_download_references(cache, live_paths, cancel)?;
+    ensure_not_cancelled(cancel, "cancelled before clearing downloads")?;
+    cache.allow_destructive_operations();
+    Ok(())
+}
+
 fn protect_download_references(
     cache: &DownloadCache,
     paths: &BTreeSet<PathBuf>,
+    cancel: &AtomicBool,
 ) -> Result<(), String> {
     for path in paths {
+        ensure_not_cancelled(cancel, "cancelled while protecting project downloads")?;
         cache.protect_path(path).map_err(|error| {
             bounded_error(
                 "project download could not be protected",
@@ -1223,6 +1287,27 @@ mod tests {
 
     use super::*;
 
+    fn saved_download_report(paths: &[PathBuf]) -> DraftReferenceReport {
+        let mut report = DraftReferenceReport::default();
+        report
+            .references
+            .by_cache
+            .get_mut(&CacheId::Download)
+            .unwrap()
+            .extend(paths.iter().cloned());
+        report
+    }
+
+    fn live_download_report(paths: &[PathBuf]) -> CacheReferenceReport {
+        let mut report = CacheReferenceReport::default();
+        report
+            .by_cache
+            .get_mut(&CacheId::Download)
+            .unwrap()
+            .extend(paths.iter().cloned());
+        report
+    }
+
     #[test]
     fn disk_snapshots_are_deterministic_and_missing_directories_are_zero() {
         let temporary = tempfile::tempdir().unwrap();
@@ -1327,6 +1412,167 @@ mod tests {
             disk_path(&layout, CacheId::Download).unwrap(),
             download_override
         );
+    }
+
+    #[test]
+    fn incomplete_missing_or_cancelled_download_inventory_stays_blocked() {
+        let temporary = tempfile::tempdir().unwrap();
+        let cache = DownloadCache::new(temporary.path().join("downloads"), 1_000);
+        let complete_saved = saved_download_report(&[]);
+        let complete_live = live_download_report(&[]);
+
+        let incomplete_saved = DraftReferenceReport {
+            skipped_or_errored: 1,
+            ..complete_saved.clone()
+        };
+        let error = prepare_download_cache_clear(
+            &cache,
+            &incomplete_saved,
+            &complete_live,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("saved"));
+        assert!(error.contains("incomplete"));
+        assert!(cache.destructive_operations_blocked());
+
+        cache.allow_destructive_operations();
+        let incomplete_live = CacheReferenceReport {
+            counts: crate::cache_references::ReferenceCounts {
+                rejected: 1,
+                ..crate::cache_references::ReferenceCounts::default()
+            },
+            ..complete_live.clone()
+        };
+        let error = prepare_download_cache_clear(
+            &cache,
+            &complete_saved,
+            &incomplete_live,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("current"));
+        assert!(error.contains("incomplete"));
+        assert!(cache.destructive_operations_blocked());
+
+        cache.allow_destructive_operations();
+        let mut missing_saved = complete_saved.clone();
+        missing_saved.references.by_cache.remove(&CacheId::Download);
+        let error = prepare_download_cache_clear(
+            &cache,
+            &missing_saved,
+            &complete_live,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("omitted"));
+        assert!(cache.destructive_operations_blocked());
+
+        cache.allow_destructive_operations();
+        let mut missing_live = complete_live.clone();
+        missing_live.by_cache.remove(&CacheId::Download);
+        let error = prepare_download_cache_clear(
+            &cache,
+            &complete_saved,
+            &missing_live,
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        assert!(error.contains("omitted"));
+        assert!(cache.destructive_operations_blocked());
+
+        cache.allow_destructive_operations();
+        let error = prepare_download_cache_clear(
+            &cache,
+            &complete_saved,
+            &complete_live,
+            &AtomicBool::new(true),
+        )
+        .unwrap_err();
+        assert!(error.contains("cancelled"));
+        assert!(cache.destructive_operations_blocked());
+    }
+
+    #[test]
+    fn complete_download_inventory_heals_block_after_all_paths_are_protected() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("downloads");
+        fs::create_dir_all(root.join("stock")).unwrap();
+        let saved_path = root.join("stock/saved.mp4");
+        let live_path = root.join("stock/live.mp4");
+        fs::write(&saved_path, b"saved").unwrap();
+        fs::write(&live_path, b"live").unwrap();
+        let cache = DownloadCache::new(root, 1_000);
+        cache.block_destructive_operations();
+
+        prepare_download_cache_clear(
+            &cache,
+            &saved_download_report(std::slice::from_ref(&saved_path)),
+            &live_download_report(std::slice::from_ref(&live_path)),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(cache.protected_path_count(), 2);
+        assert!(!cache.destructive_operations_blocked());
+    }
+
+    #[test]
+    fn download_protection_failure_leaves_cache_blocked() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("downloads");
+        fs::create_dir_all(root.join("directory")).unwrap();
+        let valid = root.join("valid.mp4");
+        fs::write(&valid, b"valid").unwrap();
+        let invalid = root.join("directory");
+        let cache = DownloadCache::new(root, 1_000);
+
+        let error = prepare_download_cache_clear(
+            &cache,
+            &saved_download_report(std::slice::from_ref(&valid)),
+            &live_download_report(std::slice::from_ref(&invalid)),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("could not be protected"));
+        assert_eq!(cache.protected_path_count(), 1);
+        assert!(cache.destructive_operations_blocked());
+    }
+
+    #[test]
+    fn protected_downloads_survive_clear_with_exact_accounting() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("downloads");
+        fs::create_dir_all(root.join("stock")).unwrap();
+        let saved_path = root.join("stock/saved.mp4");
+        let live_path = root.join("stock/live.mp4");
+        let disposable = root.join("stock/disposable.bin");
+        fs::write(&saved_path, b"saved").unwrap();
+        fs::write(&live_path, b"live").unwrap();
+        fs::write(&disposable, b"discard").unwrap();
+        let cache = DownloadCache::new(root, 1_000);
+
+        let removed = clear_download_cache_from_inventories(
+            &cache,
+            &saved_download_report(std::slice::from_ref(&saved_path)),
+            &live_download_report(std::slice::from_ref(&live_path)),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert_eq!(
+            removed,
+            CacheUsage {
+                bytes: 7,
+                entries: 0,
+                files: 1,
+            }
+        );
+        assert_eq!(fs::read(saved_path).unwrap(), b"saved");
+        assert_eq!(fs::read(live_path).unwrap(), b"live");
+        assert!(!disposable.exists());
+        assert!(!cache.destructive_operations_blocked());
     }
 
     #[test]
