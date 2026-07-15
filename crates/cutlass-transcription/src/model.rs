@@ -551,11 +551,13 @@ impl ModelManager {
     /// durable temporary-file writes. A single blocking transport or reader
     /// call, and the existing-model hash pass, cannot be interrupted midway.
     ///
-    /// Once the final pre-commit check passes, cancellation is no longer
-    /// consulted: replacement, durability confirmation, and root-mapping
-    /// checks finish and return their actual result. Consequently, an outer
-    /// job cancellation flag can win a tiny race even though installation
-    /// completed successfully.
+    /// The final cancellation check is used as this standalone API's commit
+    /// decision. Once it passes, cancellation is no longer consulted:
+    /// replacement, durability confirmation, and root-mapping checks finish
+    /// and return their actual result. An outer job that must atomically
+    /// coordinate cancellation with publication should instead use
+    /// [`Self::ensure_with_cancellation_and_commit`] and bind its commit
+    /// callback to the job owner's atomic commit handshake.
     ///
     /// # Errors
     ///
@@ -568,7 +570,54 @@ impl ModelManager {
         downloader: &dyn ModelDownloader,
         cancelled: &dyn Fn() -> bool,
     ) -> Result<PathBuf, ModelManagerError> {
-        self.ensure_spec_with_cancellation(model.spec(), downloader, cancelled)
+        let begin_commit = || check_cancelled(cancelled).is_ok();
+        self.ensure_with_cancellation_and_commit(model, downloader, cancelled, &begin_commit)
+    }
+
+    /// Ensures a verified model with cancellation and an atomic commit handshake.
+    ///
+    /// Both callbacks are borrowed for this call and may directly borrow an
+    /// outer job context. `cancelled` has the same cooperative semantics as in
+    /// [`Self::ensure_with_cancellation`]: it may be called many times before
+    /// publication and a panic is treated as cancellation.
+    ///
+    /// `begin_commit` is not called when a verified existing model is reused.
+    /// For a download or replacement, it is called exactly once, after the
+    /// complete stream has passed exact length and SHA-256 verification, the
+    /// temporary file has been flushed and synced, temporary-file identity and
+    /// replacement-target safety have been checked, and the configured root
+    /// mapping has been revalidated. The call occurs immediately before the
+    /// first target removal or rename.
+    ///
+    /// Returning `false`, or panicking, fails closed with
+    /// [`ModelManagerError::Cancelled`]. The temporary file is cleaned up and
+    /// an existing target is left unchanged. Returning `true` is the point of
+    /// no return: neither callback is consulted again, and replacement,
+    /// directory durability, and final root-mapping checks return their actual
+    /// result.
+    ///
+    /// An outer job manager can remove the cancellation/publication race by
+    /// making `begin_commit` perform its atomic transition from cancellable to
+    /// committing (for example, by calling its `try_begin_commit` operation).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelManagerError::Cancelled`] when cancellation is observed
+    /// before commit or the commit callback rejects or panics. Other failures
+    /// retain the same meaning as [`Self::ensure_with`].
+    pub fn ensure_with_cancellation_and_commit(
+        &self,
+        model: WhisperModel,
+        downloader: &dyn ModelDownloader,
+        cancelled: &dyn Fn() -> bool,
+        begin_commit: &dyn Fn() -> bool,
+    ) -> Result<PathBuf, ModelManagerError> {
+        self.ensure_spec_with_cancellation_and_commit(
+            model.spec(),
+            downloader,
+            cancelled,
+            begin_commit,
+        )
     }
 
     /// Removes only the known regular model file.
@@ -618,11 +667,23 @@ impl ModelManager {
         self.ensure_spec_with_cancellation(spec, downloader, &never_cancelled)
     }
 
+    #[cfg(test)]
     fn ensure_spec_with_cancellation(
         &self,
         spec: &ModelSpec,
         downloader: &dyn ModelDownloader,
         cancelled: &dyn Fn() -> bool,
+    ) -> Result<PathBuf, ModelManagerError> {
+        let begin_commit = || check_cancelled(cancelled).is_ok();
+        self.ensure_spec_with_cancellation_and_commit(spec, downloader, cancelled, &begin_commit)
+    }
+
+    fn ensure_spec_with_cancellation_and_commit(
+        &self,
+        spec: &ModelSpec,
+        downloader: &dyn ModelDownloader,
+        cancelled: &dyn Fn() -> bool,
+        begin_commit: &dyn Fn() -> bool,
     ) -> Result<PathBuf, ModelManagerError> {
         validate_spec(spec)?;
         check_cancelled(cancelled)?;
@@ -727,8 +788,7 @@ impl ModelManager {
         temporary.verify_current()?;
         let target_exists = ensure_safe_replace_target(&snapshot, spec)?;
         snapshot.verify_mapping()?;
-        check_cancelled(cancelled)?;
-        temporary.commit(spec.filename(), target_exists)?;
+        temporary.commit(spec.filename(), target_exists, begin_commit)?;
         sync_containing_directory(&snapshot, &physical_path)?;
         snapshot.verify_mapping()?;
         Ok(reported_path)
@@ -1396,6 +1456,16 @@ fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), ModelManagerError
     }
 }
 
+fn check_begin_commit(begin_commit: &dyn Fn() -> bool) -> Result<(), ModelManagerError> {
+    let accepted =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(begin_commit)).unwrap_or(false);
+    if accepted {
+        Ok(())
+    } else {
+        Err(ModelManagerError::Cancelled)
+    }
+}
+
 fn lock_model_with_cancellation<'a>(
     lock: &'a Mutex<()>,
     cancelled: &dyn Fn() -> bool,
@@ -1568,9 +1638,16 @@ impl TemporaryDownload {
         Ok(())
     }
 
-    fn commit(mut self, target_name: &str, target_exists: bool) -> Result<(), ModelManagerError> {
+    fn commit(
+        mut self,
+        target_name: &str,
+        target_exists: bool,
+        begin_commit: &dyn Fn() -> bool,
+    ) -> Result<(), ModelManagerError> {
         drop(self.identity.take());
         drop(self.file.take());
+
+        check_begin_commit(begin_commit)?;
 
         #[cfg(windows)]
         if target_exists {
@@ -1852,22 +1929,347 @@ mod tests {
     }
 
     #[test]
+    fn begin_commit_is_called_once_for_fresh_install_and_replacement() {
+        for existing in [None, Some(&b"jello"[..])] {
+            let temp = TempDir::new().expect("temporary directory");
+            let manager = ModelManager::new(temp.path()).expect("valid manager");
+            let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
+            if let Some(bytes) = existing {
+                fs::write(&path, bytes).expect("write invalid existing model");
+            }
+            let downloader = CountingDownloader::new(b"hello");
+            let begin_calls = AtomicUsize::new(0);
+
+            let installed = manager
+                .ensure_spec_with_cancellation_and_commit(
+                    &TINY_SPEC,
+                    &downloader,
+                    &never_cancelled,
+                    &|| {
+                        begin_calls.fetch_add(1, Ordering::SeqCst);
+                        true
+                    },
+                )
+                .expect("installation succeeds");
+
+            assert_eq!(installed, path);
+            assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(downloader.calls(), 1);
+            assert_eq!(fs::read(&path).expect("read installed model"), b"hello");
+            assert_no_temporary_files(temp.path());
+        }
+    }
+
+    #[test]
+    fn rejected_begin_commit_preserves_target_and_cleans_temp() {
+        for existing in [None, Some(&b"bad"[..])] {
+            let temp = TempDir::new().expect("temporary directory");
+            let manager = ModelManager::new(temp.path()).expect("valid manager");
+            let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
+            if let Some(bytes) = existing {
+                fs::write(&path, bytes).expect("write invalid existing model");
+            }
+            let downloader = CountingDownloader::new(b"hello");
+            let begin_calls = AtomicUsize::new(0);
+
+            let error = manager
+                .ensure_spec_with_cancellation_and_commit(
+                    &TINY_SPEC,
+                    &downloader,
+                    &never_cancelled,
+                    &|| {
+                        begin_calls.fetch_add(1, Ordering::SeqCst);
+                        false
+                    },
+                )
+                .expect_err("rejected commit must cancel");
+
+            assert!(matches!(error, ModelManagerError::Cancelled));
+            assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+            match existing {
+                Some(bytes) => {
+                    assert_eq!(fs::read(&path).expect("read preserved target"), bytes);
+                }
+                None => assert!(!path.exists()),
+            }
+            assert_no_temporary_files(temp.path());
+        }
+    }
+
+    #[test]
+    fn panicking_begin_commit_preserves_target_and_cleans_temp() {
+        for existing in [None, Some(&b"bad"[..])] {
+            let temp = TempDir::new().expect("temporary directory");
+            let manager = ModelManager::new(temp.path()).expect("valid manager");
+            let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
+            if let Some(bytes) = existing {
+                fs::write(&path, bytes).expect("write invalid existing model");
+            }
+            let downloader = CountingDownloader::new(b"hello");
+            let begin_calls = AtomicUsize::new(0);
+
+            let error = manager
+                .ensure_spec_with_cancellation_and_commit(
+                    &TINY_SPEC,
+                    &downloader,
+                    &never_cancelled,
+                    &|| {
+                        begin_calls.fetch_add(1, Ordering::SeqCst);
+                        panic!("injected begin-commit panic")
+                    },
+                )
+                .expect_err("panicking commit callback must cancel");
+
+            assert!(matches!(error, ModelManagerError::Cancelled));
+            assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+            match existing {
+                Some(bytes) => {
+                    assert_eq!(fs::read(&path).expect("read preserved target"), bytes);
+                }
+                None => assert!(!path.exists()),
+            }
+            assert_no_temporary_files(temp.path());
+        }
+    }
+
+    #[test]
+    fn begin_commit_observes_complete_verified_and_synced_temporary_file() {
+        let temp = TempDir::new().expect("temporary directory");
+        let manager = ModelManager::new(temp.path()).expect("valid manager");
+        let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
+        let read_calls = Arc::new(AtomicUsize::new(0));
+        let saw_eof = Arc::new(AtomicBool::new(false));
+        let read_calls_for_downloader = Arc::clone(&read_calls);
+        let saw_eof_for_downloader = Arc::clone(&saw_eof);
+        let downloader = move |_spec: &ModelSpec| -> Result<DownloadReader, DownloadError> {
+            Ok(Box::new(CompletionTrackingReader {
+                cursor: Cursor::new(b"hello"),
+                read_calls: Arc::clone(&read_calls_for_downloader),
+                saw_eof: Arc::clone(&saw_eof_for_downloader),
+            }))
+        };
+
+        manager
+            .ensure_spec_with_cancellation_and_commit(
+                &TINY_SPEC,
+                &downloader,
+                &never_cancelled,
+                &|| {
+                    assert!(saw_eof.load(Ordering::SeqCst));
+                    assert!(read_calls.load(Ordering::SeqCst) >= 2);
+                    assert!(!path.exists());
+
+                    let temporary_paths: Vec<_> = fs::read_dir(temp.path())
+                        .expect("read model directory")
+                        .map(|entry| entry.expect("directory entry").path())
+                        .filter(|entry| {
+                            entry
+                                .extension()
+                                .is_some_and(|extension| extension == "tmp")
+                        })
+                        .collect();
+                    assert_eq!(temporary_paths.len(), 1);
+                    assert_eq!(
+                        fs::read(&temporary_paths[0]).expect("read synced temporary model"),
+                        b"hello"
+                    );
+                    true
+                },
+            )
+            .expect("installation succeeds");
+
+        assert_eq!(fs::read(&path).expect("read installed model"), b"hello");
+        assert_no_temporary_files(temp.path());
+    }
+
+    #[test]
+    fn cancellation_before_commit_skips_begin_commit() {
+        let temp = TempDir::new().expect("temporary directory");
+        let manager = ModelManager::new(temp.path()).expect("valid manager");
+        let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
+        fs::write(&path, b"bad").expect("write invalid existing model");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled_for_downloader = Arc::clone(&cancelled);
+        let downloader = move |_spec: &ModelSpec| -> Result<DownloadReader, DownloadError> {
+            Ok(Box::new(CancelAtEofReader {
+                cursor: Cursor::new(b"hello"),
+                cancelled: Arc::clone(&cancelled_for_downloader),
+            }))
+        };
+        let begin_calls = AtomicUsize::new(0);
+
+        let error = manager
+            .ensure_spec_with_cancellation_and_commit(
+                &TINY_SPEC,
+                &downloader,
+                &|| cancelled.load(Ordering::SeqCst),
+                &|| {
+                    begin_calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+            )
+            .expect_err("pre-commit cancellation must win");
+
+        assert!(matches!(error, ModelManagerError::Cancelled));
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&path).expect("read preserved target"), b"bad");
+        assert_no_temporary_files(temp.path());
+    }
+
+    #[test]
+    fn cancellation_after_begin_commit_cannot_reclassify_success() {
+        let temp = TempDir::new().expect("temporary directory");
+        let manager = ModelManager::new(temp.path()).expect("valid manager");
+        let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
+        let downloader = CountingDownloader::new(b"hello");
+        let cancelled = AtomicBool::new(false);
+        let cancellation_checks = AtomicUsize::new(0);
+        let checks_at_commit = AtomicUsize::new(0);
+        let begin_calls = AtomicUsize::new(0);
+
+        let installed = manager
+            .ensure_spec_with_cancellation_and_commit(
+                &TINY_SPEC,
+                &downloader,
+                &|| {
+                    cancellation_checks.fetch_add(1, Ordering::SeqCst);
+                    cancelled.load(Ordering::SeqCst)
+                },
+                &|| {
+                    begin_calls.fetch_add(1, Ordering::SeqCst);
+                    checks_at_commit
+                        .store(cancellation_checks.load(Ordering::SeqCst), Ordering::SeqCst);
+                    cancelled.store(true, Ordering::SeqCst);
+                    true
+                },
+            )
+            .expect("accepted commit must finish despite later cancellation");
+
+        assert_eq!(installed, path);
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            cancellation_checks.load(Ordering::SeqCst),
+            checks_at_commit.load(Ordering::SeqCst)
+        );
+        assert_eq!(fs::read(&path).expect("read installed model"), b"hello");
+        assert_no_temporary_files(temp.path());
+    }
+
+    #[test]
+    fn ready_reuse_skips_begin_commit_and_remains_cancellation_aware() {
+        let temp = TempDir::new().expect("temporary directory");
+        let manager = ModelManager::new(temp.path()).expect("valid manager");
+        let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
+        fs::write(&path, b"hello").expect("write verified model");
+        let downloader = |_spec: &ModelSpec| -> Result<DownloadReader, DownloadError> {
+            panic!("verified model must not be downloaded")
+        };
+        let begin_calls = AtomicUsize::new(0);
+
+        let reused = manager
+            .ensure_spec_with_cancellation_and_commit(
+                &TINY_SPEC,
+                &downloader,
+                &never_cancelled,
+                &|| {
+                    begin_calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+            )
+            .expect("ready model reuse succeeds");
+        assert_eq!(reused, path);
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 0);
+
+        let cancellation_checks = AtomicUsize::new(0);
+        let error = manager
+            .ensure_spec_with_cancellation_and_commit(
+                &TINY_SPEC,
+                &downloader,
+                &|| cancellation_checks.fetch_add(1, Ordering::SeqCst) + 1 >= 5,
+                &|| {
+                    begin_calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                },
+            )
+            .expect_err("cancellation after ready verification must be observed");
+        assert!(matches!(error, ModelManagerError::Cancelled));
+        assert!(cancellation_checks.load(Ordering::SeqCst) >= 5);
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(&path).expect("read reused model"), b"hello");
+        assert_no_temporary_files(temp.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_commit_mapping_error_is_not_reclassified_as_cancellation() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().expect("temporary directory");
+        let root = temp.path().join("models");
+        let pinned_root = temp.path().join("models-pinned");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&root).expect("create model root");
+        fs::create_dir(&outside).expect("create outside directory");
+        let manager = ModelManager::new(&root).expect("valid manager");
+        let downloader = CountingDownloader::new(b"hello");
+        let cancelled = AtomicBool::new(false);
+        let begin_calls = AtomicUsize::new(0);
+
+        let error = manager
+            .ensure_spec_with_cancellation_and_commit(
+                &TINY_SPEC,
+                &downloader,
+                &|| cancelled.load(Ordering::SeqCst),
+                &|| {
+                    begin_calls.fetch_add(1, Ordering::SeqCst);
+                    cancelled.store(true, Ordering::SeqCst);
+                    fs::rename(&root, &pinned_root).expect("rename pinned root");
+                    symlink(&outside, &root).expect("replace root with symlink");
+                    true
+                },
+            )
+            .expect_err("post-commit mapping change must remain an actual error");
+
+        assert!(matches!(
+            error,
+            ModelManagerError::RootMappingChanged { .. }
+        ));
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fs::read(pinned_root.join(TINY_SPEC.filename())).expect("read committed model"),
+            b"hello"
+        );
+        assert!(!outside.join(TINY_SPEC.filename()).exists());
+        assert_no_temporary_files(&pinned_root);
+    }
+
+    #[test]
     fn concurrent_ensure_commits_one_complete_download() {
         const WORKERS: usize = 8;
 
         let temp = TempDir::new().expect("temporary directory");
         let manager = Arc::new(ModelManager::new(temp.path()).expect("valid manager"));
         let downloader = Arc::new(CountingDownloader::new(b"hello"));
+        let begin_calls = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(Barrier::new(WORKERS));
         let mut workers = Vec::new();
 
         for _ in 0..WORKERS {
             let manager = Arc::clone(&manager);
             let downloader = Arc::clone(&downloader);
+            let begin_calls = Arc::clone(&begin_calls);
             let barrier = Arc::clone(&barrier);
             workers.push(thread::spawn(move || {
                 barrier.wait();
-                manager.ensure_spec(&TINY_SPEC, downloader.as_ref())
+                manager.ensure_spec_with_cancellation_and_commit(
+                    &TINY_SPEC,
+                    downloader.as_ref(),
+                    &never_cancelled,
+                    &|| {
+                        begin_calls.fetch_add(1, Ordering::SeqCst);
+                        true
+                    },
+                )
             }));
         }
 
@@ -1879,6 +2281,7 @@ mod tests {
         }
 
         assert_eq!(downloader.calls(), 1);
+        assert_eq!(begin_calls.load(Ordering::SeqCst), 1);
         let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
         assert_eq!(fs::read(path).expect("read committed model"), b"hello");
         assert_no_temporary_files(temp.path());
@@ -2244,6 +2647,38 @@ mod tests {
             self.read_count += 1;
             buffer[..bytes.len()].copy_from_slice(bytes);
             Ok(bytes.len())
+        }
+    }
+
+    struct CompletionTrackingReader {
+        cursor: Cursor<&'static [u8]>,
+        read_calls: Arc<AtomicUsize>,
+        saw_eof: Arc<AtomicBool>,
+    }
+
+    impl Read for CompletionTrackingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.read_calls.fetch_add(1, Ordering::SeqCst);
+            let count = self.cursor.read(buffer)?;
+            if count == 0 {
+                self.saw_eof.store(true, Ordering::SeqCst);
+            }
+            Ok(count)
+        }
+    }
+
+    struct CancelAtEofReader {
+        cursor: Cursor<&'static [u8]>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl Read for CancelAtEofReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let count = self.cursor.read(buffer)?;
+            if count == 0 {
+                self.cancelled.store(true, Ordering::SeqCst);
+            }
+            Ok(count)
         }
     }
 
