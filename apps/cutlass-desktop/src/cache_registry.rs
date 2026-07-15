@@ -124,6 +124,19 @@ impl CacheRegistry {
         })
     }
 
+    /// The immutable storage root selected when this registry was created.
+    pub(crate) fn startup_storage_root(&self) -> &Path {
+        self.layout.root()
+    }
+
+    /// Resolve one cache's immutable startup path.
+    ///
+    /// Memory caches deliberately return a short error instead of inventing a
+    /// filesystem location.
+    pub(crate) fn cache_path(&self, id: CacheId) -> Result<PathBuf, String> {
+        disk_path(&self.layout, id)
+    }
+
     /// Snapshot every cache in stable descriptor order.
     ///
     /// This method dispatches Slint-owned cache reads to the UI event loop and
@@ -155,9 +168,7 @@ impl CacheRegistry {
         ensure_not_cancelled(cancel, "cancelled before clearing the cache")?;
 
         let descriptor = id.descriptor();
-        if descriptor.tier == CacheTier::UserData {
-            return Err("user data cannot be cleared through the cache registry".into());
-        }
+        ensure_cache_can_be_cleared(id)?;
 
         let removed = match descriptor.kind {
             CacheKind::Memory => {
@@ -196,6 +207,12 @@ impl CacheRegistry {
     /// Human-readable target shown before an irreversible cache clear.
     pub(crate) fn clear_approval_detail(&self, id: CacheId) -> String {
         let descriptor = id.descriptor();
+        if id == CacheId::Download {
+            return format!(
+                "Cache: {}\n\nClearing is blocked while Cutlass migrates downloaded source media to durable project storage.",
+                descriptor.label
+            );
+        }
         match self.layout.resolve(id) {
             Some(path) => format!(
                 "Cache: {}\nLocation: {}\n\nClearing runs immediately and cannot be undone from Cutlass.",
@@ -454,6 +471,19 @@ fn clear_disk_contents(
         entries: 0,
         files: report.removed_files,
     })
+}
+
+fn ensure_cache_can_be_cleared(id: CacheId) -> Result<(), String> {
+    if id.descriptor().tier == CacheTier::UserData {
+        return Err("user data cannot be cleared through the cache registry".into());
+    }
+    if id == CacheId::Download {
+        return Err(
+            "download cache clearing is temporarily unavailable because existing drafts may reference downloaded source media"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_layout(layout: &StorageLayout) -> Result<(), String> {
@@ -729,7 +759,12 @@ mod tests {
     #[test]
     fn disk_helpers_honor_cancellation_and_reject_memory_paths() {
         let temporary = tempfile::tempdir().unwrap();
-        let layout = StorageLayout::new(temporary.path()).unwrap();
+        let root = temporary.path().to_path_buf();
+        let mut layout = StorageLayout::new(&root).unwrap();
+        let download_override = root.join("download-override");
+        layout
+            .set_override(CacheId::Download, &download_override)
+            .unwrap();
         let cancelled = AtomicBool::new(true);
         assert!(
             snapshot_disk_caches(&layout, &cancelled)
@@ -746,6 +781,19 @@ mod tests {
                 .unwrap_err()
                 .contains("memory")
         );
+        assert_eq!(layout.root(), root);
+        assert_eq!(
+            disk_path(&layout, CacheId::Download).unwrap(),
+            download_override
+        );
+    }
+
+    #[test]
+    fn download_clearing_fails_closed_until_source_media_is_durable() {
+        assert!(ensure_cache_can_be_cleared(CacheId::Proxies).is_ok());
+        let error = ensure_cache_can_be_cleared(CacheId::Download).unwrap_err();
+        assert!(error.contains("drafts"));
+        assert!(error.contains("source media"));
     }
 
     #[test]
