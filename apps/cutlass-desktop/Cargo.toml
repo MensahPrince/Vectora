@@ -30,6 +30,7 @@ cutlass-text = { path = "../../crates/cutlass-text" }
 cutlass-models = { path = "../../crates/cutlass-models" }
 cutlass-render = { path = "../../crates/cutlass-render" }
 cutlass-settings = { path = "../../crates/cutlass-settings" }
+cutlass-storage = { path = "../../crates/cutlass-storage" }
 cutlass-ai = { path = "../../crates/cutlass-ai" }
 cutlass-cloud = { path = "../../crates/cutlass-cloud" }
 cpal = "0.18.1"

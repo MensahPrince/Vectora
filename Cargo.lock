@@ -1346,6 +1346,7 @@ dependencies = [
  "cutlass-models",
  "cutlass-render",
  "cutlass-settings",
+ "cutlass-storage",
  "cutlass-text",
  "dirs",
  "objc2 0.6.4",
