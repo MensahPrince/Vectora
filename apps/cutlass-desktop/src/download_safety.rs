@@ -98,7 +98,7 @@ pub(crate) fn protect_project_downloads(
 
     for media in project.media_iter() {
         counts.examined = counts.examined.saturating_add(1);
-        if !is_lexically_beneath(cache.root(), media.path()) {
+        if !is_lexically_beneath(&cache.root(), media.path()) {
             continue;
         }
 

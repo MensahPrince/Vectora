@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use cutlass_cloud::cache::DownloadCache;
 use cutlass_storage::{
-    CacheDescriptor, CacheId, CacheKind, CacheTier, StorageLayout, cache_descriptors, clear_cache,
-    measure_disk_usage,
+    CacheDescriptor, CacheId, CacheKind, CacheTier, SharedStorageLayout, StorageLayout,
+    cache_descriptors, clear_cache, measure_disk_usage,
 };
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
@@ -99,7 +99,7 @@ impl Serialize for CacheClearReport {
 /// The single cloneable desktop cache service shared by agent and Settings.
 #[derive(Clone)]
 pub(crate) struct CacheRegistry {
-    layout: Arc<StorageLayout>,
+    layout: SharedStorageLayout,
     app: slint::Weak<AppWindow>,
     preview: WorkerHandle,
     download_cache: Arc<DownloadCache>,
@@ -108,15 +108,16 @@ pub(crate) struct CacheRegistry {
 
 impl CacheRegistry {
     pub(crate) fn new(
-        layout: StorageLayout,
+        layout: SharedStorageLayout,
         app: slint::Weak<AppWindow>,
         preview: WorkerHandle,
         download_cache: Arc<DownloadCache>,
     ) -> Result<Self, String> {
-        validate_layout(&layout)?;
-        validate_download_root(&layout, download_cache.root())?;
+        let snapshot = layout.snapshot();
+        validate_layout(snapshot.layout())?;
+        validate_download_root(snapshot.layout(), &download_cache.root())?;
         Ok(Self {
-            layout: Arc::new(layout),
+            layout,
             app,
             preview,
             download_cache,
@@ -124,17 +125,18 @@ impl CacheRegistry {
         })
     }
 
-    /// The immutable storage root selected when this registry was created.
-    pub(crate) fn startup_storage_root(&self) -> &Path {
-        self.layout.root()
+    /// The current default storage root.
+    pub(crate) fn storage_root(&self) -> PathBuf {
+        self.layout.snapshot().layout().root().to_path_buf()
     }
 
-    /// Resolve one cache's immutable startup path.
+    /// Resolve one cache's current path.
     ///
     /// Memory caches deliberately return a short error instead of inventing a
     /// filesystem location.
     pub(crate) fn cache_path(&self, id: CacheId) -> Result<PathBuf, String> {
-        disk_path(&self.layout, id)
+        let snapshot = self.layout.snapshot();
+        disk_path(snapshot.layout(), id)
     }
 
     /// Snapshot every cache in stable descriptor order.
@@ -148,8 +150,9 @@ impl CacheRegistry {
             GATE_WAIT_TIMEOUT,
             GATE_WAIT_SLICE,
         )?;
-        self.validate_runtime_wiring()?;
-        self.snapshot_all_locked(cancel)
+        let layout = self.layout.snapshot();
+        validate_download_root(layout.layout(), &self.download_cache.root())?;
+        self.snapshot_all_locked(layout.layout(), cancel)
     }
 
     /// Clear exactly one cache. There is intentionally no aggregate clear.
@@ -164,7 +167,8 @@ impl CacheRegistry {
             GATE_WAIT_TIMEOUT,
             GATE_WAIT_SLICE,
         )?;
-        self.validate_runtime_wiring()?;
+        let layout = self.layout.snapshot();
+        validate_download_root(layout.layout(), &self.download_cache.root())?;
         ensure_not_cancelled(cancel, "cancelled before clearing the cache")?;
 
         let descriptor = id.descriptor();
@@ -172,11 +176,11 @@ impl CacheRegistry {
 
         let removed = match descriptor.kind {
             CacheKind::Memory => {
-                ensure_memory_has_no_path(&self.layout, id)?;
+                ensure_memory_has_no_path(layout.layout(), id)?;
                 self.clear_memory_cache(id, cancel)?
             }
             CacheKind::Disk if id == CacheId::Download => self.clear_download_cache(cancel)?,
-            CacheKind::Disk => clear_disk_contents(&self.layout, id, cancel)?,
+            CacheKind::Disk => clear_disk_contents(layout.layout(), id, cancel)?,
         };
 
         // A cancellation that arrives after an exact clear should not erase
@@ -184,7 +188,7 @@ impl CacheRegistry {
         let current = if cancel.load(Ordering::Acquire) {
             None
         } else {
-            match self.snapshot_one_locked(id, cancel) {
+            match self.snapshot_one_locked(layout.layout(), id, cancel) {
                 Ok(snapshot) => Some(snapshot),
                 Err(error) => {
                     tracing::debug!(
@@ -234,10 +238,6 @@ impl CacheRegistry {
         }
     }
 
-    fn validate_runtime_wiring(&self) -> Result<(), String> {
-        validate_download_root(&self.layout, self.download_cache.root())
-    }
-
     fn clear_download_cache(&self, cancel: &AtomicBool) -> Result<CacheUsage, String> {
         ensure_not_cancelled(cancel, "cancelled before protecting project downloads")?;
         let saved = crate::download_safety::protect_saved_draft_downloads(
@@ -273,9 +273,13 @@ impl CacheRegistry {
         })
     }
 
-    fn snapshot_all_locked(&self, cancel: &AtomicBool) -> Result<Vec<CacheSnapshot>, String> {
+    fn snapshot_all_locked(
+        &self,
+        layout: &StorageLayout,
+        cancel: &AtomicBool,
+    ) -> Result<Vec<CacheSnapshot>, String> {
         let memory = self.memory_snapshots(cancel)?;
-        let disk = snapshot_disk_caches(&self.layout, cancel)?;
+        let disk = snapshot_disk_caches(layout, cancel)?;
         let mut disk = disk.into_iter();
         let mut snapshots = Vec::with_capacity(cache_descriptors().len());
 
@@ -303,13 +307,14 @@ impl CacheRegistry {
 
     fn snapshot_one_locked(
         &self,
+        layout: &StorageLayout,
         id: CacheId,
         cancel: &AtomicBool,
     ) -> Result<CacheSnapshot, String> {
         let descriptor = id.descriptor();
         match descriptor.kind {
             CacheKind::Memory => {
-                ensure_memory_has_no_path(&self.layout, id)?;
+                ensure_memory_has_no_path(layout, id)?;
                 let usage = match id {
                     CacheId::PreviewFrames => {
                         ensure_not_cancelled(cancel, "cancelled while reading preview cache")?;
@@ -335,7 +340,7 @@ impl CacheRegistry {
                 };
                 Ok(memory_snapshot(descriptor, usage))
             }
-            CacheKind::Disk => snapshot_disk_cache(&self.layout, id, cancel),
+            CacheKind::Disk => snapshot_disk_cache(layout, id, cancel),
         }
     }
 

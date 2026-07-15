@@ -733,6 +733,7 @@ fn main() -> Result<(), slint::PlatformError> {
             })?
         }
     };
+    let storage_layout = cutlass_storage::SharedStorageLayout::new(storage_layout);
     let download_quota_bytes = download_quota_mib
         .checked_mul(MIB_BYTES)
         .ok_or_else(|| slint::PlatformError::from("download cache quota exceeds byte range"))?;
@@ -829,10 +830,9 @@ fn main() -> Result<(), slint::PlatformError> {
         "engine session ready"
     );
 
-    let download_root = paths::cache_path(&storage_layout, cutlass_storage::CacheId::Download)
-        .map_err(|error| {
-            slint::PlatformError::from(format!("download cache path is invalid: {error}"))
-        })?;
+    let download_root = storage_layout
+        .resolve(cutlass_storage::CacheId::Download)
+        .ok_or_else(|| slint::PlatformError::from("download cache has no disk path"))?;
     let download_cache = std::sync::Arc::new(cutlass_cloud::cache::DownloadCache::new(
         download_root,
         download_quota_bytes,
@@ -1737,7 +1737,7 @@ fn main() -> Result<(), slint::PlatformError> {
     settings_backend.set_ai_use_account(app_settings.ai.use_account);
     settings_backend.set_storage_root(
         cache_registry
-            .startup_storage_root()
+            .storage_root()
             .to_string_lossy()
             .into_owned()
             .into(),
