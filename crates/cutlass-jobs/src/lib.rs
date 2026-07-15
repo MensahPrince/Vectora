@@ -20,21 +20,24 @@
 //!   — the terminal state is [`JobState::Cancelled`], with the returned
 //!   string kept as the final detail. A job that never checks simply runs to
 //!   completion and is then marked cancelled anyway.
-//! - **Subscribers are called with no lock held.** Every transition collects
-//!   the snapshot and the subscriber list under the lock, drops the guard,
-//!   then calls — so callbacks may re-enter the registry (query, spawn,
-//!   cancel) without deadlocking. The `Queued` notification runs on the
-//!   spawning thread, everything after on the job's own thread; because
-//!   `Queued` is delivered before the thread starts, a subscriber sees each
-//!   job strictly in lifecycle order: Queued → Running → progress… →
-//!   terminal.
+//! - **Subscribers are called with no lock held and isolated from each
+//!   other.** Every transition collects the snapshot and subscriber list
+//!   under the lock, drops the guard, then calls — so callbacks may re-enter
+//!   the registry (query, spawn, cancel) without deadlocking. Each callback
+//!   is separately panic-contained, so one broken UI bridge cannot alter a
+//!   job's lifecycle or keep healthy subscribers from receiving the event.
+//!   The `Queued` notification runs on the spawning thread, everything after
+//!   on the job's own thread; because `Queued` is delivered before the thread
+//!   starts, a subscriber sees each job strictly in lifecycle order: Queued
+//!   → Running → progress… → terminal.
 //! - **`Instant`, not `SystemTime`.** Timestamps exist to render elapsed
 //!   time and to order pruning — both monotonic concerns; wall-clock time
 //!   can jump under NTP. Nothing here persists across runs, so wall time
 //!   buys nothing.
-//! - **Bounded.** Finished jobs beyond the newest [`KEEP_FINISHED`] are
-//!   pruned (by *finish* time — a long export that just ended is recent
-//!   news even if it was spawned first). Running jobs are never pruned.
+//! - **Bounded.** Labels and details are sanitized to fixed byte caps, and
+//!   finished jobs beyond the newest [`KEEP_FINISHED`] are pruned (by
+//!   *finish* time — a long export that just ended is recent news even if it
+//!   was spawned first). Running jobs are never pruned.
 //! - **Panic containment.** A panicking job is caught (`catch_unwind`) and
 //!   becomes [`JobState::Failed`] with a `panicked: …` detail — one bad
 //!   export must not take down the app. Panic wins over cancellation: a job
@@ -52,6 +55,20 @@ use std::time::Instant;
 /// The oldest-finished beyond this are dropped at each terminal transition,
 /// so the registry stays a bounded status board, never an unbounded history.
 pub const KEEP_FINISHED: usize = 64;
+
+/// Maximum UTF-8 byte length retained for a job label.
+///
+/// Longer labels are truncated on a character boundary and end in one
+/// ellipsis within this cap. Controls and line separators are replaced with
+/// spaces before labels reach snapshots, thread names, or UI/tool boundaries.
+pub const MAX_JOB_LABEL_BYTES: usize = 256;
+
+/// Maximum UTF-8 byte length retained for progress and terminal details.
+///
+/// Longer details are truncated on a character boundary and end in one
+/// ellipsis within this cap. Controls and line separators are replaced with
+/// spaces so every retained detail is safe to render as one line.
+pub const MAX_JOB_DETAIL_BYTES: usize = 4096;
 
 /// Registry-unique job handle. Ids come from a per-manager counter and are
 /// never reused, so a stale id (a pruned job) reads as unknown rather than
@@ -102,7 +119,8 @@ impl JobState {
 #[derive(Debug, Clone)]
 pub struct JobSnapshot {
     pub id: JobId,
-    /// Human label ("Exporting draft.mp4", "Transcribing interview.mov").
+    /// Human label ("Exporting draft.mp4", "Transcribing interview.mov"),
+    /// sanitized to one line and at most [`MAX_JOB_LABEL_BYTES`] UTF-8 bytes.
     pub label: String,
     pub state: JobState,
     /// `0.0..=1.0` when the job reports progress; `None` for indeterminate.
@@ -110,7 +128,8 @@ pub struct JobSnapshot {
     /// Failed/Cancelled keep the last reported value.
     pub progress: Option<f32>,
     /// One-line current detail ("frame 1200/3600"), the failure reason after
-    /// [`JobState::Failed`], or the result summary after [`JobState::Done`].
+    /// [`JobState::Failed`], or the result summary after [`JobState::Done`],
+    /// sanitized to at most [`MAX_JOB_DETAIL_BYTES`] UTF-8 bytes.
     pub detail: String,
     /// A cancel was requested but the job hasn't exited yet — render as
     /// "cancelling…". Stays set on the terminal snapshot of cancelled jobs.
@@ -139,7 +158,7 @@ impl JobContext {
         } else {
             fraction.clamp(0.0, 1.0)
         };
-        let detail = detail.into();
+        let detail = sanitize_detail(&detail.into());
         self.shared.update(self.id, |job| {
             job.snap.progress = Some(fraction);
             job.snap.detail = detail;
@@ -180,7 +199,7 @@ impl JobManager {
         label: impl Into<String>,
         work: impl FnOnce(&JobContext) -> Result<String, String> + Send + 'static,
     ) -> JobId {
-        let label = label.into();
+        let label = sanitize_label(&label.into());
         let id = JobId(self.shared.next_id.fetch_add(1, Ordering::Relaxed));
         let cancel = Arc::new(AtomicBool::new(false));
 
@@ -204,9 +223,7 @@ impl JobManager {
         };
         // Deliver Queued before the thread exists, so a subscriber's event
         // stream for this job can never open with Running.
-        for subscriber in &subscribers {
-            subscriber(snapshot.clone());
-        }
+        deliver_to_subscribers(&snapshot, &subscribers);
 
         let context = JobContext {
             id,
@@ -224,11 +241,11 @@ impl JobManager {
                     // the way out is a bug to surface, not a clean stop.
                     Err(payload) => (
                         JobState::Failed,
-                        format!("panicked: {}", panic_message(&*payload)),
+                        sanitize_detail(&format!("panicked: {}", panic_message(&*payload))),
                         true,
                     ),
-                    Ok(Ok(summary)) => (JobState::Done, summary, false),
-                    Ok(Err(reason)) => (JobState::Failed, reason, false),
+                    Ok(Ok(summary)) => (JobState::Done, sanitize_detail(&summary), false),
+                    Ok(Err(reason)) => (JobState::Failed, sanitize_detail(&reason), false),
                 };
                 shared.update(id, |job| {
                     // Decide under the same registry lock as `cancel`: if
@@ -255,9 +272,10 @@ impl JobManager {
         if let Err(err) = spawned {
             // Thread spawn failure (resource exhaustion) is the one way a
             // job dies without running; surface it like any other failure.
+            let detail = sanitize_detail(&format!("failed to spawn thread: {err}"));
             self.shared.update(id, |job| {
                 job.snap.state = JobState::Failed;
-                job.snap.detail = format!("failed to spawn thread: {err}");
+                job.snap.detail = detail;
                 job.snap.finished = Some(Instant::now());
             });
         }
@@ -313,10 +331,12 @@ impl JobManager {
     /// live as long as the registry, i.e. the app).
     ///
     /// Callbacks run on the job's thread (`Queued` on the spawning thread)
-    /// with **no registry lock held**, in per-job lifecycle order. Keep them
-    /// cheap — post into an event loop rather than doing work inline. To
-    /// catch up on pre-existing jobs, subscribe first, then render one
-    /// [`snapshot`](Self::snapshot).
+    /// with **no registry lock held**, in per-job lifecycle order. Each
+    /// invocation is panic-contained independently; a panicking subscriber
+    /// is skipped for that event while later subscribers are still called.
+    /// Keep callbacks cheap — post into an event loop rather than doing work
+    /// inline. To catch up on pre-existing jobs, subscribe first, then render
+    /// one [`snapshot`](Self::snapshot).
     pub fn subscribe(&self, subscriber: impl Fn(JobSnapshot) + Send + Sync + 'static) {
         let mut inner = self.shared.inner.lock().expect("job registry lock");
         inner.subscribers.push(Arc::new(subscriber));
@@ -330,6 +350,16 @@ impl Default for JobManager {
 }
 
 type Subscriber = Arc<dyn Fn(JobSnapshot) + Send + Sync>;
+
+/// Deliver one transition outside the registry lock. Each callback gets its
+/// own unwind boundary so subscriber bugs cannot abort lifecycle transitions
+/// or suppress delivery to the rest of the subscriber list.
+fn deliver_to_subscribers(snapshot: &JobSnapshot, subscribers: &[Subscriber]) {
+    for subscriber in subscribers {
+        let event = snapshot.clone();
+        let _ = catch_unwind(AssertUnwindSafe(|| subscriber(event)));
+    }
+}
 
 struct Shared {
     /// Ids start at 1 and never recycle (see [`JobId`]).
@@ -370,9 +400,7 @@ impl Shared {
             }
             (snapshot, inner.subscribers.clone())
         };
-        for subscriber in &subscribers {
-            subscriber(snapshot.clone());
-        }
+        deliver_to_subscribers(&snapshot, &subscribers);
     }
 }
 
@@ -408,15 +436,56 @@ impl Inner {
     }
 }
 
+const MAX_THREAD_NAME_BYTES: usize = 32;
+const ELLIPSIS: char = '…';
+
+fn sanitize_label(label: &str) -> String {
+    sanitize_text(label, MAX_JOB_LABEL_BYTES)
+}
+
+fn sanitize_detail(detail: &str) -> String {
+    sanitize_text(detail, MAX_JOB_DETAIL_BYTES)
+}
+
+/// Replace controls and Unicode line separators, then retain at most
+/// `max_bytes` of valid UTF-8. Truncated values have exactly one appended
+/// ellipsis character within the cap. Applying this to its own output is a
+/// no-op.
+fn sanitize_text(value: &str, max_bytes: usize) -> String {
+    debug_assert!(max_bytes >= ELLIPSIS.len_utf8());
+
+    let mut sanitized = String::with_capacity(value.len().min(max_bytes));
+    let mut truncated = false;
+    for character in value.chars() {
+        let safe = if character.is_control() || matches!(character, '\u{2028}' | '\u{2029}') {
+            ' '
+        } else {
+            character
+        };
+        if sanitized.len() + safe.len_utf8() > max_bytes {
+            truncated = true;
+            break;
+        }
+        sanitized.push(safe);
+    }
+
+    if truncated {
+        while sanitized.len() + ELLIPSIS.len_utf8() > max_bytes {
+            sanitized.pop();
+        }
+        sanitized.push(ELLIPSIS);
+    }
+    sanitized
+}
+
 /// Worker threads are named so profilers, debuggers, and crash reports
 /// attribute the work. Capped at 32 bytes on a char boundary — platforms
 /// impose their own hard limits (15 bytes on Linux), we just keep names tidy
 /// and valid UTF-8 ourselves.
 fn thread_name(label: &str) -> String {
-    const MAX_LEN: usize = 32;
     let mut name = format!("job: {label}");
-    if name.len() > MAX_LEN {
-        let mut end = MAX_LEN;
+    if name.len() > MAX_THREAD_NAME_BYTES {
+        let mut end = MAX_THREAD_NAME_BYTES;
         while !name.is_char_boundary(end) {
             end -= 1;
         }
@@ -472,6 +541,30 @@ mod tests {
                 return events;
             }
         }
+    }
+
+    fn assert_one_line_bounded(value: &str, max_bytes: usize) {
+        assert!(
+            value.len() <= max_bytes,
+            "{} bytes exceeds {max_bytes}",
+            value.len()
+        );
+        assert!(std::str::from_utf8(value.as_bytes()).is_ok());
+        assert!(
+            !value
+                .chars()
+                .any(|character| character.is_control()
+                    || matches!(character, '\u{2028}' | '\u{2029}')),
+            "unsafe one-line value: {value:?}"
+        );
+    }
+
+    fn oversized_text(prefix: &str, cap: usize) -> String {
+        let mut value = format!("{prefix}\n\r\t\0\u{2028}\u{2029}");
+        while value.len() <= cap + 8 {
+            value.push_str("动画🦀");
+        }
+        value
     }
 
     #[test]
@@ -714,6 +807,222 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn queued_subscriber_panic_does_not_block_spawn_or_lifecycle() {
+        let manager = JobManager::new();
+        manager.subscribe(|snapshot| {
+            if snapshot.state == JobState::Queued {
+                panic!("queued subscriber failed");
+            }
+        });
+        let (healthy_tx, healthy_rx) = mpsc::channel();
+        manager.subscribe(move |snapshot| {
+            let _ = healthy_tx.send(snapshot);
+        });
+
+        // Queued delivery is synchronous, so reaching this assignment proves
+        // the first subscriber's panic did not unwind `spawn`.
+        let id = manager.spawn("observed", |ctx| {
+            ctx.set_progress(0.5, "halfway");
+            Ok("complete".into())
+        });
+        let history = wait_history(&healthy_rx, id);
+        let states: Vec<JobState> = history.iter().map(|event| event.state).collect();
+        assert_eq!(
+            states,
+            [
+                JobState::Queued,
+                JobState::Running,
+                JobState::Running,
+                JobState::Done,
+            ]
+        );
+        assert_eq!(manager.get(id).unwrap().state, JobState::Done);
+    }
+
+    #[test]
+    fn panics_on_worker_notifications_do_not_strand_job() {
+        let manager = JobManager::new();
+        let running_panics = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let terminal_panics = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let running_panics_in_callback = Arc::clone(&running_panics);
+        let terminal_panics_in_callback = Arc::clone(&terminal_panics);
+        manager.subscribe(move |snapshot| {
+            if snapshot.state == JobState::Running {
+                running_panics_in_callback.fetch_add(1, Ordering::Relaxed);
+                panic!("running/progress subscriber failed");
+            }
+            if snapshot.state.is_terminal() {
+                terminal_panics_in_callback.fetch_add(1, Ordering::Relaxed);
+                panic!("terminal subscriber failed");
+            }
+        });
+        let (healthy_tx, healthy_rx) = mpsc::channel();
+        manager.subscribe(move |snapshot| {
+            let _ = healthy_tx.send(snapshot);
+        });
+
+        let id = manager.spawn("observed", |ctx| {
+            ctx.set_progress(0.5, "halfway");
+            Ok("complete".into())
+        });
+        let history = wait_history(&healthy_rx, id);
+        let states: Vec<JobState> = history.iter().map(|event| event.state).collect();
+        assert_eq!(
+            states,
+            [
+                JobState::Queued,
+                JobState::Running,
+                JobState::Running,
+                JobState::Done,
+            ]
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| event.state.is_terminal())
+                .count(),
+            1
+        );
+        assert!(healthy_rx.try_recv().is_err());
+        assert_eq!(running_panics.load(Ordering::Relaxed), 2);
+        assert_eq!(terminal_panics.load(Ordering::Relaxed), 1);
+        assert_eq!(manager.get(id).unwrap().state, JobState::Done);
+    }
+
+    #[test]
+    fn subscriber_can_query_cancel_and_spawn_reentrantly() {
+        let manager = JobManager::new();
+        let (event_tx, event_rx) = mpsc::channel();
+        manager.subscribe(move |snapshot| {
+            let _ = event_tx.send(snapshot);
+        });
+
+        let reentrant_manager = manager.clone();
+        let (reentrant_tx, reentrant_rx) = mpsc::channel();
+        manager.subscribe(move |snapshot| {
+            if snapshot.label == "outer" && snapshot.state == JobState::Queued {
+                let get_saw_queued = reentrant_manager
+                    .get(snapshot.id)
+                    .is_some_and(|stored| stored.state == JobState::Queued);
+                let snapshot_saw_job = reentrant_manager
+                    .snapshot()
+                    .iter()
+                    .any(|stored| stored.id == snapshot.id);
+                let cancelled = reentrant_manager.cancel(snapshot.id);
+                let inner = reentrant_manager.spawn("inner", |_| Ok("inner done".into()));
+                let _ = reentrant_tx.send((get_saw_queued, snapshot_saw_job, cancelled, inner));
+            }
+        });
+
+        let outer = manager.spawn("outer", |ctx| {
+            assert!(ctx.cancelled());
+            Ok("outer stopped".into())
+        });
+        let (get_saw_queued, snapshot_saw_job, cancelled, inner) = reentrant_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("reentrant subscriber did not finish");
+        assert!(get_saw_queued);
+        assert!(snapshot_saw_job);
+        assert!(cancelled);
+
+        let mut terminals = Vec::new();
+        while terminals.len() < 2 {
+            let snapshot = event_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("timed out waiting for reentrant jobs");
+            if snapshot.state.is_terminal() {
+                terminals.push((snapshot.id, snapshot.state));
+            }
+        }
+        assert!(terminals.contains(&(inner, JobState::Done)));
+        assert!(terminals.contains(&(outer, JobState::Cancelled)));
+    }
+
+    #[test]
+    fn retained_text_is_safe_bounded_and_deterministic() {
+        assert_eq!(
+            sanitize_text("a\nb\rc\td\0e\u{2028}f\u{2029}g", MAX_JOB_DETAIL_BYTES),
+            "a b c d e f g"
+        );
+
+        let label = oversized_text("label:", MAX_JOB_LABEL_BYTES);
+        let progress = oversized_text("progress:", MAX_JOB_DETAIL_BYTES);
+        let summary = oversized_text("summary:", MAX_JOB_DETAIL_BYTES);
+        let expected_label = sanitize_label(&label);
+        let expected_progress = sanitize_detail(&progress);
+        let expected_summary = sanitize_detail(&summary);
+        for (value, cap) in [
+            (&expected_label, MAX_JOB_LABEL_BYTES),
+            (&expected_progress, MAX_JOB_DETAIL_BYTES),
+            (&expected_summary, MAX_JOB_DETAIL_BYTES),
+        ] {
+            assert_one_line_bounded(value, cap);
+            assert!(value.ends_with(ELLIPSIS));
+        }
+        assert_eq!(sanitize_label(&label), expected_label);
+        assert_eq!(sanitize_label(&expected_label), expected_label);
+        assert_eq!(sanitize_detail(&progress), expected_progress);
+        assert_eq!(sanitize_detail(&expected_progress), expected_progress);
+        assert_eq!(sanitize_detail(&summary), expected_summary);
+        assert_eq!(sanitize_detail(&expected_summary), expected_summary);
+
+        let (manager, rx) = manager_with_events();
+        let (name_tx, name_rx) = mpsc::channel();
+        let id = manager.spawn(label, move |ctx| {
+            name_tx
+                .send(thread::current().name().unwrap_or("").to_owned())
+                .unwrap();
+            ctx.set_progress(0.5, progress);
+            Ok(summary)
+        });
+        let actual_thread_name = name_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("job did not report its thread name");
+        let history = wait_history(&rx, id);
+        let states: Vec<JobState> = history.iter().map(|event| event.state).collect();
+        assert_eq!(
+            states,
+            [
+                JobState::Queued,
+                JobState::Running,
+                JobState::Running,
+                JobState::Done,
+            ]
+        );
+        assert_eq!(actual_thread_name, thread_name(&expected_label));
+        assert!(actual_thread_name.len() <= MAX_THREAD_NAME_BYTES);
+        for snapshot in &history {
+            assert_eq!(snapshot.label, expected_label);
+            assert_one_line_bounded(&snapshot.label, MAX_JOB_LABEL_BYTES);
+            assert_one_line_bounded(&snapshot.detail, MAX_JOB_DETAIL_BYTES);
+        }
+        assert_eq!(history[2].detail, expected_progress);
+        assert_eq!(history[3].detail, expected_summary);
+
+        let error = oversized_text("error:", MAX_JOB_DETAIL_BYTES);
+        let expected_error = sanitize_detail(&error);
+        let error_id = manager.spawn("error job", move |_| Err(error));
+        let error_history = wait_history(&rx, error_id);
+        let failed = error_history.last().unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.detail, expected_error);
+        assert_one_line_bounded(&failed.detail, MAX_JOB_DETAIL_BYTES);
+        assert_eq!(sanitize_detail(&failed.detail), failed.detail);
+
+        let panic_payload = oversized_text("panic:", MAX_JOB_DETAIL_BYTES);
+        let expected_panic = sanitize_detail(&format!("panicked: {panic_payload}"));
+        let panic_id = manager.spawn("panic job", move |_| {
+            std::panic::panic_any(panic_payload);
+        });
+        let panic_history = wait_history(&rx, panic_id);
+        let panicked = panic_history.last().unwrap();
+        assert_eq!(panicked.state, JobState::Failed);
+        assert_eq!(panicked.detail, expected_panic);
+        assert_one_line_bounded(&panicked.detail, MAX_JOB_DETAIL_BYTES);
+        assert_eq!(sanitize_detail(&panicked.detail), panicked.detail);
     }
 
     #[test]
