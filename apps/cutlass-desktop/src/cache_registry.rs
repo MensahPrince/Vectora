@@ -1,11 +1,13 @@
-//! Shared desktop cache inventory and exact per-cache clearing.
+//! Shared desktop cache inventory, clearing, and coordinated relocation.
 //!
-//! The registry owns the startup storage layout. It deliberately does not
-//! reload settings or relocate live writers: those require a later
-//! coordination slice. All public operations are synchronous and intended for
-//! an off-UI worker thread.
+//! The registry owns the live storage layout and serializes every destructive
+//! cache operation. All public operations are synchronous and intended for an
+//! off-UI worker thread.
 
 use std::collections::BTreeSet;
+use std::error::Error;
+use std::fmt;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -14,14 +16,15 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use cutlass_cloud::cache::DownloadCache;
 use cutlass_storage::{
-    CacheDescriptor, CacheId, CacheKind, CacheTier, SharedStorageLayout, StorageLayout,
-    cache_descriptors, clear_cache, measure_disk_usage,
+    CacheDescriptor, CacheId, CacheKind, CacheTier, SharedStorageLayout, StorageError,
+    StorageLayout, cache_descriptors, clear_cache, measure_disk_usage, relocate_cache,
 };
 use serde::ser::SerializeStruct;
 use serde::{Serialize, Serializer};
 
 use crate::AppWindow;
-use crate::preview_worker::{PreviewCacheStats, WorkerHandle};
+use crate::cache_references::{CacheReferenceReport, DraftReferenceReport};
+use crate::preview_worker::{PreviewCacheStats, ProjectMaintenanceGuard, WorkerHandle};
 
 const GATE_WAIT_SLICE: Duration = Duration::from_millis(25);
 const GATE_WAIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -90,6 +93,47 @@ impl Serialize for CacheClearReport {
         fields.serialize_field("removed_bytes", &self.removed_bytes)?;
         fields.serialize_field("removed_entries", &self.removed_entries)?;
         fields.serialize_field("removed_files", &self.removed_files)?;
+        if let Some(current) = &self.current {
+            fields.serialize_field("cache", current)?;
+        }
+        fields.end()
+    }
+}
+
+/// Committed relocation accounting and the newly published cache generation.
+#[allow(dead_code)] // Public(crate) DTO for the following UI/agent wiring slice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CacheRelocationReport {
+    pub(crate) id: CacheId,
+    pub(crate) old_path: PathBuf,
+    pub(crate) new_path: PathBuf,
+    pub(crate) bytes: u64,
+    pub(crate) files: u64,
+    pub(crate) used_copy_fallback: bool,
+    pub(crate) cleanup_warning: Option<String>,
+    pub(crate) generation: u64,
+    pub(crate) current: Option<CacheSnapshot>,
+}
+
+impl Serialize for CacheRelocationReport {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut fields = serializer.serialize_struct(
+            "CacheRelocationReport",
+            7 + usize::from(self.cleanup_warning.is_some()) + usize::from(self.current.is_some()),
+        )?;
+        fields.serialize_field("cache_id", self.id.as_str())?;
+        fields.serialize_field("old_path", &self.old_path.to_string_lossy())?;
+        fields.serialize_field("new_path", &self.new_path.to_string_lossy())?;
+        fields.serialize_field("bytes", &self.bytes)?;
+        fields.serialize_field("files", &self.files)?;
+        fields.serialize_field("used_copy_fallback", &self.used_copy_fallback)?;
+        if let Some(warning) = &self.cleanup_warning {
+            fields.serialize_field("cleanup_warning", warning)?;
+        }
+        fields.serialize_field("generation", &self.generation)?;
         if let Some(current) = &self.current {
             fields.serialize_field("cache", current)?;
         }
@@ -208,6 +252,177 @@ impl CacheRegistry {
             removed_bytes: removed.bytes,
             removed_entries: removed.entries,
             removed_files: removed.files,
+            current,
+        })
+    }
+
+    /// Relocate exactly one disk cache and publish its new layout generation.
+    ///
+    /// This method waits for storage users, freezes the preview worker in queue
+    /// order, inventories every saved and live project reference, completes
+    /// the filesystem move, persists settings, and only then publishes the new
+    /// shared layout. It must run on a background maintenance thread.
+    #[allow(dead_code)] // Public(crate) seam for the following UI/agent wiring slice.
+    pub(crate) fn relocate(
+        &self,
+        id: CacheId,
+        destination: &Path,
+        config_path: &Path,
+        cancel: &AtomicBool,
+    ) -> Result<CacheRelocationReport, String> {
+        let _operation = acquire_operation_gate(
+            &self.operation_gate,
+            cancel,
+            GATE_WAIT_TIMEOUT,
+            GATE_WAIT_SLICE,
+        )?;
+        ensure_not_cancelled(cancel, "cancelled before relocating the cache")?;
+        ensure_cache_can_be_relocated(id)?;
+
+        // This clone is deliberately detached. It must not hold a read lease
+        // while transition waits for exclusive storage access.
+        let snapshot = self.layout.snapshot();
+        validate_download_root(snapshot.layout(), &self.download_cache.root())?;
+        let (mut replacement, expected_generation) = snapshot.into_parts();
+        let old_path = disk_path(&replacement, id)?;
+        replacement
+            .set_override(id, destination.to_path_buf())
+            .map_err(|error| {
+                bounded_error("cache relocation destination is unsafe", &error.to_string())
+            })?;
+        let new_path = disk_path(&replacement, id)?;
+        validate_relocation_paths(&old_path, &new_path)?;
+        validate_relocation_destination(&new_path)?;
+
+        // A malformed or unreadable config is never replaced with defaults.
+        // Prepare the complete settings value before touching either cache.
+        let mut settings = cutlass_settings::load(config_path)
+            .map_err(|_| "cache relocation could not load the current settings".to_string())?;
+        set_storage_path_override(&mut settings, id, new_path.clone())?;
+        ensure_not_cancelled(cancel, "cancelled before relocating the cache")?;
+
+        let mut project_guard: Option<ProjectMaintenanceGuard> = None;
+        let mut committed = None;
+        let transition = self.layout.transition(
+            expected_generation,
+            replacement,
+            |old_layout, new_layout| -> Result<(), CacheRelocationFailure> {
+                let transition_old =
+                    disk_path(old_layout, id).map_err(CacheRelocationFailure::from_message)?;
+                let transition_new =
+                    disk_path(new_layout, id).map_err(CacheRelocationFailure::from_message)?;
+                if transition_old != old_path || transition_new != new_path {
+                    return Err(CacheRelocationFailure::from_message(
+                        "storage layout changed before cache relocation",
+                    ));
+                }
+
+                // Lock order is SharedStorageLayout -> project maintenance ->
+                // DownloadCache (for the download target only).
+                project_guard = Some(
+                    self.preview
+                        .begin_project_maintenance_with_cancel(cancel)
+                        .map_err(|error| {
+                            CacheRelocationFailure::with_detail(
+                                "project maintenance could not begin",
+                                &error,
+                            )
+                        })?,
+                );
+                ensure_not_cancelled(cancel, "cancelled before inventorying project references")
+                    .map_err(CacheRelocationFailure::from_message)?;
+
+                let saved = crate::cache_references::scan_saved_draft_references(
+                    &crate::drafts::root_dir(),
+                    old_layout,
+                );
+                ensure_not_cancelled(cancel, "cancelled while inventorying project references")
+                    .map_err(CacheRelocationFailure::from_message)?;
+                let live = crate::cache_references::analyze_project_references(
+                    project_guard
+                        .as_ref()
+                        .ok_or_else(|| {
+                            CacheRelocationFailure::from_message(
+                                "project maintenance snapshot is unavailable",
+                            )
+                        })?
+                        .project(),
+                    old_layout,
+                );
+                validate_relocation_references(id, &saved, &live)?;
+                ensure_not_cancelled(cancel, "cancelled before moving the cache")
+                    .map_err(CacheRelocationFailure::from_message)?;
+
+                let outcome = if id == CacheId::Download {
+                    relocate_download_root(
+                        self.download_cache.as_ref(),
+                        &transition_old,
+                        &transition_new,
+                        cancel,
+                        |_| persist_relocation_settings(config_path, &settings),
+                    )?
+                } else {
+                    relocate_disk_root(&transition_old, &transition_new, cancel, |_| {
+                        persist_relocation_settings(config_path, &settings)
+                    })?
+                };
+                committed = Some(outcome);
+                Ok(())
+            },
+        );
+
+        // The guard lives outside the transition closure so preview cannot
+        // resume in the gap between a completed move and layout publication.
+        let generation = match transition {
+            Ok(generation) => generation,
+            Err(error) => {
+                drop(project_guard);
+                return Err(bounded_message(&format!(
+                    "cache relocation could not be completed: {error}"
+                )));
+            }
+        };
+        let Some(committed) = committed else {
+            drop(project_guard);
+            return Err("cache relocation completed without accounting".into());
+        };
+        if id == CacheId::Proxies {
+            if let Some(guard) = project_guard.as_mut() {
+                guard.refresh_proxies_on_resume();
+            }
+        }
+        drop(project_guard);
+
+        let layout = self.layout.lease();
+        if layout.generation() != generation {
+            return Err("storage layout changed before relocation could be verified".into());
+        }
+        validate_download_root(layout.layout(), &self.download_cache.root())?;
+        let current = if cancel.load(Ordering::Acquire) {
+            None
+        } else {
+            match snapshot_disk_cache(layout.layout(), id, cancel) {
+                Ok(snapshot) => Some(snapshot),
+                Err(error) => {
+                    tracing::debug!(
+                        cache = id.as_str(),
+                        %error,
+                        "cache relocated but its post-move snapshot was unavailable"
+                    );
+                    None
+                }
+            }
+        };
+
+        Ok(CacheRelocationReport {
+            id,
+            old_path,
+            new_path,
+            bytes: committed.report.bytes,
+            files: committed.report.files,
+            used_copy_fallback: committed.report.used_copy_fallback,
+            cleanup_warning: committed.cleanup_warning,
+            generation,
             current,
         })
     }
@@ -449,6 +664,242 @@ impl CacheRegistry {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommittedRelocation {
+    report: cutlass_storage::RelocationReport,
+    cleanup_warning: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CacheRelocationFailure(String);
+
+impl CacheRelocationFailure {
+    fn from_message(message: impl Into<String>) -> Self {
+        Self(bounded_message(&message.into()))
+    }
+
+    fn with_detail(prefix: &str, detail: &str) -> Self {
+        Self(bounded_message(&format!("{prefix}: {detail}")))
+    }
+}
+
+impl fmt::Display for CacheRelocationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl Error for CacheRelocationFailure {}
+
+fn ensure_cache_can_be_relocated(id: CacheId) -> Result<(), String> {
+    if !cache_descriptors()
+        .iter()
+        .any(|descriptor| descriptor.id == id)
+    {
+        return Err("unknown cache cannot be relocated".into());
+    }
+    let descriptor = id.descriptor();
+    if descriptor.kind == CacheKind::Memory {
+        return Err("memory cache cannot be relocated".into());
+    }
+    if descriptor.tier == CacheTier::UserData {
+        return Err("user data cannot be relocated through the cache registry".into());
+    }
+    if !matches!(
+        id,
+        CacheId::Proxies
+            | CacheId::Download
+            | CacheId::Catalog
+            | CacheId::Luts
+            | CacheId::Lottie
+            | CacheId::Templates
+    ) {
+        return Err("cache target is not relocatable".into());
+    }
+    Ok(())
+}
+
+fn validate_relocation_paths(old_path: &Path, new_path: &Path) -> Result<(), String> {
+    if old_path == new_path || old_path.starts_with(new_path) || new_path.starts_with(old_path) {
+        return Err("cache relocation source and destination must not overlap".into());
+    }
+    Ok(())
+}
+
+fn validate_relocation_destination(destination: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            Err("cache relocation destination cannot be a symbolic link".into())
+        }
+        Ok(_) => Err("cache relocation destination already exists".into()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("cache relocation destination could not be inspected".into()),
+    }
+}
+
+fn set_storage_path_override(
+    settings: &mut cutlass_settings::Settings,
+    id: CacheId,
+    path: PathBuf,
+) -> Result<(), String> {
+    ensure_cache_can_be_relocated(id)?;
+    let field = match id {
+        CacheId::Proxies => &mut settings.storage.paths.proxies,
+        CacheId::Download => &mut settings.storage.paths.download,
+        CacheId::Catalog => &mut settings.storage.paths.catalog,
+        CacheId::Luts => &mut settings.storage.paths.luts,
+        CacheId::Lottie => &mut settings.storage.paths.lottie,
+        CacheId::Templates => &mut settings.storage.paths.templates,
+        _ => return Err("cache target has no storage settings field".into()),
+    };
+    *field = Some(path);
+    Ok(())
+}
+
+fn persist_relocation_settings(
+    config_path: &Path,
+    settings: &cutlass_settings::Settings,
+) -> Result<(), String> {
+    cutlass_settings::save(config_path, settings)
+        .map_err(|_| "storage settings could not be saved".to_string())
+}
+
+fn validate_relocation_references(
+    id: CacheId,
+    saved: &DraftReferenceReport,
+    live: &CacheReferenceReport,
+) -> Result<(), CacheRelocationFailure> {
+    if !saved.is_complete() {
+        return Err(CacheRelocationFailure::from_message(
+            "saved project reference inventory is incomplete; cache relocation was refused",
+        ));
+    }
+    if !live.is_complete() {
+        return Err(CacheRelocationFailure::from_message(
+            "current project reference inventory is incomplete; cache relocation was refused",
+        ));
+    }
+    if !matches!(
+        id,
+        CacheId::Download | CacheId::Luts | CacheId::Lottie | CacheId::Templates
+    ) {
+        return Ok(());
+    }
+
+    let saved_references = saved.references.by_cache.get(&id).ok_or_else(|| {
+        CacheRelocationFailure::from_message(
+            "saved project reference inventory omitted the target cache",
+        )
+    })?;
+    let live_references = live.by_cache.get(&id).ok_or_else(|| {
+        CacheRelocationFailure::from_message(
+            "current project reference inventory omitted the target cache",
+        )
+    })?;
+    if !saved_references.is_empty() || !live_references.is_empty() {
+        return Err(CacheRelocationFailure::from_message(
+            "project files reference this cache; cache relocation was refused",
+        ));
+    }
+    Ok(())
+}
+
+fn relocate_disk_root<F>(
+    old_path: &Path,
+    new_path: &Path,
+    cancel: &AtomicBool,
+    persist: F,
+) -> Result<CommittedRelocation, CacheRelocationFailure>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    ensure_not_cancelled(cancel, "cancelled before creating the cache source")
+        .map_err(CacheRelocationFailure::from_message)?;
+    ensure_relocation_source_exists(old_path)?;
+    let cancellation = || cancel.load(Ordering::Acquire);
+    classify_relocation_result(relocate_cache(old_path, new_path, &cancellation, persist)).map_err(
+        |error| {
+            CacheRelocationFailure::with_detail(
+                "cache filesystem relocation failed",
+                &error.to_string(),
+            )
+        },
+    )
+}
+
+fn relocate_download_root<F>(
+    cache: &DownloadCache,
+    expected_old_path: &Path,
+    new_path: &Path,
+    cancel: &AtomicBool,
+    persist: F,
+) -> Result<CommittedRelocation, CacheRelocationFailure>
+where
+    F: FnOnce(&Path) -> Result<(), String>,
+{
+    let mut committed = None;
+    cache
+        .switch_root(new_path, |old_path, destination| {
+            if old_path != expected_old_path || destination != new_path {
+                return Err(CacheRelocationFailure::from_message(
+                    "download cache root changed before relocation",
+                ));
+            }
+            committed = Some(relocate_disk_root(old_path, destination, cancel, persist)?);
+            Ok(())
+        })
+        .map_err(|error| {
+            CacheRelocationFailure::with_detail(
+                "download cache root could not be switched",
+                &error.to_string(),
+            )
+        })?;
+    committed.ok_or_else(|| {
+        CacheRelocationFailure::from_message(
+            "download cache root switched without relocation accounting",
+        )
+    })
+}
+
+fn ensure_relocation_source_exists(path: &Path) -> Result<(), CacheRelocationFailure> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => std::fs::create_dir_all(path)
+            .map_err(|error| {
+                CacheRelocationFailure::with_detail(
+                    "missing cache source could not be created",
+                    &error.to_string(),
+                )
+            }),
+        Err(error) => Err(CacheRelocationFailure::with_detail(
+            "cache source could not be inspected",
+            &error.to_string(),
+        )),
+    }
+}
+
+fn classify_relocation_result(
+    result: Result<cutlass_storage::RelocationReport, StorageError>,
+) -> Result<CommittedRelocation, StorageError> {
+    match result {
+        Ok(report) => Ok(CommittedRelocation {
+            report,
+            cleanup_warning: None,
+        }),
+        Err(error) => {
+            let Some(report) = error.committed_relocation() else {
+                return Err(error);
+            };
+            Ok(CommittedRelocation {
+                report,
+                cleanup_warning: Some(bounded_message(&format!(
+                    "cache relocation committed, but old-copy cleanup did not finish: {error}"
+                ))),
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CacheUsage {
     bytes: u64,
@@ -586,7 +1037,7 @@ fn validate_layout(layout: &StorageLayout) -> Result<(), String> {
 fn validate_download_root(layout: &StorageLayout, download_root: &Path) -> Result<(), String> {
     let resolved = disk_path(layout, CacheId::Download)?;
     if resolved != download_root {
-        return Err("download cache root does not match the startup storage layout".into());
+        return Err("download cache root does not match the active storage layout".into());
     }
     Ok(())
 }
@@ -741,6 +1192,14 @@ fn bounded_error(prefix: &str, error: &str) -> String {
     format!("{prefix}: {bounded}")
 }
 
+fn bounded_message(message: &str) -> String {
+    let mut bounded: String = message.chars().take(MAX_ERROR_CHARS).collect();
+    if message.chars().count() > MAX_ERROR_CHARS {
+        bounded.push('…');
+    }
+    bounded
+}
+
 const fn cache_kind_key(kind: CacheKind) -> &'static str {
     match kind {
         CacheKind::Memory => "memory",
@@ -877,6 +1336,367 @@ mod tests {
         for id in [CacheId::Luts, CacheId::Lottie, CacheId::Templates] {
             assert!(!cache_can_be_cleared(id), "{id} must fail closed");
         }
+    }
+
+    #[test]
+    fn relocation_field_mapping_covers_every_disk_cache_and_preserves_other_settings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let disk_ids = [
+            CacheId::Proxies,
+            CacheId::Download,
+            CacheId::Catalog,
+            CacheId::Luts,
+            CacheId::Lottie,
+            CacheId::Templates,
+        ];
+        let mut original = cutlass_settings::Settings::default();
+        original.appearance.theme = cutlass_settings::ThemeChoice::Ember;
+        original.ai.base_url = "http://localhost:11434/v1".into();
+        original.ai.model = "qwen-test".into();
+        original.account.base_url = "https://api.example.test".into();
+        original.storage.root = Some(temporary.path().join("configured-root"));
+        original.storage.download_quota_mib = 777;
+        for id in disk_ids {
+            set_storage_path_override(
+                &mut original,
+                id,
+                temporary.path().join(format!("original-{}", id.as_str())),
+            )
+            .unwrap();
+        }
+
+        for id in disk_ids {
+            let destination = temporary.path().join(format!("moved-{}", id.as_str()));
+            let mut updated = original.clone();
+            set_storage_path_override(&mut updated, id, destination.clone()).unwrap();
+
+            assert_eq!(updated.appearance, original.appearance);
+            assert_eq!(updated.ai, original.ai);
+            assert_eq!(updated.providers, original.providers);
+            assert_eq!(updated.account, original.account);
+            assert_eq!(updated.storage.root, original.storage.root);
+            assert_eq!(
+                updated.storage.download_quota_mib,
+                original.storage.download_quota_mib
+            );
+            for candidate in disk_ids {
+                let expected = if candidate == id {
+                    destination.as_path()
+                } else {
+                    original
+                        .storage
+                        .paths
+                        .get(candidate.as_str())
+                        .expect("seeded override")
+                };
+                assert_eq!(
+                    updated.storage.paths.get(candidate.as_str()),
+                    Some(expected),
+                    "wrong field mapping for {id}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn relocation_policy_refuses_memory_references_and_incomplete_inventory() {
+        assert!(
+            ensure_cache_can_be_relocated(CacheId::PreviewFrames)
+                .unwrap_err()
+                .contains("memory")
+        );
+
+        let mut saved = DraftReferenceReport::default();
+        saved
+            .references
+            .by_cache
+            .get_mut(&CacheId::Download)
+            .unwrap()
+            .insert(PathBuf::from("/managed/download.mp4"));
+        let live = CacheReferenceReport::default();
+        assert!(
+            validate_relocation_references(CacheId::Download, &saved, &live)
+                .unwrap_err()
+                .to_string()
+                .contains("reference")
+        );
+        assert!(
+            validate_relocation_references(CacheId::Proxies, &saved, &live).is_ok(),
+            "proxies have no persisted reference fields"
+        );
+
+        let incomplete_saved = DraftReferenceReport {
+            skipped_or_errored: 1,
+            ..DraftReferenceReport::default()
+        };
+        assert!(
+            validate_relocation_references(CacheId::Catalog, &incomplete_saved, &live)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
+
+        let saved = DraftReferenceReport::default();
+        let incomplete_live = CacheReferenceReport {
+            counts: crate::cache_references::ReferenceCounts {
+                rejected: 1,
+                ..crate::cache_references::ReferenceCounts::default()
+            },
+            ..CacheReferenceReport::default()
+        };
+        assert!(
+            validate_relocation_references(CacheId::Catalog, &saved, &incomplete_live)
+                .unwrap_err()
+                .to_string()
+                .contains("incomplete")
+        );
+    }
+
+    #[test]
+    fn same_filesystem_relocation_persists_and_publishes_exact_accounting() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(temporary.path().join("storage")).unwrap();
+        let old_path = layout.resolve(CacheId::Proxies).unwrap();
+        fs::create_dir_all(old_path.join("nested")).unwrap();
+        fs::write(old_path.join("nested/proxy.mp4"), b"1234567").unwrap();
+        let shared = SharedStorageLayout::new(layout);
+        let destination = temporary.path().join("moved-proxies");
+        let config_path = temporary.path().join("config.toml");
+        fs::write(
+            &config_path,
+            "# preserved comment\n[appearance]\ntheme = \"ember\"\n\
+             [ai]\nbase_url = \"http://localhost:11434/v1\"\nmodel = \"qwen-test\"\n\
+             [storage]\ndownload_quota_mib = 321\n\
+             [future]\nflag = true\n",
+        )
+        .unwrap();
+
+        let snapshot = shared.snapshot();
+        let (mut replacement, expected_generation) = snapshot.into_parts();
+        replacement
+            .set_override(CacheId::Proxies, &destination)
+            .unwrap();
+        let mut settings = cutlass_settings::load(&config_path).unwrap();
+        set_storage_path_override(&mut settings, CacheId::Proxies, destination.clone()).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut committed = None;
+
+        let generation = shared
+            .transition(
+                expected_generation,
+                replacement,
+                |old_layout, new_layout| -> Result<(), CacheRelocationFailure> {
+                    committed = Some(relocate_disk_root(
+                        &disk_path(old_layout, CacheId::Proxies)
+                            .map_err(CacheRelocationFailure::from_message)?,
+                        &disk_path(new_layout, CacheId::Proxies)
+                            .map_err(CacheRelocationFailure::from_message)?,
+                        &cancel,
+                        |_| persist_relocation_settings(&config_path, &settings),
+                    )?);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let committed = committed.unwrap();
+
+        assert_eq!(generation, 1);
+        assert_eq!(
+            committed.report,
+            cutlass_storage::RelocationReport {
+                bytes: 7,
+                files: 1,
+                used_copy_fallback: false,
+            }
+        );
+        assert_eq!(committed.cleanup_warning, None);
+        assert!(!old_path.exists());
+        assert_eq!(
+            fs::read(destination.join("nested/proxy.mp4")).unwrap(),
+            b"1234567"
+        );
+        let published = shared.snapshot();
+        assert_eq!(published.generation(), generation);
+        assert_eq!(
+            published.resolve(CacheId::Proxies),
+            Some(destination.clone())
+        );
+        let persisted = cutlass_settings::load(&config_path).unwrap();
+        assert_eq!(persisted.storage.paths.proxies, Some(destination.clone()));
+        assert_eq!(persisted.storage.download_quota_mib, 321);
+        assert_eq!(persisted.ai.model, "qwen-test");
+        let raw = fs::read_to_string(&config_path).unwrap();
+        assert!(raw.contains("# preserved comment"));
+        assert!(raw.contains("[future]"));
+        assert!(raw.contains("flag = true"));
+
+        let current = snapshot_disk_cache(published.layout(), CacheId::Proxies, &cancel).unwrap();
+        assert_eq!((current.bytes, current.files), (7, 1));
+    }
+
+    #[test]
+    fn missing_source_becomes_an_empty_relocated_cache_after_cancellation_check() {
+        let temporary = tempfile::tempdir().unwrap();
+        let old_path = temporary.path().join("missing-old");
+        let destination = temporary.path().join("empty-new");
+        let cancelled = AtomicBool::new(true);
+        assert!(relocate_disk_root(&old_path, &destination, &cancelled, |_| Ok(())).is_err());
+        assert!(!old_path.exists());
+        assert!(!destination.exists());
+
+        let outcome =
+            relocate_disk_root(&old_path, &destination, &AtomicBool::new(false), |_| Ok(()))
+                .unwrap();
+        assert_eq!(
+            outcome.report,
+            cutlass_storage::RelocationReport {
+                bytes: 0,
+                files: 0,
+                used_copy_fallback: false,
+            }
+        );
+        assert!(!old_path.exists());
+        assert!(destination.is_dir());
+        assert_eq!(fs::read_dir(destination).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn relocation_persist_failure_rolls_filesystem_and_layout_back() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(temporary.path().join("storage")).unwrap();
+        let old_path = layout.resolve(CacheId::Catalog).unwrap();
+        fs::create_dir_all(&old_path).unwrap();
+        fs::write(old_path.join("catalog.json"), b"unchanged").unwrap();
+        let shared = SharedStorageLayout::new(layout);
+        let destination = temporary.path().join("moved-catalog");
+        let snapshot = shared.snapshot();
+        let (mut replacement, expected_generation) = snapshot.into_parts();
+        replacement
+            .set_override(CacheId::Catalog, &destination)
+            .unwrap();
+        let cancel = AtomicBool::new(false);
+        let persist_saw_complete_destination = AtomicBool::new(false);
+
+        let result = shared.transition(
+            expected_generation,
+            replacement,
+            |old_layout, new_layout| -> Result<(), CacheRelocationFailure> {
+                relocate_disk_root(
+                    &disk_path(old_layout, CacheId::Catalog)
+                        .map_err(CacheRelocationFailure::from_message)?,
+                    &disk_path(new_layout, CacheId::Catalog)
+                        .map_err(CacheRelocationFailure::from_message)?,
+                    &cancel,
+                    |completed| {
+                        assert_eq!(completed, destination);
+                        assert_eq!(
+                            fs::read(completed.join("catalog.json")).unwrap(),
+                            b"unchanged"
+                        );
+                        persist_saw_complete_destination.store(true, Ordering::Release);
+                        Err("injected settings persistence failure".into())
+                    },
+                )?;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(persist_saw_complete_destination.load(Ordering::Acquire));
+        let unchanged = shared.snapshot();
+        assert_eq!(unchanged.generation(), 0);
+        assert_eq!(unchanged.resolve(CacheId::Catalog), Some(old_path.clone()));
+        assert_eq!(
+            fs::read(old_path.join("catalog.json")).unwrap(),
+            b"unchanged"
+        );
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn committed_cleanup_failure_is_success_with_a_bounded_warning() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(temporary.path().join("storage")).unwrap();
+        let shared = SharedStorageLayout::new(layout);
+        let snapshot = shared.snapshot();
+        let (mut replacement, expected_generation) = snapshot.into_parts();
+        let destination = temporary.path().join("catalog-new");
+        replacement
+            .set_override(CacheId::Catalog, &destination)
+            .unwrap();
+        let report = cutlass_storage::RelocationReport {
+            bytes: 19,
+            files: 2,
+            used_copy_fallback: true,
+        };
+        let mut outcome = None;
+        let generation = shared
+            .transition(
+                expected_generation,
+                replacement,
+                |_, _| -> Result<(), StorageError> {
+                    outcome = Some(classify_relocation_result(Err(
+                        StorageError::CommittedCleanupFailed {
+                            message: "x".repeat(MAX_ERROR_CHARS * 4),
+                            report,
+                        },
+                    ))?);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let outcome = outcome.unwrap();
+
+        assert_eq!(generation, 1);
+        assert_eq!(
+            shared.snapshot().resolve(CacheId::Catalog),
+            Some(destination)
+        );
+        assert_eq!(outcome.report, report);
+        let warning = outcome.cleanup_warning.unwrap();
+        assert!(warning.contains("committed"));
+        assert!(warning.chars().count() <= MAX_ERROR_CHARS + 1);
+        assert!(classify_relocation_result(Err(StorageError::Cancelled)).is_err());
+    }
+
+    #[test]
+    fn download_relocation_switches_root_and_remaps_protected_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let old_path = temporary.path().join("download-old");
+        let destination = temporary.path().join("download-new");
+        fs::create_dir_all(old_path.join("stock")).unwrap();
+        let protected = old_path.join("stock/project.mp4");
+        let disposable = old_path.join("stock/disposable.bin");
+        fs::write(&protected, b"project").unwrap();
+        fs::write(&disposable, b"temporary").unwrap();
+        let cache = DownloadCache::new(old_path.clone(), 1_000);
+        cache.protect_path(&protected).unwrap();
+
+        let outcome = relocate_download_root(
+            &cache,
+            &old_path,
+            &destination,
+            &AtomicBool::new(false),
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.report.bytes, 16);
+        assert_eq!(outcome.report.files, 2);
+        assert_eq!(cache.root(), destination);
+        assert!(!old_path.exists());
+        let moved_protected = destination.join("stock/project.mp4");
+        let moved_disposable = destination.join("stock/disposable.bin");
+        assert!(moved_protected.exists());
+        assert!(moved_disposable.exists());
+
+        cache.set_quota_bytes(0);
+        cache.enforce_quota();
+        assert!(
+            moved_protected.exists(),
+            "protected path must be remapped with the root"
+        );
+        assert!(!moved_disposable.exists());
     }
 
     #[test]
@@ -1055,6 +1875,31 @@ mod tests {
                 }
             })
         );
+
+        let relocation = CacheRelocationReport {
+            id: CacheId::Catalog,
+            old_path: PathBuf::from("/tmp/catalog-old"),
+            new_path: PathBuf::from("/tmp/catalog-new"),
+            bytes: 12,
+            files: 2,
+            used_copy_fallback: true,
+            cleanup_warning: Some("old copy remains".into()),
+            generation: 4,
+            current: None,
+        };
+        assert_eq!(
+            serde_json::to_value(relocation).unwrap(),
+            json!({
+                "cache_id": "catalog",
+                "old_path": "/tmp/catalog-old",
+                "new_path": "/tmp/catalog-new",
+                "bytes": 12,
+                "files": 2,
+                "used_copy_fallback": true,
+                "cleanup_warning": "old copy remains",
+                "generation": 4
+            })
+        );
     }
 
     #[test]
@@ -1065,7 +1910,7 @@ mod tests {
         assert_eq!(validate_download_root(&layout, &exact), Ok(()));
         assert_eq!(
             validate_download_root(&layout, &temporary.path().join("other")).unwrap_err(),
-            "download cache root does not match the startup storage layout"
+            "download cache root does not match the active storage layout"
         );
     }
 }
