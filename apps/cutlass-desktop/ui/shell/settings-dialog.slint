@@ -210,6 +210,12 @@ export component SettingsDialog inherits Rectangle {
     }
 
     function close() {
+        if (SettingsBackend.cache-busy-id != "") {
+            root.section = 2;
+            SettingsBackend.cache-status = "";
+            SettingsBackend.cache-error = "Wait for the cache operation to finish before closing Settings.";
+            return;
+        }
         if (SettingsBackend.save()) {
             AppState.settings-open = false;
         }
@@ -489,7 +495,7 @@ export component SettingsDialog inherits Rectangle {
                                     label: SettingsBackend.cache-busy-id == ""
                                         ? "Choose…"
                                         : "Working…";
-                                    enabled: SettingsBackend.cache-relocation-enabled
+                                    enabled: SettingsBackend.storage-root-relocation-enabled
                                         && !SettingsBackend.cache-loading
                                         && SettingsBackend.cache-busy-id == "";
                                     clicked => {
@@ -497,8 +503,8 @@ export component SettingsDialog inherits Rectangle {
                                     }
                                 }
                             }
-                            if !SettingsBackend.cache-relocation-enabled: Hint {
-                                text: "Moving the cache root or individual caches is not available yet.";
+                            if !SettingsBackend.storage-root-relocation-enabled: Hint {
+                                text: "Per-cache Move is available. Changing the default cache root is not available yet.";
                             }
 
                             FieldRow {

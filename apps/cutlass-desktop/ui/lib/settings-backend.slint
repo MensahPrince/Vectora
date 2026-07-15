@@ -44,9 +44,10 @@ export global SettingsBackend {
     in-out property <string> cache-busy-id;
     in-out property <string> cache-status;
     in-out property <string> cache-error;
-    // Relocation callbacks and row metadata stay in place for the follow-up
-    // slice, but no move affordance is interactive until Rust opts in.
+    // Per-cache moves and aggregate default-root relocation are separate
+    // capabilities. Rust enables only the operation it can complete safely.
     in-out property <bool> cache-relocation-enabled: false;
+    in-out property <bool> storage-root-relocation-enabled: false;
 
     // The config file path, shown at the foot of the screen.
     in-out property <string> config-path;

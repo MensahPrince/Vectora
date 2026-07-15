@@ -472,6 +472,33 @@ fn cache_item_count_label(kind: cutlass_storage::CacheKind, entries: u64, files:
     }
 }
 
+fn cache_relocation_supported(id: cutlass_storage::CacheId) -> bool {
+    matches!(
+        id,
+        cutlass_storage::CacheId::Proxies
+            | cutlass_storage::CacheId::Download
+            | cutlass_storage::CacheId::Catalog
+            | cutlass_storage::CacheId::Luts
+            | cutlass_storage::CacheId::Lottie
+            | cutlass_storage::CacheId::Templates
+    ) && id.descriptor().kind == cutlass_storage::CacheKind::Disk
+        && id.descriptor().default_relative.is_some()
+}
+
+fn cache_relocation_destination(
+    selected_parent: &std::path::Path,
+    id: cutlass_storage::CacheId,
+) -> Result<PathBuf, &'static str> {
+    if !cache_relocation_supported(id) {
+        return Err("cache target is not relocatable");
+    }
+    let relative = id
+        .descriptor()
+        .default_relative
+        .ok_or("disk cache has no default relative path")?;
+    Ok(selected_parent.join(relative))
+}
+
 fn cache_rows_from_snapshots(
     mut snapshots: Vec<cache_registry::CacheSnapshot>,
 ) -> Result<Vec<CacheUsageRow>, String> {
@@ -507,7 +534,8 @@ fn cache_rows_from_snapshots(
                 .into(),
                 path: path.into(),
                 clearable: cache_registry::cache_can_be_cleared(snapshot.id),
-                relocatable: false,
+                relocatable: snapshot.kind == cutlass_storage::CacheKind::Disk
+                    && cache_relocation_supported(snapshot.id),
             })
         })
         .collect()
@@ -525,6 +553,21 @@ fn cache_clear_success(report: &cache_registry::CacheClearReport) -> String {
             report.removed_files
         )
     )
+}
+
+fn cache_relocation_success(report: &cache_registry::CacheRelocationReport) -> String {
+    let mut status = format!(
+        "Moved {} to {}: {} in {}.",
+        report.id.descriptor().label,
+        report.new_path.display(),
+        format_bytes_iec(report.bytes),
+        pluralized_count(report.files, "file", "files"),
+    );
+    if let Some(warning) = report.cleanup_warning.as_deref() {
+        status.push_str(" Cleanup warning: ");
+        status.push_str(&bounded_cache_ui_error(warning));
+    }
+    status
 }
 
 fn bounded_cache_ui_error(error: &str) -> String {
@@ -545,6 +588,21 @@ fn spawn_short_lived_worker(
         .map_err(|error| format!("could not start {name}: {error}"))?;
     drop(worker);
     Ok(())
+}
+
+async fn pick_cache_relocation_parent(
+    label: &str,
+    starting_directory: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let title = format!("Choose a parent folder for {label}");
+    let mut dialog = rfd::AsyncFileDialog::new().set_title(&title);
+    if let Some(directory) = starting_directory.filter(|directory| directory.is_dir()) {
+        dialog = dialog.set_directory(directory);
+    }
+    dialog
+        .pick_folder()
+        .await
+        .map(|folder| folder.path().to_path_buf())
 }
 
 /// Native save dialog for the export destination, seeded with the current
@@ -1748,15 +1806,11 @@ fn main() -> Result<(), slint::PlatformError> {
             .into(),
     );
     settings_backend.set_ai_use_account(app_settings.ai.use_account);
-    settings_backend.set_storage_root(
-        cache_registry
-            .storage_root()
-            .to_string_lossy()
-            .into_owned()
-            .into(),
-    );
+    let storage_root = cache_registry.storage_root();
+    settings_backend.set_storage_root(storage_root.to_string_lossy().into_owned().into());
     settings_backend.set_download_quota_mib(download_quota_mib.to_string().into());
-    settings_backend.set_cache_relocation_enabled(false);
+    settings_backend.set_cache_relocation_enabled(true);
+    settings_backend.set_storage_root_relocation_enabled(false);
     app.global::<AppStore>()
         .set_theme_id(app_settings.appearance.theme.index());
 
@@ -2050,6 +2104,169 @@ fn main() -> Result<(), slint::PlatformError> {
         });
     }
 
+    // Relocate one exact disk cache. The picker chooses an existing parent;
+    // the registry receives only the derived, absent cache-specific child.
+    // Busy state covers the asynchronous picker and the background move so no
+    // other cache or settings-persistence operation can overlap it.
+    {
+        let app_weak = app.as_weak();
+        let registry = cache_registry.clone();
+        let generation = Arc::clone(&cache_ui_generation);
+        let config_path = config_path.clone();
+        let picker_directory = storage_root
+            .parent()
+            .filter(|directory| directory.is_dir())
+            .map(std::path::Path::to_path_buf)
+            .or_else(dirs::home_dir);
+        settings_backend.on_relocate_cache(move |cache_id| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let sb = app.global::<SettingsBackend>();
+            let id = match cutlass_storage::CacheId::parse(cache_id.as_str()) {
+                Ok(id) => id,
+                Err(_) => {
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error("Unknown cache.".into());
+                    return;
+                }
+            };
+            if !cache_relocation_supported(id) {
+                sb.set_cache_status(SharedString::new());
+                sb.set_cache_error("This cache cannot be moved.".into());
+                return;
+            }
+            if sb.get_cache_loading() || !sb.get_cache_busy_id().is_empty() {
+                return;
+            }
+            let operation_generation = match next_cache_generation(&generation) {
+                Ok(value) => value,
+                Err(error) => {
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error(error.into());
+                    return;
+                }
+            };
+
+            sb.set_cache_busy_id(id.as_str().into());
+            sb.set_cache_status(SharedString::new());
+            sb.set_cache_error(SharedString::new());
+
+            let dialog_app = app_weak.clone();
+            let dialog_registry = registry.clone();
+            let dialog_generation = Arc::clone(&generation);
+            let dialog_config_path = config_path.clone();
+            let dialog_directory = picker_directory.clone();
+            let task = slint::spawn_local(async move {
+                let selected_parent =
+                    pick_cache_relocation_parent(id.descriptor().label, dialog_directory).await;
+                if dialog_generation.load(Ordering::Acquire) != operation_generation {
+                    return;
+                }
+                let Some(app) = dialog_app.upgrade() else {
+                    return;
+                };
+                let sb = app.global::<SettingsBackend>();
+                let Some(selected_parent) = selected_parent else {
+                    sb.set_cache_busy_id(SharedString::new());
+                    sb.set_cache_error(SharedString::new());
+                    return;
+                };
+                let destination = match cache_relocation_destination(&selected_parent, id) {
+                    Ok(destination) => destination,
+                    Err(error) => {
+                        sb.set_cache_busy_id(SharedString::new());
+                        sb.set_cache_status(SharedString::new());
+                        sb.set_cache_error(bounded_cache_ui_error(error).into());
+                        return;
+                    }
+                };
+
+                let worker_app = dialog_app.clone();
+                let worker_registry = dialog_registry.clone();
+                let worker_generation = Arc::clone(&dialog_generation);
+                if let Err(error) = spawn_short_lived_worker("cutlass-cache-relocate", move || {
+                    let cancel = AtomicBool::new(false);
+                    let relocation_result =
+                        worker_registry.relocate(id, &destination, &dialog_config_path, &cancel);
+                    let rows_result = worker_registry
+                        .snapshot_all(&cancel)
+                        .and_then(cache_rows_from_snapshots);
+
+                    if let Err(error) = &relocation_result {
+                        tracing::warn!(
+                            cache = id.as_str(),
+                            %error,
+                            "cache relocation did not complete"
+                        );
+                    }
+                    if let Err(error) = &rows_result {
+                        tracing::warn!(
+                            cache = id.as_str(),
+                            %error,
+                            "cache inventory refresh after relocation failed"
+                        );
+                    }
+
+                    let relocation_succeeded = relocation_result.is_ok();
+                    let refresh_failed = rows_result.is_err();
+                    let (status, mut feedback_error) = match relocation_result {
+                        Ok(report) => (cache_relocation_success(&report), String::new()),
+                        Err(error) => (
+                            String::new(),
+                            format!("Could not move {}: {error}", id.descriptor().label),
+                        ),
+                    };
+                    if refresh_failed {
+                        if relocation_succeeded {
+                            feedback_error =
+                                "Cache moved, but cache usage could not be refreshed.".into();
+                        } else {
+                            feedback_error.push_str(" Cache usage also could not be refreshed.");
+                        }
+                    }
+                    if !feedback_error.is_empty() {
+                        feedback_error = bounded_cache_ui_error(&feedback_error);
+                    }
+
+                    let apply_generation = Arc::clone(&worker_generation);
+                    if let Err(error) = slint::invoke_from_event_loop(move || {
+                        if apply_generation.load(Ordering::Acquire) != operation_generation {
+                            return;
+                        }
+                        let Some(app) = worker_app.upgrade() else {
+                            return;
+                        };
+                        let sb = app.global::<SettingsBackend>();
+                        sb.set_cache_busy_id(SharedString::new());
+                        if let Ok(rows) = rows_result {
+                            sb.set_cache_rows(ModelRc::new(VecModel::from(rows)));
+                        }
+                        sb.set_cache_status(status.into());
+                        sb.set_cache_error(feedback_error.into());
+                    }) {
+                        tracing::debug!(%error, "cache relocation event-loop publish failed");
+                    }
+                }) {
+                    tracing::error!(%error, "cache relocation worker could not start");
+                    if dialog_generation.load(Ordering::Acquire) == operation_generation {
+                        sb.set_cache_busy_id(SharedString::new());
+                        sb.set_cache_status(SharedString::new());
+                        sb.set_cache_error("Cache move could not start.".into());
+                    }
+                }
+            });
+            if let Err(error) = task {
+                tracing::error!(%error, "cache relocation dialog could not open");
+                if generation.load(Ordering::Acquire) == operation_generation {
+                    sb.set_cache_busy_id(SharedString::new());
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error("Cache move dialog could not open.".into());
+                }
+            }
+        });
+    }
+
     // Save returns whether dismissal is safe. Load-then-patch preserves
     // unknown TOML, and a malformed existing file is never replaced.
     {
@@ -2062,6 +2279,12 @@ fn main() -> Result<(), slint::PlatformError> {
                 return false;
             };
             let sb = app.global::<SettingsBackend>();
+            if !sb.get_cache_busy_id().is_empty() {
+                sb.set_save_error(
+                    "Wait for the cache operation to finish before saving Settings.".into(),
+                );
+                return false;
+            }
             sb.set_save_error(SharedString::new());
             let quota = match parse_download_quota_mib(&sb.get_download_quota_mib()) {
                 Ok(quota) => quota,
@@ -3269,7 +3492,7 @@ mod settings_cache_tests {
         assert_eq!(rows[1].size_label.as_str(), "1.5 KiB");
         assert_eq!(rows[1].item_count_label.as_str(), "1 file");
         assert!(rows[1].clearable);
-        assert!(!rows[1].relocatable);
+        assert!(rows[1].relocatable);
 
         assert!(
             cache_rows_from_snapshots(vec![snapshot(
@@ -3292,6 +3515,114 @@ mod settings_cache_tests {
             )])
             .unwrap_err()
             .contains("no storage path")
+        );
+    }
+
+    #[test]
+    fn cache_relocation_support_is_exactly_the_six_disk_caches() {
+        let supported = cutlass_storage::CacheId::ALL
+            .into_iter()
+            .filter(|id| cache_relocation_supported(*id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            supported,
+            vec![
+                cutlass_storage::CacheId::Proxies,
+                cutlass_storage::CacheId::Download,
+                cutlass_storage::CacheId::Catalog,
+                cutlass_storage::CacheId::Luts,
+                cutlass_storage::CacheId::Lottie,
+                cutlass_storage::CacheId::Templates,
+            ]
+        );
+        assert!(supported.iter().all(|id| {
+            let descriptor = id.descriptor();
+            descriptor.kind == cutlass_storage::CacheKind::Disk
+                && descriptor.default_relative.is_some()
+        }));
+    }
+
+    #[test]
+    fn cache_relocation_destination_uses_the_selected_parent_and_default_leaf() {
+        let parent = PathBuf::from("/chosen-parent");
+        for id in [
+            cutlass_storage::CacheId::Proxies,
+            cutlass_storage::CacheId::Download,
+            cutlass_storage::CacheId::Catalog,
+            cutlass_storage::CacheId::Luts,
+            cutlass_storage::CacheId::Lottie,
+            cutlass_storage::CacheId::Templates,
+        ] {
+            let relative = id
+                .descriptor()
+                .default_relative
+                .expect("supported disk cache has a default leaf");
+            assert_eq!(
+                cache_relocation_destination(&parent, id),
+                Ok(parent.join(relative))
+            );
+        }
+        assert_eq!(
+            cache_relocation_destination(&parent, cutlass_storage::CacheId::PreviewFrames),
+            Err("cache target is not relocatable")
+        );
+    }
+
+    #[test]
+    fn cache_relocation_success_includes_accounting_destination_and_cleanup_warning() {
+        let report = cache_registry::CacheRelocationReport {
+            id: cutlass_storage::CacheId::Proxies,
+            old_path: PathBuf::from("/old/proxies"),
+            new_path: PathBuf::from("/new-parent/proxies"),
+            bytes: 1_536,
+            files: 2,
+            used_copy_fallback: true,
+            cleanup_warning: Some("The old cache directory could not be removed.".into()),
+            generation: 7,
+            current: None,
+        };
+
+        assert_eq!(
+            cache_relocation_success(&report),
+            "Moved Proxies to /new-parent/proxies: 1.5 KiB in 2 files. Cleanup warning: The old cache directory could not be removed."
+        );
+    }
+
+    #[test]
+    fn cache_rows_mark_exactly_supported_disk_caches_relocatable() {
+        let root = PathBuf::from("/cache-root");
+        let snapshots = cutlass_storage::CacheId::ALL
+            .into_iter()
+            .map(|id| {
+                let path = id
+                    .descriptor()
+                    .default_relative
+                    .map(|relative| root.join(relative));
+                snapshot(id, path, 0, 0, 0)
+            })
+            .collect();
+        let rows = cache_rows_from_snapshots(snapshots).unwrap();
+        let relocatable = rows
+            .iter()
+            .filter(|row| row.relocatable)
+            .map(|row| row.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            relocatable,
+            vec![
+                "proxies",
+                "download",
+                "catalog",
+                "luts",
+                "lottie",
+                "templates"
+            ]
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.kind.as_str() == "memory")
+                .all(|row| !row.relocatable)
         );
     }
 
