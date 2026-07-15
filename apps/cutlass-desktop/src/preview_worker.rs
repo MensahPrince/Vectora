@@ -95,6 +95,36 @@ pub(crate) struct RelinkFolderRpcResult {
     pub(crate) relinked: Vec<RelinkMediaRpcResult>,
 }
 
+/// Result of an acknowledged project open. `path` is read back from the
+/// engine after the load, and therefore names the session's actual binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenProjectRpcResult {
+    pub(crate) path: PathBuf,
+    pub(crate) project_name: String,
+    pub(crate) missing_media_count: usize,
+}
+
+/// Result of an acknowledged fresh-session replacement. A new session is
+/// intentionally unbound until the host creates an app-owned draft and sends
+/// a separate [`WorkerHandle::save_project_rpc`] in queue order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NewProjectRpcResult {
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) project_name: String,
+    pub(crate) missing_media_count: usize,
+    pub(crate) requires_save_binding: bool,
+}
+
+/// Result of an acknowledged template application. An `Ok` result is only
+/// returned after the filled in-memory project has been saved and the engine
+/// reports this actual app-owned draft binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ApplyTemplateRpcResult {
+    pub(crate) path: PathBuf,
+    pub(crate) project_name: String,
+    pub(crate) missing_media_count: usize,
+}
+
 /// Work submitted to the engine thread. Scrub frames coalesce to the latest
 /// pending tick; imports must not be dropped by that coalescing (see
 /// [`worker_loop`]).
@@ -595,6 +625,13 @@ enum WorkerMsg {
     OpenProject {
         path: PathBuf,
     },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::OpenProject`].
+    OpenProjectRpc {
+        path: PathBuf,
+        reply: Sender<Result<OpenProjectRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Re-point a media-pool entry (raw id) at a new file (missing-media
     /// relink, M0): the engine re-probes the file and swaps the entry's
     /// path/metadata in place (id and clips untouched), the tile workers
@@ -636,16 +673,32 @@ enum WorkerMsg {
     /// `project.cutlass` is written by the `SaveProject` that follows).
     /// Same epoch bump as `OpenProject`.
     NewProject,
+    /// Queue-ordered, acknowledged counterpart to [`WorkerMsg::NewProject`].
+    /// It deliberately does not create or bind a draft; the orchestration
+    /// layer follows it with an acknowledged save to its chosen app-owned path.
+    NewProjectRpc {
+        reply: Sender<Result<NewProjectRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
+    },
     /// Replace the session with an installed `.cutlasst` template filled by
     /// `picks` (CapCut "use template"). On success a fresh draft directory
     /// is created and the filled project saved into it (the engine resets
     /// the project path, so the bind happens here, not via a queued
     /// `SaveProject` that would also run after a failure). Same epoch bump
-    /// as `OpenProject`; failure publishes `session-error` and leaves the
-    /// current session untouched.
+    /// as `OpenProject`. A pre-apply failure leaves the current session
+    /// untouched; a later draft/binding failure publishes the applied
+    /// in-memory session and reports that partial outcome explicitly.
     ApplyTemplate {
         path: PathBuf,
         picks: Vec<TemplatePick>,
+    },
+    /// Queue-ordered, acknowledged counterpart to
+    /// [`WorkerMsg::ApplyTemplate`].
+    ApplyTemplateRpc {
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+        reply: Sender<Result<ApplyTemplateRpcResult, String>>,
+        operation: Arc<WorkerRpcOperation>,
     },
     /// Rename the current draft (its display name). Applied as one undoable
     /// edit; the projection republish updates the title bar and the next
@@ -990,12 +1043,89 @@ impl WorkerHandle {
         let _ = self.tx.send(WorkerMsg::OpenProject { path });
     }
 
+    /// Open a project in queue order and return its actual bound path and
+    /// acknowledged session state.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn open_project_rpc(&self, path: PathBuf) -> Result<OpenProjectRpcResult, String> {
+        self.open_project_rpc_with_cancel(path, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn open_project_rpc_with_cancel(
+        &self,
+        path: PathBuf,
+        cancel: &AtomicBool,
+    ) -> Result<OpenProjectRpcResult, String> {
+        self.project_rpc(
+            "open project",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::OpenProjectRpc {
+                path,
+                reply,
+                operation,
+            },
+        )
+    }
+
     pub fn apply_template(&self, path: PathBuf, picks: Vec<TemplatePick>) {
         let _ = self.tx.send(WorkerMsg::ApplyTemplate { path, picks });
     }
 
+    /// Apply and bind a template in queue order. `Ok` confirms the actual
+    /// app-owned draft path; a post-apply binding failure is returned as an
+    /// explicit uncertain/partially committed outcome.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn apply_template_rpc(
+        &self,
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+    ) -> Result<ApplyTemplateRpcResult, String> {
+        self.apply_template_rpc_with_cancel(path, picks, &AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn apply_template_rpc_with_cancel(
+        &self,
+        path: PathBuf,
+        picks: Vec<TemplatePick>,
+        cancel: &AtomicBool,
+    ) -> Result<ApplyTemplateRpcResult, String> {
+        self.project_rpc(
+            "apply template",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::ApplyTemplateRpc {
+                path,
+                picks,
+                reply,
+                operation,
+            },
+        )
+    }
+
     pub fn new_project(&self) {
         let _ = self.tx.send(WorkerMsg::NewProject);
+    }
+
+    /// Replace the live session with a fresh unbound project in queue order.
+    /// Binding remains a separate acknowledged save owned by the caller.
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn new_project_rpc(&self) -> Result<NewProjectRpcResult, String> {
+        self.new_project_rpc_with_cancel(&AtomicBool::new(false))
+    }
+
+    #[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+    pub(crate) fn new_project_rpc_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<NewProjectRpcResult, String> {
+        self.project_rpc(
+            "new project",
+            PROJECT_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::NewProjectRpc { reply, operation },
+        )
     }
 
     pub fn rename_project(&self, name: String) {
@@ -2380,6 +2510,13 @@ fn worker_loop(
                 save_project_rpc_and_publish(engine, path, Some(&ui))
             }),
             WorkerMsg::OpenProject { path } => open_project_and_publish(engine, path, &ui),
+            WorkerMsg::OpenProjectRpc {
+                path,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                open_project_rpc_and_publish(engine, path, Some(&ui))
+            }),
             WorkerMsg::RelinkMedia { media, path } => {
                 relink_media_and_publish(engine, &media, &path, &ui)
             }
@@ -2403,9 +2540,22 @@ fn worker_loop(
                 remove_media_and_publish(engine, &media, force, &ui)
             }
             WorkerMsg::NewProject => new_project_and_publish(engine, &ui),
+            WorkerMsg::NewProjectRpc { reply, operation } => {
+                serve_worker_rpc(reply, operation, || {
+                    new_project_rpc_and_publish(engine, Some(&ui))
+                })
+            }
             WorkerMsg::ApplyTemplate { path, picks } => {
                 apply_template_and_publish(engine, path, picks, &ui)
             }
+            WorkerMsg::ApplyTemplateRpc {
+                path,
+                picks,
+                reply,
+                operation,
+            } => serve_worker_rpc(reply, operation, || {
+                apply_template_rpc_and_publish(engine, path, picks, Some(&ui))
+            }),
             WorkerMsg::RenameProject { name } => rename_project_and_publish(engine, name, &ui),
             WorkerMsg::GetPreviewCacheStats { reply, operation } => {
                 if operation.claim() {
@@ -2997,9 +3147,12 @@ fn message_invalidates_preview(msg: &WorkerMsg) -> bool {
             | WorkerMsg::SetMainMagnet(_)
             | WorkerMsg::SetTrackFlag { .. }
             | WorkerMsg::OpenProject { .. }
+            | WorkerMsg::OpenProjectRpc { .. }
             | WorkerMsg::NewProject
+            | WorkerMsg::NewProjectRpc { .. }
             // A filled template is a whole new composite.
             | WorkerMsg::ApplyTemplate { .. }
+            | WorkerMsg::ApplyTemplateRpc { .. }
             // Relinked media decodes again — refresh the stale composite.
             | WorkerMsg::RelinkMedia { .. }
             | WorkerMsg::RelinkFolder { .. }
@@ -3736,59 +3889,192 @@ fn save_project_rpc_and_publish(
     }
 }
 
-/// Replace the session from a `.cutlass` file. Tolerant (`Load`, not the
-/// strict `Open`): entries whose media file is gone are kept so the user
-/// can relink them instead of being locked out of the project — the
-/// projection republish carries the missing set (count + per-tile badges)
-/// and app.slint raises the relink dialog on the epoch bump. On success
-/// every still-present pool media re-registers with the thumbnail and
-/// strip workers — the same bookkeeping an import does — the projection
-/// republish swaps the UI over, and the session epoch bump resets UI
-/// session state (playhead, selection, in/out range). On failure the
-/// current session is untouched (the engine rejects before replacing) and
-/// `session-error` names the offending path.
-fn open_project_and_publish(engine: &mut Engine, path: PathBuf, ui: &UiSink) {
-    match engine.apply(Command::Project(ProjectCommand::Load {
-        path: path.clone(),
-    })) {
-        Ok(ApplyOutcome::Loaded) => {
-            info!(
-                path = %path.display(),
-                pool = engine.project().media_count(),
-                "opened project"
-            );
-            for media in engine.project().media_iter() {
-                if media.path().exists() {
-                    register_media_with_workers(media, ui);
-                }
-            }
-            publish_projection(engine, ui);
-            bump_session_epoch(ui);
+/// Internal error contract for a whole-session operation. The worker transport
+/// gets `rpc_message`; the fire-and-forget UI transport gets `ui_message`.
+/// `session_replaced_in_memory` distinguishes a rejected atomic operation from
+/// a post-replacement persistence/binding failure that still needs projection
+/// publication and an epoch bump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionReplacementError {
+    rpc_message: String,
+    ui_message: String,
+    session_replaced_in_memory: bool,
+}
+
+impl SessionReplacementError {
+    fn unchanged(rpc_message: String, ui_message: String) -> Self {
+        Self {
+            rpc_message,
+            ui_message,
+            session_replaced_in_memory: false,
         }
-        Ok(other) => error!(path = %path.display(), "unexpected open outcome: {other:?}"),
-        Err(e) => {
-            error!(path = %path.display(), "open failed: {e}");
-            publish_session_error(ui, format!("Couldn't open {}: {e}", path.display()));
+    }
+
+    fn after_replacement(rpc_message: String, ui_message: String) -> Self {
+        Self {
+            rpc_message,
+            ui_message,
+            session_replaced_in_memory: true,
         }
     }
 }
 
-/// Replace the session with an installed template filled by the user's
-/// picks (the launch gallery's "Use template"). `ApplyTemplate` is atomic
-/// engine-side — a failed pick probe or fill leaves the current session
-/// untouched, surfaced through `session-error`. Success yields a *new
-/// unsaved* project, so a fresh draft directory is created here and the
-/// filled project saved into it (the same bind `New` performs via its
-/// queued save — done inline so a failure never litters an empty draft).
-/// Media registration, projection republish, and the session-epoch bump
-/// mirror `open_project_and_publish`; the epoch bump also dismisses the
-/// launch screen.
-fn apply_template_and_publish(
+/// An `Ok` session operation always replaced the session. An error only did
+/// so when it occurred after the atomic engine replacement (currently draft
+/// creation/binding after a template apply).
+fn session_was_replaced<T>(result: &Result<T, SessionReplacementError>) -> bool {
+    result
+        .as_ref()
+        .map(|_| true)
+        .unwrap_or_else(|error| error.session_replaced_in_memory)
+}
+
+fn count_missing_media(engine: &Engine) -> usize {
+    engine
+        .project()
+        .media_iter()
+        .filter(|media| !media.path().exists())
+        .count()
+}
+
+/// Finish one transport-neutral session operation. UI fire-and-forget callers
+/// opt into one `session-error`; acknowledged RPC callers receive the explicit
+/// error instead. A replaced in-memory session is published and bumps the
+/// epoch exactly once even when its subsequent template binding failed.
+fn complete_session_replacement<T>(
+    engine: &mut Engine,
+    ui: Option<&UiSink>,
+    result: Result<T, SessionReplacementError>,
+    publish_ui_error: bool,
+) -> Result<T, String> {
+    if publish_ui_error && let (Some(ui), Err(error)) = (ui, &result) {
+        publish_session_error(ui, error.ui_message.clone());
+    }
+
+    if session_was_replaced(&result)
+        && let Some(ui) = ui
+    {
+        for media in engine.project().media_iter() {
+            if media.path().exists() {
+                register_media_with_workers(media, ui);
+            }
+        }
+        publish_projection(engine, ui);
+        bump_session_epoch(ui);
+    }
+
+    result.map_err(|error| error.rpc_message)
+}
+
+/// Transport-neutral tolerant project load. Missing media is retained for the
+/// relink flow, and the result reads the actual binding back from the engine.
+fn open_project_core(
+    engine: &mut Engine,
+    path: PathBuf,
+) -> Result<OpenProjectRpcResult, SessionReplacementError> {
+    match engine.apply(Command::Project(ProjectCommand::Load {
+        path: path.clone(),
+    })) {
+        Ok(ApplyOutcome::Loaded) => {
+            let Some(actual_path) = engine.project_path().cloned() else {
+                let message = format!(
+                    "open project outcome uncertain/partially committed: {} replaced the \
+                     in-memory session, but the engine reports no bound project path",
+                    path.display()
+                );
+                error!("{message}");
+                return Err(SessionReplacementError::after_replacement(
+                    message,
+                    "The project was opened, but its file binding couldn't be confirmed.".into(),
+                ));
+            };
+            info!(
+                path = %actual_path.display(),
+                pool = engine.project().media_count(),
+                "opened project"
+            );
+            Ok(OpenProjectRpcResult {
+                path: actual_path,
+                project_name: engine.project().name.clone(),
+                missing_media_count: count_missing_media(engine),
+            })
+        }
+        Ok(other) => {
+            let message = format!("unexpected open outcome for {}: {other:?}", path.display());
+            error!("{message}");
+            Err(SessionReplacementError::unchanged(
+                message,
+                format!(
+                    "Couldn't open {}: unexpected engine outcome {other:?}",
+                    path.display()
+                ),
+            ))
+        }
+        Err(e) => {
+            let message = format!("open project failed for {}: {e}", path.display());
+            error!("{message}");
+            Err(SessionReplacementError::unchanged(
+                message,
+                format!("Couldn't open {}: {e}", path.display()),
+            ))
+        }
+    }
+}
+
+/// Fire-and-forget UI wrapper: errors are published exactly once.
+fn open_project_and_publish(engine: &mut Engine, path: PathBuf, ui: &UiSink) {
+    let result = open_project_core(engine, path);
+    let _ = complete_session_replacement(engine, Some(ui), result, true);
+}
+
+/// Acknowledged wrapper: success still updates the live UI, while errors are
+/// returned to the RPC caller and never duplicated through `session-error`.
+fn open_project_rpc_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    ui: Option<&UiSink>,
+) -> Result<OpenProjectRpcResult, String> {
+    let result = open_project_core(engine, path);
+    complete_session_replacement(engine, ui, result, false)
+}
+
+/// Transport-neutral fresh-session replacement. It intentionally remains
+/// unbound: the host owns app-draft creation and the subsequent queue-ordered
+/// acknowledged save.
+fn new_project_core(engine: &mut Engine) -> Result<NewProjectRpcResult, SessionReplacementError> {
+    engine.new_session();
+    info!("new session");
+    let path = engine.project_path().cloned();
+    Ok(NewProjectRpcResult {
+        requires_save_binding: path.is_none(),
+        path,
+        project_name: engine.project().name.clone(),
+        missing_media_count: count_missing_media(engine),
+    })
+}
+
+fn new_project_and_publish(engine: &mut Engine, ui: &UiSink) {
+    let result = new_project_core(engine);
+    let _ = complete_session_replacement(engine, Some(ui), result, true);
+}
+
+fn new_project_rpc_and_publish(
+    engine: &mut Engine,
+    ui: Option<&UiSink>,
+) -> Result<NewProjectRpcResult, String> {
+    let result = new_project_core(engine);
+    complete_session_replacement(engine, ui, result, false)
+}
+
+/// Transport-neutral template mutation and app-draft binding. The injected
+/// creator is the production draft allocator and a filesystem-failure seam for
+/// tests; it runs only after the engine atomically applied the template.
+fn apply_template_core(
     engine: &mut Engine,
     path: PathBuf,
     picks: Vec<TemplatePick>,
-    ui: &UiSink,
-) {
+    create_draft: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<ApplyTemplateRpcResult, SessionReplacementError> {
     match engine.apply(Command::Project(ProjectCommand::ApplyTemplate {
         path: path.clone(),
         picks,
@@ -3799,32 +4085,89 @@ fn apply_template_and_publish(
                 pool = engine.project().media_count(),
                 "applied template"
             );
-            match crate::drafts::create() {
-                Ok(draft) => save_project_and_publish(engine, Some(draft), ui),
-                Err(e) => {
-                    error!("couldn't create a draft for the filled template: {e}");
-                    publish_session_error(
-                        ui,
-                        format!(
-                            "The template was applied but a project draft couldn't be created: {e}"
-                        ),
-                    );
-                }
-            }
-            for media in engine.project().media_iter() {
-                if media.path().exists() {
-                    register_media_with_workers(media, ui);
-                }
-            }
-            publish_projection(engine, ui);
-            bump_session_epoch(ui);
         }
-        Ok(other) => error!(template = %path.display(), "unexpected apply outcome: {other:?}"),
+        Ok(other) => {
+            let message = format!(
+                "unexpected apply-template outcome for {}: {other:?}",
+                path.display()
+            );
+            error!("{message}");
+            return Err(SessionReplacementError::unchanged(
+                message,
+                format!("Couldn't use the template: unexpected engine outcome {other:?}"),
+            ));
+        }
         Err(e) => {
-            error!(template = %path.display(), "apply template failed: {e}");
-            publish_session_error(ui, format!("Couldn't use the template: {e}"));
+            let message = format!("apply template failed for {}: {e}", path.display());
+            error!("{message}");
+            return Err(SessionReplacementError::unchanged(
+                message,
+                format!("Couldn't use the template: {e}"),
+            ));
         }
     }
+
+    let draft = create_draft().map_err(|error| {
+        let message = format!(
+            "apply template outcome uncertain/partially committed: {} replaced the in-memory \
+             session, but creating an app-owned draft failed: {error}; the current session is \
+             unbound and has not been persisted",
+            path.display()
+        );
+        error!("{message}");
+        SessionReplacementError::after_replacement(
+            message,
+            format!("The template was applied but a project draft couldn't be created: {error}"),
+        )
+    })?;
+
+    let saved =
+        save_project_rpc_and_publish(engine, Some(draft.clone()), None).map_err(|error| {
+            let binding = engine
+                .project_path()
+                .map(|bound| bound.display().to_string())
+                .unwrap_or_else(|| "<unbound>".into());
+            let message = format!(
+                "apply template outcome uncertain/partially committed: {} replaced the in-memory \
+             session, but binding/persisting app-owned draft {} failed or could not be verified: \
+             {error}; current engine binding: {binding}",
+                path.display(),
+                draft.display()
+            );
+            error!("{message}");
+            SessionReplacementError::after_replacement(
+                message,
+                format!(
+                    "The template was applied but its project draft couldn't be saved: {error}"
+                ),
+            )
+        })?;
+
+    Ok(ApplyTemplateRpcResult {
+        path: saved.path,
+        project_name: engine.project().name.clone(),
+        missing_media_count: count_missing_media(engine),
+    })
+}
+
+fn apply_template_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    picks: Vec<TemplatePick>,
+    ui: &UiSink,
+) {
+    let result = apply_template_core(engine, path, picks, crate::drafts::create);
+    let _ = complete_session_replacement(engine, Some(ui), result, true);
+}
+
+fn apply_template_rpc_and_publish(
+    engine: &mut Engine,
+    path: PathBuf,
+    picks: Vec<TemplatePick>,
+    ui: Option<&UiSink>,
+) -> Result<ApplyTemplateRpcResult, String> {
+    let result = apply_template_core(engine, path, picks, crate::drafts::create);
+    complete_session_replacement(engine, ui, result, false)
 }
 
 /// Re-point a pool entry at a user-picked file (missing-media relink, M0).
@@ -4259,16 +4602,6 @@ fn bind_media_proxy(
         Some(_) => info!(%media, "proxy ignored: media was relinked while it generated"),
         None => info!(%media, "proxy ignored: media left the pool while it generated"),
     }
-}
-
-/// Replace the session with a fresh, empty project (the launch screen's New,
-/// or New from the editor). The draft's `project.cutlass` is written by the
-/// `SaveProject { Some(path) }` main.rs sends right after.
-fn new_project_and_publish(engine: &mut Engine, ui: &UiSink) {
-    engine.new_session();
-    info!("new session");
-    publish_projection(engine, ui);
-    bump_session_epoch(ui);
 }
 
 /// Rename the current draft (title bar). Applied as one undoable edit so it
@@ -7967,7 +8300,7 @@ fn deliver_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cutlass_models::Project;
+    use cutlass_models::{Project, Template, TemplateMeta};
 
     fn cache_key(tick: i64) -> FrameKey {
         FrameKey {
@@ -7988,6 +8321,14 @@ mod tests {
 
     fn copy_image_fixture(path: &Path) {
         std::fs::copy(image_fixture(), path).expect("copy image fixture");
+    }
+
+    fn write_template_fixture(path: &Path, name: &str) {
+        let mut project = Project::new(name, Rational::FPS_24);
+        project.add_track(TrackKind::Video, "Main");
+        Template::from_project(project, TemplateMeta::new(name))
+            .save_to_file(path)
+            .expect("write template fixture");
     }
 
     #[test]
@@ -8080,6 +8421,38 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Err(TryRecvError::Empty)),
             "pre-cancelled RPC must not enqueue a worker message"
+        );
+    }
+
+    #[test]
+    fn session_replacement_rpc_pre_cancel_does_not_enqueue() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            handle
+                .open_project_rpc_with_cancel(PathBuf::from("/unused/project.cutlass"), &cancel)
+                .unwrap_err(),
+            "open project request cancelled before worker claim; not started"
+        );
+        assert_eq!(
+            handle.new_project_rpc_with_cancel(&cancel).unwrap_err(),
+            "new project request cancelled before worker claim; not started"
+        );
+        assert_eq!(
+            handle
+                .apply_template_rpc_with_cancel(
+                    PathBuf::from("/unused/template.cutlasst"),
+                    Vec::new(),
+                    &cancel,
+                )
+                .unwrap_err(),
+            "apply template request cancelled before worker claim; not started"
+        );
+        assert!(
+            matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+            "pre-cancelled session RPCs must not enqueue worker messages"
         );
     }
 
@@ -8325,6 +8698,149 @@ mod tests {
     }
 
     #[test]
+    fn open_project_core_returns_bound_path_name_and_missing_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("present.jpg");
+        copy_image_fixture(&present);
+        let missing = dir.path().join("missing.jpg");
+        let project_path = dir.path().join("opened.cutlass");
+
+        let mut project = Project::new("Acknowledged open", Rational::FPS_30);
+        project.add_media(cutlass_models::MediaSource::image(present, 32, 32));
+        project.add_media(cutlass_models::MediaSource::image(missing, 32, 32));
+        project.save_to_file(&project_path).expect("save fixture");
+
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+        let outcome = open_project_core(&mut engine, project_path.clone());
+        assert!(
+            session_was_replaced(&outcome),
+            "successful open must publish and bump the session epoch"
+        );
+        let result = outcome.expect("open result");
+        assert_eq!(result.path, project_path);
+        assert_eq!(result.project_name, "Acknowledged open");
+        assert_eq!(result.missing_media_count, 1);
+        assert_eq!(engine.project_path(), Some(&result.path));
+    }
+
+    #[test]
+    fn rejected_open_and_template_do_not_request_epoch_bump() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = Engine::with_project(
+            EngineConfig::default(),
+            Project::new("keep me", Rational::FPS_30),
+        )
+        .expect("engine");
+        let revision = engine.revision();
+
+        let open = open_project_core(&mut engine, dir.path().join("missing.cutlass"));
+        assert!(!session_was_replaced(&open));
+        assert!(
+            open.unwrap_err()
+                .rpc_message
+                .contains("open project failed")
+        );
+        assert_eq!(engine.project().name, "keep me");
+        assert_eq!(engine.revision(), revision);
+
+        let template = apply_template_core(
+            &mut engine,
+            dir.path().join("missing.cutlasst"),
+            Vec::new(),
+            || panic!("draft creation must not run after a rejected template"),
+        );
+        assert!(!session_was_replaced(&template));
+        assert!(
+            template
+                .unwrap_err()
+                .rpc_message
+                .contains("apply template failed")
+        );
+        assert_eq!(engine.project().name, "keep me");
+        assert_eq!(engine.revision(), revision);
+    }
+
+    #[test]
+    fn new_project_core_reports_unbound_followup_save_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_path = dir.path().join("old.cutlass");
+        let mut engine = Engine::with_project(
+            EngineConfig::default(),
+            Project::new("old", Rational::FPS_30),
+        )
+        .expect("engine");
+        engine
+            .apply(Command::Project(ProjectCommand::Save {
+                path: old_path.clone(),
+            }))
+            .expect("bind old session");
+        assert_eq!(engine.project_path(), Some(&old_path));
+
+        let outcome = new_project_core(&mut engine);
+        assert!(session_was_replaced(&outcome));
+        let result = outcome.expect("new result");
+        assert_eq!(result.project_name, "untitled");
+        assert_eq!(result.path, None);
+        assert_eq!(result.missing_media_count, 0);
+        assert!(result.requires_save_binding);
+        assert!(engine.project_path().is_none());
+        assert!(engine.project().timeline().main_track().is_some());
+    }
+
+    #[test]
+    fn apply_template_core_returns_verified_bound_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let template_path = dir.path().join("simple.cutlasst");
+        write_template_fixture(&template_path, "Template result");
+        let draft_dir = dir.path().join("draft");
+        std::fs::create_dir(&draft_dir).unwrap();
+        let draft_path = draft_dir.join("project.cutlass");
+        let mut engine = Engine::new(EngineConfig::default()).expect("engine");
+
+        let outcome = apply_template_core(&mut engine, template_path, Vec::new(), || {
+            Ok(draft_path.clone())
+        });
+        assert!(session_was_replaced(&outcome));
+        let result = outcome.expect("template result");
+        assert_eq!(result.path, draft_path);
+        assert_eq!(result.project_name, "Template result");
+        assert_eq!(result.missing_media_count, 0);
+        assert_eq!(engine.project_path(), Some(&result.path));
+        assert!(!engine.is_dirty(), "acknowledged binding must be persisted");
+        assert!(result.path.is_file());
+    }
+
+    #[test]
+    fn template_binding_failure_reports_partially_committed_memory_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let template_path = dir.path().join("simple.cutlasst");
+        write_template_fixture(&template_path, "Applied in memory");
+        let invalid_draft_file = dir.path().join("directory-not-file");
+        std::fs::create_dir(&invalid_draft_file).unwrap();
+        let mut engine = Engine::with_project(
+            EngineConfig::default(),
+            Project::new("outgoing", Rational::FPS_30),
+        )
+        .expect("engine");
+
+        let outcome = apply_template_core(&mut engine, template_path, Vec::new(), || {
+            Ok(invalid_draft_file)
+        });
+        assert!(
+            session_was_replaced(&outcome),
+            "the applied in-memory session still needs publication and an epoch bump"
+        );
+        let error = outcome.unwrap_err();
+        assert!(error.session_replaced_in_memory);
+        assert!(error.rpc_message.contains("uncertain/partially committed"));
+        assert!(error.rpc_message.contains("binding/persisting"));
+        assert!(error.ui_message.contains("template was applied"));
+        assert_eq!(engine.project().name, "Applied in memory");
+        assert!(engine.project_path().is_none());
+        assert!(engine.is_dirty());
+    }
+
+    #[test]
     fn relink_media_rpc_helper_returns_current_path_and_validation_errors() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing.jpg");
@@ -8464,6 +8980,28 @@ mod tests {
         assert!(message_invalidates_preview(&WorkerMsg::RelinkFolderRpc {
             folder: PathBuf::from("/unused"),
             reply: folder_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+    }
+
+    #[test]
+    fn acknowledged_session_replacements_invalidate_preview() {
+        let (open_reply, _) = bounded(1);
+        let (new_reply, _) = bounded(1);
+        let (template_reply, _) = bounded(1);
+        assert!(message_invalidates_preview(&WorkerMsg::OpenProjectRpc {
+            path: PathBuf::from("/unused/project.cutlass"),
+            reply: open_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+        assert!(message_invalidates_preview(&WorkerMsg::NewProjectRpc {
+            reply: new_reply,
+            operation: Arc::new(WorkerRpcOperation::pending()),
+        }));
+        assert!(message_invalidates_preview(&WorkerMsg::ApplyTemplateRpc {
+            path: PathBuf::from("/unused/template.cutlasst"),
+            picks: Vec::new(),
+            reply: template_reply,
             operation: Arc::new(WorkerRpcOperation::pending()),
         }));
     }
