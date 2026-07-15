@@ -15,11 +15,12 @@
 //!   registry, atomics for ids and cancel flags. No async runtime — this is
 //!   a std-thread app, and a job is exactly one thread.
 //! - **Cancellation is cooperative, and the flag decides.** [`JobManager::cancel`]
-//!   flips a flag; the job observes it via [`JobContext::cancelled`] and
-//!   returns when convenient. Whatever it returns after that — `Ok` or `Err`
-//!   — the terminal state is [`JobState::Cancelled`], with the returned
-//!   string kept as the final detail. A job that never checks simply runs to
-//!   completion and is then marked cancelled anyway.
+//!   flips a flag; the job observes it via [`JobContext::cancelled`] or an
+//!   owned [`CancellationToken`] and returns when convenient. Whatever it
+//!   returns after that — `Ok` or `Err` — the terminal state is
+//!   [`JobState::Cancelled`], with the returned string kept as the final
+//!   detail. A job that never checks simply runs to completion and is then
+//!   marked cancelled anyway.
 //! - **Subscribers are called with no lock held and isolated from each
 //!   other.** Every transition collects the snapshot and subscriber list
 //!   under the lock, drops the guard, then calls — so callbacks may re-enter
@@ -140,13 +141,40 @@ pub struct JobSnapshot {
     pub finished: Option<Instant>,
 }
 
+/// An owned, read-only view of one job's cooperative cancellation flag.
+///
+/// Cloning this token only clones an [`Arc`], so it can cheaply move into
+/// APIs that retain `Send + Sync + 'static` callbacks. It intentionally
+/// exposes no cancellation authority. A token may outlive both the
+/// [`JobContext`] and the job: after the job reaches a terminal state it
+/// continues to report whether cancellation was ever requested.
+#[derive(Clone)]
+pub struct CancellationToken {
+    flag: Arc<AtomicBool>,
+}
+
+impl CancellationToken {
+    fn new(flag: Arc<AtomicBool>) -> Self {
+        Self { flag }
+    }
+
+    /// True once [`JobManager::cancel`] was called for this job.
+    ///
+    /// This check is lock-free and uses [`Ordering::Relaxed`]. The flag is
+    /// only a historical cancellation signal; it neither publishes nor
+    /// protects other data, while the registry mutex orders job state.
+    pub fn cancelled(&self) -> bool {
+        self.flag.load(Ordering::Relaxed)
+    }
+}
+
 /// Handle a running job uses to report progress and to notice cancellation.
 /// Deliberately not `Clone` and only lent to the work closure, so progress
 /// can never arrive from a job that already returned.
 pub struct JobContext {
     id: JobId,
     shared: Arc<Shared>,
-    cancel: Arc<AtomicBool>,
+    cancellation: CancellationToken,
 }
 
 impl JobContext {
@@ -165,11 +193,18 @@ impl JobContext {
         });
     }
 
-    /// True once [`JobManager::cancel`] was called for this job. Lock-free —
-    /// check it as often as the inner loop likes. `Relaxed` is enough: this
-    /// is a pure flag, and the registry mutex orders everything else.
+    /// Return a cheap-clone, owned cancellation check for retained callbacks.
+    ///
+    /// The token shares this context's flag but cannot request cancellation
+    /// or report progress, and keeping it does not keep the context alive.
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    /// True once [`JobManager::cancel`] was called for this job. Lock-free;
+    /// check it as often as an inner loop likes.
     pub fn cancelled(&self) -> bool {
-        self.cancel.load(Ordering::Relaxed)
+        self.cancellation.cancelled()
     }
 }
 
@@ -228,7 +263,7 @@ impl JobManager {
         let context = JobContext {
             id,
             shared: Arc::clone(&self.shared),
-            cancel,
+            cancellation: CancellationToken::new(cancel),
         };
         let shared = Arc::clone(&self.shared);
         let spawned = thread::Builder::new()
@@ -565,6 +600,120 @@ mod tests {
             value.push_str("动画🦀");
         }
         value
+    }
+
+    #[test]
+    fn cancellation_token_has_callback_safe_traits() {
+        fn assert_traits<T: Clone + Send + Sync + 'static>() {}
+
+        assert_traits::<CancellationToken>();
+    }
+
+    #[test]
+    fn cancellation_token_moves_into_static_callback_and_observes_cancel() {
+        type CancelCallback = Arc<dyn Fn() -> bool + Send + Sync + 'static>;
+
+        let (manager, rx) = manager_with_events();
+        let (callback_tx, callback_rx) = mpsc::channel::<CancelCallback>();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let id = manager.spawn("callback cancellation", move |ctx| {
+            let token = ctx.cancellation_token();
+            let callback: CancelCallback = Arc::new(move || token.cancelled());
+            if callback_tx.send(Arc::clone(&callback)).is_err() {
+                return Err("callback receiver dropped".into());
+            }
+            resume_rx
+                .recv()
+                .map_err(|_| "resume sender dropped".to_owned())?;
+            assert!(callback());
+            Ok("callback observed cancellation".into())
+        });
+
+        let callback = callback_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("job did not publish its cancellation callback");
+        assert!(!callback());
+        assert!(manager.cancel(id));
+        assert!(callback());
+        resume_tx.send(()).unwrap();
+
+        let terminal = wait_history(&rx, id).pop().unwrap();
+        assert_eq!(terminal.state, JobState::Cancelled);
+    }
+
+    #[test]
+    fn cancellation_token_and_context_agree_before_cancellation() {
+        let (manager, rx) = manager_with_events();
+        let (state_tx, state_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let id = manager.spawn("matching cancellation state", move |ctx| {
+            let token = ctx.cancellation_token();
+            state_tx
+                .send((ctx.cancelled(), token.cancelled()))
+                .map_err(|_| "state receiver dropped".to_owned())?;
+            resume_rx
+                .recv()
+                .map_err(|_| "resume sender dropped".to_owned())?;
+            Ok("states matched".into())
+        });
+
+        let (context_cancelled, token_cancelled) = state_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("job did not publish cancellation state");
+        assert_eq!(context_cancelled, token_cancelled);
+        assert!(!context_cancelled);
+        resume_tx.send(()).unwrap();
+        assert_eq!(wait_history(&rx, id).last().unwrap().state, JobState::Done);
+    }
+
+    #[test]
+    fn cancellation_tokens_remain_read_only_after_terminal_completion() {
+        let (manager, rx) = manager_with_events();
+
+        let (uncancelled_tx, uncancelled_rx) = mpsc::channel();
+        let uncancelled_id = manager.spawn("uncancelled token", move |ctx| {
+            uncancelled_tx
+                .send(ctx.cancellation_token())
+                .map_err(|_| "token receiver dropped".to_owned())?;
+            Ok("finished normally".into())
+        });
+        let uncancelled = uncancelled_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("uncancelled job did not publish its token");
+        assert_eq!(
+            wait_history(&rx, uncancelled_id).last().unwrap().state,
+            JobState::Done
+        );
+        assert!(!uncancelled.cancelled());
+
+        let (cancelled_tx, cancelled_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let cancelled_id = manager.spawn("cancelled token", move |ctx| {
+            cancelled_tx
+                .send(ctx.cancellation_token())
+                .map_err(|_| "token receiver dropped".to_owned())?;
+            resume_rx
+                .recv()
+                .map_err(|_| "resume sender dropped".to_owned())?;
+            Ok("stopped".into())
+        });
+        let cancelled = cancelled_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("cancelled job did not publish its token");
+        assert!(!cancelled.cancelled());
+        assert!(manager.cancel(cancelled_id));
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            wait_history(&rx, cancelled_id).last().unwrap().state,
+            JobState::Cancelled
+        );
+        assert!(cancelled.cancelled());
+
+        // Neither token keeps the context or registry alive, and both retain
+        // their final read-only view after those owners are gone.
+        drop(manager);
+        assert!(!uncancelled.cancelled());
+        assert!(cancelled.cancelled());
     }
 
     #[test]
