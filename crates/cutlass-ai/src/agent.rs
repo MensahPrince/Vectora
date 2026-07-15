@@ -9,10 +9,11 @@
 //! cap exceeded). In dry-run mode nothing is applied; the validated plan
 //! comes back for the UI's preview card.
 //!
-//! Beyond edits, the embedder can wire a [`ToolHost`] of its own tools
-//! (screenshots, app control, …): the loop offers their specs alongside
-//! the edit vocabulary, dispatches calls by name, and charges them
-//! against their own cap — host tools never touch the bridge. The
+//! Beyond edits, the embedder can wire a [`ToolHost`] of app tools, while
+//! the bridge can expose strictly read-only senses of its exact project
+//! state. The latter is what lets a model inspect edits inside rehearsal
+//! without accidentally looking at the untouched live project. Both are
+//! dispatched by exact name and charged against the host-call cap. The
 //! built-in `commit_progress` tool records phase breaks so a long task's
 //! live replay can land as several undo steps
 //! ([`PromptOutcome::phase_breaks`]).
@@ -34,6 +35,24 @@ use crate::wire::{self, WireCommand};
 pub trait EngineBridge {
     /// Fresh summary of the project as it stands.
     fn summary(&mut self) -> ProjectSummary;
+    /// Read-only tools that inspect this exact engine state. Unlike ordinary
+    /// host tools, these travel with the sandbox bridge so a screenshot taken
+    /// after an edit observes the rehearsed project, not the live project.
+    ///
+    /// The loop accepts only [`crate::tools::ToolTier::ReadOnly`] specs here.
+    fn sense_tools(&self) -> Vec<HostToolSpec> {
+        Vec::new()
+    }
+    /// Execute one tool previously returned by [`EngineBridge::sense_tools`].
+    /// Implementations must not mutate project state.
+    fn sense(
+        &mut self,
+        name: &str,
+        _arguments: &serde_json::Value,
+        _cancel: &AtomicBool,
+    ) -> Result<crate::tools::ToolOutput, String> {
+        Err(format!("unknown engine sense '{name}'"))
+    }
     /// Validate + apply one wire command. `Err` is a model-readable reason
     /// (validation rejection or engine error); state is unchanged on `Err`.
     fn apply(&mut self, command: &WireCommand) -> Result<EditOutcome, String>;
@@ -298,12 +317,28 @@ pub fn run_prompt_with_host(
     // never sent, never dispatched — so a host can neither shadow the edit
     // vocabulary nor the loop's own tools. (`read_skill` stays reserved
     // even when no skills are loaded.)
+    let mut seen_sense_names = HashSet::new();
+    let sense_specs: Vec<HostToolSpec> = bridge
+        .sense_tools()
+        .into_iter()
+        .filter(|spec| {
+            is_host_tool_name(&spec.name) && spec.tier == crate::tools::ToolTier::ReadOnly
+        })
+        .filter(|spec| spec.name != "read_skill" && tools.iter().all(|t| t.name != spec.name))
+        .filter(|spec| seen_sense_names.insert(spec.name.clone()))
+        .collect();
+    tools.extend(sense_specs.iter().map(|spec| wire::ToolSpec {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        parameters: spec.parameters.clone(),
+    }));
+
     let mut seen_host_names = HashSet::new();
     let host_specs: Vec<HostToolSpec> = host
         .tools()
         .into_iter()
         .filter(|spec| is_host_tool_name(&spec.name))
-        .filter(|spec| spec.name != "read_skill" && tools.iter().all(|t| t.name != spec.name))
+        .filter(|spec| tools.iter().all(|tool| tool.name != spec.name))
         .filter(|spec| seen_host_names.insert(spec.name.clone()))
         .collect();
     tools.extend(host_specs.iter().map(|spec| wire::ToolSpec {
@@ -313,7 +348,7 @@ pub fn run_prompt_with_host(
     }));
 
     let mut system = system_prompt(&summary, context, extensions);
-    if !host_specs.is_empty() {
+    if !sense_specs.is_empty() || !host_specs.is_empty() {
         system.push_str(HOST_TOOLS_RULES);
     }
     let mut messages = Vec::with_capacity(history.len() + 2);
@@ -417,6 +452,34 @@ pub fn run_prompt_with_host(
                     // No break recorded — an empty phase would replay as an
                     // empty undo group.
                     "nothing new to commit — make edits first".to_string()
+                }
+            } else if sense_specs.iter().any(|spec| spec.name == call.name) {
+                host_calls += 1;
+                if host_calls > config.max_host_calls {
+                    return abort(
+                        bridge,
+                        actions,
+                        format!(
+                            "exceeded the {}-host-call cap for one prompt",
+                            config.max_host_calls
+                        ),
+                    );
+                }
+                match bridge.sense(&call.name, &call.arguments, cancel) {
+                    Err(reason) => format!("rejected: {reason}"),
+                    Ok(output) => {
+                        let content = if output.text.is_empty() {
+                            "ok".to_string()
+                        } else {
+                            output.text
+                        };
+                        on_event(AgentEvent::HostAction {
+                            name: call.name.clone(),
+                            summary: host_action_summary(&content),
+                        });
+                        images = output.images;
+                        content
+                    }
                 }
             } else if let Some(spec) = host_specs.iter().find(|spec| spec.name == call.name) {
                 host_calls += 1;

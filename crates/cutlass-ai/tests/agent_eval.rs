@@ -23,6 +23,10 @@ const R24: Rational = Rational::FPS_24;
 /// A real engine behind the loop's bridge.
 struct EngineHost {
     engine: Engine,
+    sense_specs: Vec<HostToolSpec>,
+    sense_outputs: std::collections::VecDeque<Result<ToolOutput, String>>,
+    sense_calls: Vec<(String, serde_json::Value)>,
+    sense_clip_counts: Vec<usize>,
 }
 
 impl EngineHost {
@@ -30,6 +34,10 @@ impl EngineHost {
         let config = EngineConfig { undo_limit: 64 };
         Self {
             engine: Engine::with_project(config, project).expect("engine"),
+            sense_specs: Vec::new(),
+            sense_outputs: std::collections::VecDeque::new(),
+            sense_calls: Vec::new(),
+            sense_clip_counts: Vec::new(),
         }
     }
 }
@@ -37,6 +45,24 @@ impl EngineHost {
 impl EngineBridge for EngineHost {
     fn summary(&mut self) -> ProjectSummary {
         summarize(self.engine.project())
+    }
+
+    fn sense_tools(&self) -> Vec<HostToolSpec> {
+        self.sense_specs.clone()
+    }
+
+    fn sense(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        _cancel: &AtomicBool,
+    ) -> Result<ToolOutput, String> {
+        self.sense_clip_counts
+            .push(self.engine.project().timeline().clip_count());
+        self.sense_calls.push((name.to_string(), arguments.clone()));
+        self.sense_outputs
+            .pop_front()
+            .unwrap_or_else(|| Err("scripted engine sense ran out of outputs".into()))
     }
 
     fn apply(&mut self, command: &WireCommand) -> Result<EditOutcome, String> {
@@ -1607,6 +1633,110 @@ fn describe_project_results_are_collapsed_in_history() {
         !tool_result.contains("\"tracks\""),
         "no full project json survives in history"
     );
+}
+
+/// A bridge-owned sense runs against the already-mutated rehearsal state,
+/// which is the key distinction from a host screenshot of the live project.
+#[test]
+fn engine_sense_observes_rehearsed_edits_and_returns_images() {
+    let (mut host, _, _, clip) = fixture();
+    host.sense_specs = vec![host_spec("media_screenshot_preview")];
+    host.sense_outputs.push_back(Ok(ToolOutput {
+        text: "sandbox preview at 5.00s".into(),
+        images: vec![ImagePart::png(vec![7, 8, 9], "sandbox preview")],
+    }));
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "split_clip",
+            serde_json::json!({ "clip": clip, "at": 5.0 }),
+        )]),
+        tool_turn(vec![(
+            "call_2",
+            "media_screenshot_preview",
+            serde_json::json!({ "at": 5.0 }),
+        )]),
+        text_turn("The rehearsed split looks correct."),
+    ]);
+
+    let (outcome, events) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "split the clip and check the result",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 1);
+    assert_eq!(host.sense_clip_counts, vec![2]);
+    assert_eq!(
+        host.sense_calls,
+        vec![(
+            "media_screenshot_preview".into(),
+            serde_json::json!({ "at": 5.0 })
+        )]
+    );
+    match provider.requests()[2].last().unwrap() {
+        Message::ToolResult {
+            content, images, ..
+        } => {
+            assert_eq!(content, "sandbox preview at 5.00s");
+            assert_eq!(images[0].label, "sandbox preview");
+            assert_eq!(*images[0].data, vec![7, 8, 9]);
+        }
+        other => panic!("expected sense result, got {other:?}"),
+    }
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::HostAction { name, .. } if name == "media_screenshot_preview"
+    )));
+}
+
+#[test]
+fn engine_senses_are_read_only_filtered_and_outrank_host_collisions() {
+    let (mut bridge, _, _, _) = fixture();
+    bridge.sense_specs = vec![
+        host_spec("media_frame"),
+        host_spec("media_frame"),
+        {
+            let mut spec = host_spec("media_mutate");
+            spec.tier = ToolTier::Workspace;
+            spec
+        },
+        host_spec("invalid_name"),
+    ];
+    bridge
+        .sense_outputs
+        .push_back(Ok(ToolOutput::text("sandbox frame")));
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![("call_1", "media_frame", serde_json::json!({}))]),
+        text_turn("Checked."),
+    ]);
+    let mut tool_host = ScriptedHost::new(
+        vec![host_spec("media_frame")],
+        vec![Ok(ToolOutput::text("wrong live frame"))],
+    );
+
+    let (outcome, _) = run_with(
+        &provider,
+        &mut bridge,
+        &mut tool_host,
+        &EditorContext::default(),
+        "check the frame",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(bridge.sense_calls.len(), 1);
+    assert!(tool_host.calls.is_empty(), "sandbox sense wins the name");
+    let offered = &provider.tool_names()[0];
+    assert_eq!(
+        offered.iter().filter(|name| *name == "media_frame").count(),
+        1
+    );
+    assert!(!offered.iter().any(|name| name == "media_mutate"));
+    assert!(!offered.iter().any(|name| name == "invalid_name"));
 }
 
 /// Host dispatch round-trip: the call reaches the host with its exact
