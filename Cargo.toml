@@ -15,6 +15,7 @@ members = [
     "crates/cutlass-cli",
     "crates/cutlass-mobile",
     "crates/cutlass-settings",
+    "crates/cutlass-jobs",
     "apps/cutlass-desktop",
 ]
 # cutlass-py is a PyO3 cdylib shipped to PyPI on its own (maturin). Kept out of

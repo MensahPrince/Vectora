@@ -1395,6 +1395,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "cutlass-jobs"
+version = "0.5.3-alpha.0"
+
+[[package]]
 name = "cutlass-mobile"
 version = "0.5.3-alpha.0"
 dependencies = [

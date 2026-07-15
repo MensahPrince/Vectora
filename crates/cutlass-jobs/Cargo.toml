@@ -1,0 +1,8 @@
+[package]
+name = "cutlass-jobs"
+description = "Background-job registry: named worker threads with progress, cooperative cancel, and status snapshots"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
