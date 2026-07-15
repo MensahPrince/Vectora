@@ -24,7 +24,7 @@ pub const DEFAULT_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// A directory with a byte budget.
 pub struct DownloadCache {
-    root: PathBuf,
+    root: RwLock<PathBuf>,
     quota_bytes: AtomicU64,
     protected_paths: RwLock<HashSet<PathBuf>>,
     destructive_operations_blocked: AtomicBool,
@@ -41,6 +41,44 @@ pub struct DownloadCacheClear {
     pub removed_files: u64,
     /// Existing protected files retained in the cache.
     pub retained_protected_files: u64,
+}
+
+/// Why an exclusive download-cache root switch failed.
+#[derive(Debug, thiserror::Error)]
+pub enum DownloadCacheSwitchError<E>
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    /// Project media inventory currently blocks destructive cache operations.
+    #[error("download cache root switching is blocked until project media inventory completes")]
+    DestructiveOperationsBlocked,
+    /// Another maintenance operation or an active lease outlived the wait.
+    #[error("download cache root switching timed out while cache files were in use")]
+    MaintenanceBusy,
+    /// The destination was not absolute.
+    #[error("download cache root destination must be absolute")]
+    RelativeDestination,
+    /// The destination was a filesystem root such as `/`.
+    #[error("download cache root destination cannot be a filesystem root")]
+    FilesystemRootDestination,
+    /// The destination was the current cache root.
+    #[error("download cache root destination is already active")]
+    SameDestination,
+    /// The destination itself was a symbolic link.
+    #[error("download cache root destination cannot be a symbolic link")]
+    SymlinkDestination,
+    /// A non-symlink filesystem entry already occupied the destination.
+    #[error("download cache root destination already exists")]
+    ExistingDestination,
+    /// The destination could not be inspected safely.
+    #[error("could not inspect download cache root destination: {0}")]
+    DestinationIo(#[source] io::Error),
+    /// A protected path did not belong to the current root.
+    #[error("a protected download cache path is outside the current root")]
+    ProtectedPathOutsideRoot,
+    /// The caller's filesystem switch operation failed.
+    #[error("download cache root migration failed: {0}")]
+    Migration(#[source] E),
 }
 
 /// A cache path protected from clear or eviction for the lease's lifetime.
@@ -88,7 +126,7 @@ impl Drop for MaintenanceGuard<'_> {
 impl DownloadCache {
     pub fn new(root: PathBuf, quota_bytes: u64) -> Self {
         Self {
-            root,
+            root: RwLock::new(root),
             quota_bytes: AtomicU64::new(quota_bytes),
             protected_paths: RwLock::new(HashSet::new()),
             destructive_operations_blocked: AtomicBool::new(false),
@@ -97,8 +135,95 @@ impl DownloadCache {
         }
     }
 
-    pub fn root(&self) -> &Path {
-        &self.root
+    /// Snapshots the currently active cache root.
+    ///
+    /// A switch that follows this call does not alter the returned path.
+    #[must_use]
+    pub fn root(&self) -> PathBuf {
+        read_root(&self.root).clone()
+    }
+
+    /// Exclusively migrate the cache to a new root and publish it on success.
+    ///
+    /// `destination` must be absolute, absent, different from the current
+    /// root, and not a filesystem root or symbolic link. Existing leases are
+    /// allowed to finish before `migrate` runs, and new leases wait until this
+    /// method returns. The closure receives the old and new roots while cache
+    /// maintenance and root access are exclusive. It must use those arguments
+    /// instead of calling root-dependent methods on this cache.
+    ///
+    /// The in-memory root and every protected path are changed together only
+    /// after `migrate` succeeds. A closure error leaves both unchanged.
+    pub fn switch_root<D, F, E>(
+        &self,
+        destination: D,
+        migrate: F,
+    ) -> Result<(), DownloadCacheSwitchError<E>>
+    where
+        D: AsRef<Path>,
+        F: FnOnce(&Path, &Path) -> Result<(), E>,
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        if self.destructive_operations_blocked() {
+            return Err(DownloadCacheSwitchError::DestructiveOperationsBlocked);
+        }
+        let _maintenance = self
+            .begin_maintenance(MAINTENANCE_WAIT_TIMEOUT)
+            .map_err(|_| DownloadCacheSwitchError::MaintenanceBusy)?;
+        if self.destructive_operations_blocked() {
+            return Err(DownloadCacheSwitchError::DestructiveOperationsBlocked);
+        }
+
+        let destination = destination.as_ref();
+        let mut root = write_root(&self.root);
+        if !destination.is_absolute() {
+            return Err(DownloadCacheSwitchError::RelativeDestination);
+        }
+        if is_filesystem_root(destination) {
+            return Err(DownloadCacheSwitchError::FilesystemRootDestination);
+        }
+        if destination == root.as_path() {
+            return Err(DownloadCacheSwitchError::SameDestination);
+        }
+        match std::fs::symlink_metadata(destination) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(DownloadCacheSwitchError::SymlinkDestination);
+            }
+            Ok(_) => return Err(DownloadCacheSwitchError::ExistingDestination),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(DownloadCacheSwitchError::DestinationIo(error)),
+        }
+
+        // Root readers are excluded before this lock is acquired, and every
+        // protected-path writer takes the root lock first. Holding both locks
+        // makes the remap and root publication one observable transition.
+        let mut protected = write_protected(&self.protected_paths);
+        let remapped = protected
+            .iter()
+            .map(|path| {
+                let relative = path
+                    .strip_prefix(root.as_path())
+                    .map_err(|_| DownloadCacheSwitchError::ProtectedPathOutsideRoot)?;
+                if relative.as_os_str().is_empty()
+                    || !relative
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+                {
+                    return Err(DownloadCacheSwitchError::ProtectedPathOutsideRoot);
+                }
+                Ok(destination.join(relative))
+            })
+            .collect::<Result<HashSet<_>, DownloadCacheSwitchError<E>>>()?;
+
+        migrate(root.as_path(), destination).map_err(DownloadCacheSwitchError::Migration)?;
+
+        *protected = remapped;
+        *root = destination.to_path_buf();
+        // Publish the new root before protected-path readers resume. Any
+        // operation that needs both always acquires root first.
+        drop(root);
+        drop(protected);
+        Ok(())
     }
 
     /// Returns the current byte quota.
@@ -125,7 +250,8 @@ impl DownloadCache {
     /// cache root itself, and paths containing traversal components fail
     /// closed.
     pub fn protect_path(&self, path: &Path) -> Result<(), CloudError> {
-        let path = contained_cache_path(&self.root, path)?;
+        let root = read_root(&self.root);
+        let path = contained_cache_path(root.as_path(), path)?;
         if let Ok(metadata) = std::fs::symlink_metadata(&path)
             && !metadata.file_type().is_file()
         {
@@ -181,10 +307,11 @@ impl DownloadCache {
     /// should land. Creates parent directories.
     pub fn path_for(&self, key: &str) -> Result<PathBuf, CloudError> {
         let key = validated_key(key)?;
-        ensure_cache_root(&self.root)?;
+        let root = read_root(&self.root);
+        ensure_cache_root(root.as_path())?;
         let parent = key.parent().unwrap_or_else(|| Path::new(""));
-        ensure_safe_subdirectories(&self.root, parent)?;
-        let path = self.root.join(key);
+        ensure_safe_subdirectories(root.as_path(), parent)?;
+        let path = root.join(key);
         reject_symlink_or_directory(&path)?;
         Ok(path)
     }
@@ -192,15 +319,16 @@ impl DownloadCache {
     /// Whether `key` is already downloaded (touches it for LRU).
     pub fn hit(&self, key: &str) -> Option<PathBuf> {
         let key = validated_key(key).ok()?;
-        if !safe_existing_root(&self.root) {
+        let root = read_root(&self.root);
+        if !safe_existing_root(root.as_path()) {
             return None;
         }
         ensure_existing_safe_subdirectories(
-            &self.root,
+            root.as_path(),
             key.parent().unwrap_or_else(|| Path::new("")),
         )
         .ok()?;
-        let path = self.root.join(key);
+        let path = root.join(key);
         let metadata = std::fs::symlink_metadata(&path).ok()?;
         if metadata.file_type().is_file() {
             // Re-touch so recently-used files survive eviction.
@@ -213,8 +341,9 @@ impl DownloadCache {
 
     /// Total bytes currently cached.
     pub fn size_bytes(&self) -> u64 {
+        let root = read_root(&self.root);
         saturating_total_bytes(
-            walk_files(&self.root)
+            walk_files(root.as_path())
                 .into_iter()
                 .filter_map(|p| std::fs::symlink_metadata(p).ok())
                 .map(|m| m.len()),
@@ -236,8 +365,9 @@ impl DownloadCache {
             return;
         }
         let quota_bytes = self.quota_bytes();
+        let root = read_root(&self.root);
         let protected = read_protected(&self.protected_paths).clone();
-        let mut files: Vec<(PathBuf, u64, SystemTime)> = walk_files(&self.root)
+        let mut files: Vec<(PathBuf, u64, SystemTime)> = walk_files(root.as_path())
             .into_iter()
             .filter(|path| !protected.contains(path))
             .filter_map(|p| {
@@ -273,7 +403,8 @@ impl DownloadCache {
         if self.destructive_operations_blocked() {
             return Err(cache_inventory_incomplete());
         }
-        if safe_root_entries(&self.root)?.is_none() {
+        let root = read_root(&self.root);
+        if safe_root_entries(root.as_path())?.is_none() {
             return Ok(DownloadCacheClear {
                 removed_bytes: 0,
                 removed_files: 0,
@@ -281,7 +412,7 @@ impl DownloadCache {
             });
         }
         let protected = read_protected(&self.protected_paths).clone();
-        let (files, mut directories) = walk_tree(&self.root);
+        let (files, mut directories) = walk_tree(root.as_path());
         let mut removed_bytes = 0_u64;
         let mut removed_files = 0_u64;
         let mut retained_protected_files = 0_u64;
@@ -393,6 +524,15 @@ fn contained_cache_path(root: &Path, path: &Path) -> Result<PathBuf, CloudError>
     Ok(root.join(relative))
 }
 
+fn read_root(root: &RwLock<PathBuf>) -> std::sync::RwLockReadGuard<'_, PathBuf> {
+    root.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_root(root: &RwLock<PathBuf>) -> std::sync::RwLockWriteGuard<'_, PathBuf> {
+    root.write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn read_protected(
     protected: &RwLock<HashSet<PathBuf>>,
 ) -> std::sync::RwLockReadGuard<'_, HashSet<PathBuf>> {
@@ -433,6 +573,10 @@ fn cache_inventory_incomplete() -> CloudError {
         "download cache is protected until project media inventory completes",
     )
     .into()
+}
+
+fn is_filesystem_root(path: &Path) -> bool {
+    path.is_absolute() && path.parent().is_none()
 }
 
 fn ensure_cache_root(root: &Path) -> Result<(), CloudError> {
@@ -582,6 +726,7 @@ fn filetime_touch(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU8, AtomicUsize};
     use std::sync::{Arc, Barrier};
     use std::thread;
 
@@ -737,6 +882,276 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         assert!(cache.protect_path(&directory).is_err());
         assert_eq!(cache.protected_path_count(), 0);
+    }
+
+    #[test]
+    fn switch_root_moves_cache_and_atomically_remaps_protected_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old-cache");
+        let new_root = dir.path().join("new-cache");
+        let cache = DownloadCache::new(old_root.clone(), 1_000);
+        let protected = write(&cache, "stock/project.mp4", 100);
+        let disposable = write(&cache, "stock/disposable.bin", 20);
+        cache.protect_path(&protected).unwrap();
+
+        cache
+            .switch_root(&new_root, |old, new| {
+                assert_eq!(old, old_root);
+                assert_eq!(new, new_root);
+                std::fs::rename(old, new)
+            })
+            .unwrap();
+
+        let moved_protected = new_root.join("stock/project.mp4");
+        let moved_disposable = new_root.join("stock/disposable.bin");
+        assert_eq!(cache.root(), new_root);
+        assert!(!old_root.exists());
+        assert!(moved_protected.exists());
+        assert!(moved_disposable.exists());
+        assert_eq!(
+            &*read_protected(&cache.protected_paths),
+            &HashSet::from([moved_protected.clone()])
+        );
+
+        cache.set_quota_bytes(0);
+        cache.enforce_quota();
+        assert!(
+            moved_protected.exists(),
+            "the remapped protection must survive eviction"
+        );
+        assert!(!moved_disposable.exists());
+        assert!(!disposable.exists());
+    }
+
+    #[test]
+    fn switch_root_closure_failure_rolls_back_all_memory_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old-cache");
+        let new_root = dir.path().join("new-cache");
+        let cache = DownloadCache::new(old_root.clone(), 1_000);
+        let protected = write(&cache, "stock/project.mp4", 8);
+        cache.protect_path(&protected).unwrap();
+        let protected_before = read_protected(&cache.protected_paths).clone();
+
+        let result = cache.switch_root(&new_root, |old, new| {
+            assert_eq!(old, old_root);
+            assert_eq!(new, new_root);
+            std::fs::create_dir(new)?;
+            Err(io::Error::other("injected migration failure"))
+        });
+
+        assert!(matches!(
+            result,
+            Err(DownloadCacheSwitchError::Migration(error))
+                if error.kind() == io::ErrorKind::Other
+        ));
+        assert_eq!(cache.root(), old_root);
+        assert_eq!(&*read_protected(&cache.protected_paths), &protected_before);
+        assert_eq!(
+            cache.path_for("stock/after-failure.bin").unwrap(),
+            old_root.join("stock/after-failure.bin")
+        );
+    }
+
+    #[test]
+    fn active_lease_delays_switch_root_and_keeps_its_old_path_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old-cache");
+        let new_root = dir.path().join("new-cache");
+        let cache = Arc::new(DownloadCache::new(old_root.clone(), 1_000));
+        let lease = cache.lease("stock/in-flight.mp4").unwrap();
+        let lease_path = lease.path().to_path_buf();
+        let started = Arc::new(Barrier::new(2));
+        let closure_called = Arc::new(AtomicBool::new(false));
+
+        let worker = {
+            let cache = Arc::clone(&cache);
+            let started = Arc::clone(&started);
+            let closure_called = Arc::clone(&closure_called);
+            let new_root = new_root.clone();
+            thread::spawn(move || {
+                started.wait();
+                cache.switch_root(&new_root, |old, new| {
+                    closure_called.store(true, Ordering::Release);
+                    std::fs::rename(old, new)
+                })
+            })
+        };
+
+        started.wait();
+        thread::sleep(Duration::from_millis(20));
+        assert!(!closure_called.load(Ordering::Acquire));
+        assert_eq!(cache.root(), old_root);
+        assert_eq!(lease.path(), lease_path);
+
+        drop(lease);
+        worker.join().unwrap().unwrap();
+        assert!(closure_called.load(Ordering::Acquire));
+        assert_eq!(cache.root(), new_root);
+        assert_eq!(lease_path, old_root.join("stock/in-flight.mp4"));
+    }
+
+    #[test]
+    fn switch_root_rejects_invalid_destinations_without_calling_closure() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old-cache");
+        std::fs::create_dir(&old_root).unwrap();
+        let cache = DownloadCache::new(old_root.clone(), 1_000);
+        let calls = AtomicUsize::new(0);
+        let migrate = |_: &Path, _: &Path| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            Ok::<(), io::Error>(())
+        };
+
+        assert!(matches!(
+            cache.switch_root("relative-cache", migrate),
+            Err(DownloadCacheSwitchError::RelativeDestination)
+        ));
+        let filesystem_root = old_root.ancestors().last().unwrap().to_path_buf();
+        assert!(matches!(
+            cache.switch_root(&filesystem_root, migrate),
+            Err(DownloadCacheSwitchError::FilesystemRootDestination)
+        ));
+        assert!(matches!(
+            cache.switch_root(&old_root, migrate),
+            Err(DownloadCacheSwitchError::SameDestination)
+        ));
+
+        let existing_directory = dir.path().join("existing-directory");
+        std::fs::create_dir(&existing_directory).unwrap();
+        assert!(matches!(
+            cache.switch_root(&existing_directory, migrate),
+            Err(DownloadCacheSwitchError::ExistingDestination)
+        ));
+        let existing_file = dir.path().join("existing-file");
+        std::fs::write(&existing_file, b"occupied").unwrap();
+        assert!(matches!(
+            cache.switch_root(&existing_file, migrate),
+            Err(DownloadCacheSwitchError::ExistingDestination)
+        ));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let symlink_destination = dir.path().join("destination-link");
+            symlink(dir.path().join("missing-target"), &symlink_destination).unwrap();
+            assert!(matches!(
+                cache.switch_root(&symlink_destination, migrate),
+                Err(DownloadCacheSwitchError::SymlinkDestination)
+            ));
+        }
+
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.root(), old_root);
+    }
+
+    #[test]
+    fn blocked_destructive_operations_prevent_switch_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old-cache");
+        std::fs::create_dir(&old_root).unwrap();
+        let cache = DownloadCache::new(old_root.clone(), 1_000);
+        let closure_called = AtomicBool::new(false);
+        cache.block_destructive_operations();
+
+        let result = cache.switch_root(dir.path().join("new-cache"), |_, _| {
+            closure_called.store(true, Ordering::Release);
+            Ok::<(), io::Error>(())
+        });
+
+        assert!(matches!(
+            result,
+            Err(DownloadCacheSwitchError::DestructiveOperationsBlocked)
+        ));
+        assert!(!closure_called.load(Ordering::Acquire));
+        assert_eq!(cache.root(), old_root);
+    }
+
+    #[test]
+    fn concurrent_root_readers_observe_only_complete_old_or_new_paths() {
+        const READERS: usize = 8;
+
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old-cache-with-a-distinct-name");
+        let new_root = dir.path().join("new-cache-with-another-distinct-name");
+        std::fs::create_dir(&old_root).unwrap();
+        let cache = Arc::new(DownloadCache::new(old_root.clone(), 1_000));
+        let start = Arc::new(Barrier::new(READERS + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicU8::new(0));
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let cache = Arc::clone(&cache);
+                let start = Arc::clone(&start);
+                let stop = Arc::clone(&stop);
+                let observed = Arc::clone(&observed);
+                let old_root = old_root.clone();
+                let new_root = new_root.clone();
+                thread::spawn(move || {
+                    start.wait();
+                    while !stop.load(Ordering::Acquire) {
+                        let root = cache.root();
+                        if root == old_root {
+                            observed.fetch_or(0b01, Ordering::Release);
+                        } else if root == new_root {
+                            observed.fetch_or(0b10, Ordering::Release);
+                        } else {
+                            panic!("observed a partial or unknown root: {root:?}");
+                        }
+                        thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+
+        start.wait();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while observed.load(Ordering::Acquire) & 0b01 == 0 {
+            assert!(Instant::now() < deadline, "readers never observed old root");
+            thread::yield_now();
+        }
+
+        cache
+            .switch_root(&new_root, |old, new| {
+                std::fs::rename(old, new)?;
+                thread::sleep(Duration::from_millis(10));
+                Ok::<(), io::Error>(())
+            })
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while observed.load(Ordering::Acquire) & 0b10 == 0 {
+            assert!(Instant::now() < deadline, "readers never observed new root");
+            thread::yield_now();
+        }
+        stop.store(true, Ordering::Release);
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        assert_eq!(observed.load(Ordering::Acquire), 0b11);
+    }
+
+    #[test]
+    fn root_snapshots_and_switches_recover_from_lock_poisoning() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_root = dir.path().join("old-cache");
+        let new_root = dir.path().join("new-cache");
+        std::fs::create_dir(&old_root).unwrap();
+        let cache = DownloadCache::new(old_root.clone(), 1_000);
+
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _root = cache.root.write().unwrap();
+            panic!("poison root lock");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(cache.root(), old_root);
+
+        cache
+            .switch_root(&new_root, |old, new| std::fs::rename(old, new))
+            .unwrap();
+        assert_eq!(cache.root(), new_root);
     }
 
     #[test]
