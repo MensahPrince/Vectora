@@ -1,9 +1,9 @@
-//! Deterministic, dependency-light audio analysis over borrowed PCM.
+//! Deterministic, dependency-free media analysis over borrowed buffers.
 //!
-//! The crate deliberately stops at the PCM boundary. Callers provide finite,
-//! interleaved [`f32`] samples together with an explicit sample rate and channel
-//! count; future decoder, background-job, and index adapters can therefore use
-//! the same analysis without coupling it to an engine or platform codec.
+//! The crate deliberately stops at decoded audio and video boundaries. Callers
+//! provide finite, interleaved [`f32`] PCM or validated row-strided RGBA8 frame
+//! views; decoder, background-job, and index adapters can therefore use the same
+//! analysis without coupling it to an engine or platform codec.
 //!
 //! Multi-channel audio is measured by averaging the energy of every sample in
 //! a frame. Channels are **not** mixed as signed amplitudes first, so
@@ -19,12 +19,25 @@
 //! number of times. Each public analysis is `O(samples + windows)` and never
 //! copies the PCM. Auxiliary storage is `O(windows)` (plus returned events), not
 //! `O(samples)`. Empty PCM is valid and produces empty analysis output.
+//!
+//! Shot detection samples a configured bounded grid and fixed-bin histogram.
+//! It is linear in frames and sampled pixels, retains two bounded feature
+//! buffers rather than full frames, and returns deterministic hard-cut
+//! candidates intended for later semantic verification.
 
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
 use std::error::Error;
 use std::fmt;
+
+mod shot_detection;
+
+pub use shot_detection::{
+    MAX_SHOT_HISTOGRAM_BINS, MAX_SHOT_SAMPLE_HEIGHT, MAX_SHOT_SAMPLE_WIDTH, Rgba8Frame,
+    Rgba8FrameError, ShotBoundary, ShotBoundaryKind, ShotDetectionConfig, ShotDetectionError,
+    ShotDetector, ShotScoreWeights, detect_shots,
+};
 
 /// A failure to construct a validated analysis configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
