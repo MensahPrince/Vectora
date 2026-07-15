@@ -9,7 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -598,12 +598,14 @@ enum WorkerMsg {
     #[allow(dead_code)] // Wired into the cache registry in its follow-up phase.
     GetPreviewCacheStats {
         reply: Sender<PreviewCacheStats>,
+        operation: Arc<CacheRpcOperation>,
     },
     /// Drop every composited preview frame and report the exact pre-clear
     /// usage (the entries and bytes removed).
     #[allow(dead_code)] // Wired into the cache registry in its follow-up phase.
     ClearPreviewCache {
         reply: Sender<PreviewCacheStats>,
+        operation: Arc<CacheRpcOperation>,
     },
     /// Clone the live project for the AI agent's sandbox rehearsal
     /// (`src/agent.rs`). Ordered with mutations, so the snapshot always
@@ -684,6 +686,40 @@ pub struct WorkerHandle {
 /// Cache-management calls must not wait forever behind a stuck render.
 #[allow(dead_code)] // Used once the cache registry consumes this Phase 2b RPC.
 const PREVIEW_CACHE_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const PREVIEW_CACHE_RPC_WAIT_SLICE: Duration = Duration::from_millis(25);
+const CACHE_RPC_PENDING: u8 = 0;
+const CACHE_RPC_RUNNING: u8 = 1;
+const CACHE_RPC_ABANDONED: u8 = 2;
+
+struct CacheRpcOperation(AtomicU8);
+
+impl CacheRpcOperation {
+    fn pending() -> Self {
+        Self(AtomicU8::new(CACHE_RPC_PENDING))
+    }
+
+    fn claim(&self) -> bool {
+        self.0
+            .compare_exchange(
+                CACHE_RPC_PENDING,
+                CACHE_RPC_RUNNING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn abandon(&self) -> bool {
+        self.0
+            .compare_exchange(
+                CACHE_RPC_PENDING,
+                CACHE_RPC_ABANDONED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+}
 
 impl WorkerHandle {
     pub fn request_frame(&self, tick: i64) {
@@ -740,9 +776,19 @@ impl WorkerHandle {
     /// requests submitted before this call.
     #[allow(dead_code)] // Public(crate) seam for the follow-up registry wiring.
     pub(crate) fn preview_cache_stats(&self) -> Result<PreviewCacheStats, String> {
-        self.preview_cache_rpc("stats", PREVIEW_CACHE_RPC_TIMEOUT, |reply| {
-            WorkerMsg::GetPreviewCacheStats { reply }
-        })
+        self.preview_cache_stats_with_cancel(&AtomicBool::new(false))
+    }
+
+    pub(crate) fn preview_cache_stats_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<PreviewCacheStats, String> {
+        self.preview_cache_rpc(
+            "stats",
+            PREVIEW_CACHE_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::GetPreviewCacheStats { reply, operation },
+        )
     }
 
     /// Clear only composited preview frames and return their exact pre-clear
@@ -750,9 +796,19 @@ impl WorkerHandle {
     /// queued renders may refill it.
     #[allow(dead_code)] // Public(crate) seam for the follow-up registry wiring.
     pub(crate) fn clear_preview_cache(&self) -> Result<PreviewCacheStats, String> {
-        self.preview_cache_rpc("clear", PREVIEW_CACHE_RPC_TIMEOUT, |reply| {
-            WorkerMsg::ClearPreviewCache { reply }
-        })
+        self.clear_preview_cache_with_cancel(&AtomicBool::new(false))
+    }
+
+    pub(crate) fn clear_preview_cache_with_cancel(
+        &self,
+        cancel: &AtomicBool,
+    ) -> Result<PreviewCacheStats, String> {
+        self.preview_cache_rpc(
+            "clear",
+            PREVIEW_CACHE_RPC_TIMEOUT,
+            cancel,
+            |reply, operation| WorkerMsg::ClearPreviewCache { reply, operation },
+        )
     }
 
     #[allow(dead_code)] // Reachable through the intentionally staged APIs above.
@@ -760,21 +816,45 @@ impl WorkerHandle {
         &self,
         operation: &'static str,
         timeout: Duration,
-        request: impl FnOnce(Sender<PreviewCacheStats>) -> WorkerMsg,
+        cancel: &AtomicBool,
+        request: impl FnOnce(Sender<PreviewCacheStats>, Arc<CacheRpcOperation>) -> WorkerMsg,
     ) -> Result<PreviewCacheStats, String> {
         let (reply, response) = bounded(1);
-        self.tx.send(request(reply)).map_err(|_| {
-            format!("preview cache {operation} request failed: preview worker is not running")
-        })?;
-        match response.recv_timeout(timeout) {
-            Ok(stats) => Ok(stats),
-            Err(RecvTimeoutError::Timeout) => Err(format!(
-                "preview cache {operation} request timed out after {} ms",
-                timeout.as_millis()
-            )),
-            Err(RecvTimeoutError::Disconnected) => Err(format!(
-                "preview cache {operation} request failed: preview worker stopped before replying"
-            )),
+        let operation_state = Arc::new(CacheRpcOperation::pending());
+        self.tx
+            .send(request(reply, Arc::clone(&operation_state)))
+            .map_err(|_| {
+                operation_state.abandon();
+                format!("preview cache {operation} request failed: preview worker is not running")
+            })?;
+
+        let started = Instant::now();
+        loop {
+            if cancel.load(Ordering::Acquire) && operation_state.abandon() {
+                return Err(format!("preview cache {operation} request was cancelled"));
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                let detail = if operation_state.abandon() {
+                    "while still queued"
+                } else {
+                    "after the worker started it"
+                };
+                return Err(format!(
+                    "preview cache {operation} request timed out {detail} after {} ms",
+                    timeout.as_millis()
+                ));
+            }
+            match response.recv_timeout(PREVIEW_CACHE_RPC_WAIT_SLICE.min(remaining)) {
+                Ok(stats) => return Ok(stats),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => {
+                    operation_state.abandon();
+                    return Err(format!(
+                        "preview cache {operation} request failed: preview worker stopped before replying"
+                    ));
+                }
+            }
         }
     }
 
@@ -1810,11 +1890,15 @@ fn worker_loop(
                 apply_template_and_publish(engine, path, picks, &ui)
             }
             WorkerMsg::RenameProject { name } => rename_project_and_publish(engine, name, &ui),
-            WorkerMsg::GetPreviewCacheStats { reply } => {
-                let _ = reply.send(cache.stats());
+            WorkerMsg::GetPreviewCacheStats { reply, operation } => {
+                if operation.claim() {
+                    let _ = reply.send(cache.stats());
+                }
             }
-            WorkerMsg::ClearPreviewCache { reply } => {
-                let _ = reply.send(cache.clear());
+            WorkerMsg::ClearPreviewCache { reply, operation } => {
+                if operation.claim() {
+                    let _ = reply.send(cache.clear());
+                }
             }
             WorkerMsg::SnapshotProject { reply } => {
                 let _ = reply.send(engine.project().clone());
@@ -7149,15 +7233,47 @@ mod tests {
 
     #[test]
     fn preview_cache_rpc_times_out_when_worker_does_not_reply() {
-        let (tx, _rx) = unbounded();
+        let (tx, rx) = unbounded();
         let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(false);
 
         let error = handle
-            .preview_cache_rpc("clear", Duration::from_millis(1), |reply| {
-                WorkerMsg::ClearPreviewCache { reply }
-            })
+            .preview_cache_rpc(
+                "clear",
+                Duration::from_millis(1),
+                &cancel,
+                |reply, operation| WorkerMsg::ClearPreviewCache { reply, operation },
+            )
             .unwrap_err();
-        assert_eq!(error, "preview cache clear request timed out after 1 ms");
+        assert_eq!(
+            error,
+            "preview cache clear request timed out while still queued after 1 ms"
+        );
+        let WorkerMsg::ClearPreviewCache { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected queued clear request");
+        };
+        assert!(
+            !operation.claim(),
+            "a timed-out queued clear must remain a no-op"
+        );
+    }
+
+    #[test]
+    fn preview_cache_rpc_cancellation_abandons_a_queued_clear() {
+        let (tx, rx) = unbounded();
+        let handle = WorkerHandle { tx };
+        let cancel = AtomicBool::new(true);
+
+        assert!(
+            handle
+                .clear_preview_cache_with_cancel(&cancel)
+                .unwrap_err()
+                .contains("cancelled")
+        );
+        let WorkerMsg::ClearPreviewCache { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("expected queued clear request");
+        };
+        assert!(!operation.claim());
     }
 
     /// The ladder drops on one slow render but climbs back only on
