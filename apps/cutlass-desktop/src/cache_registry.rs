@@ -175,6 +175,7 @@ impl CacheRegistry {
                 ensure_memory_has_no_path(&self.layout, id)?;
                 self.clear_memory_cache(id, cancel)?
             }
+            CacheKind::Disk if id == CacheId::Download => self.clear_download_cache(cancel)?,
             CacheKind::Disk => clear_disk_contents(&self.layout, id, cancel)?,
         };
 
@@ -209,8 +210,9 @@ impl CacheRegistry {
         let descriptor = id.descriptor();
         if id == CacheId::Download {
             return format!(
-                "Cache: {}\n\nClearing is blocked while Cutlass migrates downloaded source media to durable project storage.",
-                descriptor.label
+                "Cache: {}\nLocation: {}\n\nUnreferenced downloads are removed. Source files still used by a project are retained.",
+                descriptor.label,
+                self.download_cache.root().display()
             );
         }
         match self.layout.resolve(id) {
@@ -228,6 +230,41 @@ impl CacheRegistry {
 
     fn validate_runtime_wiring(&self) -> Result<(), String> {
         validate_download_root(&self.layout, self.download_cache.root())
+    }
+
+    fn clear_download_cache(&self, cancel: &AtomicBool) -> Result<CacheUsage, String> {
+        ensure_not_cancelled(cancel, "cancelled before protecting project downloads")?;
+        let saved = crate::download_safety::protect_saved_draft_downloads(
+            self.download_cache.as_ref(),
+            &crate::drafts::root_dir(),
+        );
+        if !saved.is_complete() {
+            self.download_cache.block_destructive_operations();
+            return Err(
+                "saved project media inventory is incomplete; download clear was refused".into(),
+            );
+        }
+        let project = self.preview.snapshot_project().ok_or_else(|| {
+            "current project is unavailable; download clear was refused".to_string()
+        })?;
+        let protected = crate::download_safety::protect_project_downloads(
+            self.download_cache.as_ref(),
+            &project,
+        );
+        if protected.rejected != 0 {
+            return Err(
+                "current project media could not be protected; download clear was refused".into(),
+            );
+        }
+        ensure_not_cancelled(cancel, "cancelled before clearing downloads")?;
+        let report = self.download_cache.clear().map_err(|error| {
+            bounded_error("download cache could not be cleared", &error.to_string())
+        })?;
+        Ok(CacheUsage {
+            bytes: report.removed_bytes,
+            entries: 0,
+            files: report.removed_files,
+        })
     }
 
     fn snapshot_all_locked(&self, cancel: &AtomicBool) -> Result<Vec<CacheSnapshot>, String> {
@@ -476,12 +513,6 @@ fn clear_disk_contents(
 fn ensure_cache_can_be_cleared(id: CacheId) -> Result<(), String> {
     if id.descriptor().tier == CacheTier::UserData {
         return Err("user data cannot be cleared through the cache registry".into());
-    }
-    if id == CacheId::Download {
-        return Err(
-            "download cache clearing is temporarily unavailable because existing drafts may reference downloaded source media"
-                .into(),
-        );
     }
     Ok(())
 }
@@ -789,11 +820,9 @@ mod tests {
     }
 
     #[test]
-    fn download_clearing_fails_closed_until_source_media_is_durable() {
+    fn cache_clear_policy_allows_protected_download_cleanup() {
         assert!(ensure_cache_can_be_cleared(CacheId::Proxies).is_ok());
-        let error = ensure_cache_can_be_cleared(CacheId::Download).unwrap_err();
-        assert!(error.contains("drafts"));
-        assert!(error.contains("source media"));
+        assert!(ensure_cache_can_be_cleared(CacheId::Download).is_ok());
     }
 
     #[test]

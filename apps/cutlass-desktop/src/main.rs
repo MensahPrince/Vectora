@@ -505,8 +505,7 @@ fn cache_rows_from_snapshots(
                 )
                 .into(),
                 path: path.into(),
-                clearable: snapshot.tier != cutlass_storage::CacheTier::UserData
-                    && snapshot.id != cutlass_storage::CacheId::Download,
+                clearable: snapshot.tier != cutlass_storage::CacheTier::UserData,
                 relocatable: false,
             })
         })
@@ -3256,7 +3255,7 @@ mod settings_cache_tests {
         );
         assert_eq!(rows[1].size_label.as_str(), "1.5 KiB");
         assert_eq!(rows[1].item_count_label.as_str(), "1 file");
-        assert!(!rows[1].clearable);
+        assert!(rows[1].clearable);
         assert!(!rows[1].relocatable);
 
         assert!(
