@@ -69,7 +69,7 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
     spawn(reveal_command(path))
 }
 
-fn validate_existing_absolute_path(path: &Path) -> Result<(), String> {
+pub(crate) fn validate_existing_absolute_path(path: &Path) -> Result<(), String> {
     if !path.is_absolute() {
         return Err("external path must be absolute".into());
     }

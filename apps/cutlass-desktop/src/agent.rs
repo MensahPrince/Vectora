@@ -637,7 +637,9 @@ impl DesktopToolHost {
 
 impl ToolHost for DesktopToolHost {
     fn tools(&self) -> Vec<HostToolSpec> {
-        crate::agent_app_control::specs()
+        let mut specs = crate::agent_app_control::specs();
+        specs.extend(crate::agent_system::specs());
+        specs
     }
 
     fn authorize(
@@ -706,7 +708,11 @@ impl ToolHost for DesktopToolHost {
         arguments: &serde_json::Value,
         cancel: &AtomicBool,
     ) -> Result<ToolOutput, String> {
-        crate::agent_app_control::call(self.app.clone(), name, arguments, cancel)
+        match cutlass_ai::namespace(name) {
+            "app" => crate::agent_app_control::call(self.app.clone(), name, arguments, cancel),
+            "system" => crate::agent_system::call(name, arguments, cancel),
+            other => Err(format!("unsupported desktop tool namespace '{other}'")),
+        }
     }
 }
 
@@ -1338,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_host_registers_app_controls_with_close_gated_as_system() {
+    fn desktop_host_registers_app_controls_and_system_handoffs_by_tier() {
         let (_tx, rx) = unbounded();
         let host = DesktopToolHost::new(
             Autonomy::Ask,
@@ -1349,7 +1355,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         );
         let specs = host.tools();
-        assert_eq!(specs.len(), 12);
+        assert_eq!(specs.len(), 14);
         assert_eq!(
             specs
                 .iter()
@@ -1367,8 +1373,16 @@ mod tests {
         assert!(
             specs
                 .iter()
-                .filter(|spec| spec.name != "app_close")
-                .all(|spec| spec.tier != ToolTier::System)
+                .filter(|spec| spec.name.starts_with("system_"))
+                .all(|spec| spec.tier == ToolTier::System)
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.tier == ToolTier::System)
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["app_close", "system_reveal", "system_open_external"]
         );
     }
 
