@@ -10,7 +10,8 @@
 //! Settings surfaces a "clear download cache" action backed by
 //! [`DownloadCache::clear`].
 
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -57,17 +58,29 @@ impl DownloadCache {
     /// Where a download for `key` (e.g. `stock/pexels-857191-hd.mp4`)
     /// should land. Creates parent directories.
     pub fn path_for(&self, key: &str) -> Result<PathBuf, CloudError> {
+        let key = validated_key(key)?;
+        ensure_cache_root(&self.root)?;
+        let parent = key.parent().unwrap_or_else(|| Path::new(""));
+        ensure_safe_subdirectories(&self.root, parent)?;
         let path = self.root.join(key);
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
+        reject_symlink_or_directory(&path)?;
         Ok(path)
     }
 
     /// Whether `key` is already downloaded (touches it for LRU).
     pub fn hit(&self, key: &str) -> Option<PathBuf> {
+        let key = validated_key(key).ok()?;
+        if !safe_existing_root(&self.root) {
+            return None;
+        }
+        ensure_existing_safe_subdirectories(
+            &self.root,
+            key.parent().unwrap_or_else(|| Path::new("")),
+        )
+        .ok()?;
         let path = self.root.join(key);
-        if path.is_file() {
+        let metadata = std::fs::symlink_metadata(&path).ok()?;
+        if metadata.file_type().is_file() {
             // Re-touch so recently-used files survive eviction.
             let _ = filetime_touch(&path);
             Some(path)
@@ -81,7 +94,7 @@ impl DownloadCache {
         saturating_total_bytes(
             walk_files(&self.root)
                 .into_iter()
-                .filter_map(|p| std::fs::metadata(p).ok())
+                .filter_map(|p| std::fs::symlink_metadata(p).ok())
                 .map(|m| m.len()),
         )
     }
@@ -93,7 +106,7 @@ impl DownloadCache {
         let mut files: Vec<(PathBuf, u64, SystemTime)> = walk_files(&self.root)
             .into_iter()
             .filter_map(|p| {
-                let meta = std::fs::metadata(&p).ok()?;
+                let meta = std::fs::symlink_metadata(&p).ok()?;
                 let mtime = meta.modified().ok()?;
                 Some((p, meta.len(), mtime))
             })
@@ -118,20 +131,142 @@ impl DownloadCache {
     /// Delete everything (the settings "clear download cache" action).
     /// The root itself stays so in-flight paths remain valid.
     pub fn clear(&self) -> Result<(), CloudError> {
-        for entry in std::fs::read_dir(&self.root)
-            .into_iter()
-            .flatten()
-            .flatten()
-        {
+        let Some(entries) = safe_root_entries(&self.root)? else {
+            return Ok(());
+        };
+        for entry in entries {
+            let entry = entry?;
             let path = entry.path();
-            let _ = if path.is_dir() {
-                std::fs::remove_dir_all(&path)
+            let file_type = entry.file_type()?;
+            if file_type.is_dir() {
+                std::fs::remove_dir_all(path)?;
             } else {
-                std::fs::remove_file(&path)
-            };
+                std::fs::remove_file(path)?;
+            }
         }
         Ok(())
     }
+}
+
+const MAX_CACHE_KEY_BYTES: usize = 1_024;
+
+fn validated_key(key: &str) -> Result<&Path, CloudError> {
+    let path = Path::new(key);
+    let valid = !key.is_empty()
+        && key.len() <= MAX_CACHE_KEY_BYTES
+        && !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)));
+    if valid {
+        Ok(path)
+    } else {
+        Err(CloudError::Protocol(
+            "invalid download cache key".to_owned(),
+        ))
+    }
+}
+
+fn ensure_cache_root(root: &Path) -> Result<(), CloudError> {
+    if !root.is_absolute() {
+        return Err(invalid_cache_root());
+    }
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(_) => Err(invalid_cache_root()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            std::fs::create_dir_all(root)?;
+            let metadata = std::fs::symlink_metadata(root)?;
+            if metadata.file_type().is_dir() {
+                Ok(())
+            } else {
+                Err(invalid_cache_root())
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn safe_existing_root(root: &Path) -> bool {
+    root.is_absolute()
+        && std::fs::symlink_metadata(root).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
+fn ensure_safe_subdirectories(root: &Path, relative: &Path) -> Result<(), CloudError> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(invalid_cache_path());
+        };
+        current.push(name);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_dir() => {}
+            Ok(_) => return Err(invalid_cache_path()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                std::fs::create_dir(&current)?;
+                let metadata = std::fs::symlink_metadata(&current)?;
+                if !metadata.file_type().is_dir() {
+                    return Err(invalid_cache_path());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_existing_safe_subdirectories(root: &Path, relative: &Path) -> Result<(), ()> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(());
+        };
+        current.push(name);
+        let metadata = std::fs::symlink_metadata(&current).map_err(|_| ())?;
+        if !metadata.file_type().is_dir() {
+            return Err(());
+        }
+    }
+    Ok(())
+}
+
+fn reject_symlink_or_directory(path: &Path) -> Result<(), CloudError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(invalid_cache_path()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn safe_root_entries(root: &Path) -> Result<Option<std::fs::ReadDir>, CloudError> {
+    if !root.is_absolute() {
+        return Err(invalid_cache_root());
+    }
+    match std::fs::symlink_metadata(root) {
+        Ok(metadata) if metadata.file_type().is_dir() => {
+            std::fs::read_dir(root).map(Some).map_err(Into::into)
+        }
+        Ok(_) => Err(invalid_cache_root()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn invalid_cache_root() -> CloudError {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "download cache root must be an absolute, real directory",
+    )
+    .into()
+}
+
+fn invalid_cache_path() -> CloudError {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "download cache path crosses an unsafe filesystem entry",
+    )
+    .into()
 }
 
 fn saturating_total_bytes(lengths: impl IntoIterator<Item = u64>) -> u64 {
@@ -141,12 +276,18 @@ fn saturating_total_bytes(lengths: impl IntoIterator<Item = u64>) -> u64 {
 }
 
 fn walk_files(root: &Path) -> Vec<PathBuf> {
+    if !safe_existing_root(root) {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
                 stack.push(path);
             } else {
                 out.push(path);
@@ -279,6 +420,87 @@ mod tests {
         assert!(cache.hit("nope.bin").is_none());
         write(&cache, "yes.bin", 10);
         assert!(cache.hit("yes.bin").is_some());
+    }
+
+    #[test]
+    fn cache_keys_cannot_escape_or_replace_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let cache = DownloadCache::new(cache_root.clone(), 1_000);
+
+        for key in [
+            "",
+            ".",
+            "..",
+            "../escaped.bin",
+            "stock/../../escaped.bin",
+            "/absolute.bin",
+        ] {
+            assert!(cache.path_for(key).is_err(), "{key:?} must be rejected");
+            assert!(cache.hit(key).is_none(), "{key:?} cannot be a cache hit");
+        }
+        assert!(!dir.path().join("escaped.bin").exists());
+
+        std::fs::create_dir_all(cache_root.join("occupied")).unwrap();
+        assert!(cache.path_for("occupied").is_err());
+    }
+
+    #[test]
+    fn relative_cache_roots_fail_closed() {
+        let cache = DownloadCache::new(PathBuf::from("relative-cache"), 1_000);
+        assert!(cache.path_for("asset.bin").is_err());
+        assert!(cache.hit("asset.bin").is_none());
+        assert_eq!(cache.size_bytes(), 0);
+        assert!(cache.clear().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nested_symlinks_are_never_followed_or_cleared_through() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        std::fs::create_dir(&cache_root).unwrap();
+        let protected = outside.path().join("protected.bin");
+        std::fs::write(&protected, b"keep").unwrap();
+        symlink(outside.path(), cache_root.join("linked")).unwrap();
+
+        let cache = DownloadCache::new(cache_root.clone(), 0);
+        assert!(cache.path_for("linked/new.bin").is_err());
+        assert!(cache.hit("linked/protected.bin").is_none());
+
+        cache.enforce_quota();
+        assert!(protected.exists(), "eviction must not traverse the symlink");
+
+        if !cache_root.join("linked").exists() {
+            symlink(outside.path(), cache_root.join("linked")).unwrap();
+        }
+        cache.clear().unwrap();
+        assert!(protected.exists(), "clearing must not traverse the symlink");
+        assert!(!cache_root.join("linked").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_cache_root_fails_closed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let protected = outside.path().join("protected.bin");
+        std::fs::write(&protected, b"keep").unwrap();
+        let cache_root = dir.path().join("cache-link");
+        symlink(outside.path(), &cache_root).unwrap();
+        let cache = DownloadCache::new(cache_root, 0);
+
+        assert!(cache.path_for("new.bin").is_err());
+        assert!(cache.hit("protected.bin").is_none());
+        assert_eq!(cache.size_bytes(), 0);
+        cache.enforce_quota();
+        assert!(cache.clear().is_err());
+        assert!(protected.exists());
     }
 
     #[test]
