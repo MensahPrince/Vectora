@@ -620,9 +620,10 @@ fn publish_approval_card(
     name: &str,
     arguments: &serde_json::Value,
     cache_registry: Option<&CacheRegistry>,
+    validated_import: Option<&crate::agent_project::ValidatedImportMedia>,
 ) -> Result<(), String> {
     let title = approval_title(name);
-    let detail = approval_detail(name, arguments, cache_registry);
+    let detail = approval_detail(name, arguments, cache_registry, validated_import);
     let (published_tx, published_rx) = bounded(1);
     let store = store.clone();
     slint::invoke_from_event_loop(move || {
@@ -650,6 +651,7 @@ fn publish_approval_card(
 fn approval_title(name: &str) -> String {
     match name {
         "project_open" => "Open this project draft?".into(),
+        "project_import_media" => "Import this media file?".into(),
         "system_cache_list" => "Let the assistant inspect cache usage?".into(),
         "system_cache_clear" => "Clear this cache?".into(),
         "system_cache_relocate" => "Move this cache?".into(),
@@ -664,6 +666,7 @@ fn approval_detail(
     name: &str,
     arguments: &serde_json::Value,
     cache_registry: Option<&CacheRegistry>,
+    validated_import: Option<&crate::agent_project::ValidatedImportMedia>,
 ) -> String {
     if name == "project_open" {
         let draft_id = arguments
@@ -679,6 +682,22 @@ fn approval_detail(
             .unwrap_or("<invalid draft ID>");
         return bound_approval_detail(format!(
             "Draft ID: {draft_id}\n\nOpening this draft replaces the current session and may discard unsaved work."
+        ));
+    }
+
+    if name == crate::agent_project::PROJECT_IMPORT_MEDIA {
+        // Normal authorization supplies an opaque validated token retained
+        // for dispatch. If a future caller bypasses that flow, validate the
+        // raw arguments here rather than copying hostile text into the card.
+        let revalidated = crate::agent_project::validated_import_media(arguments).ok();
+        let display_path = validated_import
+            .or(revalidated.as_ref())
+            .map(crate::agent_project::ValidatedImportMedia::canonical_path);
+        let path = display_path
+            .and_then(crate::agent_project::import_path_approval_display)
+            .unwrap_or_else(|| "<invalid media path>".into());
+        return bound_approval_detail(format!(
+            "Canonical file: {path}\n\nCutlass adds a reference to this file rather than copying the source. Moving or deleting it can make the media missing."
         ));
     }
 
@@ -767,6 +786,11 @@ impl DesktopToolHandles {
     }
 }
 
+struct ApprovedProjectImport {
+    arguments: serde_json::Value,
+    validated: crate::agent_project::ValidatedImportMedia,
+}
+
 /// The desktop host-tool surface: app and job controls plus the approval
 /// broker that gates every System-tier call.
 pub struct DesktopToolHost {
@@ -776,6 +800,7 @@ pub struct DesktopToolHost {
     pending_approval_id: Arc<AtomicU64>,
     approval_id_allocator: Arc<AtomicU64>,
     ordinary_host_call_attempted: bool,
+    approved_project_import: Option<ApprovedProjectImport>,
 }
 
 impl DesktopToolHost {
@@ -793,6 +818,7 @@ impl DesktopToolHost {
             pending_approval_id,
             approval_id_allocator,
             ordinary_host_call_attempted: false,
+            approved_project_import: None,
         }
     }
 
@@ -817,16 +843,32 @@ impl ToolHost for DesktopToolHost {
         tier: ToolTier,
         cancel: &AtomicBool,
     ) -> Result<(), String> {
+        // Authorization and dispatch are synchronous in the agent loop. Clear
+        // any stale binding before considering a new call.
+        self.approved_project_import = None;
         if tier != ToolTier::System || self.autonomy == Autonomy::Full {
             return Ok(());
         }
         if cancel.load(Ordering::Acquire) {
             return Err("cancelled before the system tool could run".into());
         }
-        match cutlass_ai::namespace(name) {
-            "project" => crate::agent_project::validate_request(name, arguments)?,
-            "system" => crate::agent_system::validate_request(name, arguments)?,
-            _ => {}
+        let validated_import = match cutlass_ai::namespace(name) {
+            "project" => {
+                crate::agent_project::validate_request(name, arguments)?;
+                if name == crate::agent_project::PROJECT_IMPORT_MEDIA {
+                    Some(crate::agent_project::validated_import_media(arguments)?)
+                } else {
+                    None
+                }
+            }
+            "system" => {
+                crate::agent_system::validate_request(name, arguments)?;
+                None
+            }
+            _ => None,
+        };
+        if cancel.load(Ordering::Acquire) {
+            return Err("cancelled before the system tool could run".into());
         }
 
         let request_id = allocate_approval_request_id(&self.approval_id_allocator)?;
@@ -838,6 +880,7 @@ impl ToolHost for DesktopToolHost {
             name,
             arguments,
             self.runtime.cache_registry.as_ref(),
+            validated_import.as_ref(),
         ) {
             let _ = self.pending_approval_id.compare_exchange(
                 request_id,
@@ -867,7 +910,15 @@ impl ToolHost for DesktopToolHost {
             ApprovalWaitOutcome::Approved if cancel.load(Ordering::Acquire) => {
                 Err("cancelled before the system tool could run".into())
             }
-            ApprovalWaitOutcome::Approved => Ok(()),
+            ApprovalWaitOutcome::Approved => {
+                if let Some(validated) = validated_import {
+                    self.approved_project_import = Some(ApprovedProjectImport {
+                        arguments: arguments.clone(),
+                        validated,
+                    });
+                }
+                Ok(())
+            }
             ApprovalWaitOutcome::Declined => Err(format!(
                 "the user declined system tool '{name}'; the tool was not run"
             )),
@@ -895,13 +946,42 @@ impl ToolHost for DesktopToolHost {
             // host-side effect, so abort messaging must be conservative.
             self.ordinary_host_call_attempted = true;
         }
+        let approved_import = if name == crate::agent_project::PROJECT_IMPORT_MEDIA
+            && self.autonomy == Autonomy::Ask
+        {
+            let approval = self.approved_project_import.take().ok_or_else(|| {
+                "project_import_media approval could not be confirmed; not started".to_string()
+            })?;
+            if approval.arguments != *arguments {
+                error!("project media-import arguments changed after approval");
+                return Err(
+                    "project_import_media approval did not match this request; not started".into(),
+                );
+            }
+            Some(approval.validated)
+        } else {
+            self.approved_project_import = None;
+            None
+        };
         match namespace {
             "app" => {
                 crate::agent_app_control::call(self.runtime.app.clone(), name, arguments, cancel)
             }
-            "project" => {
-                crate::agent_project::call(self.runtime.worker.as_ref(), name, arguments, cancel)
-            }
+            "project" => match approved_import.as_ref() {
+                Some(approved) => crate::agent_project::call_with_approved_import(
+                    self.runtime.worker.as_ref(),
+                    name,
+                    arguments,
+                    Some(approved),
+                    cancel,
+                ),
+                None => crate::agent_project::call(
+                    self.runtime.worker.as_ref(),
+                    name,
+                    arguments,
+                    cancel,
+                ),
+            },
             "job" => crate::agent_jobs::call(&self.runtime.job_manager, name, arguments, cancel),
             "system" => crate::agent_system::call(
                 self.runtime.cache_registry.as_ref(),
@@ -1521,11 +1601,15 @@ mod tests {
     #[test]
     fn approval_detail_is_bounded_and_handles_empty_arguments() {
         assert_eq!(approval_title("project_open"), "Open this project draft?");
+        assert_eq!(
+            approval_title("project_import_media"),
+            "Import this media file?"
+        );
         assert_eq!(approval_title("system_cache_clear"), "Clear this cache?");
         assert_eq!(approval_title("system_cache_relocate"), "Move this cache?");
         assert_eq!(approval_title("future_tool"), "Run future_tool?");
         assert_eq!(
-            approval_detail("system_cache_list", &serde_json::json!({}), None),
+            approval_detail("system_cache_list", &serde_json::json!({}), None, None),
             "No arguments."
         );
 
@@ -1535,6 +1619,7 @@ mod tests {
                 "script": "x".repeat(APPROVAL_DETAIL_MAX_CHARS + 100)
             }),
             None,
+            None,
         );
         assert_eq!(detail.chars().count(), APPROVAL_DETAIL_MAX_CHARS + 1);
         assert!(detail.ends_with('…'));
@@ -1543,6 +1628,7 @@ mod tests {
         let project_detail = approval_detail(
             "project_open",
             &serde_json::json!({"draft_id": "abcdef-12"}),
+            None,
             None,
         );
         assert_eq!(
@@ -1561,10 +1647,45 @@ mod tests {
                 "draft_id": "/private/agent-secret/project.cutlass"
             }),
             None,
+            None,
         );
         assert!(unsafe_project_detail.contains("<invalid draft ID>"));
         assert!(!unsafe_project_detail.contains("/private"));
         assert!(!unsafe_project_detail.contains("agent-secret"));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let media = temp.path().join("approval clip.mp4");
+        std::fs::write(&media, b"media").expect("write media");
+        let import_arguments = serde_json::json!({"path": media});
+        let validated = crate::agent_project::validated_import_media(&import_arguments)
+            .expect("validated approval media");
+        let canonical = validated.canonical_path().to_path_buf();
+        let import_detail = approval_detail(
+            "project_import_media",
+            &import_arguments,
+            None,
+            Some(&validated),
+        );
+        assert_eq!(
+            import_detail,
+            format!(
+                "Canonical file: {}\n\nCutlass adds a reference to this file rather than copying the source. Moving or deleting it can make the media missing.",
+                canonical.display()
+            )
+        );
+        assert!(import_detail.contains("rather than copying the source"));
+        assert!(import_detail.contains("Moving or deleting it"));
+        assert!(import_detail.chars().count() <= APPROVAL_DETAIL_MAX_CHARS);
+
+        let hostile_import_detail = approval_detail(
+            "project_import_media",
+            &serde_json::json!({"path": "../../agent-secret\nclip.mp4"}),
+            None,
+            None,
+        );
+        assert!(hostile_import_detail.contains("<invalid media path>"));
+        assert!(!hostile_import_detail.contains("agent-secret"));
+        assert!(!hostile_import_detail.contains("clip.mp4"));
 
         let relocation_detail = format_cache_relocation_approval_detail(
             cutlass_storage::CacheId::Download,
@@ -1642,6 +1763,27 @@ mod tests {
         assert!(dispatch_error.contains("canonical app-owned draft ID"));
         assert!(!dispatch_error.contains("/private"));
         assert!(!dispatch_error.contains("agent-secret"));
+
+        assert_eq!(
+            host.authorize(
+                "project_import_media",
+                &serde_json::json!({ "path": "relative/clip.mp4" }),
+                ToolTier::System,
+                &cancel,
+            ),
+            Ok(())
+        );
+        let import_dispatch_error = host
+            .call(
+                "project_import_media",
+                &serde_json::json!({ "path": "relative/clip.mp4" }),
+                &cancel,
+            )
+            .expect_err("full-autonomy dispatch must still validate import paths");
+        assert_eq!(
+            import_dispatch_error,
+            "project_import_media argument 'path' must be absolute"
+        );
 
         assert_eq!(
             host.authorize(
@@ -1737,6 +1879,46 @@ mod tests {
     }
 
     #[test]
+    fn project_import_preflight_rejects_paths_before_approval_side_effects() {
+        let (_tx, rx) = unbounded();
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Ask,
+            test_tool_handles(JobManager::new()),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let missing = temp.path().join("agent-secret-missing.mp4");
+
+        for arguments in [
+            serde_json::json!({"path": "relative/clip.mp4"}),
+            serde_json::json!({"path": missing}),
+            serde_json::json!({"path": format!("{}\0clip.mp4", temp.path().display())}),
+            serde_json::json!({"path": temp.path().join(".").join("clip.mp4")}),
+        ] {
+            let error = host
+                .authorize(
+                    "project_import_media",
+                    &arguments,
+                    ToolTier::System,
+                    &cancel,
+                )
+                .expect_err("unsafe import path must fail before approval");
+            assert!(!error.contains("agent-secret"), "{error}");
+            assert!(
+                !error.contains(temp.path().to_string_lossy().as_ref()),
+                "{error}"
+            );
+            assert_eq!(pending.load(Ordering::Acquire), 0);
+            assert_eq!(allocator.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[test]
     fn desktop_host_registers_app_project_job_and_system_tools_by_tier() {
         let (_tx, rx) = unbounded();
         let host = DesktopToolHost::new(
@@ -1747,7 +1929,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         );
         let specs = host.tools();
-        assert_eq!(specs.len(), 23);
+        assert_eq!(specs.len(), 24);
         assert_eq!(
             specs
                 .iter()
@@ -1772,6 +1954,7 @@ mod tests {
                 ("project_list_drafts", ToolTier::ReadOnly),
                 ("project_save", ToolTier::Workspace),
                 ("project_open", ToolTier::System),
+                ("project_import_media", ToolTier::System),
             ]
         );
         assert_eq!(
@@ -1801,6 +1984,7 @@ mod tests {
             vec![
                 "app_close",
                 "project_open",
+                "project_import_media",
                 "system_reveal",
                 "system_open_external",
                 "system_cache_list",
