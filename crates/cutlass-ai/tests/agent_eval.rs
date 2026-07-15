@@ -1734,10 +1734,7 @@ fn system_host_tools_fail_closed_without_an_approval_broker() {
     ]);
     let mut spec = host_spec("system_cache_clear");
     spec.tier = ToolTier::System;
-    let mut tool_host = ScriptedHost::new(
-        vec![spec],
-        vec![Ok(ToolOutput::text("cache cleared"))],
-    );
+    let mut tool_host = ScriptedHost::new(vec![spec], vec![Ok(ToolOutput::text("cache cleared"))]);
 
     let (outcome, _) = run_with(
         &provider,
