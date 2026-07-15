@@ -549,6 +549,22 @@ fn shared_layout_failed_transition_does_not_publish_replacement() {
 }
 
 #[test]
+fn committed_cleanup_failure_exposes_the_published_relocation() {
+    let report = cutlass_storage::RelocationReport {
+        bytes: 4096,
+        files: 3,
+        used_copy_fallback: true,
+    };
+    let error = StorageError::CommittedCleanupFailed {
+        message: "old cache cleanup failed".into(),
+        report,
+    };
+
+    assert_eq!(error.committed_relocation(), Some(report));
+    assert_eq!(StorageError::Cancelled.committed_relocation(), None);
+}
+
+#[test]
 fn missing_usage_is_zero_and_missing_clear_creates_root() {
     let temporary = TestDirectory::new();
     let missing = temporary.path.join("missing");

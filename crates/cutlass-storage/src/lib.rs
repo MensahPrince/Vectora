@@ -860,7 +860,24 @@ pub enum StorageError {
     CommittedCleanupFailed {
         /// Bounded cleanup error.
         message: String,
+        /// The relocation that was already committed and must be published.
+        report: RelocationReport,
     },
+}
+
+impl StorageError {
+    /// Return relocation accounting when the durable destination was committed
+    /// even though best-effort cleanup of the old cross-device copy failed.
+    ///
+    /// Callers must publish the new root for this outcome. Treating it like a
+    /// pre-commit failure would leave live state pointing at the stale source
+    /// while persisted settings already name the destination.
+    pub const fn committed_relocation(&self) -> Option<RelocationReport> {
+        match self {
+            Self::CommittedCleanupFailed { report, .. } => Some(*report),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Display for StorageError {
@@ -908,7 +925,7 @@ impl fmt::Display for StorageError {
                 f,
                 "{original}; temporary relocation cleanup failed: {cleanup}"
             ),
-            Self::CommittedCleanupFailed { message } => write!(
+            Self::CommittedCleanupFailed { message, .. } => write!(
                 f,
                 "relocation committed, but old cache cleanup failed: {message}"
             ),
@@ -1103,17 +1120,19 @@ where
         };
     }
 
-    if transfer == TransferKind::Copied {
-        remove_path_if_exists(&old_path).map_err(|error| StorageError::CommittedCleanupFailed {
-            message: bounded_text(&error.to_string()),
-        })?;
-    }
-
-    Ok(RelocationReport {
+    let report = RelocationReport {
         bytes: usage.bytes,
         files: usage.files,
         used_copy_fallback: transfer == TransferKind::Copied,
-    })
+    };
+    if transfer == TransferKind::Copied {
+        remove_path_if_exists(&old_path).map_err(|error| StorageError::CommittedCleanupFailed {
+            message: bounded_text(&error.to_string()),
+            report,
+        })?;
+    }
+
+    Ok(report)
 }
 
 fn prepare_relocation(
