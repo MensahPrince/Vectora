@@ -3,9 +3,9 @@
 //! Stock files, template bundles, and packs land here before import.
 //! Unbounded data-dir growth is a real complaint generator, so the cache
 //! enforces a byte quota with LRU eviction (by modification time — files
-//! get re-touched on use). Files *imported into a project* are copied out
-//! by the import path and become pool media; nothing in a project ever
-//! references a cache path, so eviction is always safe.
+//! get re-touched on use). Legacy projects may still reference downloaded
+//! source files directly; those paths are explicitly protected until import
+//! promotion migrates every project to durable media storage.
 //!
 //! Settings surfaces a "clear download cache" action backed by
 //! [`DownloadCache::clear`].
@@ -13,9 +13,9 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::sync::{Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::error::CloudError;
 
@@ -27,6 +27,8 @@ pub struct DownloadCache {
     root: PathBuf,
     quota_bytes: AtomicU64,
     protected_paths: RwLock<HashSet<PathBuf>>,
+    activity: Mutex<CacheActivity>,
+    activity_changed: Condvar,
 }
 
 /// Exact accounting for an explicit download-cache clear.
@@ -40,12 +42,56 @@ pub struct DownloadCacheClear {
     pub retained_protected_files: u64,
 }
 
+/// A cache path protected from clear or eviction for the lease's lifetime.
+///
+/// Keep the lease alive while reading, downloading, verifying, or promoting
+/// the path. Drop it before calling [`DownloadCache::enforce_quota`] or
+/// [`DownloadCache::clear`].
+pub struct DownloadCacheLease<'a> {
+    cache: &'a DownloadCache,
+    path: PathBuf,
+}
+
+impl DownloadCacheLease<'_> {
+    /// Absolute path represented by this lease.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for DownloadCacheLease<'_> {
+    fn drop(&mut self) {
+        self.cache.finish_access();
+    }
+}
+
+#[derive(Debug, Default)]
+struct CacheActivity {
+    active_leases: usize,
+    maintenance: bool,
+}
+
+struct MaintenanceGuard<'a> {
+    cache: &'a DownloadCache,
+}
+
+impl Drop for MaintenanceGuard<'_> {
+    fn drop(&mut self) {
+        let mut activity = lock_activity(&self.cache.activity);
+        activity.maintenance = false;
+        self.cache.activity_changed.notify_all();
+    }
+}
+
 impl DownloadCache {
     pub fn new(root: PathBuf, quota_bytes: u64) -> Self {
         Self {
             root,
             quota_bytes: AtomicU64::new(quota_bytes),
             protected_paths: RwLock::new(HashSet::new()),
+            activity: Mutex::new(CacheActivity::default()),
+            activity_changed: Condvar::new(),
         }
     }
 
@@ -91,6 +137,21 @@ impl DownloadCache {
     #[must_use]
     pub fn protected_path_count(&self) -> usize {
         read_protected(&self.protected_paths).len()
+    }
+
+    /// Reserve one safe cache path for a complete read or write operation.
+    ///
+    /// Concurrent leases are allowed. Clear and eviction wait for every lease
+    /// to drop, while new leases wait for maintenance to finish.
+    pub fn lease(&self, key: &str) -> Result<DownloadCacheLease<'_>, CloudError> {
+        self.begin_access()?;
+        match self.path_for(key) {
+            Ok(path) => Ok(DownloadCacheLease { cache: self, path }),
+            Err(error) => {
+                self.finish_access();
+                Err(error)
+            }
+        }
     }
 
     /// Where a download for `key` (e.g. `stock/pexels-857191-hd.mp4`)
@@ -140,6 +201,10 @@ impl DownloadCache {
     /// Evict least-recently-modified files until under quota. Called after
     /// each completed download; cheap when under budget.
     pub fn enforce_quota(&self) {
+        let Ok(_maintenance) = self.begin_maintenance(MAINTENANCE_WAIT_TIMEOUT) else {
+            tracing::debug!("download cache eviction skipped while files remain in use");
+            return;
+        };
         let quota_bytes = self.quota_bytes();
         let protected = read_protected(&self.protected_paths).clone();
         let mut files: Vec<(PathBuf, u64, SystemTime)> = walk_files(&self.root)
@@ -171,6 +236,7 @@ impl DownloadCache {
     /// Delete everything (the settings "clear download cache" action).
     /// The root itself stays so in-flight paths remain valid.
     pub fn clear(&self) -> Result<DownloadCacheClear, CloudError> {
+        let _maintenance = self.begin_maintenance(MAINTENANCE_WAIT_TIMEOUT)?;
         if safe_root_entries(&self.root)?.is_none() {
             return Ok(DownloadCacheClear {
                 removed_bytes: 0,
@@ -211,9 +277,53 @@ impl DownloadCache {
             retained_protected_files,
         })
     }
+
+    fn begin_access(&self) -> Result<(), CloudError> {
+        let mut activity = lock_activity(&self.activity);
+        while activity.maintenance {
+            activity = self
+                .activity_changed
+                .wait(activity)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+        activity.active_leases = activity
+            .active_leases
+            .checked_add(1)
+            .ok_or_else(cache_activity_exhausted)?;
+        Ok(())
+    }
+
+    fn finish_access(&self) {
+        let mut activity = lock_activity(&self.activity);
+        activity.active_leases = activity.active_leases.saturating_sub(1);
+        if activity.active_leases == 0 {
+            self.activity_changed.notify_all();
+        }
+    }
+
+    fn begin_maintenance(&self, timeout: Duration) -> Result<MaintenanceGuard<'_>, CloudError> {
+        let deadline = Instant::now() + timeout;
+        let mut activity = lock_activity(&self.activity);
+        while activity.maintenance || activity.active_leases != 0 {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Err(cache_busy());
+            };
+            let (next, result) = self
+                .activity_changed
+                .wait_timeout(activity, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            activity = next;
+            if result.timed_out() && (activity.maintenance || activity.active_leases != 0) {
+                return Err(cache_busy());
+            }
+        }
+        activity.maintenance = true;
+        Ok(MaintenanceGuard { cache: self })
+    }
 }
 
 const MAX_CACHE_KEY_BYTES: usize = 1_024;
+const MAINTENANCE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn validated_key(key: &str) -> Result<&Path, CloudError> {
     let path = Path::new(key);
@@ -261,6 +371,24 @@ fn write_protected(
     protected
         .write()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock_activity(activity: &Mutex<CacheActivity>) -> std::sync::MutexGuard<'_, CacheActivity> {
+    activity
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn cache_activity_exhausted() -> CloudError {
+    io::Error::other("download cache has too many active operations").into()
+}
+
+fn cache_busy() -> CloudError {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "download cache files are still in use",
+    )
+    .into()
 }
 
 fn ensure_cache_root(root: &Path) -> Result<(), CloudError> {
@@ -565,6 +693,48 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         assert!(cache.protect_path(&directory).is_err());
         assert_eq!(cache.protected_path_count(), 0);
+    }
+
+    #[test]
+    fn leases_exclude_maintenance_until_they_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DownloadCache::new(dir.path().to_path_buf(), 100);
+        let lease = cache.lease("stock/in-flight.mp4").unwrap();
+        assert_eq!(lease.path(), dir.path().join("stock/in-flight.mp4"));
+        assert!(cache.begin_maintenance(Duration::ZERO).is_err());
+
+        drop(lease);
+        assert!(cache.begin_maintenance(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn maintenance_excludes_new_leases_until_it_drops() {
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DownloadCache::new(dir.path().to_path_buf(), 100);
+        let maintenance = cache.begin_maintenance(Duration::ZERO).unwrap();
+        let acquired = AtomicBool::new(false);
+
+        thread::scope(|scope| {
+            let worker = scope.spawn(|| {
+                let _lease = cache.lease("stock/after-clear.mp4").unwrap();
+                acquired.store(true, Ordering::Release);
+            });
+            thread::sleep(Duration::from_millis(20));
+            assert!(!acquired.load(Ordering::Acquire));
+            drop(maintenance);
+            worker.join().unwrap();
+        });
+        assert!(acquired.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_rejected_lease_does_not_leak_activity() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DownloadCache::new(dir.path().to_path_buf(), 100);
+        assert!(cache.lease("../outside.mp4").is_err());
+        assert!(cache.begin_maintenance(Duration::ZERO).is_ok());
     }
 
     #[test]
