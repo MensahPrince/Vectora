@@ -35,6 +35,12 @@ impl Transcript {
     pub fn into_parts(self) -> (String, Vec<TranscriptSegment>) {
         (self.text, self.segments)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture(segments: Vec<TranscriptSegment>) -> Self {
+        let text = join_segment_text(&segments);
+        Self { text, segments }
+    }
 }
 
 /// One time-ordered transcription segment.
@@ -95,6 +101,21 @@ impl TranscriptSegment {
     pub fn into_parts(self) -> (u64, u64, String, Vec<TranscriptWord>) {
         (self.start_cs, self.end_cs, self.text, self.words)
     }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture(
+        start_cs: u64,
+        end_cs: u64,
+        text: impl Into<String>,
+        words: Vec<TranscriptWord>,
+    ) -> Self {
+        Self {
+            start_cs,
+            end_cs,
+            text: text.into(),
+            words,
+        }
+    }
 }
 
 /// One word, or one merged group of Whisper subword tokens.
@@ -150,6 +171,21 @@ impl TranscriptWord {
     #[must_use]
     pub fn into_parts(self) -> (u64, u64, String, f32) {
         (self.start_cs, self.end_cs, self.text, self.probability)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_fixture(
+        start_cs: u64,
+        end_cs: u64,
+        text: impl Into<String>,
+        probability: f32,
+    ) -> Self {
+        Self {
+            start_cs,
+            end_cs,
+            text: text.into(),
+            probability,
+        }
     }
 }
 

@@ -7,6 +7,9 @@
 //!   native media pipeline and are intentionally not included here.
 //! - [`ModelManager`] installs catalogued Whisper models transactionally after
 //!   exact size and SHA-256 verification.
+//! - [`transcript_to_moment_batch`] converts normalized output into one atomic,
+//!   analyzer-scoped moments replacement batch without depending on moments
+//!   persistence.
 //!
 //! No model is bundled in the binary and no model download occurs implicitly
 //! during transcription. Callers decide where models live and when to install
@@ -16,12 +19,18 @@
 #![deny(missing_docs)]
 
 mod model;
+mod moments;
 mod transcribe;
 mod transcript;
 
 pub use model::{
     DownloadError, DownloadReader, HttpDownloader, ModelDownloader, ModelIntegrityError,
     ModelManager, ModelManagerError, ModelSpec, ModelStatus, WhisperModel,
+};
+pub use moments::{
+    TRANSCRIPT_MOMENT_PAYLOAD_VERSION, TRANSCRIPT_SEGMENT_FALLBACK_CONFIDENCE,
+    TranscriptMomentConversionError, TranscriptMomentErrorField, TranscriptMomentErrorReason,
+    TranscriptMomentRecordIndex, transcript_to_moment_batch,
 };
 pub use transcribe::{
     CancellationCheck, NeverCancel, TranscriptionError, TranscriptionOptions,

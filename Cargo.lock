@@ -1569,7 +1569,9 @@ name = "cutlass-transcription"
 version = "0.5.3-alpha.0"
 dependencies = [
  "cap-std",
+ "cutlass-analysis",
  "same-file",
+ "serde_json",
  "sha2",
  "tempfile",
  "thiserror 2.0.18",

@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 cap-std = "4"
+cutlass-analysis = { path = "../cutlass-analysis" }
 same-file = "1"
 sha2 = "0.10"
 thiserror.workspace = true
@@ -21,4 +22,5 @@ whisper-rs = { version = "0.16", default-features = false, features = ["metal"] 
 whisper-rs = { version = "0.16", default-features = false }
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile = "3"
