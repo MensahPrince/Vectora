@@ -82,6 +82,13 @@ fn registry_is_exact_unique_and_round_trips() {
             Some("proxies"),
         ),
         (
+            "analysis",
+            "Media analysis",
+            CacheKind::Disk,
+            CacheTier::Disposable,
+            Some("analysis"),
+        ),
+        (
             "download",
             "Downloads",
             CacheKind::Disk,
@@ -131,6 +138,11 @@ fn registry_is_exact_unique_and_round_trips() {
         })
         .collect();
     assert_eq!(actual, expected);
+    let registry_ids: Vec<_> = CACHE_REGISTRY
+        .iter()
+        .map(|descriptor| descriptor.id)
+        .collect();
+    assert_eq!(CacheId::ALL.as_slice(), registry_ids.as_slice());
 
     let unique: HashSet<_> = CACHE_REGISTRY
         .iter()
@@ -154,6 +166,53 @@ fn registry_is_exact_unique_and_round_trips() {
     }
     assert!(CacheId::parse("Proxies").is_err());
     assert!(CacheId::parse("proxies ").is_err());
+}
+
+#[test]
+fn analysis_cache_has_a_stable_disk_contract() {
+    let temporary = TestDirectory::new();
+    let layout = StorageLayout::new(&temporary.path).unwrap();
+    let descriptor = CacheId::Analysis.descriptor();
+
+    assert_eq!(CacheId::parse("analysis"), Ok(CacheId::Analysis));
+    assert_eq!("analysis".parse::<CacheId>(), Ok(CacheId::Analysis));
+    assert_eq!(CacheId::Analysis.to_string(), "analysis");
+    assert_eq!(cache_descriptor_by_key("analysis"), Some(descriptor));
+    assert_eq!(descriptor.label, "Media analysis");
+    assert_eq!(descriptor.kind, CacheKind::Disk);
+    assert_eq!(descriptor.tier, CacheTier::Disposable);
+    assert_eq!(descriptor.default_relative, Some("analysis"));
+    assert_eq!(
+        layout.resolve(CacheId::Analysis),
+        Some(temporary.path.join("analysis"))
+    );
+}
+
+#[test]
+fn analysis_cache_participates_in_overlap_validation() {
+    let temporary = TestDirectory::new();
+    let mut layout = StorageLayout::new(&temporary.path).unwrap();
+
+    assert!(matches!(
+        layout.set_override(
+            CacheId::Analysis,
+            temporary.path.join("proxies").join("nested")
+        ),
+        Err(StorageError::CachePathsOverlap {
+            cache: CacheId::Analysis,
+            other: CacheId::Proxies,
+        })
+    ));
+    assert!(matches!(
+        layout.set_override(
+            CacheId::Download,
+            temporary.path.join("analysis").join("nested")
+        ),
+        Err(StorageError::CachePathsOverlap {
+            cache: CacheId::Download,
+            other: CacheId::Analysis,
+        })
+    ));
 }
 
 #[test]
@@ -197,6 +256,7 @@ fn layout_resolves_roots_and_overrides_deterministically() {
         resolved_ids,
         [
             CacheId::Proxies,
+            CacheId::Analysis,
             CacheId::Download,
             CacheId::Catalog,
             CacheId::Luts,

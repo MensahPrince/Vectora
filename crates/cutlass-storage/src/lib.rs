@@ -45,6 +45,8 @@ pub enum CacheId {
     TimelineWaveforms,
     /// Generated lower-resolution media proxies.
     Proxies,
+    /// Regenerable media-analysis state such as moments and transcripts.
+    Analysis,
     /// Remotely downloaded source assets.
     Download,
     /// Downloaded asset-catalog data.
@@ -59,12 +61,13 @@ pub enum CacheId {
 
 impl CacheId {
     /// Every cache identifier in deterministic registry order.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::PreviewFrames,
         Self::LibraryThumbnails,
         Self::TimelineFilmstrips,
         Self::TimelineWaveforms,
         Self::Proxies,
+        Self::Analysis,
         Self::Download,
         Self::Catalog,
         Self::Luts,
@@ -80,6 +83,7 @@ impl CacheId {
             Self::TimelineFilmstrips => "timeline_filmstrips",
             Self::TimelineWaveforms => "timeline_waveforms",
             Self::Proxies => "proxies",
+            Self::Analysis => "analysis",
             Self::Download => "download",
             Self::Catalog => "catalog",
             Self::Luts => "luts",
@@ -115,6 +119,7 @@ impl FromStr for CacheId {
             "timeline_filmstrips" => Ok(Self::TimelineFilmstrips),
             "timeline_waveforms" => Ok(Self::TimelineWaveforms),
             "proxies" => Ok(Self::Proxies),
+            "analysis" => Ok(Self::Analysis),
             "download" => Ok(Self::Download),
             "catalog" => Ok(Self::Catalog),
             "luts" => Ok(Self::Luts),
@@ -184,7 +189,7 @@ pub struct CacheDescriptor {
 ///
 /// Projects, configuration, and agent sessions are intentionally absent:
 /// they are not clearable caches.
-pub static CACHE_REGISTRY: [CacheDescriptor; 10] = [
+pub static CACHE_REGISTRY: [CacheDescriptor; 11] = [
     CacheDescriptor {
         id: CacheId::PreviewFrames,
         label: "Preview frames",
@@ -219,6 +224,13 @@ pub static CACHE_REGISTRY: [CacheDescriptor; 10] = [
         kind: CacheKind::Disk,
         tier: CacheTier::Disposable,
         default_relative: Some("proxies"),
+    },
+    CacheDescriptor {
+        id: CacheId::Analysis,
+        label: "Media analysis",
+        kind: CacheKind::Disk,
+        tier: CacheTier::Disposable,
+        default_relative: Some("analysis"),
     },
     CacheDescriptor {
         id: CacheId::Download,
