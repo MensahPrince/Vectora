@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
 use std::time::Duration;
 
 use cap_std::ambient_authority;
@@ -31,6 +31,7 @@ const TEMP_FILE_ATTEMPTS: u64 = 256;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+const MODEL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 static MODEL_LOCKS: OnceLock<Mutex<ModelLockMap>> = OnceLock::new();
@@ -326,6 +327,9 @@ pub enum ModelStatus {
 /// A model catalog, filesystem, download, or integrity failure.
 #[derive(Debug, Error)]
 pub enum ModelManagerError {
+    /// Cooperative model installation cancellation was requested.
+    #[error("model installation cancelled")]
+    Cancelled,
     /// The configured model root was relative.
     #[error("model root must be absolute: `{root}`")]
     RootNotAbsolute {
@@ -533,7 +537,38 @@ impl ModelManager {
         model: WhisperModel,
         downloader: &dyn ModelDownloader,
     ) -> Result<PathBuf, ModelManagerError> {
-        self.ensure_spec(model.spec(), downloader)
+        self.ensure_with_cancellation(model, downloader, &never_cancelled)
+    }
+
+    /// Ensures a verified model with cooperative cancellation.
+    ///
+    /// `cancelled` is borrowed for this call, so it may directly borrow a job
+    /// context. It can be called many times and should be inexpensive. A panic
+    /// from the callback is treated as a cancellation request.
+    ///
+    /// Cancellation is checked around root setup, lock acquisition, existing
+    /// model verification, stream establishment, each download read, and
+    /// durable temporary-file writes. A single blocking transport or reader
+    /// call, and the existing-model hash pass, cannot be interrupted midway.
+    ///
+    /// Once the final pre-commit check passes, cancellation is no longer
+    /// consulted: replacement, durability confirmation, and root-mapping
+    /// checks finish and return their actual result. Consequently, an outer
+    /// job cancellation flag can win a tiny race even though installation
+    /// completed successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModelManagerError::Cancelled`] when cancellation is observed
+    /// before commit. Other failures retain the same meaning as
+    /// [`Self::ensure_with`].
+    pub fn ensure_with_cancellation(
+        &self,
+        model: WhisperModel,
+        downloader: &dyn ModelDownloader,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PathBuf, ModelManagerError> {
+        self.ensure_spec_with_cancellation(model.spec(), downloader, cancelled)
     }
 
     /// Removes only the known regular model file.
@@ -574,41 +609,56 @@ impl ModelManager {
         }
     }
 
+    #[cfg(test)]
     fn ensure_spec(
         &self,
         spec: &ModelSpec,
         downloader: &dyn ModelDownloader,
     ) -> Result<PathBuf, ModelManagerError> {
+        self.ensure_spec_with_cancellation(spec, downloader, &never_cancelled)
+    }
+
+    fn ensure_spec_with_cancellation(
+        &self,
+        spec: &ModelSpec,
+        downloader: &dyn ModelDownloader,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<PathBuf, ModelManagerError> {
         validate_spec(spec)?;
+        check_cancelled(cancelled)?;
         let snapshot = self.create_and_capture_root()?;
         let physical_path = snapshot.physical_model_path(spec);
         let reported_path = snapshot.configured_model_path(spec);
         let lock = model_lock(&physical_path);
-        let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = lock_model_with_cancellation(lock.as_ref(), cancelled)?;
         snapshot.verify_mapping()?;
 
-        if matches!(
-            self.inspect_path(spec, &snapshot)?,
-            ModelStatus::Ready { .. }
-        ) {
+        check_cancelled(cancelled)?;
+        let status = self.inspect_path(spec, &snapshot);
+        check_cancelled(cancelled)?;
+        if matches!(status?, ModelStatus::Ready { .. }) {
             return Ok(reported_path);
         }
 
         let mut temporary = TemporaryDownload::create(&snapshot, spec.filename())?;
         let temporary_path = temporary.path.clone();
-        let mut reader = downloader.download(spec)?;
+        check_cancelled(cancelled)?;
+        let download = downloader.download(spec);
+        check_cancelled(cancelled)?;
+        let mut reader = download?;
         let mut hasher = Sha256::new();
         let mut total = 0_u64;
         let mut buffer = [0_u8; DOWNLOAD_BUFFER_BYTES];
 
         loop {
             let read_length = next_read_length(spec.exact_bytes(), total, buffer.len());
-            let count = reader.read(&mut buffer[..read_length]).map_err(|source| {
-                ModelManagerError::Io {
-                    operation: "read model download",
-                    path: temporary_path.clone(),
-                    source,
-                }
+            check_cancelled(cancelled)?;
+            let read = reader.read(&mut buffer[..read_length]);
+            check_cancelled(cancelled)?;
+            let count = read.map_err(|source| ModelManagerError::Io {
+                operation: "read model download",
+                path: temporary_path.clone(),
+                source,
             })?;
             if count == 0 {
                 break;
@@ -654,6 +704,7 @@ impl ModelManager {
             ));
         }
 
+        check_cancelled(cancelled)?;
         temporary
             .file_mut()
             .flush()
@@ -662,6 +713,7 @@ impl ModelManager {
                 path: temporary_path.clone(),
                 source,
             })?;
+        check_cancelled(cancelled)?;
         temporary
             .file_mut()
             .sync_all()
@@ -670,10 +722,12 @@ impl ModelManager {
                 path: temporary_path,
                 source,
             })?;
+        check_cancelled(cancelled)?;
 
         temporary.verify_current()?;
         let target_exists = ensure_safe_replace_target(&snapshot, spec)?;
         snapshot.verify_mapping()?;
+        check_cancelled(cancelled)?;
         temporary.commit(spec.filename(), target_exists)?;
         sync_containing_directory(&snapshot, &physical_path)?;
         snapshot.verify_mapping()?;
@@ -1328,6 +1382,44 @@ fn digest_to_hex(digest: &[u8]) -> String {
     output
 }
 
+fn never_cancelled() -> bool {
+    false
+}
+
+fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), ModelManagerError> {
+    let requested =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(cancelled)).unwrap_or(true);
+    if requested {
+        Err(ModelManagerError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn lock_model_with_cancellation<'a>(
+    lock: &'a Mutex<()>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<MutexGuard<'a, ()>, ModelManagerError> {
+    loop {
+        check_cancelled(cancelled)?;
+        match lock.try_lock() {
+            Ok(guard) => {
+                check_cancelled(cancelled)?;
+                return Ok(guard);
+            }
+            Err(TryLockError::Poisoned(poisoned)) => {
+                let guard = poisoned.into_inner();
+                check_cancelled(cancelled)?;
+                return Ok(guard);
+            }
+            Err(TryLockError::WouldBlock) => {
+                std::thread::yield_now();
+                std::thread::sleep(MODEL_LOCK_RETRY_DELAY);
+            }
+        }
+    }
+}
+
 fn model_lock(path: &Path) -> Arc<Mutex<()>> {
     let locks = MODEL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
     let mut locks = locks
@@ -1525,9 +1617,10 @@ impl Drop for TemporaryDownload {
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
-    use std::sync::Barrier;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Barrier, mpsc};
     use std::thread;
+    use std::time::Instant;
 
     use tempfile::TempDir;
 
@@ -1595,6 +1688,41 @@ mod tests {
             Err(ModelManagerError::InvalidCatalogEntry { .. })
         ));
         assert!(!temp.path().join("../escape.bin").exists());
+    }
+
+    #[test]
+    fn pre_cancelled_install_creates_no_root_or_download() {
+        let temp = TempDir::new().expect("temporary directory");
+        let root = temp.path().join("models");
+        let manager = ModelManager::new(&root).expect("valid manager");
+        let downloader = CountingDownloader::new(b"unused");
+
+        let error = manager
+            .ensure_with_cancellation(WhisperModel::BaseEn, &downloader, &|| true)
+            .expect_err("pre-cancelled installation must stop");
+
+        assert!(matches!(&error, ModelManagerError::Cancelled));
+        assert_eq!(error.to_string(), "model installation cancelled");
+        assert!(!root.exists());
+        assert_eq!(downloader.calls(), 0);
+    }
+
+    #[test]
+    fn panicking_cancellation_callback_fails_closed() {
+        let temp = TempDir::new().expect("temporary directory");
+        let root = temp.path().join("models");
+        let manager = ModelManager::new(&root).expect("valid manager");
+        let downloader = CountingDownloader::new(b"unused");
+
+        let error = manager
+            .ensure_with_cancellation(WhisperModel::BaseEn, &downloader, &|| {
+                panic!("injected cancellation callback panic")
+            })
+            .expect_err("callback panic must be cancellation");
+
+        assert!(matches!(error, ModelManagerError::Cancelled));
+        assert!(!root.exists());
+        assert_eq!(downloader.calls(), 0);
     }
 
     #[test]
@@ -1693,6 +1821,37 @@ mod tests {
     }
 
     #[test]
+    fn mid_stream_cancellation_cleans_temp_and_preserves_invalid_target() {
+        let temp = TempDir::new().expect("temporary directory");
+        let manager = ModelManager::new(temp.path()).expect("valid manager");
+        let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
+        fs::write(&path, b"bad").expect("write invalid existing model");
+
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let downloader_calls = Arc::new(AtomicUsize::new(0));
+        let cancelled_for_reader = Arc::clone(&cancelled);
+        let calls_for_downloader = Arc::clone(&downloader_calls);
+        let downloader = move |_spec: &ModelSpec| -> Result<DownloadReader, DownloadError> {
+            calls_for_downloader.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(CancellingReader {
+                read_count: 0,
+                cancelled: Arc::clone(&cancelled_for_reader),
+            }))
+        };
+
+        let error = manager
+            .ensure_spec_with_cancellation(&TINY_SPEC, &downloader, &|| {
+                cancelled.load(Ordering::SeqCst)
+            })
+            .expect_err("mid-stream cancellation must stop");
+
+        assert!(matches!(error, ModelManagerError::Cancelled));
+        assert_eq!(downloader_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fs::read(&path).expect("read invalid target"), b"bad");
+        assert_no_temporary_files(temp.path());
+    }
+
+    #[test]
     fn concurrent_ensure_commits_one_complete_download() {
         const WORKERS: usize = 8;
 
@@ -1722,6 +1881,87 @@ mod tests {
         assert_eq!(downloader.calls(), 1);
         let path = manager.path_for_spec(&TINY_SPEC).expect("known path");
         assert_eq!(fs::read(path).expect("read committed model"), b"hello");
+        assert_no_temporary_files(temp.path());
+    }
+
+    #[test]
+    fn cancellation_while_waiting_for_model_lock_returns_promptly() {
+        let temp = TempDir::new().expect("temporary directory");
+        let manager = Arc::new(ModelManager::new(temp.path()).expect("valid manager"));
+        let entered_download = Arc::new(Barrier::new(2));
+        let release_download = Arc::new(Barrier::new(2));
+        let first_calls = Arc::new(AtomicUsize::new(0));
+
+        let first_downloader = Arc::new({
+            let entered_download = Arc::clone(&entered_download);
+            let release_download = Arc::clone(&release_download);
+            let first_calls = Arc::clone(&first_calls);
+            move |_spec: &ModelSpec| -> Result<DownloadReader, DownloadError> {
+                first_calls.fetch_add(1, Ordering::SeqCst);
+                entered_download.wait();
+                release_download.wait();
+                Ok(Box::new(Cursor::new(b"hello")))
+            }
+        });
+        let first_worker = thread::spawn({
+            let manager = Arc::clone(&manager);
+            let first_downloader = Arc::clone(&first_downloader);
+            move || manager.ensure_spec(&TINY_SPEC, first_downloader.as_ref())
+        });
+        entered_download.wait();
+
+        let second_downloader = Arc::new(CountingDownloader::new(b"hello"));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (check_sender, check_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let second_worker = thread::spawn({
+            let manager = Arc::clone(&manager);
+            let second_downloader = Arc::clone(&second_downloader);
+            let cancelled = Arc::clone(&cancelled);
+            move || {
+                let result = manager.ensure_spec_with_cancellation(
+                    &TINY_SPEC,
+                    second_downloader.as_ref(),
+                    &|| {
+                        let _ = check_sender.send(());
+                        cancelled.load(Ordering::SeqCst)
+                    },
+                );
+                result_sender.send(result).expect("send second result");
+            }
+        });
+
+        let mut observed_lock_retry = true;
+        for _ in 0..3 {
+            if check_receiver.recv_timeout(Duration::from_secs(1)).is_err() {
+                observed_lock_retry = false;
+                break;
+            }
+        }
+        let cancellation_started = Instant::now();
+        cancelled.store(true, Ordering::SeqCst);
+        let second_result = result_receiver.recv_timeout(Duration::from_secs(1));
+        let cancellation_elapsed = cancellation_started.elapsed();
+
+        release_download.wait();
+        let first_result = first_worker.join().expect("first worker did not panic");
+        second_worker.join().expect("second worker did not panic");
+
+        assert!(
+            observed_lock_retry,
+            "second installation did not reach a contended lock retry"
+        );
+        assert!(
+            cancellation_elapsed < Duration::from_secs(1),
+            "lock-wait cancellation took {cancellation_elapsed:?}"
+        );
+        assert!(matches!(
+            second_result.expect("lock waiter did not cancel promptly"),
+            Err(ModelManagerError::Cancelled)
+        ));
+        first_result.expect("first installation succeeds");
+        assert_eq!(first_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(second_downloader.calls(), 0);
         assert_no_temporary_files(temp.path());
     }
 
@@ -1985,6 +2225,25 @@ mod tests {
             self.emitted = true;
             buffer[..2].copy_from_slice(b"he");
             Ok(2)
+        }
+    }
+
+    struct CancellingReader {
+        read_count: usize,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    impl Read for CancellingReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let bytes = if self.read_count == 0 {
+                &b"he"[..]
+            } else {
+                self.cancelled.store(true, Ordering::SeqCst);
+                &b"ll"[..]
+            };
+            self.read_count += 1;
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            Ok(bytes.len())
         }
     }
 
