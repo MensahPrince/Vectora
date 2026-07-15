@@ -8,11 +8,33 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use cutlass_ai::{HostToolSpec, ToolOutput, ToolTier};
+use cutlass_storage::CacheId;
 use serde_json::{Map, Value, json};
+
+use crate::cache_registry::CacheRegistry;
 
 const SYSTEM_REVEAL: &str = "system_reveal";
 const SYSTEM_OPEN_EXTERNAL: &str = "system_open_external";
-const TOOL_NAMES: [&str; 2] = [SYSTEM_REVEAL, SYSTEM_OPEN_EXTERNAL];
+const SYSTEM_CACHE_LIST: &str = "system_cache_list";
+const SYSTEM_CACHE_CLEAR: &str = "system_cache_clear";
+const TOOL_NAMES: [&str; 4] = [
+    SYSTEM_REVEAL,
+    SYSTEM_OPEN_EXTERNAL,
+    SYSTEM_CACHE_LIST,
+    SYSTEM_CACHE_CLEAR,
+];
+const CACHE_IDS: [&str; 10] = [
+    "preview_frames",
+    "library_thumbnails",
+    "timeline_filmstrips",
+    "timeline_waveforms",
+    "proxies",
+    "download",
+    "catalog",
+    "luts",
+    "lottie",
+    "templates",
+];
 
 pub fn specs() -> Vec<HostToolSpec> {
     vec![
@@ -48,16 +70,53 @@ pub fn specs() -> Vec<HostToolSpec> {
                 "required": ["target"]
             }),
         ),
+        spec(
+            SYSTEM_CACHE_LIST,
+            "List exact memory and disk usage for every registered application cache.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {},
+                "required": []
+            }),
+        ),
+        spec(
+            SYSTEM_CACHE_CLEAR,
+            "Clear exactly one registered cache and report the removed and remaining usage.",
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "cache_id": {
+                        "type": "string",
+                        "enum": CACHE_IDS,
+                        "description": "Stable identifier of the one cache to clear."
+                    }
+                },
+                "required": ["cache_id"]
+            }),
+        ),
     ]
 }
 
-pub fn call(name: &str, arguments: &Value, cancel: &AtomicBool) -> Result<ToolOutput, String> {
+pub fn call(
+    cache_registry: Option<&CacheRegistry>,
+    name: &str,
+    arguments: &Value,
+    cancel: &AtomicBool,
+) -> Result<ToolOutput, String> {
     if cancel.load(Ordering::Acquire) {
         return Err("cancelled before the system tool could run".into());
     }
     let request = parse_request(name, arguments)?;
     if cancel.load(Ordering::Acquire) {
-        return Err("cancelled before the external application could open".into());
+        return Err(
+            if matches!(&request, Request::Reveal(_) | Request::Open(_)) {
+                "cancelled before the external application could open".into()
+            } else {
+                "cancelled before the cache operation could run".into()
+            },
+        );
     }
 
     let result = match request {
@@ -76,6 +135,18 @@ pub fn call(name: &str, arguments: &Value, cancel: &AtomicBool) -> Result<ToolOu
                 "action": "open-external",
                 "target": target_label(&target)
             })
+        }
+        Request::CacheList => {
+            let registry =
+                cache_registry.ok_or_else(|| "cache registry is unavailable".to_string())?;
+            let caches = registry.snapshot_all(cancel)?;
+            json!({ "caches": caches })
+        }
+        Request::CacheClear(id) => {
+            let registry =
+                cache_registry.ok_or_else(|| "cache registry is unavailable".to_string())?;
+            let report = registry.clear(id, cancel)?;
+            json!(report)
         }
     };
     serde_json::to_string(&result)
@@ -96,6 +167,8 @@ fn spec(name: &str, description: &str, parameters: Value) -> HostToolSpec {
 enum Request {
     Reveal(PathBuf),
     Open(crate::external::ExternalTarget),
+    CacheList,
+    CacheClear(CacheId),
 }
 
 fn parse_request(name: &str, arguments: &Value) -> Result<Request, String> {
@@ -118,8 +191,28 @@ fn parse_request(name: &str, arguments: &Value) -> Result<Request, String> {
             crate::external::parse_target(string_argument(name, object, "target")?)
                 .map(Request::Open)
         }
+        SYSTEM_CACHE_LIST => {
+            validate_no_fields(name, object)?;
+            Ok(Request::CacheList)
+        }
+        SYSTEM_CACHE_CLEAR => {
+            if object.keys().any(|key| key != "cache_id") {
+                return Err("system_cache_clear has an unknown argument".into());
+            }
+            validate_single_string(name, object, "cache_id")?;
+            CacheId::parse(string_argument(name, object, "cache_id")?)
+                .map(Request::CacheClear)
+                .map_err(|_| "system_cache_clear argument 'cache_id' is unknown".to_string())
+        }
         _ => Err(format!("unknown system tool '{name}'")),
     }
+}
+
+fn validate_no_fields(tool: &str, object: &Map<String, Value>) -> Result<(), String> {
+    if !object.is_empty() {
+        return Err(format!("{tool} does not accept arguments"));
+    }
+    Ok(())
 }
 
 fn validate_single_string(
@@ -181,12 +274,20 @@ mod tests {
                 .len(),
             TOOL_NAMES.len()
         );
-        for entry in registry {
+        for entry in &registry {
             assert_eq!(entry.tier, ToolTier::System);
             assert_eq!(entry.parameters["type"], "object");
             assert_eq!(entry.parameters["additionalProperties"], false);
             assert!(!entry.description.is_empty());
         }
+        assert_eq!(
+            registry
+                .iter()
+                .find(|entry| entry.name == SYSTEM_CACHE_CLEAR)
+                .unwrap()
+                .parameters["properties"]["cache_id"]["enum"],
+            json!(CACHE_IDS)
+        );
     }
 
     #[test]
@@ -217,6 +318,20 @@ mod tests {
     }
 
     #[test]
+    fn parser_accepts_strict_cache_requests() {
+        assert_eq!(
+            parse_request(SYSTEM_CACHE_LIST, &json!({})),
+            Ok(Request::CacheList)
+        );
+        for id in CacheId::ALL {
+            assert_eq!(
+                parse_request(SYSTEM_CACHE_CLEAR, &json!({ "cache_id": id.as_str() })),
+                Ok(Request::CacheClear(id))
+            );
+        }
+    }
+
+    #[test]
     fn parser_rejects_unknown_names_shapes_fields_and_unsafe_targets() {
         assert!(parse_request("system_missing", &json!({})).is_err());
         assert!(parse_request(SYSTEM_REVEAL, &Value::Null).is_err());
@@ -244,12 +359,35 @@ mod tests {
             )
             .is_err()
         );
+        assert!(parse_request(SYSTEM_CACHE_LIST, &json!({ "all": true })).is_err());
+        assert!(parse_request(SYSTEM_CACHE_CLEAR, &json!({})).is_err());
+        assert!(parse_request(SYSTEM_CACHE_CLEAR, &json!({ "cache_id": 1 })).is_err());
+        assert!(parse_request(SYSTEM_CACHE_CLEAR, &json!({ "cache_id": "all" })).is_err());
+        assert!(
+            parse_request(
+                SYSTEM_CACHE_CLEAR,
+                &json!({ "cache_id": "download", "unexpected": true })
+            )
+            .is_err()
+        );
+
+        let oversized_id = parse_request(
+            SYSTEM_CACHE_CLEAR,
+            &json!({ "cache_id": "x".repeat(10_000) }),
+        )
+        .unwrap_err();
+        assert!(oversized_id.len() < 128);
+        let mut oversized_field = Map::new();
+        oversized_field.insert("x".repeat(10_000), Value::Bool(true));
+        let oversized_field =
+            parse_request(SYSTEM_CACHE_CLEAR, &Value::Object(oversized_field)).unwrap_err();
+        assert!(oversized_field.len() < 128);
     }
 
     #[test]
     fn call_honors_cancellation_before_parsing_or_process_launch() {
         let cancel = AtomicBool::new(true);
-        let error = call(SYSTEM_OPEN_EXTERNAL, &Value::Null, &cancel).unwrap_err();
+        let error = call(None, SYSTEM_OPEN_EXTERNAL, &Value::Null, &cancel).unwrap_err();
         assert!(error.contains("cancelled"));
     }
 }

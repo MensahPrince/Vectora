@@ -36,6 +36,7 @@ use tracing::{error, info, warn};
 
 use crate::agent_senses::AgentSenses;
 use crate::agent_session::{AgentSession, TranscriptEntry};
+use crate::cache_registry::CacheRegistry;
 use crate::preview_worker::WorkerHandle;
 use crate::{AgentEntry, AgentStore, AppWindow};
 
@@ -148,9 +149,10 @@ pub struct AgentWorker {
     _join: JoinHandle<()>,
 }
 
-struct AgentUiHandles {
+struct AgentRuntimeHandles {
     store: slint::Weak<AgentStore<'static>>,
     app: slint::Weak<AppWindow>,
+    cache_registry: CacheRegistry,
 }
 
 impl AgentWorker {
@@ -158,6 +160,7 @@ impl AgentWorker {
         worker: WorkerHandle,
         store: slint::Weak<AgentStore<'static>>,
         app: slint::Weak<AppWindow>,
+        cache_registry: CacheRegistry,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded();
         let (approval_tx, approval_rx) = unbounded();
@@ -171,7 +174,11 @@ impl AgentWorker {
             .spawn(move || {
                 agent_main(
                     worker,
-                    AgentUiHandles { store, app },
+                    AgentRuntimeHandles {
+                        store,
+                        app,
+                        cache_registry,
+                    },
                     rx,
                     thread_cancel,
                     approval_rx,
@@ -557,9 +564,10 @@ fn publish_approval_card(
     store: &slint::Weak<AgentStore<'static>>,
     name: &str,
     arguments: &serde_json::Value,
+    cache_registry: Option<&CacheRegistry>,
 ) -> Result<(), String> {
-    let title = format!("Run {name}?");
-    let detail = approval_detail(arguments);
+    let title = approval_title(name);
+    let detail = approval_detail(name, arguments, cache_registry);
     let (published_tx, published_rx) = bounded(1);
     let store = store.clone();
     slint::invoke_from_event_loop(move || {
@@ -584,11 +592,40 @@ fn publish_approval_card(
     }
 }
 
-fn approval_detail(arguments: &serde_json::Value) -> String {
+fn approval_title(name: &str) -> String {
+    match name {
+        "system_cache_list" => "Let the assistant inspect cache usage?".into(),
+        "system_cache_clear" => "Clear this cache?".into(),
+        "system_reveal" => "Reveal this path?".into(),
+        "system_open_external" => "Open this outside Cutlass?".into(),
+        "app_close" => "Close Cutlass?".into(),
+        _ => format!("Run {name}?"),
+    }
+}
+
+fn approval_detail(
+    name: &str,
+    arguments: &serde_json::Value,
+    cache_registry: Option<&CacheRegistry>,
+) -> String {
+    if name == "system_cache_clear"
+        && let Some(id) = arguments
+            .get("cache_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| cutlass_storage::CacheId::parse(id).ok())
+        && let Some(registry) = cache_registry
+    {
+        return bound_approval_detail(registry.clear_approval_detail(id));
+    }
+
     let detail = match arguments.as_object() {
         Some(arguments) if arguments.is_empty() => "No arguments.".to_string(),
         _ => serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string()),
     };
+    bound_approval_detail(detail)
+}
+
+fn bound_approval_detail(detail: String) -> String {
     let mut bounded: String = detail.chars().take(APPROVAL_DETAIL_MAX_CHARS).collect();
     if detail.chars().count() > APPROVAL_DETAIL_MAX_CHARS {
         bounded.push('…');
@@ -610,6 +647,7 @@ pub struct DesktopToolHost {
     autonomy: Autonomy,
     store: slint::Weak<AgentStore<'static>>,
     app: slint::Weak<AppWindow>,
+    cache_registry: Option<CacheRegistry>,
     approval_rx: Receiver<ApprovalDecision>,
     pending_approval_id: Arc<AtomicU64>,
     approval_id_allocator: Arc<AtomicU64>,
@@ -620,6 +658,7 @@ impl DesktopToolHost {
         autonomy: Autonomy,
         store: slint::Weak<AgentStore<'static>>,
         app: slint::Weak<AppWindow>,
+        cache_registry: Option<CacheRegistry>,
         approval_rx: Receiver<ApprovalDecision>,
         pending_approval_id: Arc<AtomicU64>,
         approval_id_allocator: Arc<AtomicU64>,
@@ -628,6 +667,7 @@ impl DesktopToolHost {
             autonomy,
             store,
             app,
+            cache_registry,
             approval_rx,
             pending_approval_id,
             approval_id_allocator,
@@ -660,7 +700,9 @@ impl ToolHost for DesktopToolHost {
         self.pending_approval_id
             .compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
             .map_err(|_| "another system tool approval is already pending".to_string())?;
-        if let Err(error) = publish_approval_card(&self.store, name, arguments) {
+        if let Err(error) =
+            publish_approval_card(&self.store, name, arguments, self.cache_registry.as_ref())
+        {
             let _ = self.pending_approval_id.compare_exchange(
                 request_id,
                 0,
@@ -710,7 +752,9 @@ impl ToolHost for DesktopToolHost {
     ) -> Result<ToolOutput, String> {
         match cutlass_ai::namespace(name) {
             "app" => crate::agent_app_control::call(self.app.clone(), name, arguments, cancel),
-            "system" => crate::agent_system::call(name, arguments, cancel),
+            "system" => {
+                crate::agent_system::call(self.cache_registry.as_ref(), name, arguments, cancel)
+            }
             other => Err(format!("unsupported desktop tool namespace '{other}'")),
         }
     }
@@ -741,14 +785,18 @@ impl Preview {
 
 fn agent_main(
     worker: WorkerHandle,
-    ui: AgentUiHandles,
+    runtime: AgentRuntimeHandles,
     rx: Receiver<AgentRequest>,
     cancel: Arc<AtomicBool>,
     approval_rx: Receiver<ApprovalDecision>,
     pending_approval_id: Arc<AtomicU64>,
     approval_id_allocator: Arc<AtomicU64>,
 ) {
-    let AgentUiHandles { store, app } = ui;
+    let AgentRuntimeHandles {
+        store,
+        app,
+        cache_registry,
+    } = runtime;
     let mut sandbox: Option<Engine> = None;
     let mut senses = AgentSenses::new();
     let mut preview = Preview::default();
@@ -813,6 +861,7 @@ fn agent_main(
                     &worker,
                     &store,
                     &app,
+                    &cache_registry,
                     &mut sandbox,
                     &mut senses,
                     &mut preview,
@@ -886,6 +935,7 @@ fn run_one_prompt(
     worker: &WorkerHandle,
     store: &slint::Weak<AgentStore<'static>>,
     app: &slint::Weak<AppWindow>,
+    cache_registry: &CacheRegistry,
     sandbox: &mut Option<Engine>,
     senses: &mut AgentSenses,
     preview: &mut Preview,
@@ -1020,6 +1070,7 @@ fn run_one_prompt(
         section.autonomy,
         store.clone(),
         app.clone(),
+        Some(cache_registry.clone()),
         approval_rx.clone(),
         pending_approval_id.clone(),
         approval_id_allocator.clone(),
@@ -1294,11 +1345,20 @@ mod tests {
 
     #[test]
     fn approval_detail_is_bounded_and_handles_empty_arguments() {
-        assert_eq!(approval_detail(&serde_json::json!({})), "No arguments.");
+        assert_eq!(approval_title("system_cache_clear"), "Clear this cache?");
+        assert_eq!(approval_title("future_tool"), "Run future_tool?");
+        assert_eq!(
+            approval_detail("system_cache_list", &serde_json::json!({}), None),
+            "No arguments."
+        );
 
-        let detail = approval_detail(&serde_json::json!({
-            "script": "x".repeat(APPROVAL_DETAIL_MAX_CHARS + 100)
-        }));
+        let detail = approval_detail(
+            "python_run",
+            &serde_json::json!({
+                "script": "x".repeat(APPROVAL_DETAIL_MAX_CHARS + 100)
+            }),
+            None,
+        );
         assert_eq!(detail.chars().count(), APPROVAL_DETAIL_MAX_CHARS + 1);
         assert!(detail.ends_with('…'));
         assert!(detail.starts_with("{\n  \"script\": \""));
@@ -1314,6 +1374,7 @@ mod tests {
             Autonomy::Full,
             slint::Weak::default(),
             slint::Weak::default(),
+            None,
             rx,
             pending.clone(),
             allocator.clone(),
@@ -1323,7 +1384,7 @@ mod tests {
         assert_eq!(
             host.authorize(
                 "system_cache_clear",
-                &serde_json::json!({ "scope": "all" }),
+                &serde_json::json!({ "cache_id": "download" }),
                 ToolTier::System,
                 &cancel,
             ),
@@ -1350,12 +1411,13 @@ mod tests {
             Autonomy::Ask,
             slint::Weak::default(),
             slint::Weak::default(),
+            None,
             rx,
             Arc::new(AtomicU64::new(0)),
             Arc::new(AtomicU64::new(0)),
         );
         let specs = host.tools();
-        assert_eq!(specs.len(), 14);
+        assert_eq!(specs.len(), 16);
         assert_eq!(
             specs
                 .iter()
@@ -1382,7 +1444,13 @@ mod tests {
                 .filter(|spec| spec.tier == ToolTier::System)
                 .map(|spec| spec.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["app_close", "system_reveal", "system_open_external"]
+            vec![
+                "app_close",
+                "system_reveal",
+                "system_open_external",
+                "system_cache_list",
+                "system_cache_clear",
+            ]
         );
     }
 

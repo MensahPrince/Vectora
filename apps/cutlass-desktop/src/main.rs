@@ -7,6 +7,7 @@ mod agent_system;
 mod agent_vision;
 mod ai_media;
 mod audio;
+mod cache_registry;
 mod cloud;
 mod drafts;
 mod external;
@@ -513,7 +514,38 @@ fn main() -> Result<(), slint::PlatformError> {
     // back to defaults so launch never depends on it; the theme applies
     // immediately, the AI fields seed the Settings dialog for later phases.
     let config_path = cutlass_settings::default_config_path();
-    let app_settings = cutlass_settings::load(&config_path).unwrap_or_default();
+    let app_settings = match cutlass_settings::load(&config_path) {
+        Ok(settings) => settings,
+        Err(_) => {
+            tracing::warn!(
+                path = %config_path.display(),
+                "configuration could not be loaded; using in-memory defaults without overwriting it"
+            );
+            cutlass_settings::Settings::default()
+        }
+    };
+    let (storage_layout, download_quota_mib) = match paths::storage_layout(&app_settings.storage) {
+        Ok(layout) => (layout, app_settings.storage.download_quota_mib),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "invalid cache storage layout; using default cache locations"
+            );
+            // Cache fallback never changes the authoritative project/draft
+            // root and performs no relocation.
+            let defaults = cutlass_settings::StorageSettings::default();
+            let layout = paths::storage_layout(&defaults).map_err(|fallback_error| {
+                slint::PlatformError::from(format!(
+                    "default cache storage layout is invalid: {fallback_error}"
+                ))
+            })?;
+            (layout, defaults.download_quota_mib)
+        }
+    };
+    const MIB_BYTES: u64 = 1024 * 1024;
+    let download_quota_bytes = download_quota_mib
+        .checked_mul(MIB_BYTES)
+        .ok_or_else(|| slint::PlatformError::from("download cache quota exceeds byte range"))?;
 
     // AI assistant: a dedicated worker rehearses each prompt on a sandbox
     // engine, then replays the validated plan through the preview worker as
@@ -607,10 +639,23 @@ fn main() -> Result<(), slint::PlatformError> {
         "engine session ready"
     );
 
+    let download_root = paths::cache_path(&storage_layout, cutlass_storage::CacheId::Download)
+        .map_err(|error| {
+            slint::PlatformError::from(format!("download cache path is invalid: {error}"))
+        })?;
     let download_cache = std::sync::Arc::new(cutlass_cloud::cache::DownloadCache::new(
-        paths::data_dir().join("download-cache"),
-        cutlass_cloud::cache::DEFAULT_QUOTA_BYTES,
+        download_root,
+        download_quota_bytes,
     ));
+    // Keep this owner in main for the upcoming Settings wiring; the agent
+    // receives a clone of the same registry and operation gate.
+    let cache_registry = cache_registry::CacheRegistry::new(
+        storage_layout,
+        app.as_weak(),
+        preview_worker.handle(),
+        std::sync::Arc::clone(&download_cache),
+    )
+    .map_err(slint::PlatformError::from)?;
 
     // Library stock browsing: search + direct-CDN downloads on their own
     // thread (src/cloud.rs); imports route through the preview worker like
@@ -800,6 +845,7 @@ fn main() -> Result<(), slint::PlatformError> {
         preview_worker.handle(),
         agent_store.as_weak(),
         app.as_weak(),
+        cache_registry.clone(),
     )
     .map_err(slint::PlatformError::from)?;
 
