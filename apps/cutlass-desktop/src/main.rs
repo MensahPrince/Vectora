@@ -478,6 +478,7 @@ fn cache_relocation_supported(id: cutlass_storage::CacheId) -> bool {
     matches!(
         id,
         cutlass_storage::CacheId::Proxies
+            | cutlass_storage::CacheId::Analysis
             | cutlass_storage::CacheId::Download
             | cutlass_storage::CacheId::Catalog
             | cutlass_storage::CacheId::Luts
@@ -3543,7 +3544,7 @@ mod settings_cache_tests {
     }
 
     #[test]
-    fn cache_relocation_support_is_exactly_the_six_disk_caches() {
+    fn cache_relocation_support_is_exactly_the_seven_disk_caches() {
         let supported = cutlass_storage::CacheId::ALL
             .into_iter()
             .filter(|id| cache_relocation_supported(*id))
@@ -3552,6 +3553,7 @@ mod settings_cache_tests {
             supported,
             vec![
                 cutlass_storage::CacheId::Proxies,
+                cutlass_storage::CacheId::Analysis,
                 cutlass_storage::CacheId::Download,
                 cutlass_storage::CacheId::Catalog,
                 cutlass_storage::CacheId::Luts,
@@ -3571,6 +3573,7 @@ mod settings_cache_tests {
         let parent = PathBuf::from("/chosen-parent");
         for id in [
             cutlass_storage::CacheId::Proxies,
+            cutlass_storage::CacheId::Analysis,
             cutlass_storage::CacheId::Download,
             cutlass_storage::CacheId::Catalog,
             cutlass_storage::CacheId::Luts,
@@ -3636,6 +3639,7 @@ mod settings_cache_tests {
             relocatable,
             vec![
                 "proxies",
+                "analysis",
                 "download",
                 "catalog",
                 "luts",

@@ -746,6 +746,7 @@ fn ensure_cache_can_be_relocated(id: CacheId) -> Result<(), String> {
     if !matches!(
         id,
         CacheId::Proxies
+            | CacheId::Analysis
             | CacheId::Download
             | CacheId::Catalog
             | CacheId::Luts
@@ -783,6 +784,7 @@ fn set_storage_path_override(
     ensure_cache_can_be_relocated(id)?;
     let field = match id {
         CacheId::Proxies => &mut settings.storage.paths.proxies,
+        CacheId::Analysis => &mut settings.storage.paths.analysis,
         CacheId::Download => &mut settings.storage.paths.download,
         CacheId::Catalog => &mut settings.storage.paths.catalog,
         CacheId::Luts => &mut settings.storage.paths.luts,
@@ -1364,9 +1366,12 @@ mod tests {
     fn disk_snapshots_are_deterministic_and_missing_directories_are_zero() {
         let temporary = tempfile::tempdir().unwrap();
         let layout = StorageLayout::new(temporary.path()).unwrap();
+        let analysis = layout.resolve(CacheId::Analysis).unwrap();
         let download = layout.resolve(CacheId::Download).unwrap();
+        fs::create_dir_all(&analysis).unwrap();
         let nested = download.join("stock");
         fs::create_dir_all(&nested).unwrap();
+        fs::write(analysis.join("moments.sqlite3"), b"analysis!").unwrap();
         fs::write(nested.join("clip.mp4"), b"12345").unwrap();
         fs::write(download.join("metadata.json"), b"123").unwrap();
 
@@ -1378,6 +1383,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 CacheId::Proxies,
+                CacheId::Analysis,
                 CacheId::Download,
                 CacheId::Catalog,
                 CacheId::Luts,
@@ -1393,6 +1399,17 @@ mod tests {
             (download.bytes, download.files, download.entries),
             (8, 2, 0)
         );
+        let analysis = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == CacheId::Analysis)
+            .unwrap();
+        assert_eq!(analysis.label, "Media analysis");
+        assert_eq!(analysis.kind, CacheKind::Disk);
+        assert_eq!(analysis.tier, CacheTier::Disposable);
+        assert_eq!(
+            (analysis.bytes, analysis.files, analysis.entries),
+            (9, 1, 0)
+        );
         assert_eq!(
             snapshots
                 .iter()
@@ -1406,15 +1423,15 @@ mod tests {
     fn disk_clear_removes_only_the_requested_cache_and_reports_exact_usage() {
         let temporary = tempfile::tempdir().unwrap();
         let layout = StorageLayout::new(temporary.path()).unwrap();
-        let proxies = layout.resolve(CacheId::Proxies).unwrap();
+        let analysis = layout.resolve(CacheId::Analysis).unwrap();
         let catalog = layout.resolve(CacheId::Catalog).unwrap();
-        fs::create_dir_all(&proxies).unwrap();
+        fs::create_dir_all(&analysis).unwrap();
         fs::create_dir_all(&catalog).unwrap();
-        fs::write(proxies.join("proxy.mp4"), b"1234567").unwrap();
+        fs::write(analysis.join("moments.sqlite"), b"1234567").unwrap();
         fs::write(catalog.join("catalog.json"), b"keep").unwrap();
 
         let removed =
-            clear_disk_contents(&layout, CacheId::Proxies, &AtomicBool::new(false)).unwrap();
+            clear_disk_contents(&layout, CacheId::Analysis, &AtomicBool::new(false)).unwrap();
         assert_eq!(
             removed,
             CacheUsage {
@@ -1423,11 +1440,11 @@ mod tests {
                 files: 1,
             }
         );
-        assert!(proxies.is_dir());
-        assert_eq!(fs::read_dir(&proxies).unwrap().count(), 0);
+        assert!(analysis.is_dir());
+        assert_eq!(fs::read_dir(&analysis).unwrap().count(), 0);
         assert_eq!(fs::read(catalog.join("catalog.json")).unwrap(), b"keep");
         assert_eq!(
-            snapshot_disk_cache(&layout, CacheId::Proxies, &AtomicBool::new(false))
+            snapshot_disk_cache(&layout, CacheId::Analysis, &AtomicBool::new(false))
                 .unwrap()
                 .bytes,
             0
@@ -1630,6 +1647,7 @@ mod tests {
     #[test]
     fn cache_clear_policy_fails_closed_for_project_referenced_catalog_assets() {
         assert!(ensure_cache_can_be_cleared(CacheId::Proxies).is_ok());
+        assert!(ensure_cache_can_be_cleared(CacheId::Analysis).is_ok());
         assert!(ensure_cache_can_be_cleared(CacheId::Download).is_ok());
         for id in [CacheId::Luts, CacheId::Lottie, CacheId::Templates] {
             assert!(!cache_can_be_cleared(id), "{id} must fail closed");
@@ -1641,6 +1659,7 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let disk_ids = [
             CacheId::Proxies,
+            CacheId::Analysis,
             CacheId::Download,
             CacheId::Catalog,
             CacheId::Luts,
@@ -1721,6 +1740,10 @@ mod tests {
         assert!(
             validate_relocation_references(CacheId::Proxies, &saved, &live).is_ok(),
             "proxies have no persisted reference fields"
+        );
+        assert!(
+            validate_relocation_references(CacheId::Analysis, &saved, &live).is_ok(),
+            "media analysis has no persisted project references"
         );
 
         let incomplete_saved = DraftReferenceReport {

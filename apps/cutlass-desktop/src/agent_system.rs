@@ -25,20 +25,22 @@ const TOOL_NAMES: [&str; 5] = [
     SYSTEM_CACHE_CLEAR,
     SYSTEM_CACHE_RELOCATE,
 ];
-const CACHE_IDS: [&str; 10] = [
+const CACHE_IDS: [&str; 11] = [
     "preview_frames",
     "library_thumbnails",
     "timeline_filmstrips",
     "timeline_waveforms",
     "proxies",
+    "analysis",
     "download",
     "catalog",
     "luts",
     "lottie",
     "templates",
 ];
-const RELOCATABLE_CACHE_IDS: [&str; 6] = [
+const RELOCATABLE_CACHE_IDS: [&str; 7] = [
     "proxies",
+    "analysis",
     "download",
     "catalog",
     "luts",
@@ -380,6 +382,20 @@ mod tests {
                 .unwrap()
                 .parameters["properties"]["cache_id"]["enum"],
             json!(CACHE_IDS)
+        );
+        let registered_ids: Vec<_> = cutlass_storage::cache_descriptors()
+            .iter()
+            .map(|descriptor| descriptor.id.as_str())
+            .collect();
+        assert_eq!(CACHE_IDS.as_slice(), registered_ids.as_slice());
+        let registered_disk_ids: Vec<_> = cutlass_storage::cache_descriptors()
+            .iter()
+            .filter(|descriptor| descriptor.kind == cutlass_storage::CacheKind::Disk)
+            .map(|descriptor| descriptor.id.as_str())
+            .collect();
+        assert_eq!(
+            RELOCATABLE_CACHE_IDS.as_slice(),
+            registered_disk_ids.as_slice()
         );
         let relocate = registry
             .iter()

@@ -42,6 +42,7 @@ pub fn storage_layout(
 
     for (id, override_path) in [
         (CacheId::Proxies, settings.paths.proxies.as_deref()),
+        (CacheId::Analysis, settings.paths.analysis.as_deref()),
         (CacheId::Download, settings.paths.download.as_deref()),
         (CacheId::Catalog, settings.paths.catalog.as_deref()),
         (CacheId::Luts, settings.paths.luts.as_deref()),
@@ -88,8 +89,9 @@ mod tests {
     use super::*;
     use cutlass_settings::{StoragePathOverrides, StorageSettings};
 
-    const DISK_CACHE_DIRS: [(CacheId, &str); 6] = [
+    const DISK_CACHE_DIRS: [(CacheId, &str); 7] = [
         (CacheId::Proxies, "proxies"),
+        (CacheId::Analysis, "analysis"),
         (CacheId::Download, "download-cache"),
         (CacheId::Catalog, "catalog-cache"),
         (CacheId::Luts, "luts"),
@@ -157,6 +159,7 @@ mod tests {
     #[test]
     fn each_configured_override_wins() {
         let proxy_override = test_path("overrides/proxy");
+        let analysis_override = test_path("overrides/analysis");
         let download_override = test_path("overrides/download");
         let catalog_override = test_path("overrides/catalog");
         let luts_override = test_path("overrides/luts");
@@ -166,6 +169,7 @@ mod tests {
             root: Some(test_path("override-default-root")),
             paths: StoragePathOverrides {
                 proxies: Some(proxy_override.clone()),
+                analysis: Some(analysis_override.clone()),
                 download: Some(download_override.clone()),
                 catalog: Some(catalog_override.clone()),
                 luts: Some(luts_override.clone()),
@@ -176,6 +180,7 @@ mod tests {
         };
         let expected = [
             (CacheId::Proxies, proxy_override),
+            (CacheId::Analysis, analysis_override),
             (CacheId::Download, download_override),
             (CacheId::Catalog, catalog_override),
             (CacheId::Luts, luts_override),
