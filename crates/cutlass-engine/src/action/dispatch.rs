@@ -566,10 +566,16 @@ fn dispatch_edit(
         EditCommand::DuckLanes { .. } => Err(EngineError::Unsupported(
             "audio ducking needs the decoder's audio reader (deferred on mobile-support)".into(),
         )),
-        EditCommand::DetectBeats { .. } | EditCommand::ClearBeats { .. } => {
-            Err(EngineError::Unsupported(
-                "beat detection needs the decoder's audio reader (deferred on mobile-support)"
-                    .into(),
+        EditCommand::DetectBeats { .. } => Err(EngineError::Unsupported(
+            "beat detection must run as an async decode/analysis background job outside pure \
+             dispatch, then apply its result in a follow-up edit"
+                .into(),
+        )),
+        EditCommand::ClearBeats { clip } => {
+            let inverse = edit::clip_beats::clear(ctx, clip)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(clip)),
+                Some(inverse),
             ))
         }
         EditCommand::AddMarker { at, name, color } => {
