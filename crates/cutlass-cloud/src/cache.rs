@@ -13,7 +13,7 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -27,6 +27,7 @@ pub struct DownloadCache {
     root: PathBuf,
     quota_bytes: AtomicU64,
     protected_paths: RwLock<HashSet<PathBuf>>,
+    destructive_operations_blocked: AtomicBool,
     activity: Mutex<CacheActivity>,
     activity_changed: Condvar,
 }
@@ -90,6 +91,7 @@ impl DownloadCache {
             root,
             quota_bytes: AtomicU64::new(quota_bytes),
             protected_paths: RwLock::new(HashSet::new()),
+            destructive_operations_blocked: AtomicBool::new(false),
             activity: Mutex::new(CacheActivity::default()),
             activity_changed: Condvar::new(),
         }
@@ -137,6 +139,27 @@ impl DownloadCache {
     #[must_use]
     pub fn protected_path_count(&self) -> usize {
         read_protected(&self.protected_paths).len()
+    }
+
+    /// Fail closed while project references have not been fully inventoried.
+    ///
+    /// Reads, writes, and explicit protection continue to work. Quota
+    /// enforcement becomes a no-op and explicit clearing returns an error.
+    pub fn block_destructive_operations(&self) {
+        self.destructive_operations_blocked
+            .store(true, Ordering::Release);
+    }
+
+    /// Re-enable clear and eviction after every project reference was scanned.
+    pub fn allow_destructive_operations(&self) {
+        self.destructive_operations_blocked
+            .store(false, Ordering::Release);
+    }
+
+    /// Whether clear and quota eviction currently fail closed.
+    #[must_use]
+    pub fn destructive_operations_blocked(&self) -> bool {
+        self.destructive_operations_blocked.load(Ordering::Acquire)
     }
 
     /// Reserve one safe cache path for a complete read or write operation.
@@ -201,10 +224,17 @@ impl DownloadCache {
     /// Evict least-recently-modified files until under quota. Called after
     /// each completed download; cheap when under budget.
     pub fn enforce_quota(&self) {
+        if self.destructive_operations_blocked() {
+            tracing::debug!("download cache eviction blocked pending project inventory");
+            return;
+        }
         let Ok(_maintenance) = self.begin_maintenance(MAINTENANCE_WAIT_TIMEOUT) else {
             tracing::debug!("download cache eviction skipped while files remain in use");
             return;
         };
+        if self.destructive_operations_blocked() {
+            return;
+        }
         let quota_bytes = self.quota_bytes();
         let protected = read_protected(&self.protected_paths).clone();
         let mut files: Vec<(PathBuf, u64, SystemTime)> = walk_files(&self.root)
@@ -236,7 +266,13 @@ impl DownloadCache {
     /// Delete everything (the settings "clear download cache" action).
     /// The root itself stays so in-flight paths remain valid.
     pub fn clear(&self) -> Result<DownloadCacheClear, CloudError> {
+        if self.destructive_operations_blocked() {
+            return Err(cache_inventory_incomplete());
+        }
         let _maintenance = self.begin_maintenance(MAINTENANCE_WAIT_TIMEOUT)?;
+        if self.destructive_operations_blocked() {
+            return Err(cache_inventory_incomplete());
+        }
         if safe_root_entries(&self.root)?.is_none() {
             return Ok(DownloadCacheClear {
                 removed_bytes: 0,
@@ -387,6 +423,14 @@ fn cache_busy() -> CloudError {
     io::Error::new(
         io::ErrorKind::TimedOut,
         "download cache files are still in use",
+    )
+    .into()
+}
+
+fn cache_inventory_incomplete() -> CloudError {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "download cache is protected until project media inventory completes",
     )
     .into()
 }
@@ -735,6 +779,25 @@ mod tests {
         let cache = DownloadCache::new(dir.path().to_path_buf(), 100);
         assert!(cache.lease("../outside.mp4").is_err());
         assert!(cache.begin_maintenance(Duration::ZERO).is_ok());
+    }
+
+    #[test]
+    fn destructive_operations_fail_closed_during_project_inventory() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DownloadCache::new(dir.path().to_path_buf(), 0);
+        let path = write(&cache, "stock/unclassified.mp4", 8);
+
+        cache.block_destructive_operations();
+        assert!(cache.destructive_operations_blocked());
+        cache.enforce_quota();
+        assert!(path.exists());
+        assert!(cache.clear().is_err());
+        assert!(path.exists());
+
+        cache.allow_destructive_operations();
+        assert!(!cache.destructive_operations_blocked());
+        cache.enforce_quota();
+        assert!(!path.exists());
     }
 
     #[test]
