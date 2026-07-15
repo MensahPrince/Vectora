@@ -31,6 +31,7 @@
 use std::error::Error;
 use std::fmt;
 
+pub mod moments;
 mod shot_detection;
 
 pub use shot_detection::{
