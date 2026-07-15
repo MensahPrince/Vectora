@@ -47,6 +47,8 @@ pub enum CacheId {
     Proxies,
     /// Regenerable media-analysis state such as moments and transcripts.
     Analysis,
+    /// Downloaded AI model weights for transcription, vision, and embeddings.
+    AiModels,
     /// Remotely downloaded source assets.
     Download,
     /// Downloaded asset-catalog data.
@@ -61,13 +63,14 @@ pub enum CacheId {
 
 impl CacheId {
     /// Every cache identifier in deterministic registry order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::PreviewFrames,
         Self::LibraryThumbnails,
         Self::TimelineFilmstrips,
         Self::TimelineWaveforms,
         Self::Proxies,
         Self::Analysis,
+        Self::AiModels,
         Self::Download,
         Self::Catalog,
         Self::Luts,
@@ -84,6 +87,7 @@ impl CacheId {
             Self::TimelineWaveforms => "timeline_waveforms",
             Self::Proxies => "proxies",
             Self::Analysis => "analysis",
+            Self::AiModels => "ai_models",
             Self::Download => "download",
             Self::Catalog => "catalog",
             Self::Luts => "luts",
@@ -120,6 +124,7 @@ impl FromStr for CacheId {
             "timeline_waveforms" => Ok(Self::TimelineWaveforms),
             "proxies" => Ok(Self::Proxies),
             "analysis" => Ok(Self::Analysis),
+            "ai_models" => Ok(Self::AiModels),
             "download" => Ok(Self::Download),
             "catalog" => Ok(Self::Catalog),
             "luts" => Ok(Self::Luts),
@@ -189,7 +194,7 @@ pub struct CacheDescriptor {
 ///
 /// Projects, configuration, and agent sessions are intentionally absent:
 /// they are not clearable caches.
-pub static CACHE_REGISTRY: [CacheDescriptor; 11] = [
+pub static CACHE_REGISTRY: [CacheDescriptor; 12] = [
     CacheDescriptor {
         id: CacheId::PreviewFrames,
         label: "Preview frames",
@@ -231,6 +236,13 @@ pub static CACHE_REGISTRY: [CacheDescriptor; 11] = [
         kind: CacheKind::Disk,
         tier: CacheTier::Disposable,
         default_relative: Some("analysis"),
+    },
+    CacheDescriptor {
+        id: CacheId::AiModels,
+        label: "AI models",
+        kind: CacheKind::Disk,
+        tier: CacheTier::Redownloadable,
+        default_relative: Some("ai-models"),
     },
     CacheDescriptor {
         id: CacheId::Download,

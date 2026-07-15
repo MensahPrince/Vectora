@@ -89,6 +89,13 @@ fn registry_is_exact_unique_and_round_trips() {
             Some("analysis"),
         ),
         (
+            "ai_models",
+            "AI models",
+            CacheKind::Disk,
+            CacheTier::Redownloadable,
+            Some("ai-models"),
+        ),
+        (
             "download",
             "Downloads",
             CacheKind::Disk,
@@ -189,6 +196,29 @@ fn analysis_cache_has_a_stable_disk_contract() {
 }
 
 #[test]
+fn ai_models_cache_has_a_stable_redownloadable_disk_contract() {
+    let temporary = TestDirectory::new();
+    let layout = StorageLayout::new(&temporary.path).unwrap();
+    let descriptor = CacheId::AiModels.descriptor();
+    let root = temporary.path.join("ai-models");
+
+    assert_eq!(CacheId::parse("ai_models"), Ok(CacheId::AiModels));
+    assert_eq!("ai_models".parse::<CacheId>(), Ok(CacheId::AiModels));
+    assert_eq!(CacheId::AiModels.to_string(), "ai_models");
+    assert_eq!(cache_descriptor_by_key("ai_models"), Some(descriptor));
+    assert_eq!(descriptor.label, "AI models");
+    assert_eq!(descriptor.kind, CacheKind::Disk);
+    assert_eq!(descriptor.tier, CacheTier::Redownloadable);
+    assert_eq!(descriptor.default_relative, Some("ai-models"));
+    assert_eq!(layout.resolve(CacheId::AiModels), Some(root.clone()));
+
+    fs::create_dir_all(&root).unwrap();
+    fs::write(root.join("ggml-base.en.bin"), b"model-weights").unwrap();
+    let usage = measure_disk_usage(&root, &NeverCancelled).unwrap();
+    assert_eq!((usage.bytes, usage.files), (13, 1));
+}
+
+#[test]
 fn analysis_cache_participates_in_overlap_validation() {
     let temporary = TestDirectory::new();
     let mut layout = StorageLayout::new(&temporary.path).unwrap();
@@ -216,8 +246,36 @@ fn analysis_cache_participates_in_overlap_validation() {
 }
 
 #[test]
+fn ai_models_cache_participates_in_overlap_validation() {
+    let temporary = TestDirectory::new();
+    let mut layout = StorageLayout::new(&temporary.path).unwrap();
+
+    assert!(matches!(
+        layout.set_override(
+            CacheId::AiModels,
+            temporary.path.join("analysis").join("models")
+        ),
+        Err(StorageError::CachePathsOverlap {
+            cache: CacheId::AiModels,
+            other: CacheId::Analysis,
+        })
+    ));
+    assert!(matches!(
+        layout.set_override(
+            CacheId::Download,
+            temporary.path.join("ai-models").join("nested")
+        ),
+        Err(StorageError::CachePathsOverlap {
+            cache: CacheId::Download,
+            other: CacheId::AiModels,
+        })
+    ));
+}
+
+#[test]
 fn layout_resolves_roots_and_overrides_deterministically() {
     let temporary = TestDirectory::new();
+    let ai_models_root = temporary.path.join("custom-ai-models");
     let override_root = temporary.path.join("custom-download");
     let luts_root = temporary.path.join("custom-luts");
     let layout = StorageLayout::with_overrides(
@@ -225,6 +283,7 @@ fn layout_resolves_roots_and_overrides_deterministically() {
         [
             ("luts", luts_root.clone()),
             ("download", override_root.clone()),
+            ("ai_models", ai_models_root.clone()),
         ],
     )
     .unwrap();
@@ -239,6 +298,10 @@ fn layout_resolves_roots_and_overrides_deterministically() {
         layout.resolve(CacheId::Download),
         Some(override_root.clone())
     );
+    assert_eq!(
+        layout.resolve(CacheId::AiModels),
+        Some(ai_models_root.clone())
+    );
     assert_eq!(layout.resolve(CacheId::Luts), Some(luts_root.clone()));
     assert_eq!(
         layout.resolve(CacheId::Catalog),
@@ -246,7 +309,10 @@ fn layout_resolves_roots_and_overrides_deterministically() {
     );
 
     let override_ids: Vec<_> = layout.overrides().keys().copied().collect();
-    assert_eq!(override_ids, [CacheId::Download, CacheId::Luts]);
+    assert_eq!(
+        override_ids,
+        [CacheId::AiModels, CacheId::Download, CacheId::Luts]
+    );
     let resolved_ids: Vec<_> = layout
         .resolved_disk_paths()
         .into_iter()
@@ -257,6 +323,7 @@ fn layout_resolves_roots_and_overrides_deterministically() {
         [
             CacheId::Proxies,
             CacheId::Analysis,
+            CacheId::AiModels,
             CacheId::Download,
             CacheId::Catalog,
             CacheId::Luts,
