@@ -310,8 +310,9 @@ pub fn decode_png(bytes: &[u8]) -> Result<RgbaImage, RenderError> {
     const MAX_PIXELS: u64 = 4 * 1024 * 1024;
     const DECODER_BUDGET: usize = 24 * 1024 * 1024;
 
-    let mut limits = png::Limits::default();
-    limits.bytes = DECODER_BUDGET;
+    let limits = png::Limits {
+        bytes: DECODER_BUDGET,
+    };
     let mut decoder = png::Decoder::new_with_limits(bytes, limits);
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
     let mut reader = decoder
