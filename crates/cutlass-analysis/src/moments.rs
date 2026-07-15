@@ -1,8 +1,8 @@
 //! Validated domain and query types for persistent media moments.
 //!
-//! This module contains no storage implementation. It defines the values a
-//! storage adapter must persist and the matching behavior that in-memory and
-//! database-backed queries must share.
+//! The domain values and in-memory matching behavior remain dependency-free.
+//! Enabling the `sqlite` feature also exposes the optional persistent
+//! [`MomentsIndex`] adapter.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
@@ -12,6 +12,17 @@ use std::num::NonZeroU32;
 use std::str::FromStr;
 
 use crate::TimeSpan;
+
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
+
+#[cfg(feature = "sqlite")]
+pub use sqlite::{
+    DEFAULT_MOMENTS_BUSY_TIMEOUT, DEFAULT_MOMENTS_QUERY_LIMIT, MAX_MOMENT_TIME_SECONDS,
+    MAX_MOMENTS_BUSY_TIMEOUT, MAX_MOMENTS_QUERY_LIMIT, MOMENTS_INDEX_DATABASE_FILENAME,
+    MOMENTS_INDEX_SCHEMA_VERSION, MomentsIndex, MomentsIndexConfig, MomentsIndexError,
+    MomentsQueryResult,
+};
 
 /// Number of bytes in a [`MediaContentKey`].
 pub const MEDIA_CONTENT_KEY_BYTES: usize = 32;
