@@ -1,8 +1,9 @@
 //! On-disk project files (`.cutlass` JSON).
 
-use std::fs::File;
-use std::io::{self, BufWriter, Write};
-use std::path::Path;
+use std::fs::{File, OpenOptions, Permissions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Deserialize;
 
@@ -16,6 +17,9 @@ pub const PROJECT_FILE_EXTENSION: &str = "cutlass";
 /// Numeric version from [`ProjectSchema::current`] for simple callers.
 pub const PROJECT_FILE_VERSION: u32 = PROJECT_SCHEMA_VERSION;
 
+const UNIQUE_PATH_ATTEMPTS: usize = 128;
+static UNIQUE_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
 impl Project {
     /// Serialize this project to a `.cutlass` JSON file.
     ///
@@ -27,12 +31,12 @@ impl Project {
         let mut doc = self.clone();
         doc.schema.version = PROJECT_SCHEMA_VERSION;
         doc.schema.kind = crate::schema::PROJECT_SCHEMA_KIND.into();
-        let json = serde_json::to_string_pretty(&doc).map_err(io::Error::other)?;
-        let mut writer = BufWriter::new(File::create(path)?);
-        writer.write_all(json.as_bytes())?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-        Ok(())
+        let mut json = serde_json::to_string_pretty(&doc).map_err(io::Error::other)?;
+        json.push('\n');
+
+        // Keep serialization entirely ahead of filesystem inspection so a
+        // serialization failure cannot disturb an existing project.
+        persist_serialized(path, json.as_bytes(), &StdPersistenceFs)
     }
 
     /// Deserialize a project from a `.cutlass` JSON file.
@@ -63,6 +67,359 @@ impl Project {
         project.timeline_mut().normalize_lanes();
         Ok(project)
     }
+}
+
+trait PersistenceFs {
+    fn create_new(&self, path: &Path) -> io::Result<File>;
+    fn write_all(&self, file: &mut File, contents: &[u8]) -> io::Result<()>;
+    fn flush(&self, file: &mut File) -> io::Result<()>;
+    fn set_permissions(&self, file: &File, permissions: Permissions) -> io::Result<()>;
+    fn sync_all(&self, file: &File) -> io::Result<()>;
+    fn symlink_metadata(&self, path: &Path) -> io::Result<std::fs::Metadata>;
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+    fn create_dir(&self, path: &Path) -> io::Result<()>;
+    fn remove_file(&self, path: &Path) -> io::Result<()>;
+    fn remove_dir(&self, path: &Path) -> io::Result<()>;
+}
+
+struct StdPersistenceFs;
+
+impl PersistenceFs for StdPersistenceFs {
+    fn create_new(&self, path: &Path) -> io::Result<File> {
+        open_new_temp(path)
+    }
+
+    fn write_all(&self, file: &mut File, contents: &[u8]) -> io::Result<()> {
+        file.write_all(contents)
+    }
+
+    fn flush(&self, file: &mut File) -> io::Result<()> {
+        file.flush()
+    }
+
+    fn set_permissions(&self, file: &File, permissions: Permissions) -> io::Result<()> {
+        file.set_permissions(permissions)
+    }
+
+    fn sync_all(&self, file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
+
+    fn symlink_metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+        std::fs::symlink_metadata(path)
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    fn create_dir(&self, path: &Path) -> io::Result<()> {
+        create_private_dir(path)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
+    }
+
+    fn remove_dir(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_dir(path)
+    }
+}
+
+fn persist_serialized(
+    destination: &Path,
+    contents: &[u8],
+    fs: &impl PersistenceFs,
+) -> io::Result<()> {
+    let permissions = destination_permissions(destination, fs)?;
+    let temporary = write_synced_temp(destination, contents, permissions, fs)?;
+    install_temp_with_ops(destination, &temporary, fs)
+}
+
+fn destination_permissions(
+    destination: &Path,
+    fs: &impl PersistenceFs,
+) -> io::Result<Option<Permissions>> {
+    match fs.symlink_metadata(destination) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to save through a symbolic-link project destination",
+        )),
+        Ok(metadata) if !metadata.file_type().is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project destination is not a regular file",
+        )),
+        Ok(metadata) => Ok(Some(metadata.permissions())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(contextual_error(
+            "could not inspect the project destination",
+            error,
+        )),
+    }
+}
+
+fn write_synced_temp(
+    destination: &Path,
+    contents: &[u8],
+    permissions: Option<Permissions>,
+    fs: &impl PersistenceFs,
+) -> io::Result<PathBuf> {
+    let (temporary, mut file) = create_unique_temp(destination, fs)?;
+    let result = (|| {
+        fs.write_all(&mut file, contents)
+            .map_err(|error| contextual_error("could not write the temporary project", error))?;
+        fs.flush(&mut file)
+            .map_err(|error| contextual_error("could not flush the temporary project", error))?;
+        if let Some(permissions) = permissions {
+            fs.set_permissions(&file, permissions).map_err(|error| {
+                contextual_error("could not preserve project file permissions", error)
+            })?;
+        }
+        fs.sync_all(&file)
+            .map_err(|error| contextual_error("could not sync the temporary project", error))
+    })();
+    drop(file);
+
+    match result {
+        Ok(()) => Ok(temporary),
+        Err(error) => Err(cleanup_temp_after_error(fs, &temporary, error)),
+    }
+}
+
+fn create_unique_temp(destination: &Path, fs: &impl PersistenceFs) -> io::Result<(PathBuf, File)> {
+    for _ in 0..UNIQUE_PATH_ATTEMPTS {
+        let candidate = unique_sibling_path(destination, "tmp")?;
+        match fs.create_new(&candidate) {
+            Ok(file) => return Ok((candidate, file)),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(contextual_error(
+                    "could not create a temporary project file",
+                    error,
+                ));
+            }
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique temporary project file",
+    ))
+}
+
+fn open_new_temp(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+#[derive(Debug)]
+struct BackupPaths {
+    container: PathBuf,
+    project: PathBuf,
+}
+
+fn create_unique_backup(destination: &Path, fs: &impl PersistenceFs) -> io::Result<BackupPaths> {
+    for _ in 0..UNIQUE_PATH_ATTEMPTS {
+        let container = unique_sibling_path(destination, "backup")?;
+        match fs.create_dir(&container) {
+            Ok(()) => {
+                let project = container.join("original");
+                return Ok(BackupPaths { container, project });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(contextual_error(
+                    "could not create a rollback backup for the project",
+                    error,
+                ));
+            }
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique rollback backup for the project",
+    ))
+}
+
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn install_temp_with_ops(
+    destination: &Path,
+    temporary: &Path,
+    fs: &impl PersistenceFs,
+) -> io::Result<()> {
+    // Recheck after the potentially long write/sync phase. This is not a
+    // platform-specific openat lock, but it fails closed for every symlink
+    // destination observed by the portable persistence path.
+    if let Err(error) = destination_permissions(destination, fs) {
+        return Err(cleanup_temp_after_error(fs, temporary, error));
+    }
+
+    let atomic_error = match fs.rename(temporary, destination) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+
+    match destination_permissions(destination, fs) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            let error =
+                contextual_error("could not atomically install the new project", atomic_error);
+            return Err(cleanup_temp_after_error(fs, temporary, error));
+        }
+        Err(error) => return Err(cleanup_temp_after_error(fs, temporary, error)),
+    }
+
+    // Some platforms cannot rename over an existing file. Reserve a private,
+    // unique sibling directory first, then move the old file into it. The
+    // original is always either at the destination or in this backup; it is
+    // never deleted before the new file reaches the commit point.
+    let backup = match create_unique_backup(destination, fs) {
+        Ok(backup) => backup,
+        Err(error) => {
+            let error = io::Error::new(
+                error.kind(),
+                format!(
+                    "atomic project replacement failed ({atomic_error}); \
+                     rollback backup creation also failed: {error}"
+                ),
+            );
+            return Err(cleanup_temp_after_error(fs, temporary, error));
+        }
+    };
+
+    if let Err(backup_error) = fs.rename(destination, &backup.project) {
+        let error = io::Error::new(
+            backup_error.kind(),
+            format!(
+                "atomic project replacement failed ({atomic_error}); moving the existing project \
+                 to a rollback backup also failed: {backup_error}; the existing project was left \
+                 in place"
+            ),
+        );
+        let error = cleanup_empty_backup_after_error(fs, &backup.container, error);
+        return Err(cleanup_temp_after_error(fs, temporary, error));
+    }
+
+    match fs.rename(temporary, destination) {
+        Ok(()) => {
+            // The new destination is committed. Cleanup is deliberately
+            // best-effort: a stale backup must not turn a successful save into
+            // an error after callers can already observe the new project.
+            let _ = fs.remove_file(&backup.project);
+            let _ = fs.remove_dir(&backup.container);
+            Ok(())
+        }
+        Err(install_error) => match fs.rename(&backup.project, destination) {
+            Ok(()) => {
+                let error = io::Error::new(
+                    install_error.kind(),
+                    format!(
+                        "could not install the new project after creating a rollback backup: \
+                         {install_error}; the original project was restored"
+                    ),
+                );
+                let error = cleanup_empty_backup_after_error(fs, &backup.container, error);
+                Err(cleanup_temp_after_error(fs, temporary, error))
+            }
+            Err(rollback_error) => {
+                let error = io::Error::new(
+                    install_error.kind(),
+                    format!(
+                        "could not install the new project after creating a rollback backup: \
+                         {install_error}; restoring the original project failed: {rollback_error}; \
+                         the original project was retained in a sibling backup"
+                    ),
+                );
+                Err(cleanup_temp_after_error(fs, temporary, error))
+            }
+        },
+    }
+}
+
+fn unique_sibling_path(destination: &Path, role: &str) -> io::Result<PathBuf> {
+    let parent = destination_parent(destination)?;
+    if destination.file_name().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project destination has no file name",
+        ));
+    }
+
+    let nonce = UNIQUE_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
+    Ok(parent.join(format!(
+        ".cutlass-project-{role}-{}-{nonce}",
+        std::process::id()
+    )))
+}
+
+fn destination_parent(destination: &Path) -> io::Result<&Path> {
+    let parent = destination.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project destination has no parent directory",
+        )
+    })?;
+    if parent.as_os_str().is_empty() {
+        Ok(Path::new("."))
+    } else {
+        Ok(parent)
+    }
+}
+
+fn cleanup_temp_after_error(
+    fs: &impl PersistenceFs,
+    temporary: &Path,
+    primary_error: io::Error,
+) -> io::Error {
+    match fs.remove_file(temporary) {
+        Ok(()) => primary_error,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => primary_error,
+        Err(error) => io::Error::new(
+            primary_error.kind(),
+            format!(
+                "{primary_error}; temporary project cleanup also failed: {error}; \
+                 a temporary sibling may remain"
+            ),
+        ),
+    }
+}
+
+fn cleanup_empty_backup_after_error(
+    fs: &impl PersistenceFs,
+    backup_container: &Path,
+    primary_error: io::Error,
+) -> io::Error {
+    match fs.remove_dir(backup_container) {
+        Ok(()) => primary_error,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => primary_error,
+        Err(error) => io::Error::new(
+            primary_error.kind(),
+            format!(
+                "{primary_error}; empty rollback-backup cleanup also failed: {error}; \
+                 an empty sibling directory may remain"
+            ),
+        ),
+    }
+}
+
+fn contextual_error(context: &'static str, error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("{context}: {error}"))
 }
 
 /// Unwrap the legacy `{ "version", "project" }` envelope (early v1 saves)
@@ -170,12 +527,156 @@ fn validate_schema(found: &ProjectSchema) -> Result<(), ModelError> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
     use super::*;
     use crate::clip::{Clip, Generator};
     use crate::time::{Rational, RationalTime, TimeRange};
     use crate::track::TrackKind;
 
     const R24: Rational = Rational::FPS_24;
+
+    #[derive(Default)]
+    struct FaultFs {
+        operations: RefCell<Vec<&'static str>>,
+        create_new_calls: Cell<usize>,
+        create_dir_calls: Cell<usize>,
+        rename_calls: Cell<usize>,
+        remove_file_calls: Cell<usize>,
+        temp_collisions: usize,
+        backup_collisions: usize,
+        fail_write: bool,
+        fail_flush: bool,
+        fail_permissions: bool,
+        fail_sync: bool,
+        failed_renames: Vec<usize>,
+        failed_remove_files: Vec<usize>,
+    }
+
+    impl FaultFs {
+        fn next_call(counter: &Cell<usize>) -> usize {
+            let call = counter.get() + 1;
+            counter.set(call);
+            call
+        }
+
+        fn record(&self, operation: &'static str) {
+            self.operations.borrow_mut().push(operation);
+        }
+
+        fn injected(operation: &str, call: usize) -> io::Error {
+            io::Error::other(format!("injected {operation} failure #{call}"))
+        }
+    }
+
+    impl PersistenceFs for FaultFs {
+        fn create_new(&self, path: &Path) -> io::Result<File> {
+            self.record("create_new");
+            let call = Self::next_call(&self.create_new_calls);
+            if call <= self.temp_collisions {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "injected temporary-path collision",
+                ));
+            }
+            open_new_temp(path)
+        }
+
+        fn write_all(&self, file: &mut File, contents: &[u8]) -> io::Result<()> {
+            self.record("write_all");
+            if self.fail_write {
+                return Err(Self::injected("write", 1));
+            }
+            Write::write_all(file, contents)
+        }
+
+        fn flush(&self, file: &mut File) -> io::Result<()> {
+            self.record("flush");
+            if self.fail_flush {
+                return Err(Self::injected("flush", 1));
+            }
+            Write::flush(file)
+        }
+
+        fn set_permissions(&self, file: &File, permissions: Permissions) -> io::Result<()> {
+            self.record("set_permissions");
+            if self.fail_permissions {
+                return Err(Self::injected("permission", 1));
+            }
+            file.set_permissions(permissions)
+        }
+
+        fn sync_all(&self, file: &File) -> io::Result<()> {
+            self.record("sync_all");
+            if self.fail_sync {
+                return Err(Self::injected("sync", 1));
+            }
+            file.sync_all()
+        }
+
+        fn symlink_metadata(&self, path: &Path) -> io::Result<std::fs::Metadata> {
+            std::fs::symlink_metadata(path)
+        }
+
+        fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+            self.record("rename");
+            let call = Self::next_call(&self.rename_calls);
+            if self.failed_renames.contains(&call) {
+                return Err(Self::injected("rename", call));
+            }
+            std::fs::rename(from, to)
+        }
+
+        fn create_dir(&self, path: &Path) -> io::Result<()> {
+            self.record("create_dir");
+            let call = Self::next_call(&self.create_dir_calls);
+            if call <= self.backup_collisions {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "injected backup-path collision",
+                ));
+            }
+            create_private_dir(path)
+        }
+
+        fn remove_file(&self, path: &Path) -> io::Result<()> {
+            self.record("remove_file");
+            let call = Self::next_call(&self.remove_file_calls);
+            if self.failed_remove_files.contains(&call) {
+                return Err(Self::injected("remove-file", call));
+            }
+            std::fs::remove_file(path)
+        }
+
+        fn remove_dir(&self, path: &Path) -> io::Result<()> {
+            self.record("remove_dir");
+            std::fs::remove_dir(path)
+        }
+    }
+
+    fn transaction_artifacts(directory: &Path) -> Vec<PathBuf> {
+        let mut artifacts: Vec<_> = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name().is_some_and(|name| {
+                    let name = name.to_string_lossy();
+                    name.starts_with(".cutlass-project-tmp-")
+                        || name.starts_with(".cutlass-project-backup-")
+                })
+            })
+            .collect();
+        artifacts.sort();
+        artifacts
+    }
+
+    fn assert_no_transaction_artifacts(directory: &Path) {
+        let artifacts = transaction_artifacts(directory);
+        assert!(
+            artifacts.is_empty(),
+            "unexpected project-save artifacts: {artifacts:?}"
+        );
+    }
 
     #[test]
     fn roundtrip_save_load_preserves_timeline_and_metadata() {
@@ -219,6 +720,264 @@ mod tests {
         assert_eq!(loaded.metadata, project.metadata);
         assert_eq!(loaded.media_count(), 1);
         assert_eq!(loaded.timeline().clip_count(), 2);
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn save_preserves_pretty_json_with_trailing_newline() {
+        let project = Project::new("format", R24);
+        let mut expected_document = project.clone();
+        expected_document.schema.version = PROJECT_SCHEMA_VERSION;
+        expected_document.schema.kind = crate::schema::PROJECT_SCHEMA_KIND.into();
+        let mut expected = serde_json::to_string_pretty(&expected_document).unwrap();
+        expected.push('\n');
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("format.cutlass");
+        project.save_to_file(&path).unwrap();
+
+        assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn atomic_save_replaces_and_roundtrips_without_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replace.cutlass");
+        Project::new("old", R24).save_to_file(&path).unwrap();
+
+        let mut replacement = Project::new("new", R24);
+        replacement.metadata_mut().description = "replacement".into();
+        replacement.save_to_file(&path).unwrap();
+
+        let loaded = Project::load_from_file(&path).unwrap();
+        assert_eq!(loaded.name, "new");
+        assert_eq!(loaded.metadata.description, "replacement");
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn serialization_failure_precedes_destination_access() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.cutlass");
+        let original = b"known-good project";
+        std::fs::write(&path, original).unwrap();
+
+        let mut project = Project::new("invalid path", R24);
+        project.add_media(crate::MediaSource::new(
+            PathBuf::from(OsString::from_vec(vec![0xff])),
+            1920,
+            1080,
+            R24,
+            24,
+            false,
+        ));
+
+        project.save_to_file(&path).unwrap_err();
+
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn sync_failure_keeps_old_project_and_prevents_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.cutlass");
+        let original = b"known-good project";
+        std::fs::write(&path, original).unwrap();
+        let fs = FaultFs {
+            fail_sync: true,
+            ..FaultFs::default()
+        };
+
+        let error = persist_serialized(&path, b"replacement", &fs).unwrap_err();
+
+        assert!(error.to_string().contains("could not sync"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(
+            *fs.operations.borrow(),
+            [
+                "create_new",
+                "write_all",
+                "flush",
+                "set_permissions",
+                "sync_all",
+                "remove_file"
+            ]
+        );
+        assert_eq!(fs.rename_calls.get(), 0);
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn fallback_swap_replaces_existing_project_and_cleans_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fallback.cutlass");
+        let original = b"old project";
+        let replacement = b"new project";
+        std::fs::write(&path, original).unwrap();
+        let fs = FaultFs {
+            failed_renames: vec![1],
+            ..FaultFs::default()
+        };
+
+        persist_serialized(&path, replacement, &fs).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        assert_eq!(fs.rename_calls.get(), 3);
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn fallback_install_failure_restores_original_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollback.cutlass");
+        let original = b"old project";
+        std::fs::write(&path, original).unwrap();
+        let fs = FaultFs {
+            failed_renames: vec![1, 3],
+            ..FaultFs::default()
+        };
+
+        let error = persist_serialized(&path, b"new project", &fs).unwrap_err();
+
+        assert!(
+            error.to_string().contains("original project was restored"),
+            "{error}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert_eq!(fs.rename_calls.get(), 4);
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[test]
+    fn failed_rollback_retains_the_only_good_copy_in_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("retained.cutlass");
+        let original = b"old project";
+        std::fs::write(&path, original).unwrap();
+        let fs = FaultFs {
+            failed_renames: vec![1, 3, 4],
+            ..FaultFs::default()
+        };
+
+        let error = persist_serialized(&path, b"new project", &fs).unwrap_err();
+
+        assert!(
+            error.to_string().contains("retained in a sibling backup"),
+            "{error}"
+        );
+        assert!(!path.exists());
+        let artifacts = transaction_artifacts(dir.path());
+        assert_eq!(artifacts.len(), 1, "{artifacts:?}");
+        assert_eq!(
+            std::fs::read(artifacts[0].join("original")).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn committed_save_ignores_backup_cleanup_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("committed.cutlass");
+        let original = b"old project";
+        let replacement = b"new project";
+        std::fs::write(&path, original).unwrap();
+        let fs = FaultFs {
+            failed_renames: vec![1],
+            failed_remove_files: vec![1],
+            ..FaultFs::default()
+        };
+
+        persist_serialized(&path, replacement, &fs).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), replacement);
+        let artifacts = transaction_artifacts(dir.path());
+        assert_eq!(artifacts.len(), 1, "{artifacts:?}");
+        assert_eq!(
+            std::fs::read(artifacts[0].join("original")).unwrap(),
+            original
+        );
+        std::fs::remove_dir_all(&artifacts[0]).unwrap();
+    }
+
+    #[test]
+    fn unique_path_allocation_is_bounded_under_collisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collision.cutlass");
+
+        let temp_fs = FaultFs {
+            temp_collisions: UNIQUE_PATH_ATTEMPTS,
+            ..FaultFs::default()
+        };
+        let error = create_unique_temp(&path, &temp_fs).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(temp_fs.create_new_calls.get(), UNIQUE_PATH_ATTEMPTS);
+
+        let backup_fs = FaultFs {
+            backup_collisions: UNIQUE_PATH_ATTEMPTS,
+            ..FaultFs::default()
+        };
+        let error = create_unique_backup(&path, &backup_fs).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(backup_fs.create_dir_calls.get(), UNIQUE_PATH_ATTEMPTS);
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_preserves_existing_file_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("permissions.cutlass");
+        std::fs::write(&path, b"old project").unwrap();
+        std::fs::set_permissions(&path, Permissions::from_mode(0o640)).unwrap();
+
+        Project::new("permissions", R24)
+            .save_to_file(&path)
+            .unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        assert_no_transaction_artifacts(dir.path());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_rejects_symlink_destination_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.cutlass");
+        let destination = dir.path().join("link.cutlass");
+        let original = b"known-good project";
+        std::fs::write(&target, original).unwrap();
+        symlink(&target, &destination).unwrap();
+
+        let error = Project::new("replacement", R24)
+            .save_to_file(&destination)
+            .unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            !error
+                .to_string()
+                .contains(dir.path().to_string_lossy().as_ref()),
+            "error exposed the project directory: {error}"
+        );
+        assert_eq!(std::fs::read(&target).unwrap(), original);
+        assert!(
+            std::fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_no_transaction_artifacts(dir.path());
     }
 
     #[test]
