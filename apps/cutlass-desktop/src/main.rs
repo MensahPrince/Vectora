@@ -2,6 +2,7 @@ mod account;
 mod agent;
 mod agent_app_control;
 mod agent_jobs;
+mod agent_project;
 mod agent_senses;
 mod agent_session;
 mod agent_system;

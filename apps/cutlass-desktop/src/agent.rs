@@ -487,7 +487,7 @@ impl<W: ProjectSnapshotSource + ?Sized> EngineBridge for SandboxBridge<'_, W> {
         name: &str,
         _arguments: &serde_json::Value,
     ) -> Result<(), String> {
-        if cutlass_ai::namespace(name) == "project" && !self.plan.is_empty() {
+        if crate::agent_project::mutates_live_project(name) && !self.plan.is_empty() {
             return Err(format!(
                 "{name} cannot run while timeline edits are staged; project operations must \
                  happen before staged edits, or after the user applies or discards the pending \
@@ -503,7 +503,7 @@ impl<W: ProjectSnapshotSource + ?Sized> EngineBridge for SandboxBridge<'_, W> {
         _arguments: &serde_json::Value,
         _result: Result<&ToolOutput, &str>,
     ) -> Result<(), String> {
-        if cutlass_ai::namespace(name) != "project" {
+        if !crate::agent_project::mutates_live_project(name) {
             return Ok(());
         }
 
@@ -734,15 +734,17 @@ struct DesktopToolHandles {
     app: slint::Weak<AppWindow>,
     cache_registry: Option<CacheRegistry>,
     job_manager: JobManager,
+    worker: Option<WorkerHandle>,
 }
 
-impl From<&AgentRuntimeHandles> for DesktopToolHandles {
-    fn from(runtime: &AgentRuntimeHandles) -> Self {
+impl DesktopToolHandles {
+    fn from_runtime(runtime: &AgentRuntimeHandles, worker: &WorkerHandle) -> Self {
         Self {
             store: runtime.store.clone(),
             app: runtime.app.clone(),
             cache_registry: Some(runtime.cache_registry.clone()),
             job_manager: runtime.job_manager.clone(),
+            worker: Some(worker.clone()),
         }
     }
 }
@@ -784,6 +786,7 @@ impl DesktopToolHost {
 impl ToolHost for DesktopToolHost {
     fn tools(&self) -> Vec<HostToolSpec> {
         let mut specs = crate::agent_app_control::specs();
+        specs.extend(crate::agent_project::specs());
         specs.extend(crate::agent_jobs::specs());
         specs.extend(crate::agent_system::specs());
         specs
@@ -864,7 +867,10 @@ impl ToolHost for DesktopToolHost {
         cancel: &AtomicBool,
     ) -> Result<ToolOutput, String> {
         let namespace = cutlass_ai::namespace(name);
-        if matches!(namespace, "app" | "project" | "system") || name == "job_cancel" {
+        if matches!(namespace, "app" | "system")
+            || name == "job_cancel"
+            || crate::agent_project::mutates_live_project(name)
+        {
             // Set this before dispatch: an error can still follow a partial
             // host-side effect, so abort messaging must be conservative.
             self.ordinary_host_call_attempted = true;
@@ -872,6 +878,9 @@ impl ToolHost for DesktopToolHost {
         match namespace {
             "app" => {
                 crate::agent_app_control::call(self.runtime.app.clone(), name, arguments, cancel)
+            }
+            "project" => {
+                crate::agent_project::call(self.runtime.worker.as_ref(), name, arguments, cancel)
             }
             "job" => crate::agent_jobs::call(&self.runtime.job_manager, name, arguments, cancel),
             "system" => crate::agent_system::call(
@@ -1212,7 +1221,7 @@ fn run_one_prompt(
     };
     let mut tool_host = DesktopToolHost::new(
         section.autonomy,
-        DesktopToolHandles::from(runtime),
+        DesktopToolHandles::from_runtime(runtime, worker),
         approval_rx.clone(),
         pending_approval_id.clone(),
         approval_id_allocator.clone(),
@@ -1410,6 +1419,7 @@ mod tests {
             app: slint::Weak::default(),
             cache_registry: None,
             job_manager,
+            worker: None,
         }
     }
 
@@ -1605,7 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_host_registers_app_job_and_system_tools_by_tier() {
+    fn desktop_host_registers_app_project_job_and_system_tools_by_tier() {
         let (_tx, rx) = unbounded();
         let host = DesktopToolHost::new(
             Autonomy::Ask,
@@ -1615,7 +1625,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         );
         let specs = host.tools();
-        assert_eq!(specs.len(), 20);
+        assert_eq!(specs.len(), 22);
         assert_eq!(
             specs
                 .iter()
@@ -1629,6 +1639,17 @@ mod tests {
                 .find(|spec| spec.name == "app_close")
                 .map(|spec| spec.tier),
             Some(ToolTier::System)
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .filter(|spec| spec.name.starts_with("project_"))
+                .map(|spec| (spec.name.as_str(), spec.tier))
+                .collect::<Vec<_>>(),
+            vec![
+                ("project_list_drafts", ToolTier::ReadOnly),
+                ("project_save", ToolTier::Workspace),
+            ]
         );
         assert_eq!(
             specs
@@ -1663,6 +1684,32 @@ mod tests {
                 "system_cache_relocate",
             ]
         );
+    }
+
+    #[test]
+    fn project_tools_never_enter_the_system_approval_flow() {
+        let (tx, rx) = unbounded();
+        drop(tx);
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Ask,
+            test_tool_handles(JobManager::new()),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        for (name, tier) in [
+            ("project_list_drafts", ToolTier::ReadOnly),
+            ("project_save", ToolTier::Workspace),
+        ] {
+            host.authorize(name, &serde_json::json!({}), tier, &cancel)
+                .expect("project tools do not require approval");
+        }
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1702,7 +1749,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_host_tracks_unknown_effect_namespaces_before_dispatch() {
+    fn desktop_host_dispatches_project_tools_and_tracks_only_save_as_an_effect() {
         let (_tx, rx) = unbounded();
         let mut host = DesktopToolHost::new(
             Autonomy::Full,
@@ -1714,10 +1761,23 @@ mod tests {
         let cancel = AtomicBool::new(false);
 
         assert!(!host.ordinary_host_call_attempted());
+        let list_error = host
+            .call(
+                "project_list_drafts",
+                &serde_json::json!({"limit": 0}),
+                &cancel,
+            )
+            .expect_err("malformed draft listing must dispatch to its strict parser");
+        assert!(list_error.contains("integer from 1 through 100"));
+        assert!(
+            !host.ordinary_host_call_attempted(),
+            "a read-only project query is not an ordinary host effect"
+        );
+
         let error = host
-            .call("project_future_operation", &serde_json::json!({}), &cancel)
-            .expect_err("future project dispatch is not wired yet");
-        assert!(error.contains("unsupported desktop tool namespace 'project'"));
+            .call("project_save", &serde_json::json!({}), &cancel)
+            .expect_err("test fixture has no worker");
+        assert!(error.contains("editor worker is unavailable"));
         assert!(host.ordinary_host_call_attempted());
     }
 
@@ -1892,15 +1952,17 @@ mod tests {
         };
 
         let error = bridge
-            .before_host_call(
-                "project_import_media",
-                &serde_json::json!({ "path": "/tmp/new.mp4" }),
-            )
+            .before_host_call("project_save", &serde_json::json!({}))
             .expect_err("project mutation must not invalidate a staged plan");
         assert!(error.contains("before staged edits"), "{error}");
         assert!(
             error.contains("applies or discards the pending plan"),
             "{error}"
+        );
+        assert_eq!(
+            bridge.before_host_call("project_list_drafts", &serde_json::json!({ "limit": 10 })),
+            Ok(()),
+            "read-only project tools remain available with staged edits"
         );
         assert_eq!(
             bridge.before_host_call("app_state", &serde_json::json!({})),
@@ -1938,11 +2000,7 @@ mod tests {
             bridge.begin_group();
             let output = ToolOutput::text(r#"{"media_id":42}"#);
             bridge
-                .after_host_call(
-                    "project_import_media",
-                    &serde_json::json!({ "path": "/tmp/new.mp4" }),
-                    Ok(&output),
-                )
+                .after_host_call("project_save", &serde_json::json!({}), Ok(&output))
                 .expect("successful project call reconciliation");
             assert_eq!(bridge.engine.project().name, "after-success");
             assert!(bridge.plan.is_empty());
@@ -1982,8 +2040,8 @@ mod tests {
             bridge.begin_group();
             bridge
                 .after_host_call(
-                    "project_import_media",
-                    &serde_json::json!({ "path": "/tmp/bad.mp4" }),
+                    "project_save",
+                    &serde_json::json!({}),
                     Err("import failed after dispatch"),
                 )
                 .expect("failed host result still reconciles");
@@ -2021,7 +2079,7 @@ mod tests {
 
         let error = bridge
             .after_host_call(
-                "project_relink_media",
+                "project_save",
                 &serde_json::json!({}),
                 Err("host result is immaterial"),
             )
@@ -2032,7 +2090,7 @@ mod tests {
     }
 
     #[test]
-    fn non_project_host_hooks_do_not_snapshot_or_reset_the_sandbox() {
+    fn read_only_project_and_non_project_hooks_do_not_snapshot_or_reset_the_sandbox() {
         let snapshots =
             ScriptedProjectSnapshots::new([Some(Project::new("unused", Rational::FPS_24))]);
         let (project, _) = fixture_project();
@@ -2056,6 +2114,18 @@ mod tests {
         };
         let output = ToolOutput::text("ok");
 
+        assert_eq!(
+            bridge.before_host_call("project_list_drafts", &serde_json::json!({ "limit": 5 })),
+            Ok(())
+        );
+        assert_eq!(
+            bridge.after_host_call(
+                "project_list_drafts",
+                &serde_json::json!({ "limit": 5 }),
+                Ok(&output)
+            ),
+            Ok(())
+        );
         assert_eq!(
             bridge.before_host_call("app_state", &serde_json::json!({})),
             Ok(())

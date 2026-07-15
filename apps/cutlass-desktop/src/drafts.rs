@@ -192,6 +192,12 @@ pub fn list() -> Vec<DraftSummary> {
     }
 }
 
+/// Checked counterpart to [`list`] for callers that must distinguish an empty
+/// draft store from a store that could not be read.
+pub(crate) fn list_checked() -> io::Result<Vec<DraftSummary>> {
+    list_in_root(&root_dir())
+}
+
 fn read_name(dir: &Path) -> String {
     read_name_checked(dir).unwrap_or_else(|| FALLBACK_NAME.to_owned())
 }
