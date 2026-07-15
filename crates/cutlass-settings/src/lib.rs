@@ -37,6 +37,7 @@
 //! [storage.paths]
 //! proxies = "/Volumes/Scratch/Cutlass/proxies"
 //! # analysis = "/Volumes/Scratch/Cutlass/analysis"
+//! # ai_models = "/Volumes/Scratch/Cutlass/ai-models"
 //! # download = "/Volumes/Scratch/Cutlass/download"
 //! # catalog = "/Volumes/Scratch/Cutlass/catalog"
 //! # luts = "/Volumes/Scratch/Cutlass/luts"
@@ -278,6 +279,8 @@ pub struct StoragePathOverrides {
     pub proxies: Option<PathBuf>,
     /// Regenerable media-analysis state.
     pub analysis: Option<PathBuf>,
+    /// Downloaded AI model weights for transcription, vision, and embeddings.
+    pub ai_models: Option<PathBuf>,
     /// Downloaded stock and generated assets.
     pub download: Option<PathBuf>,
     /// Cached asset-catalog responses and metadata.
@@ -299,6 +302,7 @@ impl StoragePathOverrides {
         match key {
             "proxies" => self.proxies.as_deref(),
             "analysis" => self.analysis.as_deref(),
+            "ai_models" => self.ai_models.as_deref(),
             "download" => self.download.as_deref(),
             "catalog" => self.catalog.as_deref(),
             "luts" => self.luts.as_deref(),
@@ -772,6 +776,7 @@ impl Settings {
             if let Some(paths) = t.get("paths").and_then(Item::as_table) {
                 s.storage.paths.proxies = absolute_path_at(paths, "proxies");
                 s.storage.paths.analysis = absolute_path_at(paths, "analysis");
+                s.storage.paths.ai_models = absolute_path_at(paths, "ai_models");
                 s.storage.paths.download = absolute_path_at(paths, "download");
                 s.storage.paths.catalog = absolute_path_at(paths, "catalog");
                 s.storage.paths.luts = absolute_path_at(paths, "luts");
@@ -822,6 +827,10 @@ impl Settings {
             (
                 "analysis",
                 storage_path_for_save(self.storage.paths.analysis.as_deref(), "paths.analysis")?,
+            ),
+            (
+                "ai_models",
+                storage_path_for_save(self.storage.paths.ai_models.as_deref(), "paths.ai_models")?,
             ),
             (
                 "download",
@@ -1151,6 +1160,7 @@ mod tests {
         s.storage.paths = StoragePathOverrides {
             proxies: Some(dir.path().join("proxies")),
             analysis: Some(dir.path().join("analysis")),
+            ai_models: Some(dir.path().join("ai-models")),
             download: Some(dir.path().join("download")),
             catalog: Some(dir.path().join("catalog")),
             luts: Some(dir.path().join("luts")),
@@ -1166,6 +1176,7 @@ mod tests {
         for key in [
             "proxies",
             "analysis",
+            "ai_models",
             "download",
             "catalog",
             "luts",
@@ -1180,6 +1191,7 @@ mod tests {
         for key in [
             "proxies",
             "analysis",
+            "ai_models",
             "download",
             "catalog",
             "luts",
@@ -1204,6 +1216,7 @@ mod tests {
                  [storage.paths]\n\
                  proxies = \"relative/proxies\"\n\
                  analysis = \"relative/analysis\"\n\
+                 ai_models = \"relative/ai-models\"\n\
                  download = {:?}\n\
                  catalog = 3\n\
                  luts = \"\"\n",
@@ -1216,6 +1229,7 @@ mod tests {
         assert_eq!(s.storage.root, None);
         assert_eq!(s.storage.paths.proxies, None);
         assert_eq!(s.storage.paths.analysis, None);
+        assert_eq!(s.storage.paths.ai_models, None);
         assert_eq!(
             s.storage.paths.download.as_deref(),
             Some(absolute_download.as_path())
@@ -1242,6 +1256,17 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             original,
             "failed analysis-path validation must not rewrite the file"
+        );
+        assert_no_transaction_artifacts(dir.path());
+
+        s.storage.paths.analysis = None;
+        s.storage.paths.ai_models = Some(PathBuf::from("relative/ai-models"));
+        let error = save(&path, &s).unwrap_err();
+        assert!(error.contains("paths.ai_models"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original,
+            "failed AI-models-path validation must not rewrite the file"
         );
         assert_no_transaction_artifacts(dir.path());
     }
@@ -1322,6 +1347,7 @@ mod tests {
                  [storage.paths]\n\
                  proxies = {absolute:?}\n\
                  analysis = {absolute:?}\n\
+                 ai_models = {absolute:?}\n\
                  download = {absolute:?}\n\
                  catalog = {absolute:?}\n\
                  luts = {absolute:?}\n\
@@ -1349,6 +1375,7 @@ mod tests {
         for key in [
             "proxies",
             "analysis",
+            "ai_models",
             "download",
             "catalog",
             "luts",
@@ -1383,6 +1410,7 @@ mod tests {
                  [storage.paths]\n\
                  proxies = {absolute:?} # proxy comment\n\
                  analysis = {absolute:?} # analysis comment\n\
+                 ai_models = {absolute:?} # AI models comment\n\
                  future_cache = {absolute:?} # paths unknown\n\
                  [plugins]\n\
                  enabled = true # unrelated\n"
@@ -1402,6 +1430,7 @@ mod tests {
             "# storage unknown",
             "# proxy comment",
             "# analysis comment",
+            "# AI models comment",
             "# paths unknown",
             "# unrelated",
         ] {
