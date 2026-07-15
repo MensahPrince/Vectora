@@ -301,23 +301,45 @@ pub(crate) fn cache_stats() -> StripCacheStats {
 /// renderers are deliberately retained.
 #[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
 pub(crate) fn clear_all_caches() -> StripCacheStats {
+    let filmstrips = clear_filmstrips();
+    let waves = clear_waveforms();
+    StripCacheStats { filmstrips, waves }
+}
+
+/// Clear only filmstrip images and their pending-request suppression.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+pub(crate) fn clear_filmstrips() -> StripImageCacheStats {
     let filmstrips = FILMSTRIPS.with(|cache| {
         let mut cache = cache.borrow_mut();
         let stats = image_cache_stats(cache.values().map(|entry| &entry.image));
         cache.clear();
         stats
     });
+    PENDING_FRAMES.with(|pending| pending.borrow_mut().clear());
+    reset_use_tick_if_empty();
+    filmstrips
+}
+
+/// Clear only waveform images and their pending-request suppression.
+#[allow(dead_code)] // Consumed by follow-up settings/agent cache controls.
+pub(crate) fn clear_waveforms() -> StripImageCacheStats {
     let waves = WAVES.with(|cache| {
         let mut cache = cache.borrow_mut();
         let stats = image_cache_stats(cache.values().map(|entry| &entry.image));
         cache.clear();
         stats
     });
-    PENDING_FRAMES.with(|pending| pending.borrow_mut().clear());
     PENDING_WAVES.with(|pending| pending.borrow_mut().clear());
-    USE_TICK.with(|tick| tick.set(0));
+    reset_use_tick_if_empty();
+    waves
+}
 
-    StripCacheStats { filmstrips, waves }
+fn reset_use_tick_if_empty() {
+    let empty = FILMSTRIPS.with(|cache| cache.borrow().is_empty())
+        && WAVES.with(|cache| cache.borrow().is_empty());
+    if empty {
+        USE_TICK.with(|tick| tick.set(0));
+    }
 }
 
 fn next_use_tick() -> u64 {
@@ -1112,6 +1134,54 @@ mod tests {
                 "wave can be requested again after clear"
             );
         });
+    }
+
+    #[test]
+    fn strip_cache_kinds_can_be_cleared_independently() {
+        clear_all_caches();
+        let _cleanup = StripCacheCleanup;
+        FILMSTRIPS.with(|cache| {
+            cache.borrow_mut().insert(
+                (1, 0),
+                CacheEntry {
+                    image: test_image(2, 2),
+                    last_used: 1,
+                },
+            );
+        });
+        WAVES.with(|cache| {
+            cache.borrow_mut().insert(
+                (2, 0, 0),
+                CacheEntry {
+                    image: test_image(3, 2),
+                    last_used: 2,
+                },
+            );
+        });
+        PENDING_FRAMES.with(|pending| {
+            pending.borrow_mut().insert((1, 0));
+        });
+        PENDING_WAVES.with(|pending| {
+            pending.borrow_mut().insert((2, 0, 0));
+        });
+        USE_TICK.with(|tick| tick.set(7));
+
+        assert_eq!(
+            clear_filmstrips(),
+            StripImageCacheStats {
+                entry_count: 1,
+                estimated_rgba_bytes: 16,
+            }
+        );
+        assert_eq!(cache_stats().filmstrips, StripImageCacheStats::default());
+        assert_eq!(cache_stats().waves.entry_count, 1);
+        assert!(PENDING_FRAMES.with(|pending| pending.borrow().is_empty()));
+        assert_eq!(PENDING_WAVES.with(|pending| pending.borrow().len()), 1);
+        assert_eq!(USE_TICK.with(Cell::get), 7);
+
+        assert_eq!(clear_waveforms().entry_count, 1);
+        assert!(PENDING_WAVES.with(|pending| pending.borrow().is_empty()));
+        assert_eq!(USE_TICK.with(Cell::get), 0);
     }
 
     #[test]
