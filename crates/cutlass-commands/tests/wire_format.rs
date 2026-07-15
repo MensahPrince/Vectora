@@ -278,6 +278,14 @@ fn edit_samples() -> Vec<EditCommand> {
         },
         EditCommand::RemoveClip { clip: clip(4) },
         EditCommand::RemoveTrack { track: track(2) },
+        EditCommand::MoveTrack {
+            track: track(2),
+            index: 1,
+        },
+        EditCommand::SetTrackName {
+            track: track(2),
+            name: "Dialogue".into(),
+        },
         EditCommand::SetTrackEnabled {
             track: track(2),
             enabled: false,
@@ -307,6 +315,9 @@ fn edit_samples() -> Vec<EditCommand> {
             at: t(60),
         },
         EditCommand::LinkClips {
+            clips: vec![clip(4), clip(5)],
+        },
+        EditCommand::UnlinkClips {
             clips: vec![clip(4), clip(5)],
         },
         EditCommand::DuckLanes {
@@ -407,6 +418,7 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
         EditCommand::ShiftClips { .. } => "ShiftClips",
         EditCommand::RippleInsert { .. } => "RippleInsert",
         EditCommand::LinkClips { .. } => "LinkClips",
+        EditCommand::UnlinkClips { .. } => "UnlinkClips",
         EditCommand::DuckLanes { .. } => "DuckLanes",
         EditCommand::DetectBeats { .. } => "DetectBeats",
         EditCommand::ClearBeats { .. } => "ClearBeats",
@@ -419,6 +431,12 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
 }
 
 // --- roundtrips -------------------------------------------------------------
+
+#[test]
+fn command_variant_counts_are_locked() {
+    assert_eq!(project_samples().len(), 9);
+    assert_eq!(edit_samples().len(), 55);
+}
 
 #[test]
 fn every_project_command_roundtrips_through_command() {
@@ -504,6 +522,17 @@ fn golden_split_clip() {
             "clip": 4,
             "at": {"value": 45, "rate": {"num": 30, "den": 1}},
         })
+    );
+}
+
+#[test]
+fn golden_unlink_clips() {
+    let cmd = Command::Edit(EditCommand::UnlinkClips {
+        clips: vec![clip(4), clip(5)],
+    });
+    assert_eq!(
+        serde_json::to_value(&cmd).unwrap(),
+        json!({"type": "UnlinkClips", "clips": [4, 5]})
     );
 }
 

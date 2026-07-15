@@ -539,6 +539,17 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::UnlinkClips { clips } => {
+            let first = clips
+                .first()
+                .copied()
+                .ok_or_else(|| EngineError::from(cutlass_models::ModelError::InvalidRange))?;
+            let inverse = edit::link_clips::unlink(ctx, &clips)?;
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Updated(first)),
+                Some(inverse),
+            ))
+        }
         EditCommand::DuckLanes { .. } => Err(EngineError::Unsupported(
             "audio ducking needs the decoder's audio reader (deferred on mobile-support)".into(),
         )),

@@ -186,7 +186,8 @@ mod tests {
         ripple_insert, set_project_name, set_track_flags, shift_clips, split_clip, trim_clip,
     };
     use cutlass_models::{
-        Clip, Generator, MediaSource, Rational, RationalTime, TimeRange, TrackKind,
+        Clip, Generator, LinkId, MediaSource, ModelError, Rational, RationalTime, TimeRange,
+        TrackKind,
     };
 
     fn setup() -> Project {
@@ -916,6 +917,191 @@ mod tests {
             ctx.project.clip(a).unwrap().link,
             None,
             "validated before mutating"
+        );
+    }
+
+    #[test]
+    fn unlink_one_member_dissolves_complete_group_only() {
+        let mut project = setup();
+        let track = project.add_track(TrackKind::Adjustment, "FX");
+        let a = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(0, 10)))
+            .unwrap();
+        let b = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(20, 10)))
+            .unwrap();
+        let c = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(40, 10)))
+            .unwrap();
+        let d = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(60, 10)))
+            .unwrap();
+        let touched = LinkId::next();
+        let unrelated = LinkId::next();
+        for clip in [a, b] {
+            project.timeline_mut().clip_mut(clip).unwrap().link = Some(touched);
+        }
+        for clip in [c, d] {
+            project.timeline_mut().clip_mut(clip).unwrap().link = Some(unrelated);
+        }
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
+
+        let _inverse = link_clips::unlink(&mut ctx, &[a]).unwrap();
+        assert_eq!(ctx.project.clip(a).unwrap().link, None);
+        assert_eq!(
+            ctx.project.clip(b).unwrap().link,
+            None,
+            "one member dissolves its complete group"
+        );
+        assert_eq!(ctx.project.clip(c).unwrap().link, Some(unrelated));
+        assert_eq!(ctx.project.clip(d).unwrap().link, Some(unrelated));
+        assert_eq!(ctx.project.clip(a).unwrap().start().value, 0);
+        assert_eq!(ctx.project.clip(b).unwrap().start().value, 20);
+    }
+
+    #[test]
+    fn unlink_clears_multiple_groups_with_duplicate_inputs() {
+        let mut project = setup();
+        let track = project.add_track(TrackKind::Adjustment, "FX");
+        let ids: Vec<_> = (0..6)
+            .map(|index| {
+                project
+                    .timeline_mut()
+                    .add_clip(
+                        track,
+                        Clip::generated(Generator::Adjustment, tr(index * 20, 10)),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let first = LinkId::next();
+        let second = LinkId::next();
+        let unrelated = LinkId::next();
+        for (clip, link) in [
+            (ids[0], first),
+            (ids[1], first),
+            (ids[2], second),
+            (ids[3], second),
+            (ids[4], unrelated),
+            (ids[5], unrelated),
+        ] {
+            project.timeline_mut().clip_mut(clip).unwrap().link = Some(link);
+        }
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
+
+        let _inverse =
+            link_clips::unlink(&mut ctx, &[ids[2], ids[0], ids[0], ids[1], ids[2]]).unwrap();
+        for clip in &ids[..4] {
+            assert_eq!(ctx.project.clip(*clip).unwrap().link, None);
+        }
+        for clip in &ids[4..] {
+            assert_eq!(
+                ctx.project.clip(*clip).unwrap().link,
+                Some(unrelated),
+                "unrelated group remains linked"
+            );
+        }
+    }
+
+    #[test]
+    fn unlink_rejections_leave_all_links_unchanged() {
+        let mut project = setup();
+        let track = project.add_track(TrackKind::Adjustment, "FX");
+        let a = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(0, 10)))
+            .unwrap();
+        let b = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(20, 10)))
+            .unwrap();
+        let unlinked = project
+            .timeline_mut()
+            .add_clip(track, Clip::generated(Generator::Adjustment, tr(40, 10)))
+            .unwrap();
+        let group = LinkId::next();
+        for clip in [a, b] {
+            project.timeline_mut().clip_mut(clip).unwrap().link = Some(group);
+        }
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
+
+        assert!(matches!(
+            link_clips::unlink(&mut ctx, &[]),
+            Err(EngineError::Model(ModelError::InvalidRange))
+        ));
+        let missing = cutlass_models::ClipId::from_raw(999);
+        assert!(matches!(
+            link_clips::unlink(&mut ctx, &[a, missing]),
+            Err(EngineError::Model(ModelError::UnknownClip(id))) if id == missing
+        ));
+        assert!(matches!(
+            link_clips::unlink(&mut ctx, &[unlinked, unlinked]),
+            Err(EngineError::Model(ModelError::InvalidRange))
+        ));
+        assert_eq!(ctx.project.clip(a).unwrap().link, Some(group));
+        assert_eq!(ctx.project.clip(b).unwrap().link, Some(group));
+        assert_eq!(ctx.project.clip(unlinked).unwrap().link, None);
+    }
+
+    #[test]
+    fn unlink_inverse_restores_groups_and_oscillates() {
+        let mut project = setup();
+        let track = project.add_track(TrackKind::Adjustment, "FX");
+        let ids: Vec<_> = (0..4)
+            .map(|index| {
+                project
+                    .timeline_mut()
+                    .add_clip(
+                        track,
+                        Clip::generated(Generator::Adjustment, tr(index * 20, 10)),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let first = LinkId::next();
+        let second = LinkId::next();
+        for (clip, link) in [
+            (ids[0], first),
+            (ids[1], first),
+            (ids[2], second),
+            (ids[3], second),
+        ] {
+            project.timeline_mut().clip_mut(clip).unwrap().link = Some(link);
+        }
+
+        let mut project_path = None;
+        let mut history = History::new(32);
+        let mut ctx = test_ctx(&mut project, &mut project_path, &mut history);
+
+        let undo = link_clips::unlink(&mut ctx, &[ids[0], ids[2]]).unwrap();
+        assert!(
+            ids.iter()
+                .all(|id| ctx.project.clip(*id).unwrap().link.is_none())
+        );
+
+        let redo = undo.apply(&mut ctx).unwrap();
+        assert_eq!(ctx.project.clip(ids[0]).unwrap().link, Some(first));
+        assert_eq!(ctx.project.clip(ids[1]).unwrap().link, Some(first));
+        assert_eq!(ctx.project.clip(ids[2]).unwrap().link, Some(second));
+        assert_eq!(ctx.project.clip(ids[3]).unwrap().link, Some(second));
+
+        let _undo = redo.apply(&mut ctx).unwrap();
+        assert!(
+            ids.iter()
+                .all(|id| ctx.project.clip(*id).unwrap().link.is_none())
         );
     }
 

@@ -368,6 +368,9 @@ pub enum EditCommand {
     /// select, move, and trim together. Any previous links on the clips are
     /// replaced; the inverse restores them.
     LinkClips { clips: Vec<ClipId> },
+    /// Dissolve every link group touched by `clips`. Passing any member clears
+    /// the link from the complete group; the inverse restores every group.
+    UnlinkClips { clips: Vec<ClipId> },
     /// Sidechain-duck the `music` clips under the `voice` clips (CapCut audio
     /// ducking, M8 Phase 4): analyze speech-band energy on the voice clips and
     /// write volume keyframes that dip each music clip while the voice is

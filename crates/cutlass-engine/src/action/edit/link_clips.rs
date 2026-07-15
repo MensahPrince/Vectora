@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use cutlass_models::{ClipId, LinkId, ModelError};
 
 use crate::action::{ApplyContext, EditAction};
@@ -24,6 +26,46 @@ pub fn execute(
         links: clips.iter().map(|&clip| (clip, Some(link))).collect(),
     })
     .apply(ctx)
+}
+
+/// Dissolve every link group touched by `clips`.
+///
+/// Inputs are validated before mutation. Unlinked inputs are ignored when at
+/// least one linked group is touched; an entirely unlinked input set is
+/// rejected. Every live timeline member of each touched group is cleared in
+/// deterministic track/clip order.
+pub fn unlink(
+    ctx: &mut ApplyContext<'_>,
+    clips: &[ClipId],
+) -> Result<Box<dyn EditAction>, EngineError> {
+    if clips.is_empty() {
+        return Err(EngineError::from(ModelError::InvalidRange));
+    }
+
+    let mut touched = BTreeSet::new();
+    for &clip_id in clips {
+        let clip = ctx
+            .project
+            .clip(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        if let Some(link) = clip.link {
+            touched.insert(link);
+        }
+    }
+    if touched.is_empty() {
+        return Err(EngineError::from(ModelError::InvalidRange));
+    }
+
+    let mut links = Vec::new();
+    for track in ctx.project.timeline().tracks_ordered() {
+        for clip in track.clips_ordered() {
+            if clip.link.is_some_and(|link| touched.contains(&link)) {
+                links.push((clip.id, None));
+            }
+        }
+    }
+
+    Box::new(SetClipLinksAction { links }).apply(ctx)
 }
 
 impl EditAction for SetClipLinksAction {
