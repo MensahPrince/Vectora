@@ -13,6 +13,13 @@ use std::str::FromStr;
 
 use crate::TimeSpan;
 
+pub mod adapters;
+
+pub use adapters::{
+    AdapterRecordKind, MOMENT_ADAPTER_PAYLOAD_VERSION, MomentAdapterError,
+    beat_events_to_moment_batch, shot_boundaries_to_moment_batch, silence_spans_to_moment_batch,
+};
+
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
