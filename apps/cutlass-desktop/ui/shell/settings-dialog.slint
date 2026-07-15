@@ -5,7 +5,7 @@
 //
 // All editable state lives in SettingsBackend (and the theme in
 // AppStore.theme-id, so it switches live). Fields two-way bind to those
-// globals; dismissing the dialog persists them through SettingsBackend.save
+// globals; dismissal succeeds only when SettingsBackend.save returns true
 // (wired in src/main.rs). Theme changes preview instantly.
 
 import {
@@ -17,7 +17,7 @@ import {
     CutlassScrollView,
 } from "../components/index.slint";
 import { AppStore } from "../store/index.slint";
-import { SettingsBackend } from "../lib/settings-backend.slint";
+import { CacheUsageRow, SettingsBackend } from "../lib/settings-backend.slint";
 import { AccountBackend } from "../lib/account-backend.slint";
 import { AppState } from "../state.slint";
 
@@ -107,17 +107,112 @@ component ModeChip inherits Rectangle {
     }
 }
 
+// One registry-owned cache. Operations always use the stable cache id; the
+// path is display-only so moving data cannot bypass Rust's relocation path.
+component CacheUsageCard inherits Rectangle {
+    in property <CacheUsageRow> cache;
+    private property <bool> row-busy: SettingsBackend.cache-busy-id == root.cache.id;
+    private property <bool> controls-disabled: SettingsBackend.cache-loading
+        || SettingsBackend.cache-busy-id != "";
+
+    height: 66px;
+    clip: true;
+    border-radius: AppStore.theme.metrics.radius.md;
+    border-width: 1px;
+    border-color: root.row-busy
+        ? AppStore.theme.accent.primary.with-alpha(0.44)
+        : AppStore.theme.surface.divider;
+    background: root.row-busy
+        ? AppStore.theme.accent.primary.with-alpha(0.07)
+        : AppStore.theme.surface.content-background;
+
+    VerticalLayout {
+        padding: AppStore.theme.metrics.spacing.sm;
+        spacing: AppStore.theme.metrics.spacing.xs;
+
+        HorizontalLayout {
+            height: 20px;
+            spacing: AppStore.theme.metrics.spacing.sm;
+
+            CutlassText {
+                horizontal-stretch: 1;
+                text: root.cache.label;
+                style: AppStore.theme.typography.label;
+                overflow: elide;
+            }
+
+            CutlassText {
+                text: (root.row-busy ? "Working… · " : "")
+                    + (root.cache.kind == "disk" ? "Disk" : "Memory")
+                    + " · " + root.cache.size-label
+                    + " · " + root.cache.item-count-label;
+                style: AppStore.theme.typography.caption;
+                foreground: root.row-busy
+                    ? AppStore.theme.accent.primary
+                    : AppStore.theme.text.secondary;
+                overflow: elide;
+            }
+        }
+
+        HorizontalLayout {
+            height: 26px;
+            spacing: AppStore.theme.metrics.spacing.sm;
+
+            CutlassText {
+                horizontal-stretch: 1;
+                text: root.cache.path == "" ? "In memory" : root.cache.path;
+                mono: root.cache.path != "";
+                style: AppStore.theme.typography.caption;
+                foreground: AppStore.theme.text.muted;
+                overflow: elide;
+                vertical-alignment: center;
+            }
+
+            if root.cache.clearable: SubtleButton {
+                label: "Clear";
+                enabled: !root.controls-disabled;
+                clicked => {
+                    SettingsBackend.clear-cache(root.cache.id);
+                }
+            }
+
+            if root.cache.kind == "disk": SubtleButton {
+                label: "Reveal";
+                enabled: !root.controls-disabled;
+                clicked => {
+                    SettingsBackend.reveal-cache(root.cache.id);
+                }
+            }
+
+            if root.cache.kind == "disk": SubtleButton {
+                label: "Move";
+                enabled: SettingsBackend.cache-relocation-enabled
+                    && root.cache.relocatable
+                    && !root.controls-disabled;
+                clicked => {
+                    SettingsBackend.relocate-cache(root.cache.id);
+                }
+            }
+        }
+    }
+}
+
 export component SettingsDialog inherits Rectangle {
     background: #000000A0;
 
-    // 0 = AI, 1 = Appearance, 2 = Account.
+    // 0 = AI, 1 = Appearance, 2 = Storage, 3 = Account.
     in-out property <int> section: 0;
 
     property <[string]> theme-names: ["Graphite (default)", "Ember", "Dark blue"];
 
+    init => {
+        SettingsBackend.refresh-caches();
+    }
+
     function close() {
-        SettingsBackend.save();
-        AppState.settings-open = false;
+        if (SettingsBackend.save()) {
+            AppState.settings-open = false;
+        }
     }
 
     // Scrim: absorb every pointer event so the editor underneath is inert.
@@ -199,10 +294,18 @@ export component SettingsDialog inherits Rectangle {
                         }
                     }
                     NavItem {
-                        label: "Account";
+                        label: "Storage & cache";
                         selected: root.section == 2;
                         clicked => {
                             root.section = 2;
+                            SettingsBackend.refresh-caches();
+                        }
+                    }
+                    NavItem {
+                        label: "Account";
+                        selected: root.section == 3;
+                        clicked => {
+                            root.section = 3;
                         }
                     }
 
@@ -359,8 +462,124 @@ export component SettingsDialog inherits Rectangle {
                             }
                         }
 
-                        // --- Account --------------------------------------
+                        // --- Storage & cache ------------------------------
                         if root.section == 2: VerticalLayout {
+                            spacing: AppStore.theme.metrics.spacing.md;
+
+                            PaneTitle {
+                                text: "Storage & cache";
+                            }
+                            Hint {
+                                text: "Caches are working data. Project drafts remain in their original locations; download clearing stays disabled while older imported media is migrated to durable storage.";
+                            }
+                            Hint {
+                                text: "These paths come from the same cache registry the assistant uses. Enabled cache clears take effect immediately and cannot be undone; Cutlass recreates or downloads those contents when needed.";
+                            }
+
+                            FieldRow {
+                                label: "Cache root";
+                                CutlassLineInput {
+                                    text: SettingsBackend.storage-root;
+                                    placeholder-text: "Default Cutlass cache location";
+                                    accessibility-label: "Current cache root";
+                                    read-only: true;
+                                    mono: true;
+                                }
+                                SubtleButton {
+                                    label: SettingsBackend.cache-busy-id == ""
+                                        ? "Choose…"
+                                        : "Working…";
+                                    enabled: SettingsBackend.cache-relocation-enabled
+                                        && !SettingsBackend.cache-loading
+                                        && SettingsBackend.cache-busy-id == "";
+                                    clicked => {
+                                        SettingsBackend.choose-storage-root();
+                                    }
+                                }
+                            }
+                            if !SettingsBackend.cache-relocation-enabled: Hint {
+                                text: "Moving the cache root or individual caches is not available yet.";
+                            }
+
+                            FieldRow {
+                                label: "Download quota";
+                                CutlassLineInput {
+                                    width: 112px;
+                                    horizontal-stretch: 0;
+                                    text <=> SettingsBackend.download-quota-mib;
+                                    placeholder-text: "2048";
+                                    accessibility-label: "Download cache quota in MiB";
+                                    enabled: SettingsBackend.cache-busy-id == "";
+                                    mono: true;
+                                }
+                                CutlassText {
+                                    text: "MiB";
+                                    vertical-alignment: center;
+                                    style: AppStore.theme.typography.label;
+                                    foreground: AppStore.theme.text.secondary;
+                                }
+                                Rectangle {
+                                    horizontal-stretch: 1;
+                                }
+                            }
+
+                            Rectangle {
+                                height: 1px;
+                                background: AppStore.theme.surface.divider;
+                            }
+
+                            HorizontalLayout {
+                                spacing: AppStore.theme.metrics.spacing.md;
+
+                                CutlassText {
+                                    horizontal-stretch: 1;
+                                    text: "Caches";
+                                    vertical-alignment: center;
+                                    style: AppStore.theme.typography.heading-sm;
+                                }
+                                SubtleButton {
+                                    label: SettingsBackend.cache-loading
+                                        ? "Refreshing…"
+                                        : "Refresh";
+                                    enabled: !SettingsBackend.cache-loading
+                                        && SettingsBackend.cache-busy-id == "";
+                                    clicked => {
+                                        SettingsBackend.refresh-caches();
+                                    }
+                                }
+                            }
+
+                            if SettingsBackend.cache-loading: Hint {
+                                text: "Measuring cache usage…";
+                            }
+
+                            if SettingsBackend.cache-status != "": CutlassText {
+                                text: SettingsBackend.cache-status;
+                                wrap: word-wrap;
+                                style: AppStore.theme.typography.caption;
+                                foreground: AppStore.theme.accent.primary;
+                            }
+
+                            if SettingsBackend.cache-error != "": CutlassText {
+                                text: SettingsBackend.cache-error;
+                                wrap: word-wrap;
+                                style: AppStore.theme.typography.caption;
+                                foreground: #FF6B6B;
+                            }
+
+                            if !SettingsBackend.cache-loading
+                                && SettingsBackend.cache-rows.length == 0
+                                && SettingsBackend.cache-error == "": Hint {
+                                text: "No cache usage is available yet.";
+                            }
+
+                            for cache in SettingsBackend.cache-rows: CacheUsageCard {
+                                cache: cache;
+                            }
+                        }
+
+                        // --- Account --------------------------------------
+                        if root.section == 3: VerticalLayout {
                             spacing: AppStore.theme.metrics.spacing.md;
 
                             PaneTitle {
@@ -463,6 +682,13 @@ export component SettingsDialog inherits Rectangle {
 
                     }
                 }
+            }
+
+            if SettingsBackend.save-error != "": CutlassText {
+                text: SettingsBackend.save-error;
+                wrap: word-wrap;
+                style: AppStore.theme.typography.caption;
+                foreground: #FF6B6B;
             }
 
             // --- footer ---------------------------------------------------

@@ -43,6 +43,8 @@ use std::cell::Cell;
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use cutlass_engine::EngineConfig;
@@ -355,6 +357,167 @@ fn non_empty(s: &str) -> Option<String> {
     (!t.is_empty()).then(|| t.to_string())
 }
 
+const MIB_BYTES: u64 = 1024 * 1024;
+const MAX_CACHE_UI_ERROR_CHARS: usize = 160;
+const CACHE_GENERATION_EXHAUSTED: &str = "Cache operations are unavailable until Cutlass restarts.";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DownloadQuota {
+    mib: u64,
+    bytes: u64,
+}
+
+fn parse_download_quota_mib(input: &str) -> Result<DownloadQuota, String> {
+    let invalid = || {
+        format!(
+            "Download quota must be a whole number between {} and {} MiB.",
+            cutlass_settings::MIN_DOWNLOAD_QUOTA_MIB,
+            cutlass_settings::MAX_DOWNLOAD_QUOTA_MIB
+        )
+    };
+    let mib = input.trim().parse::<u64>().map_err(|_| invalid())?;
+    if !cutlass_settings::StorageSettings::is_valid_download_quota_mib(mib) {
+        return Err(invalid());
+    }
+    let bytes = mib.checked_mul(MIB_BYTES).ok_or_else(invalid)?;
+    Ok(DownloadQuota { mib, bytes })
+}
+
+/// Reserve a generation for one accepted cache UI operation. `u64::MAX` is a
+/// terminal sentinel: reserving it invalidates any older result and reports a
+/// bounded error rather than wrapping back to zero.
+fn next_cache_generation(generation: &AtomicU64) -> Result<u64, &'static str> {
+    let mut current = generation.load(Ordering::Acquire);
+    loop {
+        let Some(next) = current.checked_add(1) else {
+            return Err(CACHE_GENERATION_EXHAUSTED);
+        };
+        if next == u64::MAX {
+            match generation.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Err(CACHE_GENERATION_EXHAUSTED),
+                Err(actual) => {
+                    current = actual;
+                    continue;
+                }
+            }
+        }
+        match generation.compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return Ok(next),
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+fn format_bytes_iec(bytes: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let mut number = format!("{value:.1}");
+    if number.ends_with(".0") {
+        number.truncate(number.len() - 2);
+    }
+    format!("{number} {}", UNITS[unit])
+}
+
+fn pluralized_count(count: u64, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("1 {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
+}
+
+fn cache_item_count_label(kind: cutlass_storage::CacheKind, entries: u64, files: u64) -> String {
+    match kind {
+        cutlass_storage::CacheKind::Memory => pluralized_count(entries, "entry", "entries"),
+        cutlass_storage::CacheKind::Disk => pluralized_count(files, "file", "files"),
+    }
+}
+
+fn cache_rows_from_snapshots(
+    mut snapshots: Vec<cache_registry::CacheSnapshot>,
+) -> Result<Vec<CacheUsageRow>, String> {
+    snapshots.sort_by_key(|snapshot| snapshot.id);
+    snapshots
+        .into_iter()
+        .map(|snapshot| {
+            let path = match (snapshot.kind, snapshot.path.as_deref()) {
+                (cutlass_storage::CacheKind::Memory, None) => String::new(),
+                (cutlass_storage::CacheKind::Memory, Some(_)) => {
+                    return Err("memory cache unexpectedly has a disk path".into());
+                }
+                (cutlass_storage::CacheKind::Disk, Some(path)) => {
+                    path.to_string_lossy().into_owned()
+                }
+                (cutlass_storage::CacheKind::Disk, None) => {
+                    return Err("disk cache has no storage path".into());
+                }
+            };
+            Ok(CacheUsageRow {
+                id: snapshot.id.as_str().into(),
+                label: snapshot.label.into(),
+                kind: match snapshot.kind {
+                    cutlass_storage::CacheKind::Memory => "memory".into(),
+                    cutlass_storage::CacheKind::Disk => "disk".into(),
+                },
+                size_label: format_bytes_iec(snapshot.bytes).into(),
+                item_count_label: cache_item_count_label(
+                    snapshot.kind,
+                    snapshot.entries,
+                    snapshot.files,
+                )
+                .into(),
+                path: path.into(),
+                clearable: snapshot.tier != cutlass_storage::CacheTier::UserData
+                    && snapshot.id != cutlass_storage::CacheId::Download,
+                relocatable: false,
+            })
+        })
+        .collect()
+}
+
+fn cache_clear_success(report: &cache_registry::CacheClearReport) -> String {
+    let descriptor = report.id.descriptor();
+    format!(
+        "Cleared {}: removed {} and {}.",
+        descriptor.label,
+        format_bytes_iec(report.removed_bytes),
+        cache_item_count_label(
+            descriptor.kind,
+            report.removed_entries,
+            report.removed_files
+        )
+    )
+}
+
+fn bounded_cache_ui_error(error: &str) -> String {
+    let mut bounded: String = error.chars().take(MAX_CACHE_UI_ERROR_CHARS).collect();
+    if error.chars().count() > MAX_CACHE_UI_ERROR_CHARS {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn spawn_short_lived_worker(
+    name: &'static str,
+    task: impl FnOnce() + Send + 'static,
+) -> Result<(), String> {
+    let worker = std::thread::Builder::new()
+        .name(name.into())
+        .spawn(task)
+        .map_err(|error| format!("could not start {name}: {error}"))?;
+    drop(worker);
+    Ok(())
+}
+
 /// Native save dialog for the export destination, seeded with the current
 /// path's folder and file name. `None` when the user cancels.
 async fn pick_export_path(current: std::path::PathBuf) -> Option<std::path::PathBuf> {
@@ -524,8 +687,9 @@ fn main() -> Result<(), slint::PlatformError> {
             cutlass_settings::Settings::default()
         }
     };
-    let (storage_layout, download_quota_mib) = match paths::storage_layout(&app_settings.storage) {
-        Ok(layout) => (layout, app_settings.storage.download_quota_mib),
+    let download_quota_mib = app_settings.storage.download_quota_mib;
+    let storage_layout = match paths::storage_layout(&app_settings.storage) {
+        Ok(layout) => layout,
         Err(error) => {
             tracing::error!(
                 %error,
@@ -534,15 +698,13 @@ fn main() -> Result<(), slint::PlatformError> {
             // Cache fallback never changes the authoritative project/draft
             // root and performs no relocation.
             let defaults = cutlass_settings::StorageSettings::default();
-            let layout = paths::storage_layout(&defaults).map_err(|fallback_error| {
+            paths::storage_layout(&defaults).map_err(|fallback_error| {
                 slint::PlatformError::from(format!(
                     "default cache storage layout is invalid: {fallback_error}"
                 ))
-            })?;
-            (layout, defaults.download_quota_mib)
+            })?
         }
     };
-    const MIB_BYTES: u64 = 1024 * 1024;
     let download_quota_bytes = download_quota_mib
         .checked_mul(MIB_BYTES)
         .ok_or_else(|| slint::PlatformError::from("download cache quota exceeds byte range"))?;
@@ -647,6 +809,10 @@ fn main() -> Result<(), slint::PlatformError> {
         download_root,
         download_quota_bytes,
     ));
+    // Legacy drafts may still reference cache-owned source files directly.
+    // Keep eviction and clearing fail-closed until the bounded draft inventory
+    // below is integrated and can explicitly protect every such path.
+    download_cache.block_destructive_operations();
     // Keep this owner in main for the upcoming Settings wiring; the agent
     // receives a clone of the same registry and operation gate.
     let cache_registry = cache_registry::CacheRegistry::new(
@@ -1518,21 +1684,338 @@ fn main() -> Result<(), slint::PlatformError> {
             .into(),
     );
     settings_backend.set_ai_use_account(app_settings.ai.use_account);
+    settings_backend.set_storage_root(
+        cache_registry
+            .startup_storage_root()
+            .to_string_lossy()
+            .into_owned()
+            .into(),
+    );
+    settings_backend.set_download_quota_mib(download_quota_mib.to_string().into());
+    settings_backend.set_cache_relocation_enabled(false);
     app.global::<AppStore>()
         .set_theme_id(app_settings.appearance.theme.index());
 
-    // Persist on dismiss (Done / ✕ / Esc). Load-then-patch so any hand-set
-    // keys the UI doesn't surface survive, then apply the live-settable bits
-    // immediately.
+    let cache_ui_generation = Arc::new(AtomicU64::new(0));
+
+    // Cache snapshots can touch the filesystem, preview worker, and Slint-owned
+    // image caches. Always collect them on one short-lived named worker.
     {
         let app_weak = app.as_weak();
-        let config_path = config_path.clone();
-        settings_backend.on_save(move || {
+        let registry = cache_registry.clone();
+        let generation = Arc::clone(&cache_ui_generation);
+        settings_backend.on_refresh_caches(move || {
             let Some(app) = app_weak.upgrade() else {
                 return;
             };
             let sb = app.global::<SettingsBackend>();
-            let mut s = cutlass_settings::load(&config_path).unwrap_or_default();
+            if sb.get_cache_loading() || !sb.get_cache_busy_id().is_empty() {
+                return;
+            }
+            let operation_generation = match next_cache_generation(&generation) {
+                Ok(value) => value,
+                Err(error) => {
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error(error.into());
+                    return;
+                }
+            };
+
+            sb.set_cache_loading(true);
+            sb.set_cache_status(SharedString::new());
+            sb.set_cache_error(SharedString::new());
+
+            let worker_app = app_weak.clone();
+            let worker_registry = registry.clone();
+            let worker_generation = Arc::clone(&generation);
+            if let Err(error) = spawn_short_lived_worker("cutlass-cache-refresh", move || {
+                let cancel = AtomicBool::new(false);
+                let result = worker_registry
+                    .snapshot_all(&cancel)
+                    .and_then(cache_rows_from_snapshots);
+                let apply_generation = Arc::clone(&worker_generation);
+                if let Err(error) = slint::invoke_from_event_loop(move || {
+                    if apply_generation.load(Ordering::Acquire) != operation_generation {
+                        return;
+                    }
+                    let Some(app) = worker_app.upgrade() else {
+                        return;
+                    };
+                    let sb = app.global::<SettingsBackend>();
+                    sb.set_cache_loading(false);
+                    match result {
+                        Ok(rows) => {
+                            sb.set_cache_rows(ModelRc::new(VecModel::from(rows)));
+                            sb.set_cache_status("Cache usage refreshed.".into());
+                            sb.set_cache_error(SharedString::new());
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "cache inventory refresh failed");
+                            sb.set_cache_status(SharedString::new());
+                            sb.set_cache_error(
+                                format!(
+                                    "Cache usage could not be refreshed: {}",
+                                    bounded_cache_ui_error(&error)
+                                )
+                                .into(),
+                            );
+                        }
+                    }
+                }) {
+                    tracing::debug!(%error, "cache refresh event-loop publish failed");
+                }
+            }) {
+                tracing::error!(%error, "cache refresh worker could not start");
+                sb.set_cache_loading(false);
+                sb.set_cache_error("Cache refresh could not start.".into());
+            }
+        });
+    }
+
+    // Clear one exact registry id, then collect the complete inventory on the
+    // same worker. A successful clear remains successful even if that
+    // follow-up snapshot is unavailable.
+    {
+        let app_weak = app.as_weak();
+        let registry = cache_registry.clone();
+        let generation = Arc::clone(&cache_ui_generation);
+        settings_backend.on_clear_cache(move |cache_id| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let sb = app.global::<SettingsBackend>();
+            let id = match cutlass_storage::CacheId::parse(cache_id.as_str()) {
+                Ok(id) => id,
+                Err(_) => {
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error("Unknown cache.".into());
+                    return;
+                }
+            };
+            if id.descriptor().tier == cutlass_storage::CacheTier::UserData {
+                sb.set_cache_status(SharedString::new());
+                sb.set_cache_error("User data cannot be cleared.".into());
+                return;
+            }
+            if sb.get_cache_loading() || !sb.get_cache_busy_id().is_empty() {
+                return;
+            }
+            let operation_generation = match next_cache_generation(&generation) {
+                Ok(value) => value,
+                Err(error) => {
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error(error.into());
+                    return;
+                }
+            };
+
+            sb.set_cache_busy_id(id.as_str().into());
+            sb.set_cache_status(SharedString::new());
+            sb.set_cache_error(SharedString::new());
+
+            let worker_app = app_weak.clone();
+            let worker_registry = registry.clone();
+            let worker_generation = Arc::clone(&generation);
+            if let Err(error) = spawn_short_lived_worker("cutlass-cache-clear", move || {
+                let cancel = AtomicBool::new(false);
+                let clear_result = worker_registry.clear(id, &cancel);
+                let rows_result = worker_registry
+                    .snapshot_all(&cancel)
+                    .and_then(cache_rows_from_snapshots);
+
+                if let Err(error) = &clear_result {
+                    tracing::warn!(cache = id.as_str(), %error, "cache clear did not complete");
+                }
+                if let Err(error) = &rows_result {
+                    tracing::warn!(
+                        cache = id.as_str(),
+                        %error,
+                        "cache inventory refresh after clear failed"
+                    );
+                }
+
+                let (clear_succeeded, status, mut feedback_error) = match clear_result {
+                    Ok(report) => (true, cache_clear_success(&report), String::new()),
+                    Err(error) => (
+                        false,
+                        String::new(),
+                        format!(
+                            "Could not fully clear {}: {}",
+                            id.descriptor().label,
+                            bounded_cache_ui_error(&error)
+                        ),
+                    ),
+                };
+                if rows_result.is_err() {
+                    if clear_succeeded {
+                        feedback_error =
+                            "Cache cleared, but its usage could not be refreshed.".into();
+                    } else {
+                        feedback_error.push_str(" Cache usage also could not be refreshed.");
+                    }
+                }
+
+                let apply_generation = Arc::clone(&worker_generation);
+                if let Err(error) = slint::invoke_from_event_loop(move || {
+                    if apply_generation.load(Ordering::Acquire) != operation_generation {
+                        return;
+                    }
+                    let Some(app) = worker_app.upgrade() else {
+                        return;
+                    };
+                    let sb = app.global::<SettingsBackend>();
+                    sb.set_cache_busy_id(SharedString::new());
+                    if let Ok(rows) = rows_result {
+                        sb.set_cache_rows(ModelRc::new(VecModel::from(rows)));
+                    }
+                    sb.set_cache_status(status.into());
+                    sb.set_cache_error(feedback_error.into());
+                }) {
+                    tracing::debug!(%error, "cache clear event-loop publish failed");
+                }
+            }) {
+                tracing::error!(%error, "cache clear worker could not start");
+                sb.set_cache_busy_id(SharedString::new());
+                sb.set_cache_error("Cache clear could not start.".into());
+            }
+        });
+    }
+
+    // Revealing is disk-only. Create a missing cache root and invoke the
+    // platform file browser from a worker; no shell is involved.
+    {
+        let app_weak = app.as_weak();
+        let registry = cache_registry.clone();
+        let generation = Arc::clone(&cache_ui_generation);
+        settings_backend.on_reveal_cache(move |cache_id| {
+            let Some(app) = app_weak.upgrade() else {
+                return;
+            };
+            let sb = app.global::<SettingsBackend>();
+            let id = match cutlass_storage::CacheId::parse(cache_id.as_str()) {
+                Ok(id) => id,
+                Err(_) => {
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error("Unknown cache.".into());
+                    return;
+                }
+            };
+            let path = match registry.cache_path(id) {
+                Ok(path) => path,
+                Err(error) => {
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error(
+                        format!(
+                            "{} cannot be revealed: {}",
+                            id.descriptor().label,
+                            bounded_cache_ui_error(&error)
+                        )
+                        .into(),
+                    );
+                    return;
+                }
+            };
+            if sb.get_cache_loading() || !sb.get_cache_busy_id().is_empty() {
+                return;
+            }
+            let operation_generation = match next_cache_generation(&generation) {
+                Ok(value) => value,
+                Err(error) => {
+                    sb.set_cache_status(SharedString::new());
+                    sb.set_cache_error(error.into());
+                    return;
+                }
+            };
+
+            sb.set_cache_busy_id(id.as_str().into());
+            sb.set_cache_status(SharedString::new());
+            sb.set_cache_error(SharedString::new());
+
+            let worker_app = app_weak.clone();
+            let worker_generation = Arc::clone(&generation);
+            if let Err(error) = spawn_short_lived_worker("cutlass-cache-reveal", move || {
+                let result = std::fs::create_dir_all(&path)
+                    .map_err(|error| format!("could not create the cache directory: {error}"))
+                    .and_then(|()| external::reveal_path(&path));
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        cache = id.as_str(),
+                        %error,
+                        "cache path could not be revealed"
+                    );
+                }
+
+                let apply_generation = Arc::clone(&worker_generation);
+                if let Err(error) = slint::invoke_from_event_loop(move || {
+                    if apply_generation.load(Ordering::Acquire) != operation_generation {
+                        return;
+                    }
+                    let Some(app) = worker_app.upgrade() else {
+                        return;
+                    };
+                    let sb = app.global::<SettingsBackend>();
+                    sb.set_cache_busy_id(SharedString::new());
+                    match result {
+                        Ok(()) => {
+                            sb.set_cache_status(
+                                format!("Revealed {} in the file browser.", id.descriptor().label)
+                                    .into(),
+                            );
+                            sb.set_cache_error(SharedString::new());
+                        }
+                        Err(error) => {
+                            sb.set_cache_status(SharedString::new());
+                            sb.set_cache_error(
+                                format!(
+                                    "Could not reveal {}: {}",
+                                    id.descriptor().label,
+                                    bounded_cache_ui_error(&error)
+                                )
+                                .into(),
+                            );
+                        }
+                    }
+                }) {
+                    tracing::debug!(%error, "cache reveal event-loop publish failed");
+                }
+            }) {
+                tracing::error!(%error, "cache reveal worker could not start");
+                sb.set_cache_busy_id(SharedString::new());
+                sb.set_cache_error("Cache reveal could not start.".into());
+            }
+        });
+    }
+
+    // Save returns whether dismissal is safe. Load-then-patch preserves
+    // unknown TOML, and a malformed existing file is never replaced.
+    {
+        let app_weak = app.as_weak();
+        let config_path = config_path.clone();
+        let download_cache = Arc::clone(&download_cache);
+        settings_backend.on_save(move || {
+            let Some(app) = app_weak.upgrade() else {
+                return false;
+            };
+            let sb = app.global::<SettingsBackend>();
+            sb.set_save_error(SharedString::new());
+            let quota = match parse_download_quota_mib(&sb.get_download_quota_mib()) {
+                Ok(quota) => quota,
+                Err(error) => {
+                    sb.set_save_error(error.into());
+                    return false;
+                }
+            };
+            let mut s = match cutlass_settings::load(&config_path) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    tracing::error!(%error, "refusing to overwrite unreadable settings");
+                    sb.set_save_error(
+                        "Settings could not be saved because the configuration file is invalid."
+                            .into(),
+                    );
+                    return false;
+                }
+            };
             s.ai.base_url = sb.get_ai_base_url().trim().to_string();
             s.ai.model = sb.get_ai_model().trim().to_string();
             s.ai.api_key = non_empty(&sb.get_ai_api_key());
@@ -1540,13 +2023,29 @@ fn main() -> Result<(), slint::PlatformError> {
             s.ai.use_account = sb.get_ai_use_account();
             s.appearance.theme =
                 cutlass_settings::ThemeChoice::from_index(app.global::<AppStore>().get_theme_id());
+            s.storage.download_quota_mib = quota.mib;
 
-            if let Err(e) = cutlass_settings::save(&config_path, &s) {
-                tracing::error!("failed to save settings: {e}");
-                return;
+            if let Err(error) = cutlass_settings::save(&config_path, &s) {
+                tracing::error!(%error, "failed to save settings");
+                sb.set_save_error(
+                    "Settings could not be saved. Check the configuration file.".into(),
+                );
+                return false;
             }
+
+            download_cache.set_quota_bytes(quota.bytes);
+            let quota_cache = Arc::clone(&download_cache);
+            if let Err(error) = spawn_short_lived_worker("cutlass-cache-quota", move || {
+                quota_cache.enforce_quota();
+            }) {
+                // Persistence and the live quota update are already committed;
+                // do not turn that success into a false save failure.
+                tracing::error!(%error, "download quota enforcement worker could not start");
+            }
+            sb.set_download_quota_mib(quota.mib.to_string().into());
             app.global::<AgentStore>()
                 .set_configured(s.ai.is_configured());
+            true
         });
     }
 
@@ -2610,4 +3109,152 @@ fn main() -> Result<(), slint::PlatformError> {
     });
 
     app.run()
+}
+
+#[cfg(test)]
+mod settings_cache_tests {
+    use super::*;
+
+    fn snapshot(
+        id: cutlass_storage::CacheId,
+        path: Option<PathBuf>,
+        bytes: u64,
+        entries: u64,
+        files: u64,
+    ) -> cache_registry::CacheSnapshot {
+        let descriptor = id.descriptor();
+        cache_registry::CacheSnapshot {
+            id,
+            label: descriptor.label,
+            kind: descriptor.kind,
+            tier: descriptor.tier,
+            path,
+            bytes,
+            entries,
+            files,
+        }
+    }
+
+    #[test]
+    fn cache_byte_and_count_labels_use_iec_and_correct_plurals() {
+        assert_eq!(format_bytes_iec(0), "0 B");
+        assert_eq!(format_bytes_iec(1_023), "1023 B");
+        assert_eq!(format_bytes_iec(1_024), "1 KiB");
+        assert_eq!(format_bytes_iec(1_536), "1.5 KiB");
+        assert_eq!(format_bytes_iec(1024 * 1024), "1 MiB");
+
+        assert_eq!(
+            cache_item_count_label(cutlass_storage::CacheKind::Memory, 1, 0),
+            "1 entry"
+        );
+        assert_eq!(
+            cache_item_count_label(cutlass_storage::CacheKind::Memory, 2, 0),
+            "2 entries"
+        );
+        assert_eq!(
+            cache_item_count_label(cutlass_storage::CacheKind::Disk, 0, 1),
+            "1 file"
+        );
+        assert_eq!(
+            cache_item_count_label(cutlass_storage::CacheKind::Disk, 0, 3),
+            "3 files"
+        );
+    }
+
+    #[test]
+    fn cache_rows_are_registry_ordered_with_exact_path_rules() {
+        let download_path = PathBuf::from("/tmp/cutlass-downloads");
+        let rows = cache_rows_from_snapshots(vec![
+            snapshot(
+                cutlass_storage::CacheId::Download,
+                Some(download_path.clone()),
+                1_536,
+                0,
+                1,
+            ),
+            snapshot(cutlass_storage::CacheId::PreviewFrames, None, 1_024, 2, 0),
+        ])
+        .unwrap();
+
+        assert_eq!(rows[0].id.as_str(), "preview_frames");
+        assert_eq!(rows[0].path.as_str(), "");
+        assert_eq!(rows[0].size_label.as_str(), "1 KiB");
+        assert_eq!(rows[0].item_count_label.as_str(), "2 entries");
+        assert!(rows[0].clearable);
+        assert!(!rows[0].relocatable);
+
+        assert_eq!(rows[1].id.as_str(), "download");
+        assert_eq!(
+            rows[1].path.as_str(),
+            download_path.to_str().expect("test path is Unicode")
+        );
+        assert_eq!(rows[1].size_label.as_str(), "1.5 KiB");
+        assert_eq!(rows[1].item_count_label.as_str(), "1 file");
+        assert!(
+            !rows[1].clearable,
+            "downloads stay protected until imported media is durable"
+        );
+        assert!(!rows[1].relocatable);
+
+        assert!(
+            cache_rows_from_snapshots(vec![snapshot(
+                cutlass_storage::CacheId::PreviewFrames,
+                Some(PathBuf::from("/tmp/not-memory")),
+                0,
+                0,
+                0,
+            )])
+            .unwrap_err()
+            .contains("memory")
+        );
+        assert!(
+            cache_rows_from_snapshots(vec![snapshot(
+                cutlass_storage::CacheId::Download,
+                None,
+                0,
+                0,
+                0,
+            )])
+            .unwrap_err()
+            .contains("no storage path")
+        );
+    }
+
+    #[test]
+    fn quota_parser_accepts_only_supported_integer_mib_values() {
+        assert_eq!(
+            parse_download_quota_mib(" 2048 ").unwrap(),
+            DownloadQuota {
+                mib: 2_048,
+                bytes: 2_048 * MIB_BYTES,
+            }
+        );
+        assert!(parse_download_quota_mib("1.5").is_err());
+        assert!(parse_download_quota_mib("-1").is_err());
+        assert!(parse_download_quota_mib("0").is_err());
+        assert!(
+            parse_download_quota_mib(&(cutlass_settings::MAX_DOWNLOAD_QUOTA_MIB + 1).to_string())
+                .is_err()
+        );
+        assert!(
+            parse_download_quota_mib(&cutlass_settings::MAX_DOWNLOAD_QUOTA_MIB.to_string()).is_ok()
+        );
+    }
+
+    #[test]
+    fn cache_generation_is_monotonic_and_exhaustion_is_bounded() {
+        let generation = AtomicU64::new(0);
+        assert_eq!(next_cache_generation(&generation), Ok(1));
+        assert_eq!(next_cache_generation(&generation), Ok(2));
+
+        let exhausted = AtomicU64::new(u64::MAX - 1);
+        let error = next_cache_generation(&exhausted).unwrap_err();
+        assert_eq!(exhausted.load(Ordering::Acquire), u64::MAX);
+        assert_eq!(error, CACHE_GENERATION_EXHAUSTED);
+        assert!(error.chars().count() < MAX_CACHE_UI_ERROR_CHARS);
+        assert_eq!(
+            next_cache_generation(&exhausted),
+            Err(CACHE_GENERATION_EXHAUSTED)
+        );
+    }
 }

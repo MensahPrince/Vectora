@@ -270,10 +270,11 @@ export component AppWindow inherits Window {
             // else is swallowed.
             if (AppState.settings-open) {
                 if (event.text == Key.Escape) {
-                    // Esc dismisses; persist first so a theme/field change
-                    // made just before closing isn't lost (same as Done/✕).
-                    SettingsBackend.save();
-                    AppState.settings-open = false;
+                    // Esc follows Done/✕: persist first, and keep the dialog
+                    // open when validation or persistence fails.
+                    if (SettingsBackend.save()) {
+                        AppState.settings-open = false;
+                    }
                 }
                 return accept;
             }
