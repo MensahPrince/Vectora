@@ -76,7 +76,7 @@ impl CacheReferenceReport {
 }
 
 /// Bounded accounting and references discovered from saved drafts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 #[must_use]
 pub(crate) struct DraftReferenceReport {
     /// Child entries inspected as possible draft directories.
@@ -95,20 +95,6 @@ pub(crate) struct DraftReferenceReport {
     pub(crate) byte_limit_reached: bool,
     /// Aggregate, globally de-duplicated paths from all loaded projects.
     pub(crate) references: CacheReferenceReport,
-}
-
-impl Default for DraftReferenceReport {
-    fn default() -> Self {
-        Self {
-            draft_entries_examined: 0,
-            projects_loaded: 0,
-            project_bytes_read: 0,
-            skipped_or_errored: 0,
-            draft_limit_reached: false,
-            byte_limit_reached: false,
-            references: CacheReferenceReport::default(),
-        }
-    }
 }
 
 impl DraftReferenceReport {
