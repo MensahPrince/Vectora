@@ -23,7 +23,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::cache::{DEFAULT_QUOTA_BYTES, DownloadCache};
+use cutlass_cloud::cache::DownloadCache;
 use cutlass_cloud::dto::CatalogEntry;
 use cutlass_cloud::{CloudClient, download};
 use cutlass_commands::TemplatePick;
@@ -65,12 +65,13 @@ impl TemplatesWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         preview_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-templates".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, preview_handle);
+                let mut worker = Worker::new(backend_weak, preview_handle, cache);
                 // Preview fetches interleave with commands: commands take
                 // priority (a queued "use" shouldn't wait for previews),
                 // previews drain in the gaps.
@@ -111,13 +112,17 @@ struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     preview_handle: WorkerHandle,
     client: CloudClient,
-    cache: DownloadCache,
+    cache: Arc<DownloadCache>,
     /// The worker-side mirror of the published (filtered) tile list.
     entries: Vec<CatalogEntry>,
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, preview_handle: WorkerHandle) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        preview_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+    ) -> Self {
         Self {
             backend_weak,
             preview_handle,
@@ -125,10 +130,7 @@ impl Worker {
                 &crate::account::base_url(),
                 Some(paths::data_dir().join("catalog-cache")),
             ),
-            cache: DownloadCache::new(
-                paths::data_dir().join("download-cache"),
-                DEFAULT_QUOTA_BYTES,
-            ),
+            cache,
             entries: Vec::new(),
         }
     }

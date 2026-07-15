@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::cache::{DEFAULT_QUOTA_BYTES, DownloadCache};
+use cutlass_cloud::cache::DownloadCache;
 use cutlass_cloud::dto::CatalogEntry;
 use cutlass_cloud::{CloudClient, download};
 use slint::{ComponentHandle, Model, ModelRc, VecModel};
@@ -52,12 +52,13 @@ impl SfxWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-sfx".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, import_handle);
+                let mut worker = Worker::new(backend_weak, import_handle, cache);
                 while let Ok(command) = rx.recv() {
                     match command {
                         Command::Refresh => worker.refresh(),
@@ -82,13 +83,17 @@ struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     import_handle: WorkerHandle,
     client: CloudClient,
-    cache: DownloadCache,
+    cache: Arc<DownloadCache>,
     /// The worker-side mirror of the published tile list.
     entries: Vec<CatalogEntry>,
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, import_handle: WorkerHandle) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+    ) -> Self {
         Self {
             backend_weak,
             import_handle,
@@ -96,10 +101,7 @@ impl Worker {
                 &crate::account::base_url(),
                 Some(paths::data_dir().join("catalog-cache")),
             ),
-            cache: DownloadCache::new(
-                paths::data_dir().join("download-cache"),
-                DEFAULT_QUOTA_BYTES,
-            ),
+            cache,
             entries: Vec::new(),
         }
     }

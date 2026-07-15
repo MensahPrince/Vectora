@@ -17,7 +17,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::cache::{DEFAULT_QUOTA_BYTES, DownloadCache};
+use cutlass_cloud::cache::DownloadCache;
 use cutlass_cloud::dto::{GenerateRequest, JobStatus};
 use cutlass_cloud::generate::{
     FalGenerationProvider, GenerationKind, GenerationProvider, ManagedGenerationProvider,
@@ -28,7 +28,7 @@ use slint::{ComponentHandle, Image, Model, ModelRc, Rgba8Pixel, SharedPixelBuffe
 use tracing::{info, warn};
 
 use crate::preview_worker::WorkerHandle;
-use crate::{AiBackend, AiItemTile, paths};
+use crate::{AiBackend, AiItemTile};
 
 /// Generation can take minutes (video); poll at a human pace.
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -68,12 +68,13 @@ impl AiMediaWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-ai-media".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, import_handle);
+                let mut worker = Worker::new(backend_weak, import_handle, cache);
                 worker.publish_route();
                 while let Ok(command) = rx.recv() {
                     worker.run(command);
@@ -110,20 +111,21 @@ enum Route {
 struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     import_handle: WorkerHandle,
-    cache: DownloadCache,
+    cache: Arc<DownloadCache>,
     media_entries: Vec<Entry>,
     tts_entries: Vec<Entry>,
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, import_handle: WorkerHandle) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+    ) -> Self {
         Self {
             backend_weak,
             import_handle,
-            cache: DownloadCache::new(
-                paths::data_dir().join("download-cache"),
-                DEFAULT_QUOTA_BYTES,
-            ),
+            cache,
             media_entries: Vec::new(),
             tts_entries: Vec::new(),
         }

@@ -606,11 +606,20 @@ fn main() -> Result<(), slint::PlatformError> {
         "engine session ready"
     );
 
+    let download_cache = std::sync::Arc::new(cutlass_cloud::cache::DownloadCache::new(
+        paths::data_dir().join("download-cache"),
+        cutlass_cloud::cache::DEFAULT_QUOTA_BYTES,
+    ));
+
     // Library stock browsing: search + direct-CDN downloads on their own
     // thread (src/cloud.rs); imports route through the preview worker like
     // any local file.
-    let cloud_worker = cloud::CloudWorker::spawn(app.as_weak(), preview_worker.handle())
-        .map_err(slint::PlatformError::Other)?;
+    let cloud_worker = cloud::CloudWorker::spawn(
+        app.as_weak(),
+        preview_worker.handle(),
+        std::sync::Arc::clone(&download_cache),
+    )
+    .map_err(slint::PlatformError::Other)?;
     {
         let cloud_backend = app.global::<CloudBackend>();
         let search_handle = cloud_worker.handle();
@@ -639,9 +648,12 @@ fn main() -> Result<(), slint::PlatformError> {
     // Launch-screen templates gallery: catalog fetches, bundle installs, and
     // the pick flow on their own thread (src/templates.rs); the filled
     // template swaps the session through the preview worker.
-    let templates_worker =
-        templates::TemplatesWorker::spawn(app.as_weak(), preview_worker.handle())
-            .map_err(slint::PlatformError::Other)?;
+    let templates_worker = templates::TemplatesWorker::spawn(
+        app.as_weak(),
+        preview_worker.handle(),
+        std::sync::Arc::clone(&download_cache),
+    )
+    .map_err(slint::PlatformError::Other)?;
     {
         let templates_backend = app.global::<TemplatesBackend>();
         let refresh_handle = templates_worker.handle();
@@ -656,8 +668,12 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // AI generation (Library AI sections): prompt → job → poll → import on
     // its own thread (src/ai_media.rs), routed BYOK-or-managed.
-    let ai_media_worker = ai_media::AiMediaWorker::spawn(app.as_weak(), preview_worker.handle())
-        .map_err(slint::PlatformError::Other)?;
+    let ai_media_worker = ai_media::AiMediaWorker::spawn(
+        app.as_weak(),
+        preview_worker.handle(),
+        std::sync::Arc::clone(&download_cache),
+    )
+    .map_err(slint::PlatformError::Other)?;
     {
         let ai_backend = app.global::<AiBackend>();
         let generate_handle = ai_media_worker.handle();
@@ -727,8 +743,12 @@ fn main() -> Result<(), slint::PlatformError> {
 
     // Sound effects (Library > Audio > Sound effects): catalog fetch on its
     // own thread, lazy download + normal media import on click (src/sfx.rs).
-    let sfx_worker = sfx::SfxWorker::spawn(app.as_weak(), preview_worker.handle())
-        .map_err(slint::PlatformError::Other)?;
+    let sfx_worker = sfx::SfxWorker::spawn(
+        app.as_weak(),
+        preview_worker.handle(),
+        std::sync::Arc::clone(&download_cache),
+    )
+    .map_err(slint::PlatformError::Other)?;
     {
         let refresh_handle = sfx_worker.handle();
         app.global::<SfxBackend>()

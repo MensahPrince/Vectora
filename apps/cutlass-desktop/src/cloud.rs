@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 use std::thread::JoinHandle;
 
 use crossbeam_channel::{Sender, unbounded};
-use cutlass_cloud::cache::{DEFAULT_QUOTA_BYTES, DownloadCache};
+use cutlass_cloud::cache::DownloadCache;
 use cutlass_cloud::dto::{StockItem, StockKind};
 use cutlass_cloud::stock::{BackendStockProvider, DirectStockProvider, StockProvider};
 use cutlass_cloud::{CloudClient, download};
@@ -73,12 +73,13 @@ impl CloudWorker {
     pub fn spawn(
         backend_weak: slint::Weak<crate::AppWindow>,
         import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded::<Command>();
         let join = std::thread::Builder::new()
             .name("cutlass-cloud".into())
             .spawn(move || {
-                let mut worker = Worker::new(backend_weak, import_handle);
+                let mut worker = Worker::new(backend_weak, import_handle, cache);
                 // Thumbnail fetches interleave with commands: commands take
                 // priority (a queued import shouldn't wait for a page of
                 // thumbnails), thumbs drain in the gaps.
@@ -119,7 +120,7 @@ struct Worker {
     backend_weak: slint::Weak<crate::AppWindow>,
     import_handle: WorkerHandle,
     provider: Box<dyn StockProvider>,
-    cache: DownloadCache,
+    cache: Arc<DownloadCache>,
     /// The worker-side mirror of the published tile list.
     items: Vec<StockItem>,
     query: String,
@@ -128,7 +129,11 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(backend_weak: slint::Weak<crate::AppWindow>, import_handle: WorkerHandle) -> Self {
+    fn new(
+        backend_weak: slint::Weak<crate::AppWindow>,
+        import_handle: WorkerHandle,
+        cache: Arc<DownloadCache>,
+    ) -> Self {
         // The BYOK-first routing rule: stock keys from the `[providers.*]`
         // settings registry (env vars still work as a fallback) route search
         // straight to the providers; otherwise anonymous search goes through
@@ -158,10 +163,7 @@ impl Worker {
             backend_weak,
             import_handle,
             provider,
-            cache: DownloadCache::new(
-                paths::data_dir().join("download-cache"),
-                DEFAULT_QUOTA_BYTES,
-            ),
+            cache,
             items: Vec::new(),
             query: String::new(),
             kind: StockKind::Video,
