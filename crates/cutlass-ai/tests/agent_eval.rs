@@ -1970,7 +1970,10 @@ fn engine_sense_observes_rehearsed_edits_and_returns_images() {
     let Message::System { content } = &requests[0][0] else {
         panic!("first message should be the system prompt");
     };
-    assert!(content.contains("inspect the current sandbox"), "{content}");
+    assert!(
+        content.contains("inspect the complete current project snapshot and sandbox"),
+        "{content}"
+    );
     assert!(content.contains("schematic timeline map"), "{content}");
     assert!(content.contains("media_screenshot_preview"), "{content}");
     assert_eq!(
@@ -1996,6 +1999,69 @@ fn engine_sense_observes_rehearsed_edits_and_returns_images() {
     )));
     assert!(events.iter().any(
         |event| matches!(event, AgentEvent::Image(image) if image.label == "sandbox preview")
+    ));
+}
+
+#[test]
+fn media_pool_sheet_sense_dispatches_and_survives_the_image_budget() {
+    let (mut host, _, _, _) = fixture();
+    host.sense_specs = vec![host_spec("media_pool_sheet")];
+    host.sense_outputs.push_back(Ok(ToolOutput {
+        text: "Media-pool contact sheet page 1 of 2.".into(),
+        images: vec![ImagePart::png(
+            vec![0x89, 0x50, 0x4e, 0x47],
+            "media pool sheet page 1 of 2",
+        )],
+    }));
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "media_pool_sheet",
+            serde_json::json!({ "page": 1, "max_width": 1024 }),
+        )]),
+        text_turn("I found footage for the freestyle edit."),
+    ]);
+    let config = AgentConfig {
+        max_images: 1,
+        max_image_bytes: 16,
+        ..AgentConfig::default()
+    };
+
+    let (outcome, events) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "freestyle an edit from my media library",
+        &config,
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(
+        host.sense_calls,
+        vec![(
+            "media_pool_sheet".into(),
+            serde_json::json!({ "page": 1, "max_width": 1024 })
+        )]
+    );
+    let requests = provider.requests();
+    let Message::System { content } = &requests[0][0] else {
+        panic!("first message should be the system prompt");
+    };
+    assert!(content.contains("freestyle edits"), "{content}");
+    assert!(content.contains("media_pool_sheet"), "{content}");
+    match requests[1].last().unwrap() {
+        Message::ToolResult {
+            content, images, ..
+        } => {
+            assert_eq!(content, "Media-pool contact sheet page 1 of 2.");
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].label, "media pool sheet page 1 of 2");
+            assert_eq!(*images[0].data, vec![0x89, 0x50, 0x4e, 0x47]);
+        }
+        other => panic!("expected media-pool sheet result, got {other:?}"),
+    }
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Image(image) if image.label == "media pool sheet page 1 of 2")
     ));
 }
 

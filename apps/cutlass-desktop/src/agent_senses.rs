@@ -4,16 +4,22 @@
 //! private to that thread through [`AgentVision`], while the timeline map stays
 //! CPU-only and deterministic.
 
+use std::fmt::Write as _;
+
 use cutlass_ai::{HostToolSpec, ImagePart, ToolOutput, ToolTier};
 use cutlass_models::{MediaId, MediaSource, Project};
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::{Value, json};
 
-use crate::agent_vision::{AgentVision, MAX_VISION_EDGE};
+use crate::agent_vision::{
+    AgentVision, MAX_MEDIA_POOL_SHEET_WIDTH, MAX_VISION_EDGE, MEDIA_POOL_SHEET_PAGE_SIZE,
+    MIN_MEDIA_POOL_SHEET_WIDTH, MediaPoolSheetFailure, safe_file_name,
+};
 use crate::timeline_map::{self, TimelineMapOptions};
 
 const TIMELINE_MAP_TOOL: &str = "media_timeline_map";
 const PREVIEW_FRAME_TOOL: &str = "media_preview_frame";
+const POOL_SHEET_TOOL: &str = "media_pool_sheet";
 const ASSET_FRAME_TOOL: &str = "media_asset_frame";
 const ASSET_STRIP_TOOL: &str = "media_asset_strip";
 
@@ -22,6 +28,7 @@ const MIN_IMAGE_EDGE: u32 = 64;
 const DEFAULT_MAP_WIDTH: u32 = 768;
 const MIN_MAP_WIDTH: u32 = 320;
 const MAX_MAP_WIDTH: u32 = 1024;
+const DEFAULT_POOL_SHEET_WIDTH: u32 = 1024;
 const DEFAULT_STRIP_FRAMES: u32 = 6;
 pub(crate) const MAX_STRIP_FRAMES: u32 = 8;
 
@@ -87,6 +94,16 @@ impl AgentSenses {
                 tier: ToolTier::ReadOnly,
             },
             HostToolSpec {
+                name: POOL_SHEET_TOOL.to_string(),
+                description: format!(
+                    "Survey one page of the media pool as a labeled contact-sheet PNG, with up to \
+                     {MEDIA_POOL_SHEET_PAGE_SIZE} visual assets sampled at their midpoints. Use \
+                     this first to choose footage for open-ended creative edits."
+                ),
+                parameters: pool_sheet_schema(),
+                tier: ToolTier::ReadOnly,
+            },
+            HostToolSpec {
                 name: ASSET_FRAME_TOOL.to_string(),
                 description: "Render one source frame from a media-pool item selected only by its project media ID.".to_string(),
                 parameters: asset_frame_schema(),
@@ -113,11 +130,12 @@ impl AgentSenses {
         match name {
             TIMELINE_MAP_TOOL => self.timeline_map(project, arguments),
             PREVIEW_FRAME_TOOL => self.preview_frame(project, default_playhead_seconds, arguments),
+            POOL_SHEET_TOOL => self.pool_sheet(project, arguments),
             ASSET_FRAME_TOOL => self.asset_frame(project, arguments),
             ASSET_STRIP_TOOL => self.asset_strip(project, arguments),
             _ => Err(format!(
                 "unknown media sense tool '{name}'; expected one of: {TIMELINE_MAP_TOOL}, \
-                 {PREVIEW_FRAME_TOOL}, {ASSET_FRAME_TOOL}, {ASSET_STRIP_TOOL}"
+                 {PREVIEW_FRAME_TOOL}, {POOL_SHEET_TOOL}, {ASSET_FRAME_TOOL}, {ASSET_STRIP_TOOL}"
             )),
         }
     }
@@ -182,6 +200,38 @@ impl AgentSenses {
         Ok(ToolOutput {
             text,
             images: vec![image],
+        })
+    }
+
+    fn pool_sheet(&mut self, project: &Project, arguments: &Value) -> Result<ToolOutput, String> {
+        let request = parse_pool_sheet_request(arguments)?;
+        let (visual, nonvisual) = ordered_media_by_visibility(project);
+        let page = media_pool_page(visual.len(), request.page)?;
+        let pictured = &visual[page.start..page.end];
+        let sheet = self.vision.media_pool_sheet(
+            pictured,
+            page.number,
+            page.total_pages,
+            request.max_width,
+        )?;
+        let png = cutlass_render::encode_png(&sheet.image)
+            .map_err(|error| format!("could not encode media-pool sheet as PNG: {error}"))?;
+        let label = format!(
+            "media pool sheet page {} of {}",
+            page.number, page.total_pages
+        );
+        let text = format_pool_sheet_output(
+            &label,
+            page,
+            visual.len(),
+            pictured,
+            &nonvisual,
+            &sheet.failures,
+        );
+
+        Ok(ToolOutput {
+            text,
+            images: vec![ImagePart::png(png, label)],
         })
     }
 
@@ -268,6 +318,20 @@ pub(crate) struct StripRequest {
     pub max_height: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PoolSheetRequest {
+    pub page: u32,
+    pub max_width: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaPoolPage {
+    number: u32,
+    total_pages: u32,
+    start: usize,
+    end: usize,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TimelineMapRequest {
     width: u32,
@@ -306,6 +370,15 @@ struct PreviewFrameArguments {
     max_width: Option<u32>,
     #[serde(default, deserialize_with = "optional_non_null")]
     max_height: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PoolSheetArguments {
+    #[serde(default, deserialize_with = "optional_non_null")]
+    page: Option<u32>,
+    #[serde(default, deserialize_with = "optional_non_null")]
+    max_width: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -396,6 +469,22 @@ pub(crate) fn parse_preview_request(
     })
 }
 
+pub(crate) fn parse_pool_sheet_request(arguments: &Value) -> Result<PoolSheetRequest, String> {
+    let arguments: PoolSheetArguments = parse_object(POOL_SHEET_TOOL, arguments)?;
+    let page = arguments.page.unwrap_or(1);
+    if page == 0 {
+        return Err("media-pool sheet page must be a positive integer".into());
+    }
+    let max_width = arguments.max_width.unwrap_or(DEFAULT_POOL_SHEET_WIDTH);
+    validate_dimension(
+        "media-pool sheet max_width",
+        max_width,
+        MIN_MEDIA_POOL_SHEET_WIDTH,
+        MAX_MEDIA_POOL_SHEET_WIDTH,
+    )?;
+    Ok(PoolSheetRequest { page, max_width })
+}
+
 fn parse_asset_frame_request(arguments: &Value) -> Result<AssetFrameRequest, String> {
     let arguments: AssetFrameArguments = parse_object(ASSET_FRAME_TOOL, arguments)?;
     validate_media_id(arguments.media_id)?;
@@ -466,6 +555,116 @@ pub(crate) fn strip_sample_times(
         *last = end_seconds;
     }
     Ok(samples)
+}
+
+fn media_pool_page(total_visual: usize, requested_page: u32) -> Result<MediaPoolPage, String> {
+    if requested_page == 0 {
+        return Err("media-pool sheet page must be a positive integer".into());
+    }
+    let total_pages_usize = total_visual.div_ceil(MEDIA_POOL_SHEET_PAGE_SIZE).max(1);
+    let total_pages =
+        u32::try_from(total_pages_usize).map_err(|_| "media pool has too many pages to address")?;
+    if requested_page > total_pages {
+        return Err(format!(
+            "media-pool sheet page {requested_page} is out of range; choose 1-{total_pages}"
+        ));
+    }
+    let page_index =
+        usize::try_from(requested_page - 1).map_err(|_| "media-pool sheet page overflow")?;
+    let start = page_index
+        .checked_mul(MEDIA_POOL_SHEET_PAGE_SIZE)
+        .ok_or("media-pool sheet page offset overflow")?;
+    let end = start
+        .checked_add(MEDIA_POOL_SHEET_PAGE_SIZE)
+        .ok_or("media-pool sheet page end overflow")?
+        .min(total_visual);
+    Ok(MediaPoolPage {
+        number: requested_page,
+        total_pages,
+        start,
+        end,
+    })
+}
+
+fn ordered_media_by_visibility(project: &Project) -> (Vec<&MediaSource>, Vec<&MediaSource>) {
+    let mut media: Vec<_> = project.media_iter().collect();
+    media.sort_unstable_by_key(|source| source.id.raw());
+    media
+        .into_iter()
+        .partition(|source| !source.is_audio_only() && source.width > 0 && source.height > 0)
+}
+
+fn format_pool_sheet_output(
+    label: &str,
+    page: MediaPoolPage,
+    total_visual: usize,
+    pictured: &[&MediaSource],
+    nonvisual: &[&MediaSource],
+    failures: &[MediaPoolSheetFailure],
+) -> String {
+    let mut text = format!(
+        "Media-pool contact sheet '{label}': page {} of {}, showing {} of {} visual item(s); \
+         {} audio-only or nonvisual item(s) are listed but not pictured.",
+        page.number,
+        page.total_pages,
+        pictured.len(),
+        total_visual,
+        nonvisual.len()
+    );
+
+    if pictured.is_empty() {
+        text.push_str("\nPictured visual media: none.");
+    } else {
+        text.push_str("\nPictured visual media:");
+        for source in pictured {
+            let _ = write!(text, "\n- {}", format_media_summary(source));
+        }
+    }
+
+    if !nonvisual.is_empty() {
+        text.push_str("\nNot pictured:");
+        for source in nonvisual {
+            let kind = if source.is_audio_only() {
+                "audio-only"
+            } else {
+                "nonvisual"
+            };
+            let _ = write!(
+                text,
+                "\n- #{} {} ({kind}, {})",
+                source.id.raw(),
+                safe_file_name(source.path()),
+                format_duration(source.duration.seconds())
+            );
+        }
+    }
+
+    if !failures.is_empty() {
+        text.push_str("\nUnavailable placeholder tiles:");
+        for failure in failures {
+            let _ = write!(text, "\n- #{}: {}", failure.media_id, failure.detail);
+        }
+    }
+    text
+}
+
+fn format_media_summary(source: &MediaSource) -> String {
+    format!(
+        "#{} {} ({}, {}x{})",
+        source.id.raw(),
+        safe_file_name(source.path()),
+        format_duration(source.duration.seconds()),
+        source.width,
+        source.height
+    )
+}
+
+fn format_duration(seconds: f64) -> String {
+    if seconds.is_finite() && seconds >= 0.0 {
+        format!("{seconds:.2}s")
+    } else {
+        "unknown duration".to_string()
+    }
 }
 
 fn resolve_visual_media(project: &Project, raw_id: u64) -> Result<&MediaSource, String> {
@@ -559,6 +758,31 @@ fn preview_frame_schema() -> Value {
     })
 }
 
+fn pool_sheet_schema() -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "page": {
+                "type": "integer",
+                "minimum": 1,
+                "default": 1,
+                "description": format!(
+                    "One-based page of visual media, with up to \
+                     {MEDIA_POOL_SHEET_PAGE_SIZE} items per page."
+                )
+            },
+            "max_width": {
+                "type": "integer",
+                "minimum": MIN_MEDIA_POOL_SHEET_WIDTH,
+                "maximum": MAX_MEDIA_POOL_SHEET_WIDTH,
+                "default": DEFAULT_POOL_SHEET_WIDTH,
+                "description": "Width of the complete contact-sheet PNG in pixels."
+            }
+        }
+    })
+}
+
 fn asset_frame_schema() -> Value {
     json!({
         "type": "object",
@@ -633,4 +857,105 @@ fn asset_strip_schema() -> Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cutlass_models::Rational;
+
+    #[test]
+    fn media_pool_sheet_spec_is_read_only_and_bounded() {
+        let spec = AgentSenses::specs()
+            .into_iter()
+            .find(|spec| spec.name == POOL_SHEET_TOOL)
+            .expect("media-pool sheet spec");
+
+        assert_eq!(spec.tier, ToolTier::ReadOnly);
+        assert_eq!(
+            spec.parameters["properties"]["max_width"]["maximum"],
+            MAX_MEDIA_POOL_SHEET_WIDTH
+        );
+        assert_eq!(
+            spec.parameters["properties"]["page"]["minimum"],
+            serde_json::json!(1)
+        );
+        assert!(spec.description.contains("open-ended creative edits"));
+    }
+
+    #[test]
+    fn media_pool_sheet_arguments_default_and_reject_invalid_values() {
+        assert_eq!(
+            parse_pool_sheet_request(&json!({})).unwrap(),
+            PoolSheetRequest {
+                page: 1,
+                max_width: DEFAULT_POOL_SHEET_WIDTH,
+            }
+        );
+        assert_eq!(
+            parse_pool_sheet_request(&json!({"page": 2, "max_width": 768})).unwrap(),
+            PoolSheetRequest {
+                page: 2,
+                max_width: 768,
+            }
+        );
+        assert!(parse_pool_sheet_request(&json!({"page": 0})).is_err());
+        assert!(
+            parse_pool_sheet_request(&json!({"max_width": MAX_MEDIA_POOL_SHEET_WIDTH + 1}))
+                .is_err()
+        );
+        assert!(parse_pool_sheet_request(&json!({"unknown": true})).is_err());
+    }
+
+    #[test]
+    fn media_pool_sheet_paging_handles_empty_and_partial_last_pages() {
+        assert_eq!(
+            media_pool_page(0, 1).unwrap(),
+            MediaPoolPage {
+                number: 1,
+                total_pages: 1,
+                start: 0,
+                end: 0,
+            }
+        );
+        assert_eq!(
+            media_pool_page(MEDIA_POOL_SHEET_PAGE_SIZE + 1, 2).unwrap(),
+            MediaPoolPage {
+                number: 2,
+                total_pages: 2,
+                start: MEDIA_POOL_SHEET_PAGE_SIZE,
+                end: MEDIA_POOL_SHEET_PAGE_SIZE + 1,
+            }
+        );
+        assert!(media_pool_page(MEDIA_POOL_SHEET_PAGE_SIZE + 1, 3).is_err());
+    }
+
+    #[test]
+    fn media_pool_sheet_text_lists_audio_and_placeholder_failures() {
+        let mut visual =
+            MediaSource::new("/private/shot.mov", 1920, 1080, Rational::FPS_24, 240, true);
+        visual.id = MediaId::from_raw(11);
+        let mut audio = MediaSource::new("/private/music.wav", 0, 0, Rational::FPS_24, 120, true);
+        audio.id = MediaId::from_raw(12);
+        let page = media_pool_page(1, 1).unwrap();
+
+        let output = format_pool_sheet_output(
+            "media pool sheet page 1 of 1",
+            page,
+            1,
+            &[&visual],
+            &[&audio],
+            &[MediaPoolSheetFailure {
+                media_id: 11,
+                detail: "shot.mov is offline".into(),
+            }],
+        );
+
+        assert!(output.contains("page 1 of 1"));
+        assert!(output.contains("#11 shot.mov (10.00s, 1920x1080)"));
+        assert!(output.contains("#12 music.wav (audio-only, 5.00s)"));
+        assert!(output.contains("Unavailable placeholder tiles"));
+        assert!(output.contains("#11: shot.mov is offline"));
+        assert!(!output.contains("/private/"));
+    }
 }

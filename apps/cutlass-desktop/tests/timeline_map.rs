@@ -6,7 +6,7 @@ use cutlass_models::{
     TrackKind,
 };
 use cutlass_render::RgbaImage;
-use timeline_map::{TimelineMapOptions, render};
+use timeline_map::{Canvas, TimelineMapOptions, render};
 
 const FPS: Rational = Rational::FPS_24;
 const VIDEO: [u8; 4] = [0x4A, 0x6F, 0xA5, 0xFF];
@@ -39,6 +39,18 @@ fn has_plot_pixel(image: &RgbaImage, color: [u8; 4]) -> bool {
             image.pixels[offset..offset + 4] == color
         })
     })
+}
+
+#[test]
+fn schematic_canvas_centers_rgba_images_for_contact_sheets() {
+    let mut canvas = Canvas::new(32, 24, [0, 0, 0, 255]).unwrap();
+    let source = RgbaImage::new(4, 2, vec![255; 4 * 2 * 4]);
+
+    assert!(canvas.draw_image_centered(&source, 4, 4, 20, 12));
+    let image = canvas.into_image();
+
+    assert_eq!(image.pixel(12, 9), [255; 4]);
+    assert_eq!(image.pixel(4, 4), [0, 0, 0, 255]);
 }
 
 fn assert_bounded_opaque_image(image: &RgbaImage) {

@@ -663,25 +663,25 @@ fn format_ruler_time(seconds: f64, interval: f64) -> String {
     }
 }
 
-struct Canvas {
+pub(crate) struct Canvas {
     width: u32,
     height: u32,
     pixels: Vec<u8>,
 }
 
 impl Canvas {
-    fn new(width: u32, height: u32, background: [u8; 4]) -> Result<Self, String> {
+    pub(crate) fn new(width: u32, height: u32, background: [u8; 4]) -> Result<Self, String> {
         if width == 0 || height == 0 || width > MAX_WIDTH || height > MAX_HEIGHT {
-            return Err("invalid timeline-map dimensions".into());
+            return Err("invalid schematic-canvas dimensions".into());
         }
         let len = (width as usize)
             .checked_mul(height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
-            .ok_or("timeline-map allocation size overflow")?;
+            .ok_or("schematic-canvas allocation size overflow")?;
         let mut bytes = Vec::new();
         bytes
             .try_reserve_exact(len)
-            .map_err(|_| "unable to allocate timeline-map pixels")?;
+            .map_err(|_| "unable to allocate schematic-canvas pixels")?;
         bytes.resize(len, 0);
         for pixel in bytes.chunks_exact_mut(4) {
             pixel.copy_from_slice(&background);
@@ -693,7 +693,7 @@ impl Canvas {
         })
     }
 
-    fn into_image(self) -> RgbaImage {
+    pub(crate) fn into_image(self) -> RgbaImage {
         RgbaImage::new(self.width, self.height, self.pixels)
     }
 
@@ -729,7 +729,7 @@ impl Canvas {
         destination[3] = ((alpha_numerator + 127) / 255) as u8;
     }
 
-    fn fill_rect(&mut self, x: i32, y: i32, width: i32, height: i32, color: [u8; 4]) {
+    pub(crate) fn fill_rect(&mut self, x: i32, y: i32, width: i32, height: i32, color: [u8; 4]) {
         if width <= 0 || height <= 0 {
             return;
         }
@@ -747,8 +747,45 @@ impl Canvas {
         }
     }
 
+    /// Draw an RGBA image centered in a bounded rectangle without scaling.
+    ///
+    /// Images larger than the rectangle are center-cropped. Callers that need
+    /// fit behavior should render to the target bound before drawing.
+    pub(crate) fn draw_image_centered(
+        &mut self,
+        image: &RgbaImage,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+    ) -> bool {
+        if width <= 0 || height <= 0 || !image.is_well_formed() {
+            return false;
+        }
+
+        let image_width = i32::try_from(image.width).unwrap_or(i32::MAX);
+        let image_height = i32::try_from(image.height).unwrap_or(i32::MAX);
+        let copy_width = image_width.min(width);
+        let copy_height = image_height.min(height);
+        let source_x = (image_width - copy_width) / 2;
+        let source_y = (image_height - copy_height) / 2;
+        let destination_x = x + (width - copy_width) / 2;
+        let destination_y = y + (height - copy_height) / 2;
+
+        for row in 0..copy_height {
+            for column in 0..copy_width {
+                self.blend_pixel(
+                    destination_x + column,
+                    destination_y + row,
+                    image.pixel((source_x + column) as u32, (source_y + row) as u32),
+                );
+            }
+        }
+        true
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn draw_text_clipped(
+    pub(crate) fn draw_text_clipped(
         &mut self,
         text: &str,
         x: i32,
