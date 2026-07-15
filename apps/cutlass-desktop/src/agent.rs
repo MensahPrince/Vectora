@@ -17,19 +17,20 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
 use cutlass_ai::providers::openai_compat::OpenAiCompatProvider;
 use cutlass_ai::{
     AgentConfig, AgentEvent, AgentExtensions, EditorContext, EngineBridge, HostToolSpec, Message,
-    ProjectSummary, PromptStatus, ToolHost, ToolOutput, WireCommand, compose_rules,
+    ProjectSummary, PromptStatus, ToolHost, ToolOutput, ToolTier, WireCommand, compose_rules,
     expand_slash_command, load_agent_dir, merge_skills, run_prompt_with_host, summarize, validate,
 };
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
+use cutlass_settings::Autonomy;
 use slint::{Model, ModelRc, SharedString, VecModel};
 use tracing::{error, info, warn};
 
@@ -70,10 +71,24 @@ enum AgentRequest {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalChoice {
+    Approve,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ApprovalDecision {
+    request_id: u64,
+    choice: ApprovalChoice,
+}
+
 #[derive(Clone)]
 pub struct AgentHandle {
     tx: Sender<AgentRequest>,
     cancel: Arc<AtomicBool>,
+    approval_tx: Sender<ApprovalDecision>,
+    pending_approval_id: Arc<AtomicU64>,
 }
 
 impl AgentHandle {
@@ -104,6 +119,27 @@ impl AgentHandle {
     pub fn cancel(&self) {
         self.cancel.store(true, Ordering::Relaxed);
     }
+
+    /// Approve only the System-tier call that is pending right now. The id
+    /// travels with the decision so a delayed duplicate click can never
+    /// authorize a later call.
+    pub fn approve_system_tool(&self) {
+        self.decide_system_tool(ApprovalChoice::Approve);
+    }
+
+    /// Decline only the System-tier call that is pending right now.
+    pub fn deny_system_tool(&self) {
+        self.decide_system_tool(ApprovalChoice::Deny);
+    }
+
+    fn decide_system_tool(&self, choice: ApprovalChoice) {
+        let request_id = self.pending_approval_id.load(Ordering::Acquire);
+        if request_id != 0 {
+            let _ = self
+                .approval_tx
+                .send(ApprovalDecision { request_id, choice });
+        }
+    }
 }
 
 pub struct AgentWorker {
@@ -117,14 +153,33 @@ impl AgentWorker {
         store: slint::Weak<AgentStore<'static>>,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded();
+        let (approval_tx, approval_rx) = unbounded();
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
+        let pending_approval_id = Arc::new(AtomicU64::new(0));
+        let thread_pending_approval_id = pending_approval_id.clone();
+        let approval_id_allocator = Arc::new(AtomicU64::new(0));
         let join = std::thread::Builder::new()
             .name("cutlass-agent".into())
-            .spawn(move || agent_main(worker, store, rx, thread_cancel))
+            .spawn(move || {
+                agent_main(
+                    worker,
+                    store,
+                    rx,
+                    thread_cancel,
+                    approval_rx,
+                    thread_pending_approval_id,
+                    approval_id_allocator,
+                )
+            })
             .map_err(|e| e.to_string())?;
         Ok(Self {
-            handle: AgentHandle { tx, cancel },
+            handle: AgentHandle {
+                tx,
+                cancel,
+                approval_tx,
+                pending_approval_id,
+            },
             _join: join,
         })
     }
@@ -330,14 +385,201 @@ impl EngineBridge for SandboxBridge<'_> {
     }
 }
 
-/// The desktop's host-tool surface. Empty for now — screenshots, app
-/// control, cache management, and analysis tools land here in later
-/// phases; the loop already routes their calls, results, and events.
-pub struct DesktopToolHost;
+const APPROVAL_WAIT_SLICE: Duration = Duration::from_millis(50);
+const APPROVAL_CARD_PUBLISH_TIMEOUT: Duration = Duration::from_secs(2);
+const APPROVAL_DETAIL_MAX_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApprovalWaitOutcome {
+    Approved,
+    Declined,
+    Cancelled,
+    ChannelClosed,
+}
+
+/// Wait for one exact approval generation. Decisions for earlier requests
+/// are consumed and ignored, so they cannot leak into a later authorization.
+fn wait_for_system_tool_approval(
+    approval_rx: &Receiver<ApprovalDecision>,
+    request_id: u64,
+    cancel: &AtomicBool,
+    wait_slice: Duration,
+) -> ApprovalWaitOutcome {
+    loop {
+        if cancel.load(Ordering::Acquire) {
+            return ApprovalWaitOutcome::Cancelled;
+        }
+        match approval_rx.recv_timeout(wait_slice) {
+            Ok(decision) if decision.request_id != request_id => continue,
+            Ok(decision) => {
+                // Stop wins if it raced with a click that was already queued.
+                if cancel.load(Ordering::Acquire) {
+                    return ApprovalWaitOutcome::Cancelled;
+                }
+                return match decision.choice {
+                    ApprovalChoice::Approve => ApprovalWaitOutcome::Approved,
+                    ApprovalChoice::Deny => ApprovalWaitOutcome::Declined,
+                };
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => {
+                return ApprovalWaitOutcome::ChannelClosed;
+            }
+        }
+    }
+}
+
+fn allocate_approval_request_id(allocator: &AtomicU64) -> Result<u64, String> {
+    allocator
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map(|previous| previous + 1)
+        .map_err(|_| "system tool approval request id space is exhausted".into())
+}
+
+fn publish_approval_card(
+    store: &slint::Weak<AgentStore<'static>>,
+    name: &str,
+    arguments: &serde_json::Value,
+) -> Result<(), String> {
+    let title = format!("Run {name}?");
+    let detail = approval_detail(arguments);
+    let (published_tx, published_rx) = bounded(1);
+    let store = store.clone();
+    slint::invoke_from_event_loop(move || {
+        let published = store.upgrade().is_some_and(|store| {
+            store.set_approval_title(title.into());
+            store.set_approval_detail(detail.into());
+            store.set_approval_pending(true);
+            true
+        });
+        let _ = published_tx.send(published);
+    })
+    .map_err(|error| format!("could not show system tool approval: {error}"))?;
+    match published_rx.recv_timeout(APPROVAL_CARD_PUBLISH_TIMEOUT) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err("could not show system tool approval because the UI is closed".into()),
+        Err(RecvTimeoutError::Timeout) => {
+            Err("timed out while showing the system tool approval".into())
+        }
+        Err(RecvTimeoutError::Disconnected) => {
+            Err("system tool approval UI closed before it could be shown".into())
+        }
+    }
+}
+
+fn approval_detail(arguments: &serde_json::Value) -> String {
+    let detail = match arguments.as_object() {
+        Some(arguments) if arguments.is_empty() => "No arguments.".to_string(),
+        _ => serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string()),
+    };
+    let mut bounded: String = detail.chars().take(APPROVAL_DETAIL_MAX_CHARS).collect();
+    if detail.chars().count() > APPROVAL_DETAIL_MAX_CHARS {
+        bounded.push('…');
+    }
+    bounded
+}
+
+fn clear_approval_card(store: &slint::Weak<AgentStore<'static>>) {
+    with_store(store, |store| {
+        store.set_approval_pending(false);
+        store.set_approval_title(SharedString::default());
+        store.set_approval_detail(SharedString::default());
+    });
+}
+
+/// The desktop's host-tool surface. Host tools themselves land in later
+/// phases; this broker already gates every future System-tier call.
+pub struct DesktopToolHost {
+    autonomy: Autonomy,
+    store: slint::Weak<AgentStore<'static>>,
+    approval_rx: Receiver<ApprovalDecision>,
+    pending_approval_id: Arc<AtomicU64>,
+    approval_id_allocator: Arc<AtomicU64>,
+}
+
+impl DesktopToolHost {
+    fn new(
+        autonomy: Autonomy,
+        store: slint::Weak<AgentStore<'static>>,
+        approval_rx: Receiver<ApprovalDecision>,
+        pending_approval_id: Arc<AtomicU64>,
+        approval_id_allocator: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            autonomy,
+            store,
+            approval_rx,
+            pending_approval_id,
+            approval_id_allocator,
+        }
+    }
+}
 
 impl ToolHost for DesktopToolHost {
     fn tools(&self) -> Vec<HostToolSpec> {
         Vec::new()
+    }
+
+    fn authorize(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        tier: ToolTier,
+        cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        if tier != ToolTier::System || self.autonomy == Autonomy::Full {
+            return Ok(());
+        }
+        if cancel.load(Ordering::Acquire) {
+            return Err("cancelled before the system tool could run".into());
+        }
+
+        let request_id = allocate_approval_request_id(&self.approval_id_allocator)?;
+        self.pending_approval_id
+            .compare_exchange(0, request_id, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "another system tool approval is already pending".to_string())?;
+        if let Err(error) = publish_approval_card(&self.store, name, arguments) {
+            let _ = self.pending_approval_id.compare_exchange(
+                request_id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            clear_approval_card(&self.store);
+            return Err(error);
+        }
+
+        let outcome = wait_for_system_tool_approval(
+            &self.approval_rx,
+            request_id,
+            cancel,
+            APPROVAL_WAIT_SLICE,
+        );
+        let _ = self.pending_approval_id.compare_exchange(
+            request_id,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        clear_approval_card(&self.store);
+
+        match outcome {
+            ApprovalWaitOutcome::Approved if cancel.load(Ordering::Acquire) => {
+                Err("cancelled before the system tool could run".into())
+            }
+            ApprovalWaitOutcome::Approved => Ok(()),
+            ApprovalWaitOutcome::Declined => Err(format!(
+                "the user declined system tool '{name}'; the tool was not run"
+            )),
+            ApprovalWaitOutcome::Cancelled => {
+                Err("cancelled while waiting for system tool approval; the tool was not run".into())
+            }
+            ApprovalWaitOutcome::ChannelClosed => {
+                Err("system tool approval closed; the tool was not run".into())
+            }
+        }
     }
 
     fn call(
@@ -378,6 +620,9 @@ fn agent_main(
     store: slint::Weak<AgentStore<'static>>,
     rx: Receiver<AgentRequest>,
     cancel: Arc<AtomicBool>,
+    approval_rx: Receiver<ApprovalDecision>,
+    pending_approval_id: Arc<AtomicU64>,
+    approval_id_allocator: Arc<AtomicU64>,
 ) {
     let mut sandbox: Option<Engine> = None;
     let mut preview = Preview::default();
@@ -449,6 +694,9 @@ fn agent_main(
                     agent_dir,
                     dry_run,
                     &cancel,
+                    &approval_rx,
+                    &pending_approval_id,
+                    &approval_id_allocator,
                 );
 
                 with_store(&store, |s| s.set_running(false));
@@ -517,6 +765,9 @@ fn run_one_prompt(
     agent_dir: cutlass_ai::AgentDir,
     dry_run: bool,
     cancel: &AtomicBool,
+    approval_rx: &Receiver<ApprovalDecision>,
+    pending_approval_id: &Arc<AtomicU64>,
+    approval_id_allocator: &Arc<AtomicU64>,
 ) {
     let config_path = cutlass_settings::default_config_path();
     let section = match cutlass_settings::load(&config_path) {
@@ -633,7 +884,13 @@ fn run_one_prompt(
         engine,
         plan: &mut plan,
     };
-    let mut tool_host = DesktopToolHost;
+    let mut tool_host = DesktopToolHost::new(
+        section.autonomy,
+        store.clone(),
+        approval_rx.clone(),
+        pending_approval_id.clone(),
+        approval_id_allocator.clone(),
+    );
     let event_store = store.clone();
     let mut on_event = move |event: AgentEvent| match event {
         AgentEvent::TextDelta(delta) => append_assistant_text(&event_store, delta),
@@ -819,6 +1076,137 @@ mod tests {
     use cutlass_models::{
         Generator, MediaSource, Project, Rational, RationalTime, TimeRange, TrackKind,
     };
+
+    const TEST_APPROVAL_WAIT: Duration = Duration::from_millis(10);
+
+    fn decision(request_id: u64, choice: ApprovalChoice) -> ApprovalDecision {
+        ApprovalDecision { request_id, choice }
+    }
+
+    #[test]
+    fn ask_approval_accepts_the_matching_run_decision() {
+        let (tx, rx) = unbounded();
+        tx.send(decision(7, ApprovalChoice::Approve)).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 7, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::Approved
+        );
+    }
+
+    #[test]
+    fn ask_approval_returns_the_matching_decline_decision() {
+        let (tx, rx) = unbounded();
+        tx.send(decision(11, ApprovalChoice::Deny)).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 11, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::Declined
+        );
+    }
+
+    #[test]
+    fn ask_approval_cancellation_wins_over_a_queued_run_decision() {
+        let (tx, rx) = unbounded();
+        tx.send(decision(19, ApprovalChoice::Approve)).unwrap();
+        let cancel = AtomicBool::new(true);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 19, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::Cancelled
+        );
+    }
+
+    #[test]
+    fn stale_run_decision_cannot_approve_a_later_request() {
+        let (tx, rx) = unbounded();
+        // Request 23 has already finished. Its delayed Run click must be
+        // consumed but ignored while request 24 waits for its own answer.
+        tx.send(decision(23, ApprovalChoice::Approve)).unwrap();
+        tx.send(decision(24, ApprovalChoice::Deny)).unwrap();
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 24, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::Declined
+        );
+    }
+
+    #[test]
+    fn approval_wait_reports_channel_closure() {
+        let (tx, rx) = unbounded();
+        drop(tx);
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            wait_for_system_tool_approval(&rx, 1, &cancel, TEST_APPROVAL_WAIT),
+            ApprovalWaitOutcome::ChannelClosed
+        );
+    }
+
+    #[test]
+    fn approval_request_ids_are_monotonic_and_never_zero() {
+        let allocator = AtomicU64::new(0);
+
+        assert_eq!(allocate_approval_request_id(&allocator).unwrap(), 1);
+        assert_eq!(allocate_approval_request_id(&allocator).unwrap(), 2);
+
+        let exhausted = AtomicU64::new(u64::MAX);
+        assert!(allocate_approval_request_id(&exhausted).is_err());
+        assert_eq!(exhausted.load(Ordering::Relaxed), u64::MAX);
+    }
+
+    #[test]
+    fn approval_detail_is_bounded_and_handles_empty_arguments() {
+        assert_eq!(approval_detail(&serde_json::json!({})), "No arguments.");
+
+        let detail = approval_detail(&serde_json::json!({
+            "script": "x".repeat(APPROVAL_DETAIL_MAX_CHARS + 100)
+        }));
+        assert_eq!(detail.chars().count(), APPROVAL_DETAIL_MAX_CHARS + 1);
+        assert!(detail.ends_with('…'));
+        assert!(detail.starts_with("{\n  \"script\": \""));
+    }
+
+    #[test]
+    fn full_autonomy_bypasses_the_approval_channel() {
+        let (tx, rx) = unbounded();
+        drop(tx);
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Full,
+            slint::Weak::default(),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        assert_eq!(
+            host.authorize(
+                "system_cache_clear",
+                &serde_json::json!({ "scope": "all" }),
+                ToolTier::System,
+                &cancel,
+            ),
+            Ok(())
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+
+        assert_eq!(
+            host.authorize(
+                "media_preview_frame",
+                &serde_json::json!({}),
+                ToolTier::ReadOnly,
+                &cancel,
+            ),
+            Ok(())
+        );
+    }
 
     fn fixture_project() -> (Project, u64) {
         let mut project = Project::new("agent-ui-fixture", Rational::FPS_24);

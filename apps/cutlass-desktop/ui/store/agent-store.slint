@@ -38,6 +38,12 @@ export global AgentStore {
     in-out property <bool> plan-pending: false;
     in-out property <[string]> plan-actions: [];
 
+    // A System-tier host tool is paused before execution. Unlike timeline
+    // plans, these actions happen immediately and are not Cutlass-undoable.
+    in-out property <bool> approval-pending: false;
+    in-out property <string> approval-title: "";
+    in-out property <string> approval-detail: "";
+
     // One-click undo on the latest applied prompt. Cleared on use and on
     // the next prompt; it drives plain history undo, so it is only shown
     // while the agent's group is the newest entry.
@@ -54,6 +60,8 @@ export global AgentStore {
     callback cancel();
     callback apply-plan();
     callback discard-plan();
+    callback approve-system-tool();
+    callback deny-system-tool();
     // Session replaced wholesale (open / new / restore): cancel any
     // running prompt and drop a parked plan — both rehearsed against the
     // old project. Fired from app.slint's session-epoch watcher.

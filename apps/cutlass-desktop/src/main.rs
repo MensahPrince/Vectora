@@ -833,6 +833,12 @@ fn main() -> Result<(), slint::PlatformError> {
     let agent_cancel = agent_worker.handle();
     agent_store.on_cancel(move || agent_cancel.cancel());
 
+    let agent_approve = agent_worker.handle();
+    agent_store.on_approve_system_tool(move || agent_approve.approve_system_tool());
+
+    let agent_deny = agent_worker.handle();
+    agent_store.on_deny_system_tool(move || agent_deny.deny_system_tool());
+
     let agent_apply = agent_worker.handle();
     agent_store.on_apply_plan(move || agent_apply.apply_plan());
 

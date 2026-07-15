@@ -454,6 +454,60 @@ export component AgentPanel inherits PanelBase {
             }
         }
 
+        // System-tier host tools execute outside the rehearsed timeline
+        // plan, so each call pauses here unless Full autonomy is enabled.
+        if AgentStore.approval-pending: Rectangle {
+            background: AppStore.theme.agent.plan-bg;
+            border-width: 1px;
+            border-color: AppStore.theme.agent.plan-border;
+            border-radius: AppStore.theme.metrics.radius.md;
+
+            VerticalLayout {
+                padding: AppStore.theme.metrics.spacing.md;
+                spacing: AppStore.theme.metrics.spacing.sm;
+
+                CutlassText {
+                    text: AgentStore.approval-title;
+                    wrap: word-wrap;
+                    style: AppStore.theme.typography.label;
+                }
+
+                CutlassText {
+                    text: AgentStore.approval-detail;
+                    wrap: word-wrap;
+                    mono: true;
+                    style: AppStore.theme.typography.caption;
+                    foreground: AppStore.theme.text.secondary;
+                }
+
+                CutlassText {
+                    text: "This action runs now and cannot be undone from Cutlass.";
+                    wrap: word-wrap;
+                    style: AppStore.theme.typography.caption;
+                    foreground: AppStore.theme.agent.error;
+                }
+
+                HorizontalLayout {
+                    spacing: AppStore.theme.metrics.spacing.sm;
+                    alignment: start;
+
+                    AccentButton {
+                        label: "Run";
+                        clicked => {
+                            AgentStore.approve-system-tool();
+                        }
+                    }
+
+                    SubtleButton {
+                        label: "Decline";
+                        clicked => {
+                            AgentStore.deny-system-tool();
+                        }
+                    }
+                }
+            }
+        }
+
         // The rehearsed plan, waiting on the user (preview-before-apply).
         if AgentStore.plan-pending: Rectangle {
             background: AppStore.theme.agent.plan-bg;
