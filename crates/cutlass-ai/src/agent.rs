@@ -8,7 +8,16 @@
 //! rolls back only when the prompt aborts (cancellation, provider error,
 //! cap exceeded). In dry-run mode nothing is applied; the validated plan
 //! comes back for the UI's preview card.
+//!
+//! Beyond edits, the embedder can wire a [`ToolHost`] of its own tools
+//! (screenshots, app control, …): the loop offers their specs alongside
+//! the edit vocabulary, dispatches calls by name, and charges them
+//! against their own cap — host tools never touch the bridge. The
+//! built-in `commit_progress` tool records phase breaks so a long task's
+//! live replay can land as several undo steps
+//! ([`PromptOutcome::phase_breaks`]).
 
+use std::collections::HashSet;
 use std::sync::atomic::AtomicBool;
 
 use cutlass_commands::EditOutcome;
@@ -16,6 +25,7 @@ use cutlass_commands::EditOutcome;
 use crate::describe::{EditorContext, ProjectSummary};
 use crate::extend::AgentExtensions;
 use crate::provider::{ChatProvider, ChatRequest, FinishReason, ImagePart, Message, ProviderError};
+use crate::tools::{HostToolSpec, ToolHost, is_host_tool_name};
 use crate::wire::{self, WireCommand};
 
 /// The loop's only view of the engine. The UI implements this over a
@@ -39,6 +49,9 @@ pub trait EngineBridge {
 pub struct AgentConfig {
     /// Hard cap on edit-tool calls per prompt (the runaway-loop fuse).
     pub max_tool_calls: usize,
+    /// Hard cap on host-tool calls per prompt. A separate fuse: senses
+    /// and app control must not starve editing, nor the reverse.
+    pub max_host_calls: usize,
     /// Hard cap on provider turns per prompt.
     pub max_turns: usize,
     /// Hard cap on images carried by one request, newest kept. Screenshot
@@ -53,6 +66,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_tool_calls: 32,
+            max_host_calls: 24,
             max_turns: 16,
             max_images: 8,
             dry_run: false,
@@ -76,6 +90,8 @@ pub enum AgentEvent {
     TextDelta(String),
     /// An edit was applied (or validated, in dry-run).
     Action(ActionLogEntry),
+    /// A host tool ran; `summary` is the first line of its output.
+    HostAction { name: String, summary: String },
 }
 
 /// How the prompt ended.
@@ -94,6 +110,12 @@ pub struct PromptOutcome {
     /// The model's final text answer (empty if it only edited).
     pub text: String,
     pub actions: Vec<ActionLogEntry>,
+    /// Indices into `actions` where a committed phase ends (exclusive),
+    /// from `commit_progress`. The tail past the last break is the final,
+    /// implicit phase — never listed; empty means one phase. Callers group
+    /// live replay by these; rehearsal and rollback stay one group per
+    /// prompt.
+    pub phase_breaks: Vec<usize>,
     pub status: PromptStatus,
     /// This turn's conversation, ready to append to the session history so
     /// the next prompt remembers it: the user message, every assistant
@@ -186,14 +208,36 @@ pub fn system_prompt(
     )
 }
 
-/// Run one prompt to completion against `bridge`.
+/// Appended to the system message only when the embedder wires host
+/// tools; `system_prompt` itself stays host-agnostic (its signature and
+/// output are relied on by other callers and tests).
+const HOST_TOOLS_RULES: &str = "\n\nHost tools: tools named {namespace}_{tool} (app_…, media_…, python_…) \
+     reach the surrounding application rather than the timeline. Read-only \
+     and workspace tools run immediately. Tools with system-wide effects may \
+     pause for the user's confirmation and can be declined. Treat a decline \
+     as an instruction to change course, not an error to retry.";
+
+/// The phase marker (a loop concern, not a wire command): lets a long
+/// task land as several undo steps instead of one monolith.
+fn commit_progress_spec() -> wire::ToolSpec {
+    wire::ToolSpec {
+        name: "commit_progress".into(),
+        description: "Mark the edits so far as one completed phase so they land as \
+                      their own undo step. Call this between logical stages of a \
+                      long task; costs nothing."
+            .into(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {},
+        }),
+    }
+}
+
+/// Run one prompt with only the validated edit vocabulary.
 ///
-/// `context` is the send-time editor snapshot (selection, playhead);
-/// `history` is the prior conversation in this session (the caller's
-/// accumulated `turn_messages`, with no system message — a fresh one is
-/// regenerated here so the current project state always wins); `on_event`
-/// receives streamed text and applied actions for the UI. The returned
-/// [`PromptOutcome::turn_messages`] is this turn's contribution to append.
+/// Kept as the compatibility/default entry point for embedders that do not
+/// expose application tools. Use [`run_prompt_with_host`] to add senses,
+/// app control, jobs, or other namespaced capabilities.
 #[allow(clippy::too_many_arguments)]
 pub fn run_prompt(
     provider: &dyn ChatProvider,
@@ -206,24 +250,84 @@ pub fn run_prompt(
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(AgentEvent),
 ) -> PromptOutcome {
+    run_prompt_with_host(
+        provider,
+        bridge,
+        &mut crate::tools::NullToolHost,
+        context,
+        extensions,
+        history,
+        prompt,
+        config,
+        cancel,
+        on_event,
+    )
+}
+
+/// Run one prompt to completion against `bridge` and `host`.
+///
+/// `context` is the send-time editor snapshot (selection, playhead);
+/// `history` is the prior conversation in this session (the caller's
+/// accumulated `turn_messages`, with no system message — a fresh one is
+/// regenerated here so the current project state always wins); `host` is
+/// the embedder's tool surface (pass [`crate::tools::NullToolHost`] when
+/// there is none); `on_event` receives streamed text and applied actions
+/// for the UI. The returned [`PromptOutcome::turn_messages`] is this
+/// turn's contribution to append.
+#[allow(clippy::too_many_arguments)]
+pub fn run_prompt_with_host(
+    provider: &dyn ChatProvider,
+    bridge: &mut dyn EngineBridge,
+    host: &mut dyn ToolHost,
+    context: &EditorContext,
+    extensions: &AgentExtensions,
+    history: &[Message],
+    prompt: &str,
+    config: &AgentConfig,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(AgentEvent),
+) -> PromptOutcome {
     let summary = bridge.summary();
-    let mut messages = Vec::with_capacity(history.len() + 2);
-    messages.push(Message::System {
-        content: system_prompt(&summary, context, extensions),
-    });
-    messages.extend_from_slice(history);
-    // This turn's own messages start here (the user prompt and everything
-    // the loop appends), kept so we can hand them back as `turn_messages`.
-    let turn_start = messages.len();
-    messages.push(Message::user(prompt));
     let mut tools = wire::tool_specs();
     tools.push(wire::describe_project_spec());
     if !extensions.skills.is_empty() {
         tools.push(crate::extend::read_skill_spec());
     }
+    tools.push(commit_progress_spec());
+    // Built-in names always win: a colliding host spec is dropped here —
+    // never sent, never dispatched — so a host can neither shadow the edit
+    // vocabulary nor the loop's own tools. (`read_skill` stays reserved
+    // even when no skills are loaded.)
+    let mut seen_host_names = HashSet::new();
+    let host_specs: Vec<HostToolSpec> = host
+        .tools()
+        .into_iter()
+        .filter(|spec| is_host_tool_name(&spec.name))
+        .filter(|spec| spec.name != "read_skill" && tools.iter().all(|t| t.name != spec.name))
+        .filter(|spec| seen_host_names.insert(spec.name.clone()))
+        .collect();
+    tools.extend(host_specs.iter().map(|spec| wire::ToolSpec {
+        name: spec.name.clone(),
+        description: spec.description.clone(),
+        parameters: spec.parameters.clone(),
+    }));
+
+    let mut system = system_prompt(&summary, context, extensions);
+    if !host_specs.is_empty() {
+        system.push_str(HOST_TOOLS_RULES);
+    }
+    let mut messages = Vec::with_capacity(history.len() + 2);
+    messages.push(Message::System { content: system });
+    messages.extend_from_slice(history);
+    // This turn's own messages start here (the user prompt and everything
+    // the loop appends), kept so we can hand them back as `turn_messages`.
+    let turn_start = messages.len();
+    messages.push(Message::user(prompt));
 
     let mut actions: Vec<ActionLogEntry> = Vec::new();
+    let mut phase_breaks: Vec<usize> = Vec::new();
     let mut edit_calls = 0usize;
+    let mut host_calls = 0usize;
     let mut final_text = String::new();
     // Call ids of `describe_project` results, collapsed in `turn_messages`
     // so the session history never carries a full stale project blob.
@@ -239,6 +343,8 @@ pub fn run_prompt(
         PromptOutcome {
             text: String::new(),
             actions,
+            // Rolled back ⇒ no phases survive to group.
+            phase_breaks: Vec::new(),
             status: PromptStatus::Aborted(reason),
             turn_messages: Vec::new(),
         }
@@ -283,6 +389,8 @@ pub fn run_prompt(
         });
 
         for call in tool_calls {
+            // Only host successes attach images; every other path is text.
+            let mut images: Vec<ImagePart> = Vec::new();
             let result: String = if call.name == "describe_project" {
                 describe_call_ids.push(call.id.clone());
                 let state = serde_json::json!({
@@ -294,6 +402,50 @@ pub fn run_prompt(
                 // Read-only like describe_project: answered from the
                 // preloaded skill set, no dispatch, no edit-cap charge.
                 read_skill_result(&extensions.skills, &call.arguments)
+            } else if call.name == "commit_progress" {
+                // Free (charges neither cap): marking a phase must never
+                // compete with the work it delimits.
+                let committed = phase_breaks.last().copied().unwrap_or(0);
+                if actions.len() > committed {
+                    phase_breaks.push(actions.len());
+                    format!(
+                        "ok: committed phase {} ({} edits)",
+                        phase_breaks.len(),
+                        actions.len() - committed
+                    )
+                } else {
+                    // No break recorded — an empty phase would replay as an
+                    // empty undo group.
+                    "nothing new to commit — make edits first".to_string()
+                }
+            } else if host_specs.iter().any(|spec| spec.name == call.name) {
+                host_calls += 1;
+                if host_calls > config.max_host_calls {
+                    return abort(
+                        bridge,
+                        actions,
+                        format!(
+                            "exceeded the {}-host-call cap for one prompt",
+                            config.max_host_calls
+                        ),
+                    );
+                }
+                match host.call(&call.name, &call.arguments, cancel) {
+                    Err(reason) => format!("rejected: {reason}"),
+                    Ok(output) => {
+                        let content = if output.text.is_empty() {
+                            "ok".to_string()
+                        } else {
+                            output.text
+                        };
+                        on_event(AgentEvent::HostAction {
+                            name: call.name.clone(),
+                            summary: host_action_summary(&content),
+                        });
+                        images = output.images;
+                        content
+                    }
+                }
             } else {
                 edit_calls += 1;
                 if edit_calls > config.max_tool_calls {
@@ -334,7 +486,11 @@ pub fn run_prompt(
                     }
                 }
             };
-            messages.push(Message::tool_result(call.id, result));
+            messages.push(Message::ToolResult {
+                call_id: call.id,
+                content: result,
+                images,
+            });
         }
 
         if _turn + 1 == config.max_turns {
@@ -352,6 +508,7 @@ pub fn run_prompt(
         return PromptOutcome {
             text: final_text,
             actions,
+            phase_breaks,
             status: PromptStatus::DryRun,
             turn_messages,
         };
@@ -360,9 +517,22 @@ pub fn run_prompt(
     PromptOutcome {
         text: final_text,
         actions,
+        phase_breaks,
         status: PromptStatus::Completed,
         turn_messages,
     }
+}
+
+/// Transcript line for one host call: the first line of its output,
+/// capped so the panel never renders a wall of tool text.
+fn host_action_summary(text: &str) -> String {
+    const MAX_CHARS: usize = 120;
+    let line = text.lines().next().unwrap_or("").trim();
+    let mut summary: String = line.chars().take(MAX_CHARS).collect();
+    if line.chars().count() > MAX_CHARS {
+        summary.push('…');
+    }
+    summary
 }
 
 /// Answer a `read_skill` call from the preloaded skill set. Unknown ids
@@ -1093,6 +1263,15 @@ mod tests {
             Some(&Message::assistant_text("done")),
             "the final answer is appended"
         );
+    }
+
+    #[test]
+    fn host_action_summary_keeps_the_first_line_capped() {
+        assert_eq!(host_action_summary("saved\ndetails follow"), "saved");
+        let long = "x".repeat(200);
+        let summary = host_action_summary(&long);
+        assert_eq!(summary.chars().count(), 121, "120 chars + ellipsis");
+        assert!(summary.ends_with('…'));
     }
 
     #[test]

@@ -934,8 +934,10 @@ impl WireCommand {
 /// arguments.
 #[derive(Debug, Clone)]
 pub struct ToolSpec {
-    pub name: &'static str,
-    pub description: &'static str,
+    /// Owned so host/MCP tool catalogs discovered at runtime can share the
+    /// same provider wire as the static edit vocabulary.
+    pub name: String,
+    pub description: String,
     pub parameters: serde_json::Value,
 }
 
@@ -949,8 +951,8 @@ fn spec<T: JsonSchema>(name: &'static str, description: &'static str) -> ToolSpe
     let parameters = serde_json::to_value(settings.into_generator().into_root_schema_for::<T>())
         .expect("tool argument schemas are plain data and always serialize");
     ToolSpec {
-        name,
-        description,
+        name: name.to_string(),
+        description: description.to_string(),
         parameters,
     }
 }
@@ -975,10 +977,11 @@ fn argument_hint(tool: &str) -> Option<&'static str> {
 /// touching dispatch.
 pub fn describe_project_spec() -> ToolSpec {
     ToolSpec {
-        name: "describe_project",
+        name: "describe_project".into(),
         description: "Get the current state of the project: tracks, clips with ids and \
                       times in seconds, the media pool, and the user's selection and \
-                      playhead. Call this whenever you are unsure about ids or timing.",
+                      playhead. Call this whenever you are unsure about ids or timing."
+            .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {},

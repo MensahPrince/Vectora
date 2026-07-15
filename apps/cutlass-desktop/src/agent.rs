@@ -493,6 +493,9 @@ fn run_one_prompt(
     let mut on_event = move |event: AgentEvent| match event {
         AgentEvent::TextDelta(delta) => append_assistant_text(&event_store, delta),
         AgentEvent::Action(action) => push_entry(&event_store, "action", action.description),
+        AgentEvent::HostAction { name, summary } => {
+            push_entry(&event_store, "action", format!("{name}: {summary}"))
+        }
     };
 
     info!(prompt, dry_run, "agent prompt started");

@@ -22,6 +22,9 @@
 //!   behind the read-only `read_skill` tool, and slash-command templates.
 //!   Rules and skills shape *how* the closed vocabulary is used; they can
 //!   never add mutation surface.
+//! - [`tools`]: the host-tool registry — the embedder's own tool surface
+//!   (screenshots, app control, …) offered alongside the edit vocabulary.
+//!   The loop only sees specs and calls; implementations stay host-side.
 //!
 //! Invariant: **AI proposes, the engine disposes.** Nothing in this crate
 //! mutates a project; output is validated commands for the caller to apply
@@ -61,11 +64,13 @@ pub mod describe;
 pub mod extend;
 pub mod provider;
 pub mod providers;
+pub mod tools;
 pub mod validate;
 pub mod wire;
 
 pub use agent::{
     ActionLogEntry, AgentConfig, AgentEvent, EngineBridge, PromptOutcome, PromptStatus, run_prompt,
+    run_prompt_with_host,
 };
 pub use describe::{EditorContext, ProjectSummary, summarize};
 pub use extend::{
@@ -73,5 +78,8 @@ pub use extend::{
     expand_slash_command, load_agent_dir, merge_skills,
 };
 pub use provider::{ImagePart, Message};
+pub use tools::{
+    HostToolSpec, NullToolHost, ToolHost, ToolOutput, ToolTier, is_host_tool_name, namespace,
+};
 pub use validate::{Rejection, validate};
 pub use wire::{TOOL_SCHEMA_VERSION, ToolSpec, WireCommand, tool_specs};

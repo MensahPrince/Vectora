@@ -88,9 +88,9 @@ impl OpenAiCompatProvider {
                     serde_json::json!({
                         "type": "function",
                         "function": {
-                            "name": t.name,
-                            "description": t.description,
-                            "parameters": t.parameters,
+                            "name": &t.name,
+                            "description": &t.description,
+                            "parameters": &t.parameters,
                         },
                     })
                 })

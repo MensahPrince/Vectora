@@ -160,11 +160,12 @@ pub fn parse_skill(id: &str, text: &str) -> Result<Skill, SkillParseError> {
 /// at least one skill exists.
 pub fn read_skill_spec() -> ToolSpec {
     ToolSpec {
-        name: "read_skill",
+        name: "read_skill".into(),
         description: "Fetch the full step-by-step procedure of a skill by id. The \
                       available skills (id, name, and what they're for) are listed in \
                       the system prompt. Call this before starting a task a skill \
-                      covers, then follow the returned procedure.",
+                      covers, then follow the returned procedure."
+            .into(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {

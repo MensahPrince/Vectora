@@ -115,6 +115,7 @@ fn main() {
                 std::io::stdout().flush().ok();
             }
             AgentEvent::Action(a) => println!("  ⚙ {}", a.description),
+            AgentEvent::HostAction { name, summary } => println!("  ⚙ {name}: {summary}"),
         },
     );
 

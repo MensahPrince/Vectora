@@ -7,9 +7,12 @@
 
 use std::sync::atomic::AtomicBool;
 
-use cutlass_ai::agent::{AgentConfig, AgentEvent, EngineBridge, PromptStatus, run_prompt};
-use cutlass_ai::provider::{ChatTurn, FinishReason, Message, ToolCall};
+use cutlass_ai::agent::{
+    AgentConfig, AgentEvent, EngineBridge, PromptStatus, run_prompt_with_host,
+};
+use cutlass_ai::provider::{ChatTurn, FinishReason, ImagePart, Message, ToolCall};
 use cutlass_ai::providers::ScriptedProvider;
+use cutlass_ai::tools::{HostToolSpec, NullToolHost, ToolHost, ToolOutput, ToolTier};
 use cutlass_ai::{EditorContext, ProjectSummary, WireCommand, summarize, validate};
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
@@ -119,15 +122,17 @@ fn text_turn(text: &str) -> ChatTurn {
 fn run_with(
     provider: &dyn cutlass_ai::provider::ChatProvider,
     host: &mut EngineHost,
+    tool_host: &mut dyn ToolHost,
     context: &EditorContext,
     prompt: &str,
     config: &AgentConfig,
 ) -> (cutlass_ai::PromptOutcome, Vec<AgentEvent>) {
     let cancel = AtomicBool::new(false);
     let mut events = Vec::new();
-    let outcome = run_prompt(
+    let outcome = run_prompt_with_host(
         provider,
         host,
+        tool_host,
         context,
         &cutlass_ai::AgentExtensions::default(),
         &[],
@@ -146,7 +151,52 @@ fn run(
     prompt: &str,
     config: &AgentConfig,
 ) -> (cutlass_ai::PromptOutcome, Vec<AgentEvent>) {
-    run_with(provider, host, context, prompt, config)
+    run_with(provider, host, &mut NullToolHost, context, prompt, config)
+}
+
+/// Scripted [`ToolHost`] double: canned outputs in call order, every
+/// call recorded for assertions.
+struct ScriptedHost {
+    specs: Vec<HostToolSpec>,
+    outputs: std::collections::VecDeque<Result<ToolOutput, String>>,
+    calls: Vec<(String, serde_json::Value)>,
+}
+
+impl ScriptedHost {
+    fn new(specs: Vec<HostToolSpec>, outputs: Vec<Result<ToolOutput, String>>) -> Self {
+        Self {
+            specs,
+            outputs: outputs.into(),
+            calls: Vec::new(),
+        }
+    }
+}
+
+impl ToolHost for ScriptedHost {
+    fn tools(&self) -> Vec<HostToolSpec> {
+        self.specs.clone()
+    }
+
+    fn call(
+        &mut self,
+        name: &str,
+        arguments: &serde_json::Value,
+        _cancel: &AtomicBool,
+    ) -> Result<ToolOutput, String> {
+        self.calls.push((name.to_string(), arguments.clone()));
+        self.outputs
+            .pop_front()
+            .unwrap_or_else(|| Err("scripted host ran out of outputs".into()))
+    }
+}
+
+fn host_spec(name: &'static str) -> HostToolSpec {
+    HostToolSpec {
+        name: name.into(),
+        description: "test tool".into(),
+        parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        tier: ToolTier::ReadOnly,
+    }
 }
 
 #[test]
@@ -551,6 +601,7 @@ fn add_a_title_that_says_intro() {
     let (outcome, _) = run_with(
         &TitleAddingModel,
         &mut host,
+        &mut NullToolHost,
         &EditorContext::default(),
         "add a title that says INTRO",
         &AgentConfig::default(),
@@ -1384,9 +1435,10 @@ fn session_history_threads_prior_turns_into_the_next_prompt() {
         )]),
         text_turn("Split the clip at 4.00s into two."),
     ]);
-    let outcome1 = run_prompt(
+    let outcome1 = run_prompt_with_host(
         &first,
         &mut host,
+        &mut NullToolHost,
         &ctx,
         &cutlass_ai::AgentExtensions::default(),
         &[],
@@ -1403,9 +1455,10 @@ fn session_history_threads_prior_turns_into_the_next_prompt() {
     assert_eq!(kinds, ["user", "assistant", "tool", "assistant"]);
 
     let second = ScriptedProvider::new(vec![text_turn("I split it into two clips.")]);
-    let _ = run_prompt(
+    let _ = run_prompt_with_host(
         &second,
         &mut host,
+        &mut NullToolHost,
         &ctx,
         &cutlass_ai::AgentExtensions::default(),
         &outcome1.turn_messages,
@@ -1474,9 +1527,10 @@ fn read_skill_feeds_the_procedure_then_edits_follow() {
         ..AgentConfig::default()
     };
     let mut events = Vec::new();
-    let outcome = run_prompt(
+    let outcome = run_prompt_with_host(
         &provider,
         &mut host,
+        &mut NullToolHost,
         &EditorContext::default(),
         &extensions,
         &[],
@@ -1523,9 +1577,10 @@ fn describe_project_results_are_collapsed_in_history() {
         tool_turn(vec![("call_1", "describe_project", serde_json::json!({}))]),
         text_turn("There is one clip on one video track."),
     ]);
-    let outcome = run_prompt(
+    let outcome = run_prompt_with_host(
         &provider,
         &mut host,
+        &mut NullToolHost,
         &EditorContext::default(),
         &cutlass_ai::AgentExtensions::default(),
         &[],
@@ -1552,4 +1607,363 @@ fn describe_project_results_are_collapsed_in_history() {
         !tool_result.contains("\"tracks\""),
         "no full project json survives in history"
     );
+}
+
+/// Host dispatch round-trip: the call reaches the host with its exact
+/// arguments, the output's text and image ride back as the tool result,
+/// and the transcript hears about it as a HostAction.
+#[test]
+fn host_tool_round_trip_carries_arguments_images_and_events() {
+    let (mut host, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "media_screenshot_preview",
+            serde_json::json!({ "at": 1.5 }),
+        )]),
+        text_turn("Here's the preview."),
+    ]);
+    let mut tool_host = ScriptedHost::new(
+        vec![host_spec("media_screenshot_preview")],
+        vec![Ok(ToolOutput {
+            text: "screenshot taken at 1.50s\n(1280x720 png)".into(),
+            images: vec![ImagePart::png(vec![1, 2, 3], "preview at 1.50s")],
+        })],
+    );
+
+    let (outcome, events) = run_with(
+        &provider,
+        &mut host,
+        &mut tool_host,
+        &EditorContext::default(),
+        "look at the preview",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert!(outcome.actions.is_empty(), "host calls are not edits");
+    assert_eq!(
+        tool_host.calls,
+        vec![(
+            "media_screenshot_preview".to_string(),
+            serde_json::json!({ "at": 1.5 })
+        )]
+    );
+
+    // The next request carries the result — text and image both.
+    let second = &provider.requests()[1];
+    match second.last().unwrap() {
+        Message::ToolResult {
+            call_id,
+            content,
+            images,
+        } => {
+            assert_eq!(call_id, "call_1");
+            assert_eq!(content, "screenshot taken at 1.50s\n(1280x720 png)");
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].label, "preview at 1.50s");
+            assert_eq!(*images[0].data, vec![1, 2, 3]);
+        }
+        other => panic!("expected tool result, got {other:?}"),
+    }
+
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::HostAction { name, summary }
+                if name == "media_screenshot_preview" && summary == "screenshot taken at 1.50s"
+        )),
+        "{events:?}"
+    );
+}
+
+#[test]
+fn host_rejection_reports_and_the_prompt_still_completes() {
+    let (mut host, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "media_screenshot_preview",
+            serde_json::json!({}),
+        )]),
+        text_turn("Couldn't grab the preview."),
+    ]);
+    let mut tool_host = ScriptedHost::new(
+        vec![host_spec("media_screenshot_preview")],
+        vec![Err("preview is not rendered yet".into())],
+    );
+
+    let (outcome, events) = run_with(
+        &provider,
+        &mut host,
+        &mut tool_host,
+        &EditorContext::default(),
+        "look at the preview",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    let second = &provider.requests()[1];
+    match second.last().unwrap() {
+        Message::ToolResult {
+            content, images, ..
+        } => {
+            assert_eq!(content, "rejected: preview is not rendered yet");
+            assert!(images.is_empty());
+        }
+        other => panic!("expected tool result, got {other:?}"),
+    }
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::HostAction { .. })),
+        "a rejected call is not an action"
+    );
+}
+
+/// The two fuses are independent: an edit cap of zero still lets host
+/// tools run, and the host cap aborts with a full rollback.
+#[test]
+fn host_calls_have_their_own_cap_separate_from_the_edit_fuse() {
+    // Edit cap 0, one host call: completes.
+    let (mut host, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "media_screenshot_preview",
+            serde_json::json!({}),
+        )]),
+        text_turn("Looked."),
+    ]);
+    let mut tool_host = ScriptedHost::new(
+        vec![host_spec("media_screenshot_preview")],
+        vec![Ok(ToolOutput::text("looks fine"))],
+    );
+    let config = AgentConfig {
+        max_tool_calls: 0,
+        ..Default::default()
+    };
+    let (outcome, _) = run_with(
+        &provider,
+        &mut host,
+        &mut tool_host,
+        &EditorContext::default(),
+        "look at the preview",
+        &config,
+    );
+    assert_eq!(outcome.status, PromptStatus::Completed);
+
+    // Host cap 1, one applied edit then two host calls: the second host
+    // call trips the cap and the whole prompt rolls back.
+    let (mut host, _, _, clip) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "split_clip",
+            serde_json::json!({ "clip": clip, "at": 5.0 }),
+        )]),
+        tool_turn(vec![
+            ("call_2", "media_screenshot_preview", serde_json::json!({})),
+            ("call_3", "media_screenshot_preview", serde_json::json!({})),
+        ]),
+    ]);
+    let mut tool_host = ScriptedHost::new(
+        vec![host_spec("media_screenshot_preview")],
+        vec![Ok(ToolOutput::text("looks fine"))],
+    );
+    let config = AgentConfig {
+        max_host_calls: 1,
+        ..Default::default()
+    };
+    let (outcome, _) = run_with(
+        &provider,
+        &mut host,
+        &mut tool_host,
+        &EditorContext::default(),
+        "split then stare at the preview forever",
+        &config,
+    );
+    match &outcome.status {
+        PromptStatus::Aborted(reason) => assert!(reason.contains("1-host-call cap"), "{reason}"),
+        other => panic!("expected abort, got {other:?}"),
+    }
+    assert_eq!(tool_host.calls.len(), 1, "the cap trips before the call");
+    assert_eq!(
+        host.engine.project().timeline().clip_count(),
+        1,
+        "the applied split was rolled back"
+    );
+    assert!(!host.engine.undo(), "an aborted prompt leaves no history");
+}
+
+/// Defense in depth: a host spec reusing a built-in name is neither
+/// offered to the provider nor dispatched — the built-in wins.
+#[test]
+fn host_tool_name_collisions_lose_to_the_built_ins() {
+    let (mut host, _, _, clip) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "split_clip",
+            serde_json::json!({ "clip": clip, "at": 5.0 }),
+        )]),
+        tool_turn(vec![("call_2", "describe_project", serde_json::json!({}))]),
+        text_turn("Split it."),
+    ]);
+    let mut tool_host = ScriptedHost::new(
+        vec![
+            host_spec("split_clip"),
+            host_spec("describe_project"),
+            host_spec("app_ping"),
+            host_spec("app_ping"),
+            host_spec("app-Bad"),
+        ],
+        Vec::new(),
+    );
+
+    let (outcome, _) = run_with(
+        &provider,
+        &mut host,
+        &mut tool_host,
+        &EditorContext::default(),
+        "split the clip",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert!(
+        tool_host.calls.is_empty(),
+        "both colliding names dispatched as built-ins"
+    );
+    assert_eq!(outcome.actions.len(), 1, "the real split applied");
+    assert_eq!(host.engine.project().timeline().clip_count(), 2);
+
+    // The offered tool list carries each name once and keeps the
+    // legitimately-namespaced host tool.
+    let offered = &provider.tool_names()[0];
+    assert_eq!(
+        offered
+            .iter()
+            .filter(|n| n.as_str() == "split_clip")
+            .count(),
+        1
+    );
+    assert_eq!(
+        offered
+            .iter()
+            .filter(|n| n.as_str() == "describe_project")
+            .count(),
+        1
+    );
+    assert_eq!(
+        offered.iter().filter(|n| n.as_str() == "app_ping").count(),
+        1,
+        "duplicate host specs are offered once"
+    );
+    assert!(
+        !offered.iter().any(|n| n == "app-Bad"),
+        "malformed host names never reach the model"
+    );
+}
+
+/// `commit_progress` records phase breaks between edits, refuses empty
+/// phases, and charges neither the edit fuse nor the host cap.
+#[test]
+fn commit_progress_records_phase_breaks_without_charging_caps() {
+    let (mut host, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        // Nothing to commit yet.
+        tool_turn(vec![("c0", "commit_progress", serde_json::json!({}))]),
+        tool_turn(vec![
+            ("c1", "add_marker", serde_json::json!({ "at": 1.0 })),
+            ("c2", "add_marker", serde_json::json!({ "at": 2.0 })),
+        ]),
+        // First commit lands; the immediate second one is empty.
+        tool_turn(vec![
+            ("c3", "commit_progress", serde_json::json!({})),
+            ("c4", "commit_progress", serde_json::json!({})),
+        ]),
+        tool_turn(vec![("c5", "add_marker", serde_json::json!({ "at": 3.0 }))]),
+        text_turn("Three markers, two phases."),
+    ]);
+
+    // Exactly three edit slots and zero host slots: commits must charge
+    // neither cap for this to complete.
+    let config = AgentConfig {
+        max_tool_calls: 3,
+        max_host_calls: 0,
+        ..Default::default()
+    };
+    let (outcome, _) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "mark the beats in phases",
+        &config,
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 3);
+    assert_eq!(outcome.phase_breaks, vec![2]);
+
+    let results: Vec<(String, String)> = provider
+        .requests()
+        .iter()
+        .flat_map(|msgs| msgs.iter())
+        .filter_map(|m| match m {
+            Message::ToolResult {
+                call_id, content, ..
+            } => Some((call_id.clone(), content.clone())),
+            _ => None,
+        })
+        .collect();
+    let result_for = |id: &str| {
+        results
+            .iter()
+            .find(|(call_id, _)| call_id == id)
+            .map(|(_, content)| content.as_str())
+            .unwrap_or_else(|| panic!("no result for {id}"))
+    };
+    assert_eq!(result_for("c0"), "nothing new to commit — make edits first");
+    assert_eq!(result_for("c3"), "ok: committed phase 1 (2 edits)");
+    assert_eq!(result_for("c4"), "nothing new to commit — make edits first");
+}
+
+#[test]
+fn system_prompt_gains_host_tool_rules_only_when_host_tools_exist() {
+    // Without host tools: no paragraph.
+    let (mut host, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![text_turn("Hi.")]);
+    let _ = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "hello",
+        &AgentConfig::default(),
+    );
+    match &provider.requests()[0][0] {
+        Message::System { content } => assert!(!content.contains("Host tools:"), "{content}"),
+        other => panic!("expected system message, got {other:?}"),
+    }
+
+    // With host tools: the paragraph and the spec both show up.
+    let (mut host, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![text_turn("Hi.")]);
+    let mut tool_host = ScriptedHost::new(vec![host_spec("app_ping")], Vec::new());
+    let _ = run_with(
+        &provider,
+        &mut host,
+        &mut tool_host,
+        &EditorContext::default(),
+        "hello",
+        &AgentConfig::default(),
+    );
+    match &provider.requests()[0][0] {
+        Message::System { content } => {
+            assert!(content.contains("Host tools:"), "{content}");
+            assert!(content.contains("declined"), "{content}");
+        }
+        other => panic!("expected system message, got {other:?}"),
+    }
+    assert!(provider.tool_names()[0].iter().any(|n| n == "app_ping"));
 }
