@@ -242,6 +242,16 @@ pub fn system_prompt(
          overlay lanes above it, text lanes on top. Put primary footage \
          on the main track and prefer reusing existing lanes over adding \
          new ones.\n\
+         - Imported media in the project state's media pool is ready to \
+         use even when no timeline clip references it. add_clip is the \
+         operation that places media-pool footage on the timeline. An \
+         empty timeline is a starting point, not a missing capability: \
+         reuse a compatible track when one exists, or call add_track first \
+         (the first video track becomes main), read the returned track id, \
+         then add clips. For open-ended creative work, inspect the media \
+         and choose the sequence, source ranges, placements, and timing \
+         yourself. Never ask the user to pre-place footage or claim that \
+         media-pool placement is unsupported.\n\
          - If a tool call is rejected, read the error and correct course; \
          do not repeat the identical call.\n\
          - The state below is a fresh snapshot of the project as it is \
@@ -299,10 +309,12 @@ fn engine_sense_rules(specs: &[HostToolSpec]) -> String {
          \"make something interesting\" are fully actionable. Survey the media pool with \
          media_pool_sheet when it is listed, inspect promising sources with media_asset_strip, \
          then use visual evidence and editorial judgment to make concrete edits rather than \
-         declining or asking the user to choose placements and ranges. Before finalizing visual \
-         or timing work, use the cheapest relevant sense to verify it: prefer a schematic \
-         timeline map for placement and timing, and a composited preview frame only when \
-         appearance or layering matters. Never claim a check succeeded if a sense failed."
+         declining or asking the user to choose placements and ranges. Media-pool sources need no \
+         pre-placement: when the timeline is empty, create the required tracks with add_track and \
+         build the sequence with add_clip. Before finalizing visual or timing work, use the \
+         cheapest relevant sense to verify it: prefer a schematic timeline map for placement and \
+         timing, and a composited preview frame only when appearance or layering matters. Never \
+         claim a check succeeded if a sense failed."
     )
 }
 
@@ -1438,6 +1450,10 @@ mod tests {
         // Unknown footage content is fetchable, not grounds to refuse.
         assert!(prompt.contains("Unknown source-footage content is not missing project state"));
         assert!(prompt.contains("instead of declining the task"));
+        // An empty timeline can be constructed directly from media-pool items.
+        assert!(prompt.contains("add_clip is the operation that places media-pool footage"));
+        assert!(prompt.contains("An empty timeline is a starting point"));
+        assert!(prompt.contains("Never ask the user to pre-place footage"));
         // The overlap rule: make room before growing into a packed track.
         assert!(prompt.contains("Clips on one track can never overlap"));
         // No extensions ⇒ no rules or skills sections.
@@ -1494,6 +1510,8 @@ mod tests {
         assert!(rules.contains("media_pool_sheet"));
         assert!(rules.contains("media_asset_strip"));
         assert!(rules.contains("rather than declining"));
+        assert!(rules.contains("create the required tracks with add_track"));
+        assert!(rules.contains("build the sequence with add_clip"));
     }
 
     #[test]
