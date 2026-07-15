@@ -6103,16 +6103,21 @@ pub(crate) fn agent_replay(
     let mut clip_map: Map<u64, u64> = Map::new();
     let mut track_map: Map<u64, u64> = Map::new();
     let mut marker_map: Map<u64, u64> = Map::new();
+    let mut cleanup_lanes = Vec::new();
 
     let total = steps.len();
     engine.begin_group();
     for (index, mut step) in steps.into_iter().enumerate() {
         step.command.remap_ids(&clip_map, &track_map, &marker_map);
+        let cleanup_lane = agent_cleanup_source_lane(engine, &step.command);
         let outcome = cutlass_ai::validate(&step.command, engine.project())
             .map_err(|r| r.message)
             .and_then(|lowered| engine.apply(lowered).map_err(|e| e.to_string()));
         match outcome {
             Ok(ApplyOutcome::Edited(edited)) => {
+                if let Some(lane) = cleanup_lane {
+                    cleanup_lanes.push(lane);
+                }
                 match (step.created, &edited) {
                     (Some(AgentCreated::Clip(sandbox)), EditOutcome::Created(live)) => {
                         clip_map.insert(sandbox, live.raw());
@@ -6142,10 +6147,32 @@ pub(crate) fn agent_replay(
             }
         }
     }
+    // Agent commands bypass the desktop gesture helpers, so mirror their
+    // CapCut lane policy once the complete plan has landed. Waiting until
+    // the end lets a plan remove and replace a clip on the same lane.
+    cleanup_lanes.sort();
+    cleanup_lanes.dedup();
+    for lane in cleanup_lanes {
+        remove_track_if_empty(engine, lane);
+    }
     engine.commit_group();
     info!(steps = total, "agent plan applied");
     after_step(engine);
     Ok(())
+}
+
+/// Source lane that may become empty after an agent structural edit.
+fn agent_cleanup_source_lane(
+    engine: &Engine,
+    command: &cutlass_ai::WireCommand,
+) -> Option<TrackId> {
+    let clip = match command {
+        cutlass_ai::WireCommand::MoveClip(args) => args.clip,
+        cutlass_ai::WireCommand::RemoveClip(args) => args.clip,
+        cutlass_ai::WireCommand::RippleDelete(args) => args.clip,
+        _ => return None,
+    };
+    engine.project().timeline().track_of(ClipId::from_raw(clip))
 }
 
 fn agent_apply_and_publish(

@@ -76,6 +76,9 @@ export component CatalogTile inherits Rectangle {
 
     if root.enabled || root.generator != "": TouchArea {
         pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                AppState.refocus-shortcuts();
+            }
             if root.generator != "" && event.kind == PointerEventKind.down
                 && event.button == PointerEventButton.left {
                 AppState.library-drag-media-id = "";
@@ -166,6 +169,9 @@ export component TransitionCatalogTile inherits Rectangle {
         height: 100%;
 
         pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                AppState.refocus-shortcuts();
+            }
             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
                 AppState.transition-drag-id = transition-id;
                 AppState.transition-drag-w = root.width;
@@ -239,6 +245,9 @@ export component MediaTile inherits Rectangle {
         height: parent.height;
 
         pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                AppState.refocus-shortcuts();
+            }
             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
                 AppState.library-drag-media-id = media.id;
                 AppState.library-drag-generator = "";
@@ -339,6 +348,7 @@ export component MediaTile inherits Rectangle {
 
         TouchArea {
             clicked => {
+                AppState.refocus-shortcuts();
                 EditorStore.on-relink-media-requested(media.id);
             }
         }
@@ -479,6 +489,9 @@ export component GeneratedTile inherits Rectangle {
         height: parent.height;
 
         pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                AppState.refocus-shortcuts();
+            }
             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
                 AppState.library-drag-media-id = "";
                 AppState.library-drag-generator = root.generator;
@@ -635,6 +648,7 @@ export component StockMediaTile inherits Rectangle {
 
     ta := TouchArea {
         clicked => {
+            AppState.refocus-shortcuts();
             if tile.state != "downloading" && tile.state != "imported" {
                 CloudBackend.stock-import(root.index);
             }
@@ -762,6 +776,7 @@ export component SfxAudioTile inherits Rectangle {
 
     ta := TouchArea {
         clicked => {
+            AppState.refocus-shortcuts();
             if tile.state != "downloading" && tile.state != "imported" {
                 SfxBackend.import(root.index);
             }
@@ -840,6 +855,9 @@ export component TextPresetLibraryTile inherits Rectangle {
         height: parent.height;
 
         pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                AppState.refocus-shortcuts();
+            }
             if event.kind == PointerEventKind.down && event.button == PointerEventButton.left {
                 AppState.library-drag-media-id = "";
                 AppState.library-drag-generator = "text-preset:" + tile.key;
@@ -966,6 +984,7 @@ export component AiMediaTile inherits Rectangle {
     ta := TouchArea {
         mouse-cursor: tile.state == "ready" ? pointer : default;
         clicked => {
+            AppState.refocus-shortcuts();
             if tile.state == "ready" {
                 AiBackend.import(tile.kind, index);
             }

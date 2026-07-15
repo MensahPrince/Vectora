@@ -633,7 +633,7 @@ mod tests {
     use super::*;
     use crate::preview_worker::agent_replay;
     use cutlass_ai::wire;
-    use cutlass_models::{MediaSource, Project, Rational};
+    use cutlass_models::{Generator, MediaSource, Project, Rational, TimeRange, TrackKind};
 
     fn fixture_project() -> (Project, u64) {
         let mut project = Project::new("agent-ui-fixture", Rational::FPS_24);
@@ -737,5 +737,41 @@ mod tests {
         let err = agent_replay(&mut live, plan, |_| {}).expect_err("stale plan must fail");
         assert!(err.contains("step 1/1"), "names the failing step: {err}");
         assert!(!live.undo(), "rollback leaves no history entry");
+    }
+
+    #[test]
+    fn removing_last_sticker_clip_also_removes_its_lane() {
+        let mut project = Project::new("agent-sticker-removal", Rational::FPS_24);
+        let main = project.add_track(TrackKind::Video, "V1");
+        let stickers = project.add_track(TrackKind::Sticker, "Stickers");
+        let sticker = project
+            .add_generated(
+                stickers,
+                Generator::sticker(""),
+                TimeRange::at_rate(0, 48, Rational::FPS_24),
+            )
+            .expect("sticker");
+        let mut live = temp_engine(project);
+
+        let plan = vec![AgentPlanStep {
+            command: WireCommand::RemoveClip(wire::RemoveClip {
+                clip: sticker.raw(),
+            }),
+            created: None,
+        }];
+        agent_replay(&mut live, plan, |_| {}).expect("replay");
+
+        let timeline = live.project().timeline();
+        assert!(timeline.track(main).is_some(), "main lane remains");
+        assert!(
+            timeline.track(stickers).is_none(),
+            "empty sticker lane is removed"
+        );
+        assert!(timeline.clip(sticker).is_none());
+
+        assert!(live.undo(), "clip removal and lane cleanup share one undo");
+        let timeline = live.project().timeline();
+        assert!(timeline.track(stickers).is_some());
+        assert!(timeline.clip(sticker).is_some());
     }
 }

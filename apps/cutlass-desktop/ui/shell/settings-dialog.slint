@@ -9,6 +9,7 @@
 // (wired in src/main.rs). Theme changes preview instantly.
 
 import {
+    CutlassLineInput,
     CutlassText,
     AccentButton,
     SubtleButton,
@@ -103,49 +104,6 @@ component ModeChip inherits Rectangle {
         clicked => {
             root.clicked();
         }
-    }
-}
-
-// A single-line text field styled like the dropdown's search box.
-component SettingsTextField inherits Rectangle {
-    in-out property <string> value;
-    in property <string> placeholder;
-    in property <bool> password: false;
-
-    height: 28px;
-    horizontal-stretch: 1;
-    border-radius: AppStore.theme.metrics.radius.sm;
-    background: #111111;
-    border-width: input.has-focus ? 1px : 1px;
-    border-color: input.has-focus ? AppStore.theme.accent.primary : #ffffff14;
-    clip: true;
-    forward-focus: input;
-
-    input := TextInput {
-        x: AppStore.theme.metrics.spacing.sm;
-        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
-        height: parent.height;
-        vertical-alignment: center;
-        single-line: true;
-        input-type: root.password ? InputType.password : InputType.text;
-        text <=> root.value;
-        color: AppStore.theme.text.primary;
-        font-size: AppStore.theme.typography.body.size;
-        font-family: AppStore.theme.typography.font-family-mono;
-        selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
-        selection-foreground-color: AppStore.theme.text.primary;
-        accessible-role: none;
-    }
-
-    if root.value == "" && !input.has-focus: CutlassText {
-        x: AppStore.theme.metrics.spacing.sm;
-        width: parent.width - 2 * AppStore.theme.metrics.spacing.sm;
-        height: parent.height;
-        vertical-alignment: center;
-        text: root.placeholder;
-        style: AppStore.theme.typography.body;
-        foreground: AppStore.theme.text.muted;
-        overflow: elide;
     }
 }
 
@@ -312,31 +270,39 @@ export component SettingsDialog inherits Rectangle {
 
                                 FieldRow {
                                     label: "Endpoint";
-                                    SettingsTextField {
-                                        value <=> SettingsBackend.ai-base-url;
-                                        placeholder: "http://localhost:11434/v1";
+                                    CutlassLineInput {
+                                        text <=> SettingsBackend.ai-base-url;
+                                        placeholder-text: "http://localhost:11434/v1";
+                                        accessibility-label: "AI endpoint";
+                                        mono: true;
                                     }
                                 }
                                 FieldRow {
                                     label: "Model";
-                                    SettingsTextField {
-                                        value <=> SettingsBackend.ai-model;
-                                        placeholder: "qwen3:14b";
+                                    CutlassLineInput {
+                                        text <=> SettingsBackend.ai-model;
+                                        placeholder-text: "qwen3:14b";
+                                        accessibility-label: "AI model";
+                                        mono: true;
                                     }
                                 }
                                 FieldRow {
                                     label: "API key";
-                                    SettingsTextField {
-                                        value <=> SettingsBackend.ai-api-key;
-                                        placeholder: "Optional — local servers need none";
-                                        password: true;
+                                    CutlassLineInput {
+                                        text <=> SettingsBackend.ai-api-key;
+                                        placeholder-text: "Optional — local servers need none";
+                                        accessibility-label: "AI API key";
+                                        input-type: InputType.password;
+                                        mono: true;
                                     }
                                 }
                                 FieldRow {
                                     label: "Key from env";
-                                    SettingsTextField {
-                                        value <=> SettingsBackend.ai-api-key-env;
-                                        placeholder: "e.g. OPENAI_API_KEY (overrides the key above)";
+                                    CutlassLineInput {
+                                        text <=> SettingsBackend.ai-api-key-env;
+                                        placeholder-text: "e.g. OPENAI_API_KEY (overrides the key above)";
+                                        accessibility-label: "AI API key environment variable";
+                                        mono: true;
                                     }
                                 }
 

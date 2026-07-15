@@ -5,8 +5,7 @@
 // maximize. Buttons are declared after the drag TouchArea so they stack
 // above it and keep their clicks.
 
-import { CutlassText, AccentButton, SubtleButton } from "../components/index.slint";
-import { LineTextInput } from "../panels/inspector/inspector-widgets.slint";
+import { CutlassLineInput, CutlassText, AccentButton, SubtleButton } from "../components/index.slint";
 import { AppStore, EditorStore } from "../store/index.slint";
 import { WindowBackend } from "../lib/window-backend.slint";
 import { ExportBackend } from "../lib/export-backend.slint";
@@ -54,10 +53,17 @@ export component TitleBar inherits Rectangle {
         ? "Untitled project"
         : EditorStore.project.title;
     changed committed-title => {
-        name-edit.text = committed-title;
+        if !name-edit.has-focus {
+            name-edit.text = committed-title;
+        }
     }
 
     drag := TouchArea {
+        pointer-event(event) => {
+            if event.kind == PointerEventKind.down {
+                AppState.refocus-shortcuts();
+            }
+        }
         moved => {
             // Small threshold so a stationary double-click never turns
             // into a 1px system move (which would eat the second click).
@@ -76,11 +82,14 @@ export component TitleBar inherits Rectangle {
     // is no dirty dot — commit on Enter or blur forwards the trimmed name to
     // the worker, which renames as one undoable edit (a no-op rename is
     // dropped worker-side, so a focus-and-leave costs nothing).
-    name-edit := LineTextInput {
+    name-edit := CutlassLineInput {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         width: 280px;
         horizontal-alignment: TextHorizontalAlignment.center;
+        accessibility-label: "Project title";
+        commit-on-blur: true;
+        revert-on-escape: true;
         text: committed-title;
         accepted(entered) => {
             EditorStore.on-rename-project(entered);
@@ -88,6 +97,18 @@ export component TitleBar inherits Rectangle {
             // would otherwise leave the box empty, and a valid one round-trips
             // back through `committed-title` on the next projection republish.
             self.text = committed-title;
+        }
+        enter-accepted(_) => {
+            AppState.refocus-shortcuts();
+        }
+        blurred(_, changed) => {
+            if !changed {
+                self.text = committed-title;
+            }
+        }
+        cancelled => {
+            self.text = committed-title;
+            AppState.refocus-shortcuts();
         }
     }
 

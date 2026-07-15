@@ -4,6 +4,7 @@
 // parent wires up, so each sheet keeps its own engine semantics.
 
 import {
+    CutlassLineInput,
     CutlassText,
     CutlassSlider,
     CutlassScrollView,
@@ -193,97 +194,6 @@ export component LabelCell inherits CutlassText {
     vertical-alignment: TextVerticalAlignment.center;
 }
 
-// Themed single-line text entry (std LineEdit clashes with the dark chrome
-// and can't be height-constrained reliably inside the property sheet).
-export component LineTextInput inherits Rectangle {
-    in-out property <string> text;
-    in property <string> placeholder-text: "";
-    in property <TextHorizontalAlignment> horizontal-alignment: TextHorizontalAlignment.left;
-    in property <length> text-padding-left: AppStore.theme.metrics.spacing.sm;
-    in property <length> text-padding-right: AppStore.theme.metrics.spacing.sm;
-    in property <bool> read-only: false;
-    in property <bool> enabled: true;
-    out property <bool> has-focus: input.has-focus;
-
-    callback accepted(text: string);
-    callback edited(text: string);
-
-    height: 28px;
-    horizontal-stretch: 1;
-    border-radius: AppStore.theme.metrics.radius.sm;
-    border-width: input.has-focus ? 1px : 0px;
-    border-color: AppStore.theme.accent.primary;
-    background: input.has-focus ? #202020 : #1a1a1a;
-    opacity: enabled ? 1.0 : 0.55;
-    clip: true;
-    forward-focus: input;
-
-    animate background {
-        duration: 120ms;
-        easing: ease-out;
-    }
-    animate border-width {
-        duration: 120ms;
-        easing: ease-out;
-    }
-
-    // Clicking the field's padding (e.g. the prefix gutter in NumberBox)
-    // focuses the input instead of falling through to the blur catcher.
-    TouchArea {
-        enabled: root.enabled && !root.read-only;
-        mouse-cursor: MouseCursor.text;
-        clicked => {
-            input.focus();
-        }
-    }
-
-    input := TextInput {
-        x: root.text-padding-left;
-        width: max(0px, root.width - root.text-padding-left - root.text-padding-right);
-        height: root.height;
-        text <=> root.text;
-        enabled: root.enabled;
-        read-only: root.read-only;
-        single-line: true;
-        horizontal-alignment: root.horizontal-alignment;
-        vertical-alignment: TextVerticalAlignment.center;
-        color: AppStore.theme.text.primary;
-        font-size: AppStore.theme.typography.body.size;
-        font-weight: AppStore.theme.typography.body.weight;
-        selection-background-color: AppStore.theme.accent.primary.with-alpha(0.33);
-        selection-foreground-color: AppStore.theme.text.primary;
-        accessible-role: none;
-
-        // Blur commits like Enter does, so a value typed and then clicked
-        // away from isn't silently left uncommitted in the box.
-        changed has-focus => {
-            if (!self.has-focus) {
-                root.accepted(self.text);
-            }
-        }
-
-        accepted => {
-            root.accepted(self.text);
-        }
-
-        edited => {
-            root.edited(self.text);
-        }
-    }
-
-    placeholder := CutlassText {
-        x: root.text-padding-left;
-        width: max(0px, root.width - root.text-padding-left - root.text-padding-right);
-        height: root.height;
-        text: (root.text == "" && input.preedit-text == "") ? root.placeholder-text : "";
-        style: AppStore.theme.typography.body;
-        foreground: AppStore.theme.text.muted;
-        vertical-alignment: TextVerticalAlignment.center;
-        overflow: TextOverflow.elide;
-        accessible-role: none;
-    }
-}
-
 // One property row: slider for coarse motion, numeric entry for precision,
 // double-click the label to reset, and (on animatable properties) the
 // keyframe cluster (◀ ◆ ▶ + easing) on the right. Slider motion fires
@@ -328,7 +238,9 @@ export component SliderRow inherits HorizontalLayout {
     // this watcher instead.
     changed value => {
         sl.value = clamp(root.value, root.minimum, root.maximum);
-        num.text = root.format(root.value);
+        if !num.has-focus {
+            num.text = root.format(root.value);
+        }
     }
 
     TouchArea {
@@ -376,11 +288,15 @@ export component SliderRow inherits HorizontalLayout {
         }
     }
 
-    num := LineTextInput {
+    num := CutlassLineInput {
         width: 62px;
+        minimum-field-width: 62px;
         height: 28px;
         vertical-stretch: 0;
         horizontal-alignment: TextHorizontalAlignment.right;
+        accessibility-label: root.label + " value";
+        commit-on-blur: true;
+        revert-on-escape: true;
         text: root.format(root.value);
 
         accepted(entered) => {
@@ -390,6 +306,18 @@ export component SliderRow inherits HorizontalLayout {
             // Re-sync the display whether or not the entry committed
             // (rejected parse, clamped value, or no-op).
             self.text = root.format(root.value);
+        }
+        enter-accepted(_) => {
+            AppState.refocus-shortcuts();
+        }
+        blurred(_, changed) => {
+            if !changed {
+                self.text = root.format(root.value);
+            }
+        }
+        cancelled => {
+            self.text = root.format(root.value);
+            AppState.refocus-shortcuts();
         }
     }
 

@@ -1,7 +1,8 @@
 import { AppStore, EditorStore, TimelineStore, TimelineActions } from "../../store/index.slint";
+import { CutlassLineInput } from "../../components/index.slint";
 import { Track, TrackKind } from "../../models/index.slint";
+import { AppState } from "../../state.slint";
 import { TimelineViewState } from "state.slint";
-import { LineTextInput } from "../inspector/inspector-widgets.slint";
 
 // One compact square toggle in a track header. `active` latches the accent
 // when the lane is in its "special" state (hidden / muted / locked).
@@ -79,6 +80,12 @@ export component TrackHead inherits Rectangle {
 
     private property <string> rename-name: track.name;
     private property <length> drag-press-y: 0px;
+
+    function submit-rename() {
+        EditorStore.on-track-renamed(root.track.id, root.rename-name);
+        rename-popup.close();
+        AppState.refocus-shortcuts();
+    }
 
     drag-ta := TouchArea {
         width: 100%;
@@ -192,6 +199,7 @@ export component TrackHead inherits Rectangle {
                     label: "Rename track…";
                     clicked => {
                         menu-popup.close();
+                        root.rename-name = root.track.name;
                         rename-popup.show();
                     }
                 }
@@ -210,6 +218,7 @@ export component TrackHead inherits Rectangle {
         x: drag-ta.absolute-position.x + 8px;
         y: drag-ta.absolute-position.y + 8px;
         close-policy: PopupClosePolicy.close-on-click-outside;
+        forward-focus: rename-input;
 
         Rectangle {
             width: 200px;
@@ -220,8 +229,19 @@ export component TrackHead inherits Rectangle {
                 padding: 8px;
                 spacing: 6px;
 
-                LineTextInput {
+                rename-input := CutlassLineInput {
                     text <=> rename-name;
+                    accessibility-label: "Track name";
+                    revert-on-escape: true;
+                    select-all-on-focus: true;
+                    accepted(_) => {
+                        root.submit-rename();
+                    }
+                    cancelled => {
+                        root.rename-name = root.track.name;
+                        rename-popup.close();
+                        AppState.refocus-shortcuts();
+                    }
                 }
 
                 Rectangle {
@@ -236,8 +256,7 @@ export component TrackHead inherits Rectangle {
                     }
                     TouchArea {
                         clicked => {
-                            EditorStore.on-track-renamed(root.track.id, rename-name);
-                            rename-popup.close();
+                            root.submit-rename();
                         }
                     }
                 }
