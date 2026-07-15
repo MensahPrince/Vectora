@@ -300,6 +300,75 @@ pub fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, RenderError> {
     Ok(bytes)
 }
 
+/// Decode one PNG into tightly packed straight-alpha RGBA8 pixels.
+///
+/// This is the inverse boundary used by desktop transcript previews. Input
+/// is bounded before allocation so an image returned by an extensible host
+/// tool cannot turn into an unbounded UI-thread allocation.
+pub fn decode_png(bytes: &[u8]) -> Result<RgbaImage, RenderError> {
+    const MAX_EDGE: u32 = 2048;
+    const MAX_PIXELS: u64 = 4 * 1024 * 1024;
+    const DECODER_BUDGET: usize = 24 * 1024 * 1024;
+
+    let mut limits = png::Limits::default();
+    limits.bytes = DECODER_BUDGET;
+    let mut decoder = png::Decoder::new_with_limits(bytes, limits);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|error| RenderError::unsupported(format!("invalid PNG header: {error}")))?;
+    let (width, height) = (reader.info().width, reader.info().height);
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| RenderError::unsupported("PNG dimensions overflow"))?;
+    if width == 0 || height == 0 || width > MAX_EDGE || height > MAX_EDGE || pixels > MAX_PIXELS {
+        return Err(RenderError::unsupported(format!(
+            "PNG dimensions {width}x{height} exceed the preview bound"
+        )));
+    }
+
+    let mut decoded = vec![0; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut decoded)
+        .map_err(|error| RenderError::unsupported(format!("invalid PNG frame: {error}")))?;
+    let source = &decoded[..info.buffer_size()];
+    let capacity = usize::try_from(pixels)
+        .ok()
+        .and_then(|count| count.checked_mul(4))
+        .ok_or_else(|| RenderError::unsupported("PNG RGBA allocation size overflow"))?;
+    let mut rgba = Vec::with_capacity(capacity);
+    match info.color_type {
+        png::ColorType::Rgba => rgba.extend_from_slice(source),
+        png::ColorType::Rgb => {
+            for pixel in source.chunks_exact(3) {
+                rgba.extend_from_slice(&[pixel[0], pixel[1], pixel[2], 255]);
+            }
+        }
+        png::ColorType::Grayscale => {
+            for &value in source {
+                rgba.extend_from_slice(&[value, value, value, 255]);
+            }
+        }
+        png::ColorType::GrayscaleAlpha => {
+            for pixel in source.chunks_exact(2) {
+                rgba.extend_from_slice(&[pixel[0], pixel[0], pixel[0], pixel[1]]);
+            }
+        }
+        png::ColorType::Indexed => {
+            return Err(RenderError::unsupported(
+                "indexed PNG was not expanded by the decoder",
+            ));
+        }
+    }
+    if rgba.len() != capacity {
+        return Err(RenderError::unsupported(format!(
+            "decoded PNG is {width}x{height} but carries {} RGBA bytes",
+            rgba.len()
+        )));
+    }
+    Ok(RgbaImage::new(width, height, rgba))
+}
+
 /// Write one RGBA8 plane to an 8-bit PNG, compacting away any row padding.
 fn write_png(path: &Path, width: u32, height: u32, plane: &Plane) -> Result<(), EncodeError> {
     let row_bytes = width as usize * 4;
@@ -340,13 +409,7 @@ mod tests {
         let encoded = encode_png(&image).expect("encode");
         assert_eq!(&encoded[..8], b"\x89PNG\r\n\x1a\n");
 
-        let decoder = png::Decoder::new(encoded.as_slice());
-        let mut reader = decoder.read_info().expect("header");
-        let mut decoded = vec![0; reader.output_buffer_size()];
-        let info = reader.next_frame(&mut decoded).expect("frame");
-        assert_eq!((info.width, info.height), (2, 1));
-        assert_eq!(info.color_type, png::ColorType::Rgba);
-        assert_eq!(&decoded[..info.buffer_size()], image.pixels);
+        assert_eq!(decode_png(&encoded).expect("decode"), image);
     }
 
     #[test]
@@ -357,5 +420,21 @@ mod tests {
             error.to_string().contains("carries 3 bytes"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn in_memory_png_decode_rejects_invalid_and_oversized_inputs() {
+        assert!(decode_png(b"not a png").is_err());
+
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, 4097, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            writer.write_image_data(&vec![0; 4097 * 4]).unwrap();
+        }
+        let error = decode_png(&encoded).expect_err("edge bound");
+        assert!(error.to_string().contains("4097x1"), "{error}");
     }
 }
