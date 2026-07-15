@@ -110,32 +110,87 @@ impl ChatProvider for OpenAiCompatProvider {
         let url = format!("{}/chat/completions", self.base_url);
         let body = self.request_body(request).to_string();
 
-        let mut http = self
-            .agent
-            .post(&url)
-            .set("Content-Type", "application/json");
-        if let Some(key) = &self.api_key {
-            http = http.set("Authorization", &format!("Bearer {key}"));
-        }
-
-        let response = match http.send_string(&body) {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, response)) => {
-                let message = response
-                    .into_string()
-                    .unwrap_or_else(|_| "<unreadable error body>".to_string());
-                return Err(ProviderError::Provider {
-                    status,
-                    message: truncate(&message, 500),
-                });
+        // Only the initial send retries: no stream bytes have been
+        // consumed yet, so a retry can't duplicate text in the UI.
+        // Mid-stream failures (in consume_sse) always surface.
+        let mut attempt = 0usize;
+        let response = loop {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(ProviderError::Cancelled);
             }
-            Err(ureq::Error::Transport(t)) => {
-                return Err(ProviderError::Network(format!("{url}: {t}")));
+            let mut http = self
+                .agent
+                .post(&url)
+                .set("Content-Type", "application/json");
+            if let Some(key) = &self.api_key {
+                http = http.set("Authorization", &format!("Bearer {key}"));
+            }
+            match http.send_string(&body) {
+                Ok(response) => break response,
+                Err(ureq::Error::Status(status, response)) => {
+                    if retryable_status(status) {
+                        match retry_delay(attempt) {
+                            Some(delay) if sleep_unless_cancelled(delay, cancel) => {
+                                attempt += 1;
+                                continue;
+                            }
+                            Some(_) => return Err(ProviderError::Cancelled),
+                            None => {}
+                        }
+                    }
+                    let message = response
+                        .into_string()
+                        .unwrap_or_else(|_| "<unreadable error body>".to_string());
+                    return Err(ProviderError::Provider {
+                        status,
+                        message: truncate(&message, 500),
+                    });
+                }
+                Err(ureq::Error::Transport(t)) => match retry_delay(attempt) {
+                    Some(delay) if sleep_unless_cancelled(delay, cancel) => attempt += 1,
+                    Some(_) => return Err(ProviderError::Cancelled),
+                    None => return Err(ProviderError::Network(format!("{url}: {t}"))),
+                },
             }
         };
 
         consume_sse(response.into_reader(), cancel, on_text)
     }
+}
+
+/// Statuses whose response is explicitly temporary. Authentication,
+/// malformed requests, and payment failures stay single-shot; retrying
+/// them only delays the actionable error.
+fn retryable_status(status: u16) -> bool {
+    status == 408 || status == 429 || (500..=599).contains(&status)
+}
+
+/// Backoff before re-sending the initial request after a transport
+/// failure: two retries, spaced so a briefly-napping local server
+/// (Ollama model load, sleep wake) gets a second chance without turning
+/// a dead endpoint into a long hang.
+fn retry_delay(attempt: usize) -> Option<Duration> {
+    match attempt {
+        0 => Some(Duration::from_millis(300)),
+        1 => Some(Duration::from_millis(900)),
+        _ => None,
+    }
+}
+
+/// Sleep in ~50ms slices, polling `cancel`. Returns false — retry
+/// abandoned — the moment cancellation shows up.
+fn sleep_unless_cancelled(total: Duration, cancel: &AtomicBool) -> bool {
+    let slice = Duration::from_millis(50);
+    let mut remaining = total;
+    while !remaining.is_zero() {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        let step = remaining.min(slice);
+        std::thread::sleep(step);
+        remaining = remaining.saturating_sub(step);
+    }
+    !cancel.load(Ordering::Relaxed)
 }
 
 /// The `image_url` content part: raw bytes become a base64 data URL here,
@@ -531,5 +586,37 @@ mod tests {
             "plain string, not a parts array, so array-less servers keep working"
         );
         assert_eq!(wire[0]["content"], "split the clip");
+    }
+
+    #[test]
+    fn retry_backoff_is_two_attempts_then_give_up() {
+        assert_eq!(retry_delay(0), Some(Duration::from_millis(300)));
+        assert_eq!(retry_delay(1), Some(Duration::from_millis(900)));
+        assert_eq!(retry_delay(2), None);
+        assert_eq!(retry_delay(99), None);
+    }
+
+    #[test]
+    fn only_transient_http_statuses_retry() {
+        for status in [408, 429, 500, 502, 599] {
+            assert!(retryable_status(status), "{status}");
+        }
+        for status in [400, 401, 402, 403, 404, 422, 600] {
+            assert!(!retryable_status(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn cancellation_shortcuts_the_retry_sleep() {
+        let cancel = AtomicBool::new(true);
+        let start = std::time::Instant::now();
+        assert!(!sleep_unless_cancelled(Duration::from_millis(900), &cancel));
+        assert!(
+            start.elapsed() < Duration::from_millis(300),
+            "a raised cancel flag must not wait out the backoff"
+        );
+
+        let live = AtomicBool::new(false);
+        assert!(sleep_unless_cancelled(Duration::from_millis(10), &live));
     }
 }
