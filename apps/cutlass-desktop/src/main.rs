@@ -480,6 +480,7 @@ fn cache_relocation_supported(id: cutlass_storage::CacheId) -> bool {
         id,
         cutlass_storage::CacheId::Proxies
             | cutlass_storage::CacheId::Analysis
+            | cutlass_storage::CacheId::AiModels
             | cutlass_storage::CacheId::Download
             | cutlass_storage::CacheId::Catalog
             | cutlass_storage::CacheId::Luts
@@ -3490,12 +3491,20 @@ mod settings_cache_tests {
 
     #[test]
     fn cache_rows_are_registry_ordered_with_exact_path_rules() {
+        let ai_models_path = PathBuf::from("/tmp/cutlass-ai-models");
         let download_path = PathBuf::from("/tmp/cutlass-downloads");
         let rows = cache_rows_from_snapshots(vec![
             snapshot(
                 cutlass_storage::CacheId::Download,
                 Some(download_path.clone()),
                 1_536,
+                0,
+                1,
+            ),
+            snapshot(
+                cutlass_storage::CacheId::AiModels,
+                Some(ai_models_path.clone()),
+                13,
                 0,
                 1,
             ),
@@ -3510,15 +3519,26 @@ mod settings_cache_tests {
         assert!(rows[0].clearable);
         assert!(!rows[0].relocatable);
 
-        assert_eq!(rows[1].id.as_str(), "download");
+        assert_eq!(rows[1].id.as_str(), "ai_models");
         assert_eq!(
             rows[1].path.as_str(),
-            download_path.to_str().expect("test path is Unicode")
+            ai_models_path.to_str().expect("test path is Unicode")
         );
-        assert_eq!(rows[1].size_label.as_str(), "1.5 KiB");
+        assert_eq!(rows[1].label.as_str(), "AI models");
+        assert_eq!(rows[1].size_label.as_str(), "13 B");
         assert_eq!(rows[1].item_count_label.as_str(), "1 file");
         assert!(rows[1].clearable);
         assert!(rows[1].relocatable);
+
+        assert_eq!(rows[2].id.as_str(), "download");
+        assert_eq!(
+            rows[2].path.as_str(),
+            download_path.to_str().expect("test path is Unicode")
+        );
+        assert_eq!(rows[2].size_label.as_str(), "1.5 KiB");
+        assert_eq!(rows[2].item_count_label.as_str(), "1 file");
+        assert!(rows[2].clearable);
+        assert!(rows[2].relocatable);
 
         assert!(
             cache_rows_from_snapshots(vec![snapshot(
@@ -3545,7 +3565,7 @@ mod settings_cache_tests {
     }
 
     #[test]
-    fn cache_relocation_support_is_exactly_the_seven_disk_caches() {
+    fn cache_relocation_support_is_exactly_the_eight_disk_caches() {
         let supported = cutlass_storage::CacheId::ALL
             .into_iter()
             .filter(|id| cache_relocation_supported(*id))
@@ -3555,6 +3575,7 @@ mod settings_cache_tests {
             vec![
                 cutlass_storage::CacheId::Proxies,
                 cutlass_storage::CacheId::Analysis,
+                cutlass_storage::CacheId::AiModels,
                 cutlass_storage::CacheId::Download,
                 cutlass_storage::CacheId::Catalog,
                 cutlass_storage::CacheId::Luts,
@@ -3575,6 +3596,7 @@ mod settings_cache_tests {
         for id in [
             cutlass_storage::CacheId::Proxies,
             cutlass_storage::CacheId::Analysis,
+            cutlass_storage::CacheId::AiModels,
             cutlass_storage::CacheId::Download,
             cutlass_storage::CacheId::Catalog,
             cutlass_storage::CacheId::Luts,
@@ -3630,6 +3652,20 @@ mod settings_cache_tests {
             })
             .collect();
         let rows = cache_rows_from_snapshots(snapshots).unwrap();
+        assert_eq!(rows.len(), 12);
+        assert_eq!(
+            rows.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            cutlass_storage::cache_descriptors()
+                .iter()
+                .map(|descriptor| descriptor.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.id.as_str() == "ai_models")
+                .count(),
+            1
+        );
         let relocatable = rows
             .iter()
             .filter(|row| row.relocatable)
@@ -3641,6 +3677,7 @@ mod settings_cache_tests {
             vec![
                 "proxies",
                 "analysis",
+                "ai_models",
                 "download",
                 "catalog",
                 "luts",

@@ -859,6 +859,7 @@ fn ensure_cache_can_be_relocated(id: CacheId) -> Result<(), String> {
         id,
         CacheId::Proxies
             | CacheId::Analysis
+            | CacheId::AiModels
             | CacheId::Download
             | CacheId::Catalog
             | CacheId::Luts
@@ -897,6 +898,7 @@ fn set_storage_path_override(
     let field = match id {
         CacheId::Proxies => &mut settings.storage.paths.proxies,
         CacheId::Analysis => &mut settings.storage.paths.analysis,
+        CacheId::AiModels => &mut settings.storage.paths.ai_models,
         CacheId::Download => &mut settings.storage.paths.download,
         CacheId::Catalog => &mut settings.storage.paths.catalog,
         CacheId::Luts => &mut settings.storage.paths.luts,
@@ -921,6 +923,18 @@ fn validate_relocation_references(
     saved: &DraftReferenceReport,
     live: &CacheReferenceReport,
 ) -> Result<(), CacheRelocationFailure> {
+    let has_persisted_project_references = match id {
+        CacheId::Proxies | CacheId::Analysis | CacheId::AiModels | CacheId::Catalog => false,
+        CacheId::Download | CacheId::Luts | CacheId::Lottie | CacheId::Templates => true,
+        CacheId::PreviewFrames
+        | CacheId::LibraryThumbnails
+        | CacheId::TimelineFilmstrips
+        | CacheId::TimelineWaveforms => {
+            return Err(CacheRelocationFailure::from_message(
+                "memory cache has no relocation reference policy",
+            ));
+        }
+    };
     if !saved.is_complete() {
         return Err(CacheRelocationFailure::from_message(
             "saved project reference inventory is incomplete; cache relocation was refused",
@@ -931,10 +945,7 @@ fn validate_relocation_references(
             "current project reference inventory is incomplete; cache relocation was refused",
         ));
     }
-    if !matches!(
-        id,
-        CacheId::Download | CacheId::Luts | CacheId::Lottie | CacheId::Templates
-    ) {
+    if !has_persisted_project_references {
         return Ok(());
     }
 
@@ -1153,7 +1164,18 @@ pub(crate) fn cache_can_be_cleared(id: CacheId) -> bool {
 }
 
 fn cache_requires_reference_migration(id: CacheId) -> bool {
-    matches!(id, CacheId::Luts | CacheId::Lottie | CacheId::Templates)
+    match id {
+        CacheId::Luts | CacheId::Lottie | CacheId::Templates => true,
+        CacheId::PreviewFrames
+        | CacheId::LibraryThumbnails
+        | CacheId::TimelineFilmstrips
+        | CacheId::TimelineWaveforms
+        | CacheId::Proxies
+        | CacheId::Analysis
+        | CacheId::AiModels
+        | CacheId::Download
+        | CacheId::Catalog => false,
+    }
 }
 
 fn clear_download_cache_from_inventories(
@@ -1551,11 +1573,14 @@ mod tests {
         let temporary = tempfile::tempdir().unwrap();
         let layout = StorageLayout::new(temporary.path()).unwrap();
         let analysis = layout.resolve(CacheId::Analysis).unwrap();
+        let ai_models = layout.resolve(CacheId::AiModels).unwrap();
         let download = layout.resolve(CacheId::Download).unwrap();
         fs::create_dir_all(&analysis).unwrap();
+        fs::create_dir_all(&ai_models).unwrap();
         let nested = download.join("stock");
         fs::create_dir_all(&nested).unwrap();
         fs::write(analysis.join("moments.sqlite3"), b"analysis!").unwrap();
+        fs::write(ai_models.join("ggml-base.en.bin"), b"model-weights").unwrap();
         fs::write(nested.join("clip.mp4"), b"12345").unwrap();
         fs::write(download.join("metadata.json"), b"123").unwrap();
 
@@ -1568,6 +1593,7 @@ mod tests {
             vec![
                 CacheId::Proxies,
                 CacheId::Analysis,
+                CacheId::AiModels,
                 CacheId::Download,
                 CacheId::Catalog,
                 CacheId::Luts,
@@ -1575,6 +1601,7 @@ mod tests {
                 CacheId::Templates,
             ]
         );
+        assert_eq!(snapshots.len(), 8);
         let download = snapshots
             .iter()
             .find(|snapshot| snapshot.id == CacheId::Download)
@@ -1593,6 +1620,17 @@ mod tests {
         assert_eq!(
             (analysis.bytes, analysis.files, analysis.entries),
             (9, 1, 0)
+        );
+        let ai_models = snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == CacheId::AiModels)
+            .unwrap();
+        assert_eq!(ai_models.label, "AI models");
+        assert_eq!(ai_models.kind, CacheKind::Disk);
+        assert_eq!(ai_models.tier, CacheTier::Redownloadable);
+        assert_eq!(
+            (ai_models.bytes, ai_models.files, ai_models.entries),
+            (13, 1, 0)
         );
         assert_eq!(
             snapshots
@@ -1633,6 +1671,42 @@ mod tests {
                 .bytes,
             0
         );
+    }
+
+    #[test]
+    fn ai_models_are_outside_download_quota_and_reference_protection() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layout = StorageLayout::new(temporary.path()).unwrap();
+        let ai_models = layout.resolve(CacheId::AiModels).unwrap();
+        let downloads = layout.resolve(CacheId::Download).unwrap();
+        fs::create_dir_all(&ai_models).unwrap();
+        fs::create_dir_all(&downloads).unwrap();
+        let model = ai_models.join("ggml-base.en.bin");
+        let protected_source = downloads.join("project-source.mp4");
+        fs::write(&model, b"model-weights").unwrap();
+        fs::write(&protected_source, b"source").unwrap();
+
+        let download_cache = DownloadCache::new(downloads, 1_000);
+        download_cache.protect_path(&protected_source).unwrap();
+        download_cache.set_quota_bytes(0);
+        download_cache.enforce_quota();
+        assert!(model.is_file(), "download quota must not inspect AI models");
+        assert!(protected_source.is_file());
+
+        let removed =
+            clear_disk_contents(&layout, CacheId::AiModels, &AtomicBool::new(false)).unwrap();
+        assert_eq!(
+            removed,
+            CacheUsage {
+                bytes: 13,
+                entries: 0,
+                files: 1,
+            }
+        );
+        assert!(ai_models.is_dir());
+        assert!(!model.exists());
+        assert!(protected_source.is_file());
+        assert_eq!(download_cache.protected_path_count(), 1);
     }
 
     #[test]
@@ -1829,9 +1903,10 @@ mod tests {
     }
 
     #[test]
-    fn cache_clear_policy_fails_closed_for_project_referenced_catalog_assets() {
+    fn cache_clear_policy_explicitly_allows_unreferenced_ai_models() {
         assert!(ensure_cache_can_be_cleared(CacheId::Proxies).is_ok());
         assert!(ensure_cache_can_be_cleared(CacheId::Analysis).is_ok());
+        assert!(ensure_cache_can_be_cleared(CacheId::AiModels).is_ok());
         assert!(ensure_cache_can_be_cleared(CacheId::Download).is_ok());
         for id in [CacheId::Luts, CacheId::Lottie, CacheId::Templates] {
             assert!(!cache_can_be_cleared(id), "{id} must fail closed");
@@ -1844,6 +1919,7 @@ mod tests {
         let disk_ids = [
             CacheId::Proxies,
             CacheId::Analysis,
+            CacheId::AiModels,
             CacheId::Download,
             CacheId::Catalog,
             CacheId::Luts,
@@ -1928,6 +2004,10 @@ mod tests {
         assert!(
             validate_relocation_references(CacheId::Analysis, &saved, &live).is_ok(),
             "media analysis has no persisted project references"
+        );
+        assert!(
+            validate_relocation_references(CacheId::AiModels, &saved, &live).is_ok(),
+            "AI model weights have no persisted project references"
         );
 
         let incomplete_saved = DraftReferenceReport {

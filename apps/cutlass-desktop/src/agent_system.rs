@@ -25,22 +25,24 @@ const TOOL_NAMES: [&str; 5] = [
     SYSTEM_CACHE_CLEAR,
     SYSTEM_CACHE_RELOCATE,
 ];
-const CACHE_IDS: [&str; 11] = [
+const CACHE_IDS: [&str; 12] = [
     "preview_frames",
     "library_thumbnails",
     "timeline_filmstrips",
     "timeline_waveforms",
     "proxies",
     "analysis",
+    "ai_models",
     "download",
     "catalog",
     "luts",
     "lottie",
     "templates",
 ];
-const RELOCATABLE_CACHE_IDS: [&str; 7] = [
+const RELOCATABLE_CACHE_IDS: [&str; 8] = [
     "proxies",
     "analysis",
+    "ai_models",
     "download",
     "catalog",
     "luts",
