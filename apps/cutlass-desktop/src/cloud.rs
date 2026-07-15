@@ -312,21 +312,25 @@ impl Worker {
             return;
         }
         let key = tile_key(item);
-        let path = match self.cache.path_for(&format!("stock-thumbs/{key}.img")) {
-            Ok(path) => path,
+        let lease = match self.cache.lease(&format!("stock-thumbs/{key}.img")) {
+            Ok(lease) => lease,
             Err(e) => {
                 warn!("thumb cache path failed: {e}");
                 return;
             }
         };
-        if !path.is_file() {
+        if !std::fs::symlink_metadata(lease.path())
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
             let cancel = Arc::new(AtomicBool::new(false));
-            if let Err(e) = download::download_to(&item.thumbnail_url, &path, &cancel, |_| {}) {
+            if let Err(e) =
+                download::download_to(&item.thumbnail_url, lease.path(), &cancel, |_| {})
+            {
                 warn!("stock thumbnail download failed: {e}");
                 return;
             }
         }
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = std::fs::read(lease.path()) else {
             return;
         };
         let Ok(decoded) = cutlass_decoder::decode_image_bytes(&bytes) else {
@@ -357,20 +361,23 @@ impl Worker {
             extension(&item, &file.content_type, &file.url)
         );
 
-        // Cache hit: straight to import, no download UI.
-        if let Some(path) = self.cache.hit(&cache_key) {
-            self.import_handle.import(path);
-            self.patch_row(index, key, |tile| tile.state = "imported".into());
-            return;
-        }
-
-        let dest = match self.cache.path_for(&cache_key) {
-            Ok(dest) => dest,
+        let lease = match self.cache.lease(&cache_key) {
+            Ok(lease) => lease,
             Err(e) => {
                 warn!("stock cache path failed: {e}");
                 return;
             }
         };
+
+        // Cache hit: straight to import, no download UI.
+        if std::fs::symlink_metadata(lease.path())
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            self.import_handle.import(lease.path().to_path_buf());
+            self.patch_row(index, key, |tile| tile.state = "imported".into());
+            return;
+        }
+
         self.patch_row(index, key.clone(), |tile| {
             tile.state = "downloading".into();
             tile.progress = 0.0;
@@ -380,7 +387,7 @@ impl Worker {
         let mut last_published = 0.0_f32;
         let progress_key = key.clone();
         let url = file.url.clone();
-        let result = download::download_to(&url, &dest, &cancel, |p| {
+        let result = download::download_to(&url, lease.path(), &cancel, |p| {
             if p.total_bytes == 0 {
                 return;
             }
@@ -397,9 +404,10 @@ impl Worker {
 
         match result {
             Ok(()) => {
-                info!("stock import: {} -> {}", url, dest.display());
-                self.import_handle.import(dest);
+                info!("stock import: {} -> {}", url, lease.path().display());
+                self.import_handle.import(lease.path().to_path_buf());
                 self.patch_row(index, key, |tile| tile.state = "imported".into());
+                drop(lease);
                 self.cache.enforce_quota();
             }
             Err(e) => {

@@ -145,23 +145,25 @@ impl Worker {
         let key = entry.id.clone();
         let cache_key = format!("sfx/{}.{}", entry.id, extension(&entry.file_url));
 
-        // Cache hit with a valid checksum: straight to import, no download UI.
-        if let Some(path) = self.cache.hit(&cache_key) {
-            if checksum_ok(&path, &entry.checksum_sha256) {
-                self.import_handle.import(path);
-                self.patch_row(index, key, |tile| tile.state = "imported".into());
-                return;
-            }
-            let _ = std::fs::remove_file(&path);
-        }
-
-        let dest = match self.cache.path_for(&cache_key) {
-            Ok(dest) => dest,
+        let lease = match self.cache.lease(&cache_key) {
+            Ok(lease) => lease,
             Err(e) => {
                 warn!("sfx cache path failed: {e}");
                 return;
             }
         };
+
+        // Cache hit with a valid checksum: straight to import, no download UI.
+        if std::fs::symlink_metadata(lease.path())
+            .is_ok_and(|metadata| metadata.file_type().is_file())
+        {
+            if checksum_ok(lease.path(), &entry.checksum_sha256) {
+                self.import_handle.import(lease.path().to_path_buf());
+                self.patch_row(index, key, |tile| tile.state = "imported".into());
+                return;
+            }
+            let _ = std::fs::remove_file(lease.path());
+        }
         self.patch_row(index, key.clone(), |tile| {
             tile.state = "downloading".into();
             tile.progress = 0.0;
@@ -170,7 +172,7 @@ impl Worker {
         let cancel = Arc::new(AtomicBool::new(false));
         let mut last_published = 0.0_f32;
         let progress_key = key.clone();
-        let result = download::download_to(&entry.file_url, &dest, &cancel, |p| {
+        let result = download::download_to(&entry.file_url, lease.path(), &cancel, |p| {
             if p.total_bytes == 0 {
                 return;
             }
@@ -185,15 +187,20 @@ impl Worker {
         });
 
         match result {
-            Ok(()) if checksum_ok(&dest, &entry.checksum_sha256) => {
-                info!("sfx import: {} -> {}", entry.file_url, dest.display());
-                self.import_handle.import(dest);
+            Ok(()) if checksum_ok(lease.path(), &entry.checksum_sha256) => {
+                info!(
+                    "sfx import: {} -> {}",
+                    entry.file_url,
+                    lease.path().display()
+                );
+                self.import_handle.import(lease.path().to_path_buf());
                 self.patch_row(index, key, |tile| tile.state = "imported".into());
+                drop(lease);
                 self.cache.enforce_quota();
             }
             Ok(()) => {
                 warn!(asset = %entry.id, "sfx checksum mismatch");
-                let _ = std::fs::remove_file(&dest);
+                let _ = std::fs::remove_file(lease.path());
                 self.patch_row(index, key, |tile| tile.state = "failed".into());
             }
             Err(e) => {
