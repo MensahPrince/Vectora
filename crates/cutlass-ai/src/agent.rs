@@ -257,7 +257,10 @@ pub fn system_prompt(
          and ids before any further edit that depends on them: recompute, \
          do not assume, and do not give up. Name clips and tracks by id \
          and content so answers stay checkable; if the state cannot \
-         answer a question, say what is missing instead of guessing.\n\
+         answer a question, say what is missing instead of guessing. \
+         Unknown source-footage content is not missing project state: \
+         when media inspection tools are available, use them instead of \
+         declining the task or asking the user to place footage first.\n\
          - Clips on one track can never overlap, and a clip can only grow \
          into free space. To lengthen a clip or insert into a packed \
          track, first make room: move or shift the later clips on that \
@@ -289,11 +292,17 @@ fn engine_sense_rules(specs: &[HostToolSpec]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "\n\nRehearsal senses ({names}) inspect the current sandbox, including edits already \
-         completed in this prompt. Before finalizing visual or timing work, use the cheapest \
-         relevant sense to verify it: prefer a schematic timeline map for placement and timing, \
-         and a composited preview frame only when appearance or layering matters. Inspect source \
-         assets when their content is uncertain. Never claim a check succeeded if a sense failed."
+        "\n\nRehearsal senses ({names}) inspect the complete current project snapshot and sandbox, \
+         including edits already completed in this prompt. Source footage is available through \
+         these senses: do not claim that you cannot browse or verify it without attempting the \
+         relevant sense. Open-ended creative requests such as freestyle edits, montages, or \
+         \"make something interesting\" are fully actionable. Survey the media pool with \
+         media_pool_sheet when it is listed, inspect promising sources with media_asset_strip, \
+         then use visual evidence and editorial judgment to make concrete edits rather than \
+         declining or asking the user to choose placements and ranges. Before finalizing visual \
+         or timing work, use the cheapest relevant sense to verify it: prefer a schematic \
+         timeline map for placement and timing, and a composited preview frame only when \
+         appearance or layering matters. Never claim a check succeeded if a sense failed."
     )
 }
 
@@ -1426,6 +1435,9 @@ mod tests {
         assert!(prompt.contains("answer directly from"));
         // The re-inspect rule: after edits, read the new state, don't give up.
         assert!(prompt.contains("call describe_project to read the new"));
+        // Unknown footage content is fetchable, not grounds to refuse.
+        assert!(prompt.contains("Unknown source-footage content is not missing project state"));
+        assert!(prompt.contains("instead of declining the task"));
         // The overlap rule: make room before growing into a packed track.
         assert!(prompt.contains("Clips on one track can never overlap"));
         // No extensions ⇒ no rules or skills sections.
@@ -1458,6 +1470,30 @@ mod tests {
         assert!(prompt.contains("podcast-cleanup (Podcast cleanup): Clean up a talk recording."));
         // Only the index enters the prompt — bodies load through read_skill.
         assert!(!prompt.contains("SECRET BODY"));
+    }
+
+    #[test]
+    fn engine_sense_rules_make_open_ended_creative_work_actionable() {
+        let rules = engine_sense_rules(&[
+            HostToolSpec {
+                name: "media_pool_sheet".into(),
+                description: "Survey imported visual media.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                tier: crate::tools::ToolTier::ReadOnly,
+            },
+            HostToolSpec {
+                name: "media_asset_strip".into(),
+                description: "Inspect one source over time.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                tier: crate::tools::ToolTier::ReadOnly,
+            },
+        ]);
+
+        assert!(rules.contains("complete current project snapshot"));
+        assert!(rules.contains("freestyle edits"));
+        assert!(rules.contains("media_pool_sheet"));
+        assert!(rules.contains("media_asset_strip"));
+        assert!(rules.contains("rather than declining"));
     }
 
     #[test]
