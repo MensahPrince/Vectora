@@ -4,7 +4,8 @@
 //! sanitized snapshots from that registry; monotonic timestamps and other
 //! registry internals never cross the tool boundary.
 //! `cancel_requested` records an accepted request; `cancellable` says whether
-//! the registry still accepts cancellation for the job.
+//! the registry still accepts cancellation for the job. Successful structured
+//! outputs cross as an exact bounded string-to-string object.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -23,13 +24,13 @@ pub fn specs() -> Vec<HostToolSpec> {
     vec![
         spec(
             JOB_LIST,
-            "List known background jobs newest first, including state, progress, whether cancellation was requested, whether cancellation is still accepted, and elapsed time.",
+            "List known background jobs newest first, including state, progress, successful structured outputs, whether cancellation was requested, whether cancellation is still accepted, and elapsed time.",
             empty_object_schema(),
             ToolTier::ReadOnly,
         ),
         spec(
             JOB_STATUS,
-            "Read one background job by job_id, including distinct cancel_requested and cancellable fields.",
+            "Read one background job by job_id, including successful structured outputs and distinct cancel_requested and cancellable fields.",
             job_id_schema(),
             ToolTier::ReadOnly,
         ),
@@ -129,10 +130,23 @@ fn snapshot_value(snapshot: JobSnapshot, now: Instant) -> Value {
         cancellable,
         progress,
         detail,
+        mut outputs,
         cancel_requested,
         started,
         finished,
     } = snapshot;
+    // Core validation guarantees unique bounded names/values. Sorting keeps
+    // serialized object order deterministic under either serde_json map mode.
+    outputs.sort_unstable_by(|left, right| left.name().cmp(right.name()));
+    let outputs = outputs
+        .into_iter()
+        .map(|output| {
+            (
+                output.name().to_owned(),
+                Value::String(output.value().to_owned()),
+            )
+        })
+        .collect::<Map<_, _>>();
     let elapsed_ms = finished
         .unwrap_or(now)
         .saturating_duration_since(started)
@@ -146,6 +160,7 @@ fn snapshot_value(snapshot: JobSnapshot, now: Instant) -> Value {
         "cancellable": cancellable,
         "progress": progress,
         "detail": detail,
+        "outputs": outputs,
         "cancel_requested": cancel_requested,
         "elapsed_ms": elapsed_ms
     })
@@ -266,6 +281,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use cutlass_jobs::JobCompletion;
 
     const WAIT: Duration = Duration::from_secs(10);
 
@@ -313,6 +329,7 @@ mod tests {
                 "elapsed_ms",
                 "job_id",
                 "label",
+                "outputs",
                 "progress",
                 "state",
             ])
@@ -322,6 +339,7 @@ mod tests {
         assert!(row["state"].is_string());
         assert!(row["progress"].is_null() || row["progress"].is_number());
         assert!(row["detail"].is_string());
+        assert!(row["outputs"].is_object());
         assert!(row["cancel_requested"].is_boolean());
         assert!(row["cancellable"].is_boolean());
         assert!(row["elapsed_ms"].as_u64().is_some());
@@ -414,6 +432,7 @@ mod tests {
             assert!(matches!(row["state"].as_str(), Some("queued" | "running")));
             assert!(row["progress"].is_null());
             assert_eq!(row["detail"], "");
+            assert_eq!(row["outputs"], json!({}));
             assert_eq!(row["cancel_requested"], false);
             assert_eq!(row["cancellable"], true);
             assert!(row.get("started").is_none());
@@ -450,6 +469,7 @@ mod tests {
         assert_eq!(queued_row["cancellable"], true);
         assert_eq!(queued_row["cancel_requested"], false);
         assert!(queued_row["progress"].is_null());
+        assert_eq!(queued_row["outputs"], json!({}));
         terminal_for(&terminal_rx, queued_id);
 
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -473,6 +493,7 @@ mod tests {
         assert_eq!(running_row["cancel_requested"], false);
         assert_eq!(running_row["progress"], 0.25);
         assert_eq!(running_row["detail"], "one quarter");
+        assert_eq!(running_row["outputs"], json!({}));
 
         release_tx.send(()).expect("release running job");
         terminal_for(&terminal_rx, running_id);
@@ -487,6 +508,7 @@ mod tests {
         assert_eq!(done_row["cancel_requested"], false);
         assert_eq!(done_row["progress"], 1.0);
         assert_eq!(done_row["detail"], "complete");
+        assert_eq!(done_row["outputs"], json!({}));
 
         let failed_id = manager.spawn("failed-status", |context| {
             context.set_progress(0.375, "before failure");
@@ -504,6 +526,7 @@ mod tests {
         assert_eq!(failed_row["cancel_requested"], false);
         assert_eq!(failed_row["progress"], 0.375);
         assert_eq!(failed_row["detail"], "fixture failed");
+        assert_eq!(failed_row["outputs"], json!({}));
 
         let (started_tx, started_rx) = mpsc::channel();
         let (finish_tx, finish_rx) = mpsc::channel();
@@ -526,6 +549,7 @@ mod tests {
         assert_eq!(cancelled_row["cancellable"], false);
         assert!(cancelled_row["progress"].is_null());
         assert_eq!(cancelled_row["cancel_requested"], true);
+        assert_eq!(cancelled_row["outputs"], json!({}));
 
         let error = call(
             &manager,
@@ -535,6 +559,46 @@ mod tests {
         )
         .expect_err("unknown status must fail");
         assert!(error.contains("unknown or has been pruned"));
+    }
+
+    #[test]
+    fn list_and_status_serialize_exact_successful_outputs() {
+        let (manager, terminal_rx) = manager_with_terminals();
+        let id = manager.spawn_with_completion("transcript outputs", |_| {
+            Ok(JobCompletion::new("indexed transcript")
+                .with_output("content_key", "transcript:asset-42")?
+                .with_output("analyzer_identity", "cutlass-transcription")?
+                .with_output("analyzer_version", "3")?
+                .with_output("segment_count", "12")?
+                .with_output("word_count", "347")?)
+        });
+        let terminal = terminal_for(&terminal_rx, id);
+        assert_eq!(terminal.state, JobState::Done);
+
+        let expected = json!({
+            "content_key": "transcript:asset-42",
+            "analyzer_identity": "cutlass-transcription",
+            "analyzer_version": "3",
+            "segment_count": "12",
+            "word_count": "347"
+        });
+
+        let status = output_json(&invoke(&manager, JOB_STATUS, json!({ "job_id": id.raw() })));
+        let status_row = job_row(&status["job"]);
+        assert_eq!(status_row["outputs"], expected);
+        assert_eq!(
+            serde_json::to_string(&status_row["outputs"]).unwrap(),
+            r#"{"analyzer_identity":"cutlass-transcription","analyzer_version":"3","content_key":"transcript:asset-42","segment_count":"12","word_count":"347"}"#
+        );
+
+        let list = output_json(&invoke(&manager, JOB_LIST, json!({})));
+        let list_row = list["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["job_id"] == id.raw())
+            .expect("completed job in list");
+        assert_eq!(job_row(list_row)["outputs"], expected);
     }
 
     #[test]
@@ -564,6 +628,7 @@ mod tests {
         assert_eq!(row["state"], "running");
         assert_eq!(row["cancellable"], false);
         assert_eq!(row["cancel_requested"], false);
+        assert_eq!(row["outputs"], json!({}));
 
         let error = call(
             &manager,
@@ -603,6 +668,7 @@ mod tests {
         assert_eq!(done_row["state"], "done");
         assert_eq!(done_row["cancellable"], false);
         assert_eq!(done_row["cancel_requested"], false);
+        assert_eq!(done_row["outputs"], json!({}));
     }
 
     #[test]
