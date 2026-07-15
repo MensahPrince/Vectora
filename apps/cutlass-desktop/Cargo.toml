@@ -21,6 +21,7 @@ slint = { version = "=1.16.1", features = [
 # The desktop app is Rust, so it links the engine directly — no C-ABI/JNI
 # bridge like the iOS/Android apps. The same `crates/cutlass-engine` drives
 # three unrelated frontends.
+cutlass-analysis = { path = "../../crates/cutlass-analysis", features = ["sqlite"] }
 cutlass-commands = { path = "../../crates/cutlass-commands" }
 cutlass-compositor = { path = "../../crates/cutlass-compositor" }
 cutlass-decoder = { path = "../../crates/cutlass-decoder" }
@@ -42,6 +43,8 @@ tracing = { workspace = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rfd = "0.17.2"
 dirs = "6.0.0"
+same-file = "1.0"
+sha2 = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.4"

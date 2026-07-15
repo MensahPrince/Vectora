@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
@@ -141,6 +142,86 @@ impl Serialize for CacheRelocationReport {
     }
 }
 
+/// Failures that can prevent a coordinated disk-cache callback from starting.
+#[derive(Debug)]
+pub(crate) enum CacheCoordinationError {
+    /// Cooperative cancellation was requested, including by a panicking
+    /// cancellation callback.
+    Cancelled,
+    /// Another cache operation held the gate for longer than the bounded wait.
+    TimedOut,
+    /// The operation gate was poisoned.
+    GateUnavailable,
+    /// The requested cache is memory-only.
+    MemoryCache,
+    /// The leased storage generation failed point-in-time filesystem
+    /// validation.
+    InvalidLayout { source: StorageError },
+    /// A registered disk cache did not resolve to an absolute path.
+    DiskPathUnavailable,
+}
+
+impl fmt::Display for CacheCoordinationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Cancelled => formatter.write_str("coordinated cache operation cancelled"),
+            Self::TimedOut => formatter.write_str("another cache operation did not finish in time"),
+            Self::GateUnavailable => {
+                formatter.write_str("cache operation coordination is unavailable")
+            }
+            Self::MemoryCache => formatter.write_str("memory cache has no coordinated disk root"),
+            Self::InvalidLayout { .. } => {
+                formatter.write_str("cache layout failed filesystem validation")
+            }
+            Self::DiskPathUnavailable => {
+                formatter.write_str("disk cache has no valid storage path")
+            }
+        }
+    }
+}
+
+impl Error for CacheCoordinationError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::InvalidLayout { source } => Some(source),
+            Self::Cancelled
+            | Self::TimedOut
+            | Self::GateUnavailable
+            | Self::MemoryCache
+            | Self::DiskPathUnavailable => None,
+        }
+    }
+}
+
+/// A coordinated disk-cache failure, preserving callback errors separately
+/// from cancellation and registry coordination failures.
+#[derive(Debug)]
+pub(crate) enum CoordinatedCacheError<E> {
+    Coordination(CacheCoordinationError),
+    Callback(E),
+}
+
+impl<E> fmt::Display for CoordinatedCacheError<E> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Coordination(error) => error.fmt(formatter),
+            Self::Callback(_) => formatter.write_str("coordinated cache callback failed"),
+        }
+    }
+}
+
+impl<E> Error for CoordinatedCacheError<E>
+where
+    E: Error + 'static,
+{
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Coordination(error) => Some(error),
+            Self::Callback(error) => Some(error),
+        }
+    }
+}
+
 /// The single cloneable desktop cache service shared by agent and Settings.
 #[derive(Clone)]
 pub(crate) struct CacheRegistry {
@@ -201,6 +282,37 @@ impl CacheRegistry {
         operation: impl FnOnce() -> T,
     ) -> Result<T, String> {
         try_with_operation_gate(&self.operation_gate, operation)
+    }
+
+    /// Run one synchronous worker operation against a resolved disk-cache root.
+    ///
+    /// The cache operation gate and one [`SharedStorageLayout`] generation
+    /// lease remain held until `operation` returns. The leased layout is
+    /// validated against the filesystem before the root is resolved and the
+    /// callback begins. This method must run on a job or worker thread, never
+    /// on the UI or preview thread.
+    ///
+    /// `cancelled` is borrowed and may directly inspect a future job context.
+    /// It is checked before and during the bounded gate wait, after the gate is
+    /// acquired, after layout validation, and immediately before the callback.
+    /// A panic from it fails closed as cancellation. Cancellation is
+    /// deliberately not checked after the callback because it may have
+    /// committed a mutation.
+    pub(crate) fn with_disk_cache_root<T, E>(
+        &self,
+        id: CacheId,
+        cancelled: &dyn Fn() -> bool,
+        operation: impl FnOnce(&Path) -> Result<T, E>,
+    ) -> Result<T, CoordinatedCacheError<E>> {
+        with_coordinated_disk_cache_root(
+            &self.layout,
+            &self.operation_gate,
+            id,
+            cancelled,
+            GATE_WAIT_TIMEOUT,
+            GATE_WAIT_SLICE,
+            operation,
+        )
     }
 
     /// Snapshot every cache in stable descriptor order.
@@ -1211,6 +1323,75 @@ fn try_with_operation_gate<T>(
     Ok(operation())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn with_coordinated_disk_cache_root<T, E>(
+    layout: &SharedStorageLayout,
+    gate: &Mutex<()>,
+    id: CacheId,
+    cancelled: &dyn Fn() -> bool,
+    timeout: Duration,
+    wait_slice: Duration,
+    operation: impl FnOnce(&Path) -> Result<T, E>,
+) -> Result<T, CoordinatedCacheError<E>> {
+    check_coordinated_cancelled(cancelled).map_err(CoordinatedCacheError::Coordination)?;
+    if id.descriptor().kind != CacheKind::Disk {
+        return Err(CoordinatedCacheError::Coordination(
+            CacheCoordinationError::MemoryCache,
+        ));
+    }
+
+    let _operation = acquire_operation_gate_with_cancel(gate, cancelled, timeout, wait_slice)
+        .map_err(CoordinatedCacheError::Coordination)?;
+    let layout = layout.lease();
+    check_coordinated_cancelled(cancelled).map_err(CoordinatedCacheError::Coordination)?;
+    layout.layout().validate_filesystem().map_err(|source| {
+        CoordinatedCacheError::Coordination(CacheCoordinationError::InvalidLayout { source })
+    })?;
+    check_coordinated_cancelled(cancelled).map_err(CoordinatedCacheError::Coordination)?;
+
+    let root = layout.resolve(id).filter(|path| path.is_absolute()).ok_or(
+        CoordinatedCacheError::Coordination(CacheCoordinationError::DiskPathUnavailable),
+    )?;
+    check_coordinated_cancelled(cancelled).map_err(CoordinatedCacheError::Coordination)?;
+    operation(&root).map_err(CoordinatedCacheError::Callback)
+}
+
+fn check_coordinated_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), CacheCoordinationError> {
+    let requested = catch_unwind(AssertUnwindSafe(cancelled)).unwrap_or(true);
+    if requested {
+        Err(CacheCoordinationError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+fn acquire_operation_gate_with_cancel<'a>(
+    gate: &'a Mutex<()>,
+    cancelled: &dyn Fn() -> bool,
+    timeout: Duration,
+    wait_slice: Duration,
+) -> Result<MutexGuard<'a, ()>, CacheCoordinationError> {
+    let started = Instant::now();
+    loop {
+        check_coordinated_cancelled(cancelled)?;
+        match gate.try_lock() {
+            Ok(guard) => {
+                check_coordinated_cancelled(cancelled)?;
+                return Ok(guard);
+            }
+            Err(TryLockError::Poisoned(_)) => {
+                return Err(CacheCoordinationError::GateUnavailable);
+            }
+            Err(TryLockError::WouldBlock) => {}
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(CacheCoordinationError::TimedOut);
+        }
+        std::thread::sleep(wait_slice.min(remaining));
+    }
+}
+
 fn acquire_operation_gate<'a>(
     gate: &'a Mutex<()>,
     cancel: &AtomicBool,
@@ -1335,7 +1516,10 @@ const fn cache_tier_key(tier: CacheTier) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
     use std::fs;
+    use std::sync::mpsc;
+    use std::thread;
 
     use serde_json::json;
 
@@ -2057,6 +2241,177 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn coordinated_disk_root_refuses_memory_caches_and_pre_cancelled_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layout =
+            SharedStorageLayout::new(StorageLayout::new(temporary.path().join("storage")).unwrap());
+        let gate = Mutex::new(());
+        let callback_ran = AtomicBool::new(false);
+
+        let memory_error = with_coordinated_disk_cache_root(
+            &layout,
+            &gate,
+            CacheId::PreviewFrames,
+            &|| false,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            |_| {
+                callback_ran.store(true, Ordering::Release);
+                Ok::<_, Infallible>(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            memory_error,
+            CoordinatedCacheError::Coordination(CacheCoordinationError::MemoryCache)
+        ));
+
+        let cancelled_error = with_coordinated_disk_cache_root(
+            &layout,
+            &gate,
+            CacheId::Analysis,
+            &|| true,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            |_| {
+                callback_ran.store(true, Ordering::Release);
+                Ok::<_, Infallible>(())
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            cancelled_error,
+            CoordinatedCacheError::Coordination(CacheCoordinationError::Cancelled)
+        ));
+        assert!(!callback_ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn coordinated_disk_root_resolves_only_the_requested_analysis_root() {
+        let temporary = tempfile::tempdir().unwrap();
+        let expected = temporary.path().join("analysis-override");
+        let mut layout = StorageLayout::new(temporary.path().join("storage")).unwrap();
+        layout.set_override(CacheId::Analysis, &expected).unwrap();
+        let layout = SharedStorageLayout::new(layout);
+        let gate = Mutex::new(());
+
+        let resolved = with_coordinated_disk_cache_root(
+            &layout,
+            &gate,
+            CacheId::Analysis,
+            &|| false,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            |root| Ok::<_, Infallible>(root.to_path_buf()),
+        )
+        .unwrap();
+
+        assert_eq!(resolved, expected);
+        assert_ne!(resolved, layout.resolve(CacheId::Proxies).unwrap());
+    }
+
+    #[test]
+    fn coordinated_disk_root_validates_layout_before_callback() {
+        let temporary = tempfile::tempdir().unwrap();
+        let storage = temporary.path().join("storage");
+        fs::create_dir_all(&storage).unwrap();
+        let layout = StorageLayout::new(&storage).unwrap();
+        fs::write(
+            layout.resolve(CacheId::Analysis).unwrap(),
+            b"not a directory",
+        )
+        .unwrap();
+        let layout = SharedStorageLayout::new(layout);
+        let gate = Mutex::new(());
+        let callback_ran = AtomicBool::new(false);
+
+        let error = with_coordinated_disk_cache_root(
+            &layout,
+            &gate,
+            CacheId::Analysis,
+            &|| false,
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            |_| {
+                callback_ran.store(true, Ordering::Release);
+                Ok::<_, Infallible>(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinatedCacheError::Coordination(CacheCoordinationError::InvalidLayout { .. })
+        ));
+        assert!(!callback_ran.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn coordinated_disk_root_serializes_against_operation_gate() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layout =
+            SharedStorageLayout::new(StorageLayout::new(temporary.path().join("storage")).unwrap());
+        let gate = Arc::new(Mutex::new(()));
+        let held = gate.lock().unwrap();
+        let (waiting_tx, waiting_rx) = mpsc::channel();
+        let (callback_tx, callback_rx) = mpsc::channel();
+
+        let worker_gate = Arc::clone(&gate);
+        let worker = thread::spawn(move || {
+            with_coordinated_disk_cache_root(
+                &layout,
+                worker_gate.as_ref(),
+                CacheId::Analysis,
+                &|| {
+                    let _ = waiting_tx.send(());
+                    false
+                },
+                Duration::from_secs(1),
+                Duration::from_millis(1),
+                |_| {
+                    callback_tx.send(()).unwrap();
+                    Ok::<_, Infallible>(())
+                },
+            )
+        });
+
+        waiting_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(callback_rx.recv_timeout(Duration::from_millis(25)).is_err());
+        drop(held);
+        callback_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn coordinated_disk_root_treats_cancellation_panic_as_cancelled() {
+        let temporary = tempfile::tempdir().unwrap();
+        let layout =
+            SharedStorageLayout::new(StorageLayout::new(temporary.path().join("storage")).unwrap());
+        let gate = Mutex::new(());
+        let callback_ran = AtomicBool::new(false);
+
+        let error = with_coordinated_disk_cache_root(
+            &layout,
+            &gate,
+            CacheId::Analysis,
+            &|| panic!("injected cancellation panic"),
+            Duration::from_millis(50),
+            Duration::from_millis(1),
+            |_| {
+                callback_ran.store(true, Ordering::Release);
+                Ok::<_, Infallible>(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            CoordinatedCacheError::Coordination(CacheCoordinationError::Cancelled)
+        ));
+        assert!(!callback_ran.load(Ordering::Acquire));
     }
 
     #[test]

@@ -8,6 +8,7 @@ mod agent_session;
 mod agent_system;
 mod agent_vision;
 mod ai_media;
+mod analysis_index;
 mod audio;
 mod cache_references;
 mod cache_registry;
