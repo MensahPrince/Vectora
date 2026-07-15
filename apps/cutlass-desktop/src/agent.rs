@@ -596,6 +596,7 @@ fn approval_title(name: &str) -> String {
     match name {
         "system_cache_list" => "Let the assistant inspect cache usage?".into(),
         "system_cache_clear" => "Clear this cache?".into(),
+        "system_cache_relocate" => "Move this cache?".into(),
         "system_reveal" => "Reveal this path?".into(),
         "system_open_external" => "Open this outside Cutlass?".into(),
         "app_close" => "Close Cutlass?".into(),
@@ -618,6 +619,24 @@ fn approval_detail(
         return bound_approval_detail(registry.clear_approval_detail(id));
     }
 
+    if name == "system_cache_relocate"
+        && let Some(id) = arguments
+            .get("cache_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|id| cutlass_storage::CacheId::parse(id).ok())
+        && let Some(destination) = arguments
+            .get("destination")
+            .and_then(serde_json::Value::as_str)
+        && let Some(registry) = cache_registry
+        && let Ok(current_path) = registry.cache_path(id)
+    {
+        return bound_approval_detail(format_cache_relocation_approval_detail(
+            id,
+            &current_path,
+            Path::new(destination),
+        ));
+    }
+
     let detail = match arguments.as_object() {
         Some(arguments) if arguments.is_empty() => "No arguments.".to_string(),
         _ => serde_json::to_string_pretty(arguments).unwrap_or_else(|_| arguments.to_string()),
@@ -631,6 +650,19 @@ fn bound_approval_detail(detail: String) -> String {
         bounded.push('…');
     }
     bounded
+}
+
+fn format_cache_relocation_approval_detail(
+    id: cutlass_storage::CacheId,
+    current_path: &Path,
+    destination: &Path,
+) -> String {
+    format!(
+        "Cache: {}\nCurrent path: {}\nRequested destination: {}\n\nThe move may be refused when projects reference cache-owned files.",
+        id.descriptor().label,
+        current_path.display(),
+        destination.display()
+    )
 }
 
 fn clear_approval_card(store: &slint::Weak<AgentStore<'static>>) {
@@ -694,6 +726,9 @@ impl ToolHost for DesktopToolHost {
         }
         if cancel.load(Ordering::Acquire) {
             return Err("cancelled before the system tool could run".into());
+        }
+        if cutlass_ai::namespace(name) == "system" {
+            crate::agent_system::validate_request(name, arguments)?;
         }
 
         let request_id = allocate_approval_request_id(&self.approval_id_allocator)?;
@@ -1346,6 +1381,7 @@ mod tests {
     #[test]
     fn approval_detail_is_bounded_and_handles_empty_arguments() {
         assert_eq!(approval_title("system_cache_clear"), "Clear this cache?");
+        assert_eq!(approval_title("system_cache_relocate"), "Move this cache?");
         assert_eq!(approval_title("future_tool"), "Run future_tool?");
         assert_eq!(
             approval_detail("system_cache_list", &serde_json::json!({}), None),
@@ -1362,6 +1398,16 @@ mod tests {
         assert_eq!(detail.chars().count(), APPROVAL_DETAIL_MAX_CHARS + 1);
         assert!(detail.ends_with('…'));
         assert!(detail.starts_with("{\n  \"script\": \""));
+
+        let relocation_detail = format_cache_relocation_approval_detail(
+            cutlass_storage::CacheId::Download,
+            Path::new("/current/download-cache"),
+            Path::new("/requested/download-cache"),
+        );
+        assert!(relocation_detail.contains("Cache: Downloads"));
+        assert!(relocation_detail.contains("Current path: /current/download-cache"));
+        assert!(relocation_detail.contains("Requested destination: /requested/download-cache"));
+        assert!(relocation_detail.contains("projects reference cache-owned files"));
     }
 
     #[test]
@@ -1393,6 +1439,22 @@ mod tests {
         assert_eq!(pending.load(Ordering::Acquire), 0);
         assert_eq!(allocator.load(Ordering::Relaxed), 0);
 
+        let temp = tempfile::tempdir().expect("tempdir");
+        assert_eq!(
+            host.authorize(
+                "system_cache_relocate",
+                &serde_json::json!({
+                    "cache_id": "download",
+                    "destination": temp.path().join("new-download-cache")
+                }),
+                ToolTier::System,
+                &cancel,
+            ),
+            Ok(())
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+
         assert_eq!(
             host.authorize(
                 "media_preview_frame",
@@ -1402,6 +1464,38 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn malformed_relocation_is_rejected_before_approval_side_effects() {
+        let (_tx, rx) = unbounded();
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Ask,
+            slint::Weak::default(),
+            slint::Weak::default(),
+            None,
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        let error = host
+            .authorize(
+                "system_cache_relocate",
+                &serde_json::json!({
+                    "cache_id": "download",
+                    "destination": "relative/cache"
+                }),
+                ToolTier::System,
+                &cancel,
+            )
+            .expect_err("relative relocation must fail before approval");
+        assert!(error.contains("must be absolute"));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -1417,7 +1511,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         );
         let specs = host.tools();
-        assert_eq!(specs.len(), 16);
+        assert_eq!(specs.len(), 17);
         assert_eq!(
             specs
                 .iter()
@@ -1450,6 +1544,7 @@ mod tests {
                 "system_open_external",
                 "system_cache_list",
                 "system_cache_clear",
+                "system_cache_relocate",
             ]
         );
     }
