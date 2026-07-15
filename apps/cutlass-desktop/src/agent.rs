@@ -37,7 +37,7 @@ use tracing::{error, info, warn};
 use crate::agent_senses::AgentSenses;
 use crate::agent_session::{AgentSession, TranscriptEntry};
 use crate::preview_worker::WorkerHandle;
-use crate::{AgentEntry, AgentStore};
+use crate::{AgentEntry, AgentStore, AppWindow};
 
 /// An entity id the sandbox allocated while rehearsing a command. Replay
 /// maps it onto the id the live engine allocates for the same step.
@@ -148,10 +148,16 @@ pub struct AgentWorker {
     _join: JoinHandle<()>,
 }
 
+struct AgentUiHandles {
+    store: slint::Weak<AgentStore<'static>>,
+    app: slint::Weak<AppWindow>,
+}
+
 impl AgentWorker {
     pub fn spawn(
         worker: WorkerHandle,
         store: slint::Weak<AgentStore<'static>>,
+        app: slint::Weak<AppWindow>,
     ) -> Result<Self, String> {
         let (tx, rx) = unbounded();
         let (approval_tx, approval_rx) = unbounded();
@@ -165,7 +171,7 @@ impl AgentWorker {
             .spawn(move || {
                 agent_main(
                     worker,
-                    store,
+                    AgentUiHandles { store, app },
                     rx,
                     thread_cancel,
                     approval_rx,
@@ -598,11 +604,12 @@ fn clear_approval_card(store: &slint::Weak<AgentStore<'static>>) {
     });
 }
 
-/// The desktop's host-tool surface. Host tools themselves land in later
-/// phases; this broker already gates every future System-tier call.
+/// The desktop host-tool surface: reversible `app_*` controls plus the
+/// approval broker that gates every System-tier call.
 pub struct DesktopToolHost {
     autonomy: Autonomy,
     store: slint::Weak<AgentStore<'static>>,
+    app: slint::Weak<AppWindow>,
     approval_rx: Receiver<ApprovalDecision>,
     pending_approval_id: Arc<AtomicU64>,
     approval_id_allocator: Arc<AtomicU64>,
@@ -612,6 +619,7 @@ impl DesktopToolHost {
     fn new(
         autonomy: Autonomy,
         store: slint::Weak<AgentStore<'static>>,
+        app: slint::Weak<AppWindow>,
         approval_rx: Receiver<ApprovalDecision>,
         pending_approval_id: Arc<AtomicU64>,
         approval_id_allocator: Arc<AtomicU64>,
@@ -619,6 +627,7 @@ impl DesktopToolHost {
         Self {
             autonomy,
             store,
+            app,
             approval_rx,
             pending_approval_id,
             approval_id_allocator,
@@ -628,7 +637,7 @@ impl DesktopToolHost {
 
 impl ToolHost for DesktopToolHost {
     fn tools(&self) -> Vec<HostToolSpec> {
-        Vec::new()
+        crate::agent_app_control::specs()
     }
 
     fn authorize(
@@ -693,11 +702,11 @@ impl ToolHost for DesktopToolHost {
 
     fn call(
         &mut self,
-        _name: &str,
-        _arguments: &serde_json::Value,
-        _cancel: &AtomicBool,
+        name: &str,
+        arguments: &serde_json::Value,
+        cancel: &AtomicBool,
     ) -> Result<ToolOutput, String> {
-        Err("no host tools are wired up yet".into())
+        crate::agent_app_control::call(self.app.clone(), name, arguments, cancel)
     }
 }
 
@@ -726,13 +735,14 @@ impl Preview {
 
 fn agent_main(
     worker: WorkerHandle,
-    store: slint::Weak<AgentStore<'static>>,
+    ui: AgentUiHandles,
     rx: Receiver<AgentRequest>,
     cancel: Arc<AtomicBool>,
     approval_rx: Receiver<ApprovalDecision>,
     pending_approval_id: Arc<AtomicU64>,
     approval_id_allocator: Arc<AtomicU64>,
 ) {
+    let AgentUiHandles { store, app } = ui;
     let mut sandbox: Option<Engine> = None;
     let mut senses = AgentSenses::new();
     let mut preview = Preview::default();
@@ -796,6 +806,7 @@ fn agent_main(
                 run_one_prompt(
                     &worker,
                     &store,
+                    &app,
                     &mut sandbox,
                     &mut senses,
                     &mut preview,
@@ -868,6 +879,7 @@ fn agent_main(
 fn run_one_prompt(
     worker: &WorkerHandle,
     store: &slint::Weak<AgentStore<'static>>,
+    app: &slint::Weak<AppWindow>,
     sandbox: &mut Option<Engine>,
     senses: &mut AgentSenses,
     preview: &mut Preview,
@@ -1001,6 +1013,7 @@ fn run_one_prompt(
     let mut tool_host = DesktopToolHost::new(
         section.autonomy,
         store.clone(),
+        app.clone(),
         approval_rx.clone(),
         pending_approval_id.clone(),
         approval_id_allocator.clone(),
@@ -1294,6 +1307,7 @@ mod tests {
         let mut host = DesktopToolHost::new(
             Autonomy::Full,
             slint::Weak::default(),
+            slint::Weak::default(),
             rx,
             pending.clone(),
             allocator.clone(),
@@ -1320,6 +1334,41 @@ mod tests {
                 &cancel,
             ),
             Ok(())
+        );
+    }
+
+    #[test]
+    fn desktop_host_registers_app_controls_with_close_gated_as_system() {
+        let (_tx, rx) = unbounded();
+        let host = DesktopToolHost::new(
+            Autonomy::Ask,
+            slint::Weak::default(),
+            slint::Weak::default(),
+            rx,
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        );
+        let specs = host.tools();
+        assert_eq!(specs.len(), 12);
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.name == "app_state")
+                .map(|spec| spec.tier),
+            Some(ToolTier::ReadOnly)
+        );
+        assert_eq!(
+            specs
+                .iter()
+                .find(|spec| spec.name == "app_close")
+                .map(|spec| spec.tier),
+            Some(ToolTier::System)
+        );
+        assert!(
+            specs
+                .iter()
+                .filter(|spec| spec.name != "app_close")
+                .all(|spec| spec.tier != ToolTier::System)
         );
     }
 

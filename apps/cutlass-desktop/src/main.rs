@@ -1,5 +1,6 @@
 mod account;
 mod agent;
+mod agent_app_control;
 mod agent_senses;
 mod agent_session;
 mod agent_vision;
@@ -800,8 +801,12 @@ fn main() -> Result<(), slint::PlatformError> {
             });
     }
 
-    let agent_worker = agent::AgentWorker::spawn(preview_worker.handle(), agent_store.as_weak())
-        .map_err(slint::PlatformError::from)?;
+    let agent_worker = agent::AgentWorker::spawn(
+        preview_worker.handle(),
+        agent_store.as_weak(),
+        app.as_weak(),
+    )
+    .map_err(slint::PlatformError::from)?;
 
     let agent_send = agent_worker.handle();
     let agent_app = app.as_weak();
