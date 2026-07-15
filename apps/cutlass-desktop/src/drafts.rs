@@ -54,6 +54,24 @@ pub fn project_file(dir: &Path) -> PathBuf {
     dir.join(PROJECT_FILE)
 }
 
+/// Resolve a canonical draft id to its app-owned lexical project path.
+///
+/// The draft directory and project file must already exist as real directory
+/// and regular-file entries. Filesystem paths are never accepted as ids.
+#[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+pub(crate) fn resolve_draft_id(draft_id: &str) -> io::Result<PathBuf> {
+    resolve_draft_id_in_root(&root_dir(), draft_id)
+}
+
+/// Extract the canonical id from an exact app-owned lexical project path.
+///
+/// This validates identity only: neither the draft directory nor project file
+/// needs to exist. That keeps newly created, not-yet-saved sessions addressable.
+#[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
+pub(crate) fn draft_id_from_project(project: &Path) -> io::Result<String> {
+    draft_id_from_project_in_root(&root_dir(), project)
+}
+
 fn meta_file(dir: &Path) -> PathBuf {
     dir.join(META_FILE)
 }
@@ -176,6 +194,65 @@ pub fn list() -> Vec<DraftSummary> {
 
 fn read_name(dir: &Path) -> String {
     read_name_checked(dir).unwrap_or_else(|| FALLBACK_NAME.to_owned())
+}
+
+#[allow(dead_code)] // Reachable through the intentionally staged API above.
+fn resolve_draft_id_in_root(root: &Path, draft_id: &str) -> io::Result<PathBuf> {
+    if !is_valid_draft_id(draft_id) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "draft id must be canonical lowercase hexadecimal time-sequence",
+        ));
+    }
+
+    let project = root.join(draft_id).join(PROJECT_FILE);
+    let identity = validate_project_identity(root, &project)?;
+    let canonical_root = canonical_existing_root(root)?
+        .ok_or_else(|| path_error(io::ErrorKind::NotFound, "draft root does not exist", root))?;
+    let Some(canonical_dir) = canonical_draft_dir(&canonical_root, &identity.id)? else {
+        return Err(path_error(
+            io::ErrorKind::NotFound,
+            "draft directory does not exist",
+            &project,
+        ));
+    };
+    if !safe_project_entry(&canonical_dir)? {
+        return Err(path_error(
+            io::ErrorKind::NotFound,
+            "draft project file does not exist",
+            &project,
+        ));
+    }
+
+    verify_root_mapping(root, &canonical_root)?;
+    let Some(current_dir) = canonical_draft_dir(&canonical_root, &identity.id)? else {
+        return Err(path_error(
+            io::ErrorKind::NotFound,
+            "draft directory disappeared during resolution",
+            &project,
+        ));
+    };
+    if current_dir != canonical_dir {
+        return Err(path_error(
+            io::ErrorKind::PermissionDenied,
+            "draft directory changed during resolution",
+            &project,
+        ));
+    }
+    if !safe_project_entry(&current_dir)? {
+        return Err(path_error(
+            io::ErrorKind::NotFound,
+            "draft project file disappeared during resolution",
+            &project,
+        ));
+    }
+    verify_root_mapping(root, &canonical_root)?;
+    Ok(project)
+}
+
+#[allow(dead_code)] // Reachable through the intentionally staged API above.
+fn draft_id_from_project_in_root(root: &Path, project: &Path) -> io::Result<String> {
+    validate_project_identity(root, project).map(|identity| identity.id)
 }
 
 fn create_in_root(root: &Path) -> io::Result<PathBuf> {
@@ -1303,17 +1380,22 @@ mod tests {
     }
 
     #[test]
-    fn project_identity_accepts_only_the_exact_owned_shape() {
+    fn project_identity_extracts_from_the_exact_owned_shape_without_io() {
         let sandbox = tempfile::tempdir().expect("tempdir");
         let root = sandbox.path().join("projects");
         let project = root.join("abcdef-12").join(PROJECT_FILE);
 
-        let identity = validate_project_identity(&root, &project).expect("valid identity");
-        assert_eq!(identity.id, "abcdef-12");
+        let id =
+            draft_id_from_project_in_root(&root, &project).expect("extract valid draft identity");
+        assert_eq!(id, "abcdef-12");
+        assert!(
+            !root.exists(),
+            "identity extraction unexpectedly created the root"
+        );
     }
 
     #[test]
-    fn project_identity_rejects_traversal_aliases_and_wrong_shapes() {
+    fn project_identity_extraction_rejects_outside_and_malformed_paths() {
         let sandbox = tempfile::tempdir().expect("tempdir");
         let root = sandbox.path().join("projects");
         let absolute_injection = root
@@ -1340,11 +1422,77 @@ mod tests {
 
         for path in invalid {
             assert!(
-                validate_project_identity(&root, &path).is_err(),
+                draft_id_from_project_in_root(&root, &path).is_err(),
                 "accepted invalid path: {}",
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn draft_identity_helpers_roundtrip_a_real_draft() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let root = sandbox.path().join("projects");
+        let project = write_test_draft(&root, "abcdef-12", b"project");
+
+        let id = draft_id_from_project_in_root(&root, &project).expect("extract draft id");
+        assert_eq!(id, "abcdef-12");
+        assert_eq!(
+            resolve_draft_id_in_root(&root, &id).expect("resolve draft id"),
+            project
+        );
+    }
+
+    #[test]
+    fn draft_id_resolution_rejects_noncanonical_ids_and_full_paths() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let root = sandbox.path().join("projects");
+        let project = write_test_draft(&root, "abc-1", b"project");
+        let invalid = [
+            "",
+            "abc",
+            "abc-",
+            "-1",
+            "../abc-1",
+            "abc/def-1",
+            "ABC-1",
+            "abc-A",
+            "0abc-1",
+            "abc-01",
+            "abc-1-2",
+        ];
+
+        for id in invalid {
+            let error = resolve_draft_id_in_root(&root, id).expect_err("accepted invalid draft id");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "id: {id}");
+        }
+
+        let full_path = project.to_string_lossy();
+        let error = resolve_draft_id_in_root(&root, &full_path)
+            .expect_err("accepted a project path as a draft id");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn draft_id_resolution_requires_an_existing_regular_project() {
+        let sandbox = tempfile::tempdir().expect("tempdir");
+        let root = sandbox.path().join("projects");
+        fs::create_dir(&root).expect("create root");
+
+        let missing_draft =
+            resolve_draft_id_in_root(&root, "abc-1").expect_err("resolved missing draft");
+        assert_eq!(missing_draft.kind(), io::ErrorKind::NotFound);
+
+        fs::create_dir(root.join("abc-1")).expect("create empty draft");
+        let missing_project =
+            resolve_draft_id_in_root(&root, "abc-1").expect_err("resolved missing project");
+        assert_eq!(missing_project.kind(), io::ErrorKind::NotFound);
+
+        let non_file_project = root.join("abc-1").join(PROJECT_FILE);
+        fs::create_dir(&non_file_project).expect("create non-file project entry");
+        let error =
+            resolve_draft_id_in_root(&root, "abc-1").expect_err("resolved non-file project");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
     }
 
     #[test]
@@ -1629,6 +1777,7 @@ mod tests {
         symlink(&outside, root.join("abc-1")).expect("symlink draft");
         let project = root.join("abc-1").join(PROJECT_FILE);
 
+        assert!(resolve_draft_id_in_root(&root, "abc-1").is_err());
         assert!(delete_checked_in_root(&root, &project).is_err());
         assert!(write_meta_in_root(&root, &project, "Outside").is_err());
         assert_eq!(
@@ -1652,6 +1801,7 @@ mod tests {
         let project = dir.join(PROJECT_FILE);
         symlink(&outside, &project).expect("symlink project");
 
+        assert!(resolve_draft_id_in_root(&root, "abc-1").is_err());
         assert!(delete_checked_in_root(&root, &project).is_err());
         assert!(write_meta_in_root(&root, &project, "Outside").is_err());
         assert_eq!(fs::read(&outside).expect("outside remains"), b"outside");
