@@ -1670,6 +1670,13 @@ fn engine_sense_observes_rehearsed_edits_and_returns_images() {
     assert_eq!(outcome.status, PromptStatus::Completed);
     assert_eq!(outcome.actions.len(), 1);
     assert_eq!(host.sense_clip_counts, vec![2]);
+    let requests = provider.requests();
+    let Message::System { content } = &requests[0][0] else {
+        panic!("first message should be the system prompt");
+    };
+    assert!(content.contains("inspect the current sandbox"), "{content}");
+    assert!(content.contains("schematic timeline map"), "{content}");
+    assert!(content.contains("media_screenshot_preview"), "{content}");
     assert_eq!(
         host.sense_calls,
         vec![(
@@ -1677,7 +1684,7 @@ fn engine_sense_observes_rehearsed_edits_and_returns_images() {
             serde_json::json!({ "at": 5.0 })
         )]
     );
-    match provider.requests()[2].last().unwrap() {
+    match requests[2].last().unwrap() {
         Message::ToolResult {
             content, images, ..
         } => {

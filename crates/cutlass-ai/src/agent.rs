@@ -241,6 +241,21 @@ const HOST_TOOLS_RULES: &str = "\n\nHost tools: tools named {namespace}_{tool} (
      pause for the user's confirmation and can be declined. Treat a decline \
      as an instruction to change course, not an error to retry.";
 
+fn engine_sense_rules(specs: &[HostToolSpec]) -> String {
+    let names = specs
+        .iter()
+        .map(|spec| spec.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "\n\nRehearsal senses ({names}) inspect the current sandbox, including edits already \
+         completed in this prompt. Before finalizing visual or timing work, use the cheapest \
+         relevant sense to verify it: prefer a schematic timeline map for placement and timing, \
+         and a composited preview frame only when appearance or layering matters. Inspect source \
+         assets when their content is uncertain. Never claim a check succeeded if a sense failed."
+    )
+}
+
 /// The phase marker (a loop concern, not a wire command): lets a long
 /// task land as several undo steps instead of one monolith.
 fn commit_progress_spec() -> wire::ToolSpec {
@@ -355,6 +370,9 @@ pub fn run_prompt_with_host(
     let mut system = system_prompt(&summary, context, extensions);
     if !sense_specs.is_empty() || !host_specs.is_empty() {
         system.push_str(HOST_TOOLS_RULES);
+    }
+    if !sense_specs.is_empty() {
+        system.push_str(&engine_sense_rules(&sense_specs));
     }
     let mut messages = Vec::with_capacity(history.len() + 2);
     messages.push(Message::System { content: system });
