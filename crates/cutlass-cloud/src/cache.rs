@@ -10,8 +10,10 @@
 //! Settings surfaces a "clear download cache" action backed by
 //! [`DownloadCache::clear`].
 
+use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
@@ -24,6 +26,18 @@ pub const DEFAULT_QUOTA_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub struct DownloadCache {
     root: PathBuf,
     quota_bytes: AtomicU64,
+    protected_paths: RwLock<HashSet<PathBuf>>,
+}
+
+/// Exact accounting for an explicit download-cache clear.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadCacheClear {
+    /// Logical bytes removed from non-directory entries.
+    pub removed_bytes: u64,
+    /// Number of non-directory entries removed.
+    pub removed_files: u64,
+    /// Existing protected files retained in the cache.
+    pub retained_protected_files: u64,
 }
 
 impl DownloadCache {
@@ -31,6 +45,7 @@ impl DownloadCache {
         Self {
             root,
             quota_bytes: AtomicU64::new(quota_bytes),
+            protected_paths: RwLock::new(HashSet::new()),
         }
     }
 
@@ -53,6 +68,29 @@ impl DownloadCache {
     /// snapshotted when it started.
     pub fn set_quota_bytes(&self, new: u64) {
         self.quota_bytes.store(new, Ordering::Relaxed);
+    }
+
+    /// Keep a cache-owned source file available while a project references it.
+    ///
+    /// Missing paths may be protected so a later re-download cannot be
+    /// evicted before the project is migrated. Paths outside this cache, the
+    /// cache root itself, and paths containing traversal components fail
+    /// closed.
+    pub fn protect_path(&self, path: &Path) -> Result<(), CloudError> {
+        let path = contained_cache_path(&self.root, path)?;
+        if let Ok(metadata) = std::fs::symlink_metadata(&path)
+            && !metadata.file_type().is_file()
+        {
+            return Err(invalid_cache_path());
+        }
+        write_protected(&self.protected_paths).insert(path);
+        Ok(())
+    }
+
+    /// Number of project-referenced cache paths currently protected.
+    #[must_use]
+    pub fn protected_path_count(&self) -> usize {
+        read_protected(&self.protected_paths).len()
     }
 
     /// Where a download for `key` (e.g. `stock/pexels-857191-hd.mp4`)
@@ -103,8 +141,10 @@ impl DownloadCache {
     /// each completed download; cheap when under budget.
     pub fn enforce_quota(&self) {
         let quota_bytes = self.quota_bytes();
+        let protected = read_protected(&self.protected_paths).clone();
         let mut files: Vec<(PathBuf, u64, SystemTime)> = walk_files(&self.root)
             .into_iter()
+            .filter(|path| !protected.contains(path))
             .filter_map(|p| {
                 let meta = std::fs::symlink_metadata(&p).ok()?;
                 let mtime = meta.modified().ok()?;
@@ -130,21 +170,46 @@ impl DownloadCache {
 
     /// Delete everything (the settings "clear download cache" action).
     /// The root itself stays so in-flight paths remain valid.
-    pub fn clear(&self) -> Result<(), CloudError> {
-        let Some(entries) = safe_root_entries(&self.root)? else {
-            return Ok(());
-        };
-        for entry in entries {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                std::fs::remove_dir_all(path)?;
-            } else {
-                std::fs::remove_file(path)?;
+    pub fn clear(&self) -> Result<DownloadCacheClear, CloudError> {
+        if safe_root_entries(&self.root)?.is_none() {
+            return Ok(DownloadCacheClear {
+                removed_bytes: 0,
+                removed_files: 0,
+                retained_protected_files: 0,
+            });
+        }
+        let protected = read_protected(&self.protected_paths).clone();
+        let (files, mut directories) = walk_tree(&self.root);
+        let mut removed_bytes = 0_u64;
+        let mut removed_files = 0_u64;
+        let mut retained_protected_files = 0_u64;
+        for path in files {
+            if protected.contains(&path) {
+                retained_protected_files = retained_protected_files.saturating_add(1);
+                continue;
+            }
+            let bytes = std::fs::symlink_metadata(&path)?.len();
+            std::fs::remove_file(path)?;
+            removed_bytes = removed_bytes.saturating_add(bytes);
+            removed_files = removed_files.saturating_add(1);
+        }
+        directories.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+        for path in directories {
+            match std::fs::remove_dir(path) {
+                Ok(()) => {}
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::DirectoryNotEmpty | io::ErrorKind::NotFound
+                    ) => {}
+                Err(error) => return Err(error.into()),
             }
         }
-        Ok(())
+        Ok(DownloadCacheClear {
+            removed_bytes,
+            removed_files,
+            retained_protected_files,
+        })
     }
 }
 
@@ -165,6 +230,37 @@ fn validated_key(key: &str) -> Result<&Path, CloudError> {
             "invalid download cache key".to_owned(),
         ))
     }
+}
+
+fn contained_cache_path(root: &Path, path: &Path) -> Result<PathBuf, CloudError> {
+    if !root.is_absolute() || !path.is_absolute() {
+        return Err(invalid_cache_path());
+    }
+    let relative = path.strip_prefix(root).map_err(|_| invalid_cache_path())?;
+    if relative.as_os_str().is_empty()
+        || !relative
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        return Err(invalid_cache_path());
+    }
+    Ok(root.join(relative))
+}
+
+fn read_protected(
+    protected: &RwLock<HashSet<PathBuf>>,
+) -> std::sync::RwLockReadGuard<'_, HashSet<PathBuf>> {
+    protected
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn write_protected(
+    protected: &RwLock<HashSet<PathBuf>>,
+) -> std::sync::RwLockWriteGuard<'_, HashSet<PathBuf>> {
+    protected
+        .write()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn ensure_cache_root(root: &Path) -> Result<(), CloudError> {
@@ -276,10 +372,15 @@ fn saturating_total_bytes(lengths: impl IntoIterator<Item = u64>) -> u64 {
 }
 
 fn walk_files(root: &Path) -> Vec<PathBuf> {
+    walk_tree(root).0
+}
+
+fn walk_tree(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
     if !safe_existing_root(root) {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let mut out = Vec::new();
+    let mut files = Vec::new();
+    let mut directories = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
@@ -288,13 +389,14 @@ fn walk_files(root: &Path) -> Vec<PathBuf> {
                 continue;
             };
             if file_type.is_dir() {
+                directories.push(path.clone());
                 stack.push(path);
             } else {
-                out.push(path);
+                files.push(path);
             }
         }
     }
-    out
+    (files, directories)
 }
 
 /// Bump a file's mtime to now (LRU touch). `File::set_times` needs no
@@ -402,6 +504,67 @@ mod tests {
     #[test]
     fn total_size_saturates_instead_of_overflowing() {
         assert_eq!(saturating_total_bytes([u64::MAX - 1, 1, 1]), u64::MAX);
+    }
+
+    #[test]
+    fn protected_project_media_survives_eviction_and_explicit_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DownloadCache::new(dir.path().to_path_buf(), 1);
+        let protected = write(&cache, "stock/project.mp4", 100);
+        backdate(&protected);
+        let disposable = write(&cache, "stock/thumbnail.img", 20);
+        cache.protect_path(&protected).unwrap();
+
+        assert_eq!(cache.protected_path_count(), 1);
+        cache.enforce_quota();
+        assert!(protected.exists());
+        assert!(!disposable.exists());
+
+        let another = write(&cache, "ai/unused.png", 12);
+        let report = cache.clear().unwrap();
+        assert_eq!(report.removed_bytes, 12);
+        assert_eq!(report.removed_files, 1);
+        assert_eq!(report.retained_protected_files, 1);
+        assert!(protected.exists());
+        assert!(!another.exists());
+    }
+
+    #[test]
+    fn missing_project_media_can_be_protected_before_redownload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = DownloadCache::new(dir.path().to_path_buf(), 0);
+        let future = dir.path().join("stock/future.mp4");
+        cache.protect_path(&future).unwrap();
+        assert_eq!(cache.protected_path_count(), 1);
+
+        write(&cache, "stock/future.mp4", 8);
+        cache.enforce_quota();
+        assert!(future.exists());
+        let report = cache.clear().unwrap();
+        assert_eq!(report.retained_protected_files, 1);
+        assert!(future.exists());
+    }
+
+    #[test]
+    fn protected_paths_must_be_contained_cache_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache_root = dir.path().join("cache");
+        let cache = DownloadCache::new(cache_root.clone(), 100);
+        std::fs::create_dir_all(&cache_root).unwrap();
+
+        for path in [
+            dir.path().join("outside.mp4"),
+            cache_root.clone(),
+            cache_root.join("../outside.mp4"),
+            PathBuf::from("relative.mp4"),
+        ] {
+            assert!(cache.protect_path(&path).is_err(), "{path:?}");
+        }
+
+        let directory = cache_root.join("directory");
+        std::fs::create_dir(&directory).unwrap();
+        assert!(cache.protect_path(&directory).is_err());
+        assert_eq!(cache.protected_path_count(), 0);
     }
 
     #[test]
