@@ -11,8 +11,10 @@ use std::io::{BufRead, BufReader, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use base64::Engine as _;
+
 use crate::provider::{
-    ChatProvider, ChatRequest, ChatTurn, FinishReason, Message, ProviderError, ToolCall,
+    ChatProvider, ChatRequest, ChatTurn, FinishReason, ImagePart, Message, ProviderError, ToolCall,
 };
 
 pub struct OpenAiCompatProvider {
@@ -71,7 +73,8 @@ impl OpenAiCompatProvider {
     }
 
     fn request_body(&self, request: &ChatRequest<'_>) -> serde_json::Value {
-        let messages: Vec<serde_json::Value> = request.messages.iter().map(to_openai).collect();
+        let messages: Vec<serde_json::Value> =
+            request.messages.iter().flat_map(to_openai).collect();
         let mut body = serde_json::json!({
             "model": self.model,
             "stream": true,
@@ -135,10 +138,33 @@ impl ChatProvider for OpenAiCompatProvider {
     }
 }
 
-fn to_openai(message: &Message) -> serde_json::Value {
+/// The `image_url` content part: raw bytes become a base64 data URL here,
+/// at the wire boundary, and nowhere earlier.
+fn image_url_part(image: &ImagePart) -> serde_json::Value {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(image.data.as_slice());
+    serde_json::json!({
+        "type": "image_url",
+        "image_url": { "url": format!("data:{};base64,{b64}", image.media_type) },
+    })
+}
+
+/// One [`Message`] can map to multiple wire messages (a tool result with
+/// images), so this returns a `Vec`. Image-free messages keep plain string
+/// content — not a one-element parts array — so local models/servers that
+/// don't understand arrays keep working.
+fn to_openai(message: &Message) -> Vec<serde_json::Value> {
     match message {
-        Message::System { content } => serde_json::json!({ "role": "system", "content": content }),
-        Message::User { content } => serde_json::json!({ "role": "user", "content": content }),
+        Message::System { content } => {
+            vec![serde_json::json!({ "role": "system", "content": content })]
+        }
+        Message::User { content, images } => {
+            if images.is_empty() {
+                return vec![serde_json::json!({ "role": "user", "content": content })];
+            }
+            let mut parts = vec![serde_json::json!({ "type": "text", "text": content })];
+            parts.extend(images.iter().map(image_url_part));
+            vec![serde_json::json!({ "role": "user", "content": parts })]
+        }
         Message::Assistant {
             content,
             tool_calls,
@@ -159,13 +185,31 @@ fn to_openai(message: &Message) -> serde_json::Value {
                     })
                     .collect();
             }
-            m
+            vec![m]
         }
-        Message::ToolResult { call_id, content } => serde_json::json!({
-            "role": "tool",
-            "tool_call_id": call_id,
-            "content": content,
-        }),
+        Message::ToolResult {
+            call_id,
+            content,
+            images,
+        } => {
+            let mut wire = vec![serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": content,
+            })];
+            // The OpenAI tool role only carries strings; hoisting images
+            // into an adjacent user message is the interoperable pattern.
+            if !images.is_empty() {
+                let labels: Vec<&str> = images.iter().map(|i| i.label.as_str()).collect();
+                let mut parts = vec![serde_json::json!({
+                    "type": "text",
+                    "text": format!("[attached: {}]", labels.join(", ")),
+                })];
+                parts.extend(images.iter().map(image_url_part));
+                wire.push(serde_json::json!({ "role": "user", "content": parts }));
+            }
+            wire
+        }
     }
 }
 
@@ -384,9 +428,7 @@ mod tests {
         assert_eq!(provider.base_url, "http://localhost:11434/v1");
 
         let messages = vec![
-            Message::System {
-                content: "You edit video timelines.".into(),
-            },
+            Message::system("You edit video timelines."),
             Message::Assistant {
                 content: String::new(),
                 tool_calls: vec![ToolCall {
@@ -395,10 +437,7 @@ mod tests {
                     arguments: serde_json::json!({"clip": 3}),
                 }],
             },
-            Message::ToolResult {
-                call_id: "call_1".into(),
-                content: "removed clip 3".into(),
-            },
+            Message::tool_result("call_1", "removed clip 3"),
         ];
         let tools = crate::wire::tool_specs();
         let body = provider.request_body(&ChatRequest {
@@ -417,5 +456,80 @@ mod tests {
         assert_eq!(body["messages"][2]["tool_call_id"], "call_1");
         assert_eq!(body["tools"].as_array().unwrap().len(), 43);
         assert_eq!(body["tools"][0]["function"]["name"], "add_track");
+    }
+
+    #[test]
+    fn user_message_with_image_becomes_content_parts() {
+        let bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a];
+        let message = Message::User {
+            content: "what's on the timeline?".into(),
+            images: vec![ImagePart::png(bytes.clone(), "timeline at 12.40s")],
+        };
+        let wire = to_openai(&message);
+        assert_eq!(wire.len(), 1);
+        assert_eq!(wire[0]["role"], "user");
+        let parts = wire[0]["content"].as_array().expect("content parts array");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "what's on the timeline?");
+        assert_eq!(parts[1]["type"], "image_url");
+        let url = parts[1]["image_url"]["url"].as_str().unwrap();
+        let b64 = url
+            .strip_prefix("data:image/png;base64,")
+            .expect("png data URL prefix");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .expect("valid base64");
+        assert_eq!(decoded, bytes, "round-trips the original bytes");
+    }
+
+    #[test]
+    fn tool_result_images_hoist_into_a_synthetic_user_message() {
+        let with_images = Message::ToolResult {
+            call_id: "call_1".into(),
+            content: "screenshot taken".into(),
+            images: vec![ImagePart::jpeg(vec![1, 2, 3], "preview at 3.00s")],
+        };
+        let wire = to_openai(&with_images);
+        assert_eq!(wire.len(), 2);
+        assert_eq!(wire[0]["role"], "tool");
+        assert_eq!(wire[0]["tool_call_id"], "call_1");
+        assert!(
+            wire[0]["content"].is_string(),
+            "the tool role carries only the text content"
+        );
+        assert_eq!(wire[0]["content"], "screenshot taken");
+        assert_eq!(wire[1]["role"], "user");
+        let parts = wire[1]["content"].as_array().expect("content parts array");
+        assert_eq!(parts[0]["type"], "text");
+        assert!(
+            parts[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("preview at 3.00s"),
+            "{}",
+            parts[0]["text"]
+        );
+        assert_eq!(parts[1]["type"], "image_url");
+        assert!(
+            parts[1]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/jpeg;base64,")
+        );
+
+        let without = Message::tool_result("call_2", "removed clip 3");
+        assert_eq!(to_openai(&without).len(), 1);
+    }
+
+    #[test]
+    fn user_message_without_images_keeps_plain_string_content() {
+        let wire = to_openai(&Message::user("split the clip"));
+        assert_eq!(wire.len(), 1);
+        assert!(
+            wire[0]["content"].is_string(),
+            "plain string, not a parts array, so array-less servers keep working"
+        );
+        assert_eq!(wire[0]["content"], "split the clip");
     }
 }

@@ -245,7 +245,9 @@ fn model_corrects_course_after_a_rejection() {
     let second_request = &provider.requests()[1];
     let last = second_request.last().unwrap();
     match last {
-        Message::ToolResult { call_id, content } => {
+        Message::ToolResult {
+            call_id, content, ..
+        } => {
             assert_eq!(call_id, "call_1");
             assert!(
                 content.contains("rejected: clip 999 does not exist"),
@@ -518,7 +520,9 @@ impl cutlass_ai::provider::ChatProvider for TitleAddingModel {
                 "add_track",
                 serde_json::json!({ "kind": "text", "name": "Titles" }),
             )]),
-            Message::ToolResult { call_id, content } if call_id == "call_1" => {
+            Message::ToolResult {
+                call_id, content, ..
+            } if call_id == "call_1" => {
                 // "ok: added text track 'Titles' (track 42)"
                 let id: u64 = content
                     .rsplit("(track ")
@@ -1421,14 +1425,14 @@ fn session_history_threads_prior_turns_into_the_next_prompt() {
     assert!(
         convo.iter().any(|m| matches!(
             m,
-            Message::User { content } if content == "split the selected clip in half"
+            Message::User { content, .. } if content == "split the selected clip in half"
         )),
         "the prior user turn is remembered"
     );
     assert!(
         matches!(
             convo.last().unwrap(),
-            Message::User { content } if content == "what did you just do?"
+            Message::User { content, .. } if content == "what did you just do?"
         ),
         "the newest user message comes last"
     );

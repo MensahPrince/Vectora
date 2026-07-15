@@ -72,6 +72,6 @@ pub use extend::{
     AgentDir, AgentExtensions, MAX_RULES_BYTES, Skill, SlashCommand, bundled_skills, compose_rules,
     expand_slash_command, load_agent_dir, merge_skills,
 };
-pub use provider::Message;
+pub use provider::{ImagePart, Message};
 pub use validate::{Rejection, validate};
 pub use wire::{TOOL_SCHEMA_VERSION, ToolSpec, WireCommand, tool_specs};

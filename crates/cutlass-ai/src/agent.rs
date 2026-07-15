@@ -15,7 +15,7 @@ use cutlass_commands::EditOutcome;
 
 use crate::describe::{EditorContext, ProjectSummary};
 use crate::extend::AgentExtensions;
-use crate::provider::{ChatProvider, ChatRequest, FinishReason, Message, ProviderError};
+use crate::provider::{ChatProvider, ChatRequest, FinishReason, ImagePart, Message, ProviderError};
 use crate::wire::{self, WireCommand};
 
 /// The loop's only view of the engine. The UI implements this over a
@@ -41,6 +41,10 @@ pub struct AgentConfig {
     pub max_tool_calls: usize,
     /// Hard cap on provider turns per prompt.
     pub max_turns: usize,
+    /// Hard cap on images carried by one request, newest kept. Screenshot
+    /// tools bound each image's dimensions, so count × bounded size caps
+    /// the whole vision payload.
+    pub max_images: usize,
     /// Validate and collect the plan without applying anything.
     pub dry_run: bool,
 }
@@ -50,6 +54,7 @@ impl Default for AgentConfig {
         Self {
             max_tool_calls: 32,
             max_turns: 16,
+            max_images: 8,
             dry_run: false,
         }
     }
@@ -210,9 +215,7 @@ pub fn run_prompt(
     // This turn's own messages start here (the user prompt and everything
     // the loop appends), kept so we can hand them back as `turn_messages`.
     let turn_start = messages.len();
-    messages.push(Message::User {
-        content: prompt.to_string(),
-    });
+    messages.push(Message::user(prompt));
     let mut tools = wire::tool_specs();
     tools.push(wire::describe_project_spec());
     if !extensions.skills.is_empty() {
@@ -242,6 +245,7 @@ pub fn run_prompt(
     };
 
     for _turn in 0..config.max_turns {
+        enforce_image_budget(&mut messages, config.max_images);
         let turn = {
             let mut forward = |delta: &str| on_event(AgentEvent::TextDelta(delta.to_string()));
             match provider.chat(
@@ -330,10 +334,7 @@ pub fn run_prompt(
                     }
                 }
             };
-            messages.push(Message::ToolResult {
-                call_id: call.id,
-                content: result,
-            });
+            messages.push(Message::tool_result(call.id, result));
         }
 
         if _turn + 1 == config.max_turns {
@@ -381,11 +382,61 @@ fn read_skill_result(skills: &[crate::extend::Skill], arguments: &serde_json::Va
     }
 }
 
+/// Keep only the newest `max_images` images across the request; older
+/// ones are dropped in place and noted with a text placeholder carrying
+/// the label, so the model knows what it saw and can re-request it.
+/// Newest-wins matches how the agent works with vision: screenshot, look,
+/// act — a stale frame is cheaper to re-take than to carry.
+fn enforce_image_budget(messages: &mut [Message], max_images: usize) {
+    let total: usize = messages.iter().map(image_count).sum();
+    let mut to_drop = total.saturating_sub(max_images);
+    if to_drop == 0 {
+        return;
+    }
+    // Oldest first: walk from the front, draining each message's images
+    // front-first until the excess is gone.
+    for message in messages.iter_mut() {
+        if to_drop == 0 {
+            break;
+        }
+        let (content, images) = match message {
+            Message::User { content, images } => (content, images),
+            Message::ToolResult {
+                content, images, ..
+            } => (content, images),
+            _ => continue,
+        };
+        while to_drop > 0 && !images.is_empty() {
+            let dropped = images.remove(0);
+            content.push_str(&format!("\n[image no longer attached: {}]", dropped.label));
+            to_drop -= 1;
+        }
+    }
+}
+
+fn image_count(message: &Message) -> usize {
+    match message {
+        Message::User { images, .. } | Message::ToolResult { images, .. } => images.len(),
+        _ => 0,
+    }
+}
+
+/// Session history is text-only: raw image bytes would bloat every later
+/// request and the persisted session file for no benefit — the agent can
+/// always re-screenshot the *current* state. A labeled placeholder keeps
+/// the narrative ("looked at the timeline here") without the payload.
+fn strip_images(content: &mut String, images: &mut Vec<ImagePart>) {
+    for image in images.drain(..) {
+        content.push_str(&format!("\n[image: {}]", image.label));
+    }
+}
+
 /// This turn's slice of the conversation (`messages[turn_start..]`: the
 /// user prompt plus every assistant/tool message the loop appended), with
-/// the final text answer added (it isn't pushed during the loop) and
-/// `describe_project` results collapsed to a placeholder. This is what the
-/// session appends to its history so the next prompt remembers the turn.
+/// the final text answer added (it isn't pushed during the loop),
+/// `describe_project` results collapsed to a placeholder, and images
+/// stripped to labels (history is text-only). This is what the session
+/// appends to its history so the next prompt remembers the turn.
 fn collect_turn_messages(
     messages: Vec<Message>,
     turn_start: usize,
@@ -394,11 +445,21 @@ fn collect_turn_messages(
 ) -> Vec<Message> {
     let mut turn: Vec<Message> = messages.into_iter().skip(turn_start).collect();
     for message in &mut turn {
-        if let Message::ToolResult { call_id, content } = message {
-            if describe_call_ids.iter().any(|id| id == call_id) {
-                *content = "(project state omitted — see the current state in the system message)"
-                    .to_string();
+        match message {
+            Message::ToolResult {
+                call_id,
+                content,
+                images,
+            } => {
+                if describe_call_ids.iter().any(|id| id == call_id) {
+                    *content =
+                        "(project state omitted — see the current state in the system message)"
+                            .to_string();
+                }
+                strip_images(content, images);
             }
+            Message::User { content, images } => strip_images(content, images),
+            _ => {}
         }
     }
     if !final_text.is_empty() {
@@ -941,6 +1002,95 @@ mod tests {
         assert!(prompt.contains("podcast-cleanup (Podcast cleanup): Clean up a talk recording."));
         // Only the index enters the prompt — bodies load through read_skill.
         assert!(!prompt.contains("SECRET BODY"));
+    }
+
+    #[test]
+    fn image_budget_drops_oldest_and_leaves_labeled_placeholders() {
+        let mut messages = vec![
+            Message::system("s"),
+            Message::User {
+                content: "look at these".into(),
+                images: vec![
+                    ImagePart::png(vec![1], "timeline at 2.00s"),
+                    ImagePart::png(vec![2], "timeline at 5.00s"),
+                ],
+            },
+            Message::ToolResult {
+                call_id: "call_1".into(),
+                content: "screenshot taken".into(),
+                images: vec![ImagePart::jpeg(vec![3], "preview at 8.00s")],
+            },
+        ];
+
+        enforce_image_budget(&mut messages, 1);
+
+        match &messages[1] {
+            Message::User { content, images } => {
+                assert!(images.is_empty(), "both older images dropped");
+                assert!(content.contains("no longer attached: timeline at 2.00s"));
+                assert!(content.contains("no longer attached: timeline at 5.00s"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &messages[2] {
+            Message::ToolResult { content, images, .. } => {
+                assert_eq!(images.len(), 1, "the newest image survives");
+                assert_eq!(images[0].label, "preview at 8.00s");
+                assert!(!content.contains("no longer attached"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Under budget: untouched.
+        let mut under = vec![Message::User {
+            content: "one".into(),
+            images: vec![ImagePart::png(vec![1], "a")],
+        }];
+        enforce_image_budget(&mut under, 8);
+        assert_eq!(image_count(&under[0]), 1);
+    }
+
+    #[test]
+    fn turn_messages_strip_images_to_labels() {
+        let messages = vec![
+            Message::system("s"),
+            Message::User {
+                content: "what's here?".into(),
+                images: vec![ImagePart::png(vec![1], "frame at 0.00s")],
+            },
+            Message::Assistant {
+                content: String::new(),
+                tool_calls: Vec::new(),
+            },
+            Message::ToolResult {
+                call_id: "call_1".into(),
+                content: "took the shot".into(),
+                images: vec![ImagePart::jpeg(vec![2], "preview at 3.00s")],
+            },
+        ];
+
+        let turn = collect_turn_messages(messages, 1, &[], "done");
+
+        for message in &turn {
+            assert_eq!(image_count(message), 0, "history is text-only: {message:?}");
+        }
+        match &turn[0] {
+            Message::User { content, .. } => {
+                assert!(content.contains("[image: frame at 0.00s]"), "{content}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        match &turn[2] {
+            Message::ToolResult { content, .. } => {
+                assert!(content.contains("[image: preview at 3.00s]"), "{content}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(
+            turn.last(),
+            Some(&Message::assistant_text("done")),
+            "the final answer is appended"
+        );
     }
 
     #[test]

@@ -9,6 +9,38 @@ use std::sync::atomic::AtomicBool;
 
 use crate::wire::ToolSpec;
 
+/// An image attached to a message. Raw encoded bytes (PNG or JPEG) —
+/// base64 encoding happens at the provider boundary, never earlier.
+/// Images are per-turn working memory: the runtime budgets them per
+/// request and strips them from session history (see agent.rs).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImagePart {
+    /// MIME type: "image/png" or "image/jpeg".
+    pub media_type: String,
+    /// Raw encoded bytes, shared so message clones stay cheap.
+    pub data: std::sync::Arc<Vec<u8>>,
+    /// Short human label for transcripts and placeholders, e.g. "timeline at 12.40s".
+    pub label: String,
+}
+
+impl ImagePart {
+    pub fn png(data: Vec<u8>, label: impl Into<String>) -> Self {
+        Self {
+            media_type: "image/png".to_string(),
+            data: std::sync::Arc::new(data),
+            label: label.into(),
+        }
+    }
+
+    pub fn jpeg(data: Vec<u8>, label: impl Into<String>) -> Self {
+        Self {
+            media_type: "image/jpeg".to_string(),
+            data: std::sync::Arc::new(data),
+            label: label.into(),
+        }
+    }
+}
+
 /// One entry in the conversation, provider-agnostic.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Message {
@@ -17,6 +49,7 @@ pub enum Message {
     },
     User {
         content: String,
+        images: Vec<ImagePart>,
     },
     /// A prior model turn (text and/or the tool calls it made).
     Assistant {
@@ -27,7 +60,38 @@ pub enum Message {
     ToolResult {
         call_id: String,
         content: String,
+        images: Vec<ImagePart>,
     },
+}
+
+impl Message {
+    pub fn system(content: impl Into<String>) -> Self {
+        Self::System {
+            content: content.into(),
+        }
+    }
+
+    pub fn user(content: impl Into<String>) -> Self {
+        Self::User {
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
+
+    pub fn assistant_text(content: impl Into<String>) -> Self {
+        Self::Assistant {
+            content: content.into(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    pub fn tool_result(call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self::ToolResult {
+            call_id: call_id.into(),
+            content: content.into(),
+            images: Vec::new(),
+        }
+    }
 }
 
 /// A tool invocation the model requested.

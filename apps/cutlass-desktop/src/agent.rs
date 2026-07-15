@@ -613,7 +613,13 @@ fn history_chars(history: &[Message]) -> usize {
 
 fn message_chars(m: &Message) -> usize {
     match m {
-        Message::System { content } | Message::User { content } => content.len(),
+        Message::System { content } => content.len(),
+        // History is text-only (turns strip images to labeled placeholders
+        // before they land here), but count any payload that does appear so
+        // the budget can never be blown by raw image bytes.
+        Message::User { content, images } => {
+            content.len() + images.iter().map(|i| i.data.len()).sum::<usize>()
+        }
         Message::Assistant {
             content,
             tool_calls,
@@ -624,7 +630,9 @@ fn message_chars(m: &Message) -> usize {
                     .map(|c| c.name.len() + c.arguments.to_string().len())
                     .sum::<usize>()
         }
-        Message::ToolResult { content, .. } => content.len(),
+        Message::ToolResult {
+            content, images, ..
+        } => content.len() + images.iter().map(|i| i.data.len()).sum::<usize>(),
     }
 }
 
