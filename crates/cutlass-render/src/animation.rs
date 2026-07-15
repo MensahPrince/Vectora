@@ -1,13 +1,9 @@
 //! Resolve persisted look-animation presets into transform/opacity deltas.
 
 use cutlass_core::Rational;
-use cutlass_models::{Clip, ClipTransform, Easing};
-
-/// Default entrance/exit window when the clip is long enough (~0.5 s).
-const DEFAULT_ANIM_SECS: f64 = 0.5;
-
-/// Loop period for combo (presence) animations (~1 s).
-const COMBO_PERIOD_SECS: f64 = 1.0;
+use cutlass_models::{
+    Clip, ClipTransform, Easing, look_animation_combo_period_ticks, look_animation_window_ticks,
+};
 
 /// Normalized slide distance as a fraction of canvas height (+y down).
 const SLIDE_OFFSET: f32 = 0.18;
@@ -39,11 +35,11 @@ pub(crate) fn apply_look_animations(
     rate: Rational,
 ) -> ClipTransform {
     let duration = clip.timeline.duration.value.max(1);
-    let window = anim_window_ticks(duration, rate);
+    let window = look_animation_window_ticks(duration, rate);
     let mut deltas = Vec::with_capacity(2);
 
     if let Some(combo) = &clip.animation_combo {
-        let period = combo_period_ticks(rate).max(1);
+        let period = look_animation_combo_period_ticks(rate);
         let phase = (local_tick_f % period as f64) / period as f64;
         deltas.push(sample_combo(&combo.id, phase));
     } else {
@@ -69,16 +65,6 @@ pub(crate) fn apply_look_animations(
         return base;
     }
     compose_transform(base, &deltas)
-}
-
-fn anim_window_ticks(duration: i64, rate: Rational) -> i64 {
-    let from_secs = (DEFAULT_ANIM_SECS / rate.seconds_per_unit()).ceil() as i64;
-    from_secs.max(1).min((duration / 2).max(1))
-}
-
-fn combo_period_ticks(rate: Rational) -> i64 {
-    let ticks = (COMBO_PERIOD_SECS / rate.seconds_per_unit()).round() as i64;
-    ticks.max(1)
 }
 
 fn compose_transform(base: ClipTransform, deltas: &[AnimationDelta]) -> ClipTransform {
@@ -328,7 +314,7 @@ mod tests {
     fn combo_repeats_after_one_period() {
         let mut clip = solid_clip(120);
         clip.animation_combo = Some(AnimationRef::new("pulse"));
-        let period = combo_period_ticks(R24) as f64;
+        let period = look_animation_combo_period_ticks(R24) as f64;
         let a = apply_look_animations(&clip, ClipTransform::IDENTITY, 0, 0.0, R24);
         let b = apply_look_animations(&clip, ClipTransform::IDENTITY, 0, period, R24);
         approx(a.scale, b.scale);

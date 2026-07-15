@@ -624,6 +624,39 @@ impl Generator {
             },
         }
     }
+
+    /// Rebase every clip-relative keyframe carried by generated content.
+    ///
+    /// Most generators are time-invariant data. Shape geometry is the one
+    /// generated source that currently owns ordinary timeline-domain
+    /// [`Param`]s; the normalized speed ramp is deliberately handled
+    /// separately by clip-splitting code.
+    fn shift_timeline_params(&mut self, delta: i64) -> Result<(), ModelError> {
+        let Generator::Shape {
+            shape,
+            rgba,
+            width,
+            height,
+            corner_radius,
+            stroke,
+        } = self
+        else {
+            return Ok(());
+        };
+
+        rgba.shift_ticks(delta)?;
+        width.shift_ticks(delta)?;
+        height.shift_ticks(delta)?;
+        corner_radius.shift_ticks(delta)?;
+        if let Shape::Star { inner_ratio, .. } = shape {
+            inner_ratio.shift_ticks(delta)?;
+        }
+        if let Some(stroke) = stroke {
+            stroke.rgba.shift_ticks(delta)?;
+            stroke.width.shift_ticks(delta)?;
+        }
+        Ok(())
+    }
 }
 
 /// A mutable reference to one animatable shape property, typed by value kind.
@@ -1448,6 +1481,16 @@ impl AnimatedTransform {
         Ok(())
     }
 
+    /// Shift every transform keyframe by `delta` clip-relative ticks.
+    fn shift_ticks(&mut self, delta: i64) -> Result<(), ModelError> {
+        self.position.shift_ticks(delta)?;
+        self.anchor_point.shift_ticks(delta)?;
+        self.scale.shift_ticks(delta)?;
+        self.rotation.shift_ticks(delta)?;
+        self.opacity.shift_ticks(delta)?;
+        Ok(())
+    }
+
     /// `Ok` iff every stored value (constants and keyframes) passes the
     /// per-property rules [`ClipTransform::validate`] enforces, and every
     /// keyframed param is structurally sound (sorted, non-empty, valid
@@ -1799,6 +1842,23 @@ pub const MAX_CLIP_VOLUME: f32 = 10.0;
 /// base-speed changes that re-derive the clip's timeline duration.
 pub const SPEED_CURVE_SCALE: i64 = 1000;
 
+/// Default entrance/exit look-animation window (~0.5 seconds), shortened to
+/// half the clip for short placements. Kept in the model so structural edits
+/// and the renderer use exactly the same timing rule.
+pub fn look_animation_window_ticks(duration: i64, rate: Rational) -> i64 {
+    const DEFAULT_ANIMATION_SECONDS: f64 = 0.5;
+    let from_seconds = (DEFAULT_ANIMATION_SECONDS / rate.seconds_per_unit()).ceil() as i64;
+    from_seconds.max(1).min((duration / 2).max(1))
+}
+
+/// Loop period for combo/presence look animations (~1 second).
+pub fn look_animation_combo_period_ticks(rate: Rational) -> i64 {
+    const COMBO_PERIOD_SECONDS: f64 = 1.0;
+    (COMBO_PERIOD_SECONDS / rate.seconds_per_unit())
+        .round()
+        .max(1.0) as i64
+}
+
 /// Slowest instantaneous speed multiplier a ramp keyframe may hold (matches
 /// the agent's `set_clip_speed` floor). A positive floor keeps the curve's
 /// average — and thus the derived duration — finite.
@@ -1999,6 +2059,23 @@ impl Clip {
             replaceable: None,
             text_editable: false,
         }
+    }
+
+    /// Rebase every ordinary clip-relative animation curve by `delta` ticks.
+    ///
+    /// This intentionally excludes [`Self::speed_curve`]: that curve lives on
+    /// the normalized [`SPEED_CURVE_SCALE`] domain and must be segmented,
+    /// rather than shifted, when a media clip is split.
+    pub(crate) fn shift_timeline_params(&mut self, delta: i64) -> Result<(), ModelError> {
+        self.transform.shift_ticks(delta)?;
+        self.volume.shift_ticks(delta)?;
+        for effect in &mut self.effects {
+            effect.shift_param_ticks(delta)?;
+        }
+        if let ClipSource::Generated(generator) = &mut self.content {
+            generator.shift_timeline_params(delta)?;
+        }
+        Ok(())
     }
 
     /// True iff the clip's framing differs from the default (full frame,

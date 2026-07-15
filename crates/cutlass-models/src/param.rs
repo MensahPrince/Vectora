@@ -375,6 +375,30 @@ impl<T: Clone> Param<T> {
             },
         }
     }
+
+    /// Shift every keyframe by `delta` ticks (constants pass through
+    /// unchanged). The operation is atomic: an overflowing tick leaves the
+    /// parameter untouched.
+    ///
+    /// Clip splitting uses this to preserve an absolute animation curve on
+    /// the tail while rebasing its clip-relative origin to the split point.
+    pub fn shift_ticks(&mut self, delta: i64) -> Result<(), ModelError> {
+        let Param::Keyframed { keyframes } = self else {
+            return Ok(());
+        };
+        let shifted = keyframes
+            .iter()
+            .map(|kf| {
+                Ok(Keyframe {
+                    tick: kf.tick.checked_add(delta).ok_or(ModelError::TimeOverflow)?,
+                    value: kf.value.clone(),
+                    easing: kf.easing,
+                })
+            })
+            .collect::<Result<Vec<_>, ModelError>>()?;
+        *keyframes = shifted;
+        Ok(())
+    }
 }
 
 impl<T> Param<T> {
