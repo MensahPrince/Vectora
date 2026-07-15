@@ -8,6 +8,7 @@ mod ai_media;
 mod audio;
 mod cloud;
 mod drafts;
+mod external;
 mod inspector;
 mod interaction;
 mod lottie_stickers;
@@ -341,33 +342,6 @@ fn request_close(app_weak: &slint::Weak<AppWindow>, handle: &preview_worker::Wor
         handle.save_project(None);
         refresh_projects(&app);
         app.global::<AppState>().set_launch_visible(true);
-    }
-}
-
-/// Reveal a file in the OS file browser, selecting it where the platform
-/// supports that (Finder on macOS, Explorer on Windows). On other platforms
-/// we fall back to opening the containing directory.
-fn reveal_in_file_browser(path: &std::path::Path) {
-    let spawn = |program: &str, args: &[&std::ffi::OsStr]| {
-        if let Err(e) = std::process::Command::new(program).args(args).spawn() {
-            tracing::error!("failed to reveal path in file browser: {e}");
-        }
-    };
-
-    #[cfg(target_os = "macos")]
-    spawn("open", &[std::ffi::OsStr::new("-R"), path.as_os_str()]);
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut select = std::ffi::OsString::from("/select,");
-        select.push(path.as_os_str());
-        spawn("explorer", &[select.as_os_str()]);
-    }
-
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let dir = path.parent().unwrap_or(path);
-        spawn("xdg-open", &[dir.as_os_str()]);
     }
 }
 
@@ -1452,7 +1426,9 @@ fn main() -> Result<(), slint::PlatformError> {
     export_backend.on_reveal_output_clicked(move || {
         if let Some(backend) = export_reveal_weak.upgrade() {
             let path = std::path::PathBuf::from(backend.get_output_path().to_string());
-            reveal_in_file_browser(&path);
+            if let Err(error) = external::reveal_path(&path) {
+                tracing::error!(%error, "failed to reveal export output");
+            }
         }
     });
 
@@ -1563,7 +1539,9 @@ fn main() -> Result<(), slint::PlatformError> {
                     .map(std::path::Path::to_path_buf)
                     .unwrap_or_else(|| config_path.clone())
             };
-            reveal_in_file_browser(&target);
+            if let Err(error) = external::reveal_path(&target) {
+                tracing::error!(%error, "failed to reveal settings file");
+            }
         });
     }
 
