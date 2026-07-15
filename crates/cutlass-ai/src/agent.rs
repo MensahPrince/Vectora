@@ -418,7 +418,7 @@ pub fn run_prompt_with_host(
                     // empty undo group.
                     "nothing new to commit — make edits first".to_string()
                 }
-            } else if host_specs.iter().any(|spec| spec.name == call.name) {
+            } else if let Some(spec) = host_specs.iter().find(|spec| spec.name == call.name) {
                 host_calls += 1;
                 if host_calls > config.max_host_calls {
                     return abort(
@@ -430,7 +430,10 @@ pub fn run_prompt_with_host(
                         ),
                     );
                 }
-                match host.call(&call.name, &call.arguments, cancel) {
+                match host
+                    .authorize(&call.name, &call.arguments, spec.tier, cancel)
+                    .and_then(|()| host.call(&call.name, &call.arguments, cancel))
+                {
                     Err(reason) => format!("rejected: {reason}"),
                     Ok(output) => {
                         let content = if output.text.is_empty() {

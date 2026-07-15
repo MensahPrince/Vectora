@@ -69,6 +69,25 @@ impl ToolOutput {
 /// `cancel`.
 pub trait ToolHost {
     fn tools(&self) -> Vec<HostToolSpec>;
+    /// Authorize one call before execution. The loop invokes this for every
+    /// registered host tool. Read-only/workspace calls are allowed by
+    /// default; System calls fail closed unless the embedder provides an
+    /// autonomy/confirmation broker.
+    fn authorize(
+        &mut self,
+        name: &str,
+        _arguments: &serde_json::Value,
+        tier: ToolTier,
+        _cancel: &AtomicBool,
+    ) -> Result<(), String> {
+        match tier {
+            ToolTier::ReadOnly | ToolTier::Workspace => Ok(()),
+            ToolTier::System => Err(format!(
+                "system tool '{name}' requires confirmation, but this host has no approval broker"
+            )),
+        }
+    }
+
     /// Execute one call. `Err` is a model-readable reason; the loop
     /// forwards it as "rejected: {reason}".
     fn call(

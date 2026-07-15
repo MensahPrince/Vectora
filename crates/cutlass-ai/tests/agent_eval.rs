@@ -1721,6 +1721,48 @@ fn host_rejection_reports_and_the_prompt_still_completes() {
     );
 }
 
+#[test]
+fn system_host_tools_fail_closed_without_an_approval_broker() {
+    let (mut host, _, _, _) = fixture();
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "system_cache_clear",
+            serde_json::json!({ "cache": "proxies" }),
+        )]),
+        text_turn("I couldn't clear it without approval."),
+    ]);
+    let mut spec = host_spec("system_cache_clear");
+    spec.tier = ToolTier::System;
+    let mut tool_host = ScriptedHost::new(
+        vec![spec],
+        vec![Ok(ToolOutput::text("cache cleared"))],
+    );
+
+    let (outcome, _) = run_with(
+        &provider,
+        &mut host,
+        &mut tool_host,
+        &EditorContext::default(),
+        "clear the proxy cache",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert!(
+        tool_host.calls.is_empty(),
+        "execution never runs before authorization"
+    );
+    let second = &provider.requests()[1];
+    match second.last().unwrap() {
+        Message::ToolResult { content, .. } => {
+            assert!(content.contains("requires confirmation"), "{content}");
+            assert!(content.contains("no approval broker"), "{content}");
+        }
+        other => panic!("expected tool result, got {other:?}"),
+    }
+}
+
 /// The two fuses are independent: an edit cap of zero still lets host
 /// tools run, and the host cap aborts with a full rollback.
 #[test]
