@@ -209,6 +209,56 @@ impl Project {
         self.timeline.add_clip(track_id, clip)
     }
 
+    /// Clone `clip_id` onto `to_track` at `start`, preserving every clip
+    /// property except identity, placement start, and linkage.
+    ///
+    /// The destination is explicit: this primitive performs no placement
+    /// search or ripple. Placement validation is completed before allocating
+    /// the fresh [`ClipId`], avoiding allocator advances on validation errors.
+    pub fn duplicate_clip(
+        &mut self,
+        clip_id: ClipId,
+        to_track: TrackId,
+        start: RationalTime,
+    ) -> Result<ClipId, ModelError> {
+        let timeline_rate = self.timeline.frame_rate;
+        check_same_rate(start.rate, timeline_rate)?;
+        if start.value < 0 {
+            return Err(ModelError::InvalidRange);
+        }
+
+        let source = self
+            .timeline
+            .clip(clip_id)
+            .ok_or(ModelError::UnknownClip(clip_id))?;
+        let destination = self
+            .timeline
+            .track(to_track)
+            .ok_or(ModelError::UnknownTrack(to_track))?;
+        if !destination.kind.accepts_content(&source.content) {
+            return Err(ModelError::IncompatibleTrackKind {
+                track: to_track,
+                kind: destination.kind,
+            });
+        }
+
+        let mut destination_range = source.timeline;
+        destination_range.start = start;
+        if destination.has_overlap(destination_range, None)? {
+            return Err(ModelError::Overlap(to_track));
+        }
+
+        // Clone first so every current and future content/property field rides
+        // along by default. Duplication deliberately resets only these three
+        // identity/placement fields; transitions live on tracks, not clips.
+        let mut duplicate = source.clone();
+        duplicate.id = ClipId::next();
+        duplicate.timeline.start = start;
+        duplicate.link = None;
+
+        self.timeline.add_clip(to_track, duplicate)
+    }
+
     /// Replace a generated clip's content (edit a title's text, recolor a
     /// shape, …). Errors if the clip is unknown, is media-backed, or the new
     /// generator isn't accepted by the clip's track.
@@ -2193,6 +2243,265 @@ mod tests {
                 expected: R24,
                 got: R30,
             })
+        );
+    }
+
+    // --- duplicate_clip ---------------------------------------------------
+
+    #[test]
+    fn duplicate_clip_preserves_full_property_snapshot() {
+        let (mut project, media_id, source_track) = project_with_media(1_000);
+        let destination_track = project.add_track(TrackKind::Video, "V2");
+        let source_id = project
+            .add_clip(source_track, media_id, tr(17, 80), rt(10))
+            .unwrap();
+        let source_link = crate::LinkId::next();
+
+        {
+            let clip = project.timeline_mut().clip_mut(source_id).unwrap();
+            clip.link = Some(source_link);
+
+            clip.transform.position.set_keyframe(
+                0,
+                [0.1, -0.2],
+                Easing::Bezier {
+                    points: [0.2, 0.8, 0.7, 0.1],
+                },
+            );
+            clip.transform
+                .position
+                .set_keyframe(60, [0.7, 0.4], Easing::EaseOut);
+            clip.transform.anchor_point = Param::Constant([0.25, 0.75]);
+            clip.transform.scale.set_keyframe(0, 0.8, Easing::EaseIn);
+            clip.transform
+                .scale
+                .set_keyframe(60, 1.6, Easing::EaseInOut);
+            clip.transform.rotation = Param::Constant(27.5);
+            clip.transform.opacity = Param::Constant(0.65);
+
+            clip.speed = Rational::new(3, 2);
+            clip.reversed = true;
+            clip.speed_curve.set_keyframe(0, 0.75, Easing::EaseIn);
+            clip.speed_curve
+                .set_keyframe(crate::SPEED_CURVE_SCALE, 1.5, Easing::EaseOut);
+            clip.preserve_pitch = false;
+
+            clip.volume.set_keyframe(0, 0.2, Easing::EaseIn);
+            clip.volume.set_keyframe(60, 1.4, Easing::EaseOut);
+            clip.fade_in = 9;
+            clip.fade_out = 11;
+            clip.denoise = true;
+
+            clip.crop = CropRect {
+                x: 0.1,
+                y: 0.2,
+                w: 0.7,
+                h: 0.6,
+            };
+            clip.flip_h = true;
+            clip.flip_v = true;
+
+            let mut effect = EffectInstance::new("gaussian_blur");
+            effect
+                .set_param_keyframe(0, 0, 2.0, Easing::EaseIn)
+                .unwrap();
+            effect
+                .set_param_keyframe(0, 60, 12.0, Easing::EaseOut)
+                .unwrap();
+            clip.effects = vec![effect];
+            clip.beats = vec![19, 31, 47];
+
+            clip.mask = Some(Mask {
+                kind: MaskKind::Heart,
+                feather: 0.35,
+                invert: true,
+            });
+            clip.chroma_key = Some(ChromaKey {
+                rgb: [3, 240, 17],
+                strength: 0.72,
+                shadow: 0.18,
+            });
+            clip.stabilize = Some(StabilizeLevel::MaxSmooth);
+            clip.filter = Some(Filter {
+                id: "vivid".into(),
+                intensity: 0.63,
+            });
+            clip.lut = Some(crate::look::Lut {
+                path: "/tmp/cinematic.cube".into(),
+                intensity: 0.71,
+            });
+            clip.adjust = ColorAdjustments {
+                brightness: 0.1,
+                contrast: -0.2,
+                saturation: 0.3,
+                exposure: -0.4,
+                temperature: 0.5,
+            };
+            clip.animation_in = Some(AnimationRef::new("zoom_in"));
+            clip.animation_out = Some(AnimationRef::new("drop"));
+            clip.animation_combo = Some(AnimationRef::new("pulse"));
+            clip.audio_role = Some(AudioRole::Voiceover);
+            clip.replaceable = Some(
+                Replaceable::new(7)
+                    .with_accepts(SlotMedia::VideoOnly)
+                    .with_label("Hero"),
+            );
+            clip.text_editable = true;
+        }
+
+        let source_before = project.clip(source_id).unwrap().clone();
+        let destination_start = rt(240);
+        let duplicate_id = project
+            .duplicate_clip(source_id, destination_track, destination_start)
+            .unwrap();
+        let duplicate = project.clip(duplicate_id).unwrap();
+
+        let mut expected = source_before.clone();
+        expected.id = duplicate_id;
+        expected.timeline.start = destination_start;
+        expected.link = None;
+        assert_eq!(
+            duplicate, &expected,
+            "normalizing only id/start/link makes the full snapshots equal"
+        );
+        assert_eq!(
+            project.clip(source_id).unwrap(),
+            &source_before,
+            "duplication never mutates the source"
+        );
+        assert_ne!(duplicate_id, source_id);
+        assert_eq!(
+            project.timeline().track_of(duplicate_id),
+            Some(destination_track)
+        );
+    }
+
+    #[test]
+    fn duplicate_clip_clones_generated_content_and_template_flag() {
+        let mut project = Project::new("test", R24);
+        let source_track = project.add_track(TrackKind::Text, "Titles");
+        let destination_track = project.add_track(TrackKind::Text, "Titles 2");
+        let source_id = project
+            .add_generated(source_track, Generator::text("Animated title"), tr(5, 40))
+            .unwrap();
+        project.set_text_editable(source_id, true).unwrap();
+        project
+            .set_param_keyframe(
+                source_id,
+                ClipParam::Scale,
+                rt(5),
+                ParamValue::Scalar(0.75),
+                Easing::EaseInOut,
+            )
+            .unwrap();
+
+        let source_before = project.clip(source_id).unwrap().clone();
+        let start = rt(100);
+        let duplicate_id = project
+            .duplicate_clip(source_id, destination_track, start)
+            .unwrap();
+
+        let mut expected = source_before.clone();
+        expected.id = duplicate_id;
+        expected.timeline.start = start;
+        expected.link = None;
+        assert_eq!(project.clip(duplicate_id).unwrap(), &expected);
+        assert!(project.clip(duplicate_id).unwrap().text_editable);
+        assert_eq!(project.clip(source_id).unwrap(), &source_before);
+    }
+
+    #[test]
+    fn duplicate_clip_unlinks_copy_without_changing_source_group() {
+        let (mut project, media_id, source_track) = project_with_media(300);
+        let destination_track = project.add_track(TrackKind::Video, "V2");
+        let first = project
+            .add_clip(source_track, media_id, tr(0, 20), rt(0))
+            .unwrap();
+        let second = project
+            .add_clip(source_track, media_id, tr(20, 20), rt(20))
+            .unwrap();
+        let group = crate::LinkId::next();
+        for id in [first, second] {
+            project.timeline_mut().clip_mut(id).unwrap().link = Some(group);
+        }
+
+        let duplicate = project
+            .duplicate_clip(first, destination_track, rt(100))
+            .unwrap();
+
+        assert_eq!(project.clip(first).unwrap().link, Some(group));
+        assert_eq!(project.clip(second).unwrap().link, Some(group));
+        assert_eq!(project.clip(duplicate).unwrap().link, None);
+    }
+
+    #[test]
+    fn duplicate_clip_rejections_are_atomic() {
+        let (mut project, media_id, source_track) = project_with_media(500);
+        let destination_track = project.add_track(TrackKind::Video, "V2");
+        let incompatible_track = project.add_track(TrackKind::Text, "Titles");
+        let source = project
+            .add_clip(source_track, media_id, tr(0, 40), rt(0))
+            .unwrap();
+        let blocker = project
+            .add_clip(destination_track, media_id, tr(40, 40), rt(100))
+            .unwrap();
+        let source_before = project.clip(source).unwrap().clone();
+        let blocker_before = project.clip(blocker).unwrap().clone();
+        let clip_count_before = project.timeline().clip_count();
+        let project_before = serde_json::to_value(&project).unwrap();
+
+        macro_rules! assert_atomic_rejection {
+            ($result:expr, $expected:expr) => {{
+                assert_eq!($result, Err($expected));
+                assert_eq!(project.timeline().clip_count(), clip_count_before);
+                assert_eq!(project.clip(source).unwrap(), &source_before);
+                assert_eq!(project.clip(blocker).unwrap(), &blocker_before);
+                assert_eq!(
+                    serde_json::to_value(&project).unwrap(),
+                    project_before,
+                    "the complete serialized project remains unchanged"
+                );
+            }};
+        }
+
+        let equivalent_but_noncanonical_rate = Rational::new(48, 2);
+        assert_atomic_rejection!(
+            project.duplicate_clip(
+                source,
+                destination_track,
+                RationalTime::new(200, equivalent_but_noncanonical_rate)
+            ),
+            ModelError::RateMismatch {
+                expected: R24,
+                got: equivalent_but_noncanonical_rate,
+            }
+        );
+        assert_atomic_rejection!(
+            project.duplicate_clip(source, destination_track, rt(-1)),
+            ModelError::InvalidRange
+        );
+
+        let missing_clip = ClipId::from_raw(u64::MAX - 1);
+        assert_atomic_rejection!(
+            project.duplicate_clip(missing_clip, destination_track, rt(200)),
+            ModelError::UnknownClip(missing_clip)
+        );
+
+        let missing_track = TrackId::from_raw(u64::MAX - 1);
+        assert_atomic_rejection!(
+            project.duplicate_clip(source, missing_track, rt(200)),
+            ModelError::UnknownTrack(missing_track)
+        );
+        assert_atomic_rejection!(
+            project.duplicate_clip(source, incompatible_track, rt(200)),
+            ModelError::IncompatibleTrackKind {
+                track: incompatible_track,
+                kind: TrackKind::Text,
+            }
+        );
+        assert_atomic_rejection!(
+            project.duplicate_clip(source, destination_track, rt(110)),
+            ModelError::Overlap(destination_track)
         );
     }
 

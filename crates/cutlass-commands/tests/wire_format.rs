@@ -98,6 +98,11 @@ fn edit_samples() -> Vec<EditCommand> {
             source: tr(0, 90),
             start: t(30),
         },
+        EditCommand::DuplicateClip {
+            clip: clip(4),
+            to_track: track(2),
+            start: t(120),
+        },
         EditCommand::AddGenerated {
             track: track(1),
             generator: Generator::SolidColor {
@@ -374,6 +379,7 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
     match cmd {
         EditCommand::AddTrack { .. } => "AddTrack",
         EditCommand::AddClip { .. } => "AddClip",
+        EditCommand::DuplicateClip { .. } => "DuplicateClip",
         EditCommand::AddGenerated { .. } => "AddGenerated",
         EditCommand::SetGenerator { .. } => "SetGenerator",
         EditCommand::SetClipMedia { .. } => "SetClipMedia",
@@ -435,7 +441,7 @@ fn edit_variant_name(cmd: &EditCommand) -> &'static str {
 #[test]
 fn command_variant_counts_are_locked() {
     assert_eq!(project_samples().len(), 9);
-    assert_eq!(edit_samples().len(), 55);
+    assert_eq!(edit_samples().len(), 56);
 }
 
 #[test]
@@ -505,6 +511,24 @@ fn golden_add_clip() {
                 "duration": {"value": 90, "rate": {"num": 30, "den": 1}},
             },
             "start": {"value": 30, "rate": {"num": 30, "den": 1}},
+        })
+    );
+}
+
+#[test]
+fn golden_duplicate_clip() {
+    let cmd = Command::Edit(EditCommand::DuplicateClip {
+        clip: clip(4),
+        to_track: track(2),
+        start: t(120),
+    });
+    assert_eq!(
+        serde_json::to_value(&cmd).unwrap(),
+        json!({
+            "type": "DuplicateClip",
+            "clip": 4,
+            "to_track": 2,
+            "start": {"value": 120, "rate": {"num": 30, "den": 1}},
         })
     );
 }

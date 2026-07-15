@@ -151,6 +151,19 @@ fn dispatch_edit(
                 Some(inverse),
             ))
         }
+        EditCommand::DuplicateClip {
+            clip,
+            to_track,
+            start,
+        } => {
+            let guard = transitions_guard(ctx);
+            let (id, primary) = edit::duplicate_clip::execute(ctx, clip, to_track, start)?;
+            let inverse = finalize_structural(ctx, guard, primary);
+            Ok((
+                ApplyOutcome::Edited(EditOutcome::Created(id)),
+                Some(inverse),
+            ))
+        }
         EditCommand::AddGenerated {
             track,
             generator,

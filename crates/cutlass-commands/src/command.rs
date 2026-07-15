@@ -101,6 +101,15 @@ pub enum EditCommand {
         source: TimeRange,
         start: RationalTime,
     },
+    /// Deep-copy one clip to an explicit track/start. The copy receives a
+    /// fresh id and is unlinked; every other clip property and keyframe is
+    /// preserved. This is a pure placement edit: no search, ripple, transition
+    /// copy, or batch/link policy.
+    DuplicateClip {
+        clip: ClipId,
+        to_track: TrackId,
+        start: RationalTime,
+    },
     /// Place a generated clip (text, solid, shape, …) on a track.
     AddGenerated {
         track: TrackId,

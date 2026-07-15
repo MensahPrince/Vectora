@@ -5,6 +5,7 @@ pub mod add_generated;
 pub mod add_track;
 // `detect_beats` and `duck` need the decoder's audio reader/DSP — deferred on
 // mobile-support (FFmpeg-free); their command arms return `Unsupported`.
+pub mod duplicate_clip;
 pub mod insert_clip;
 pub mod insert_media;
 pub mod link_clips;
