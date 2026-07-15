@@ -58,7 +58,6 @@ pub fn project_file(dir: &Path) -> PathBuf {
 ///
 /// The draft directory and project file must already exist as real directory
 /// and regular-file entries. Filesystem paths are never accepted as ids.
-#[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
 pub(crate) fn resolve_draft_id(draft_id: &str) -> io::Result<PathBuf> {
     resolve_draft_id_in_root(&root_dir(), draft_id)
 }
@@ -67,7 +66,6 @@ pub(crate) fn resolve_draft_id(draft_id: &str) -> io::Result<PathBuf> {
 ///
 /// This validates identity only: neither the draft directory nor project file
 /// needs to exist. That keeps newly created, not-yet-saved sessions addressable.
-#[allow(dead_code)] // Phase 2c foundation; consumed by agent project RPCs next.
 pub(crate) fn draft_id_from_project(project: &Path) -> io::Result<String> {
     draft_id_from_project_in_root(&root_dir(), project)
 }
@@ -202,7 +200,6 @@ fn read_name(dir: &Path) -> String {
     read_name_checked(dir).unwrap_or_else(|| FALLBACK_NAME.to_owned())
 }
 
-#[allow(dead_code)] // Reachable through the intentionally staged API above.
 fn resolve_draft_id_in_root(root: &Path, draft_id: &str) -> io::Result<PathBuf> {
     if !is_valid_draft_id(draft_id) {
         return Err(io::Error::new(
@@ -256,7 +253,6 @@ fn resolve_draft_id_in_root(root: &Path, draft_id: &str) -> io::Result<PathBuf> 
     Ok(project)
 }
 
-#[allow(dead_code)] // Reachable through the intentionally staged API above.
 fn draft_id_from_project_in_root(root: &Path, project: &Path) -> io::Result<String> {
     validate_project_identity(root, project).map(|identity| identity.id)
 }

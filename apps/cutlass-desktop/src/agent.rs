@@ -649,6 +649,7 @@ fn publish_approval_card(
 
 fn approval_title(name: &str) -> String {
     match name {
+        "project_open" => "Open this project draft?".into(),
         "system_cache_list" => "Let the assistant inspect cache usage?".into(),
         "system_cache_clear" => "Clear this cache?".into(),
         "system_cache_relocate" => "Move this cache?".into(),
@@ -664,6 +665,23 @@ fn approval_detail(
     arguments: &serde_json::Value,
     cache_registry: Option<&CacheRegistry>,
 ) -> String {
+    if name == "project_open" {
+        let draft_id = arguments
+            .get("draft_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|draft_id| {
+                !draft_id.is_empty()
+                    && draft_id.chars().count() <= crate::agent_project::MAX_DRAFT_ID_CHARS
+                    && draft_id.bytes().all(|byte| {
+                        byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte) || byte == b'-'
+                    })
+            })
+            .unwrap_or("<invalid draft ID>");
+        return bound_approval_detail(format!(
+            "Draft ID: {draft_id}\n\nOpening this draft replaces the current session and may discard unsaved work."
+        ));
+    }
+
     if name == "system_cache_clear"
         && let Some(id) = arguments
             .get("cache_id")
@@ -805,8 +823,10 @@ impl ToolHost for DesktopToolHost {
         if cancel.load(Ordering::Acquire) {
             return Err("cancelled before the system tool could run".into());
         }
-        if cutlass_ai::namespace(name) == "system" {
-            crate::agent_system::validate_request(name, arguments)?;
+        match cutlass_ai::namespace(name) {
+            "project" => crate::agent_project::validate_request(name, arguments)?,
+            "system" => crate::agent_system::validate_request(name, arguments)?,
+            _ => {}
         }
 
         let request_id = allocate_approval_request_id(&self.approval_id_allocator)?;
@@ -1500,6 +1520,7 @@ mod tests {
 
     #[test]
     fn approval_detail_is_bounded_and_handles_empty_arguments() {
+        assert_eq!(approval_title("project_open"), "Open this project draft?");
         assert_eq!(approval_title("system_cache_clear"), "Clear this cache?");
         assert_eq!(approval_title("system_cache_relocate"), "Move this cache?");
         assert_eq!(approval_title("future_tool"), "Run future_tool?");
@@ -1518,6 +1539,32 @@ mod tests {
         assert_eq!(detail.chars().count(), APPROVAL_DETAIL_MAX_CHARS + 1);
         assert!(detail.ends_with('…'));
         assert!(detail.starts_with("{\n  \"script\": \""));
+
+        let project_detail = approval_detail(
+            "project_open",
+            &serde_json::json!({"draft_id": "abcdef-12"}),
+            None,
+        );
+        assert_eq!(
+            project_detail,
+            "Draft ID: abcdef-12\n\nOpening this draft replaces the current session and may discard unsaved work."
+        );
+        assert!(!project_detail.contains("project.cutlass"));
+        assert!(
+            project_detail.chars().count() <= APPROVAL_DETAIL_MAX_CHARS,
+            "{project_detail}"
+        );
+
+        let unsafe_project_detail = approval_detail(
+            "project_open",
+            &serde_json::json!({
+                "draft_id": "/private/agent-secret/project.cutlass"
+            }),
+            None,
+        );
+        assert!(unsafe_project_detail.contains("<invalid draft ID>"));
+        assert!(!unsafe_project_detail.contains("/private"));
+        assert!(!unsafe_project_detail.contains("agent-secret"));
 
         let relocation_detail = format_cache_relocation_approval_detail(
             cutlass_storage::CacheId::Download,
@@ -1573,6 +1620,29 @@ mod tests {
         assert_eq!(pending.load(Ordering::Acquire), 0);
         assert_eq!(allocator.load(Ordering::Relaxed), 0);
 
+        let private_path = "/private/agent-secret/project.cutlass";
+        assert_eq!(
+            host.authorize(
+                "project_open",
+                &serde_json::json!({ "draft_id": private_path }),
+                ToolTier::System,
+                &cancel,
+            ),
+            Ok(())
+        );
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+        let dispatch_error = host
+            .call(
+                "project_open",
+                &serde_json::json!({ "draft_id": private_path }),
+                &cancel,
+            )
+            .expect_err("dispatch must still validate under full autonomy");
+        assert!(dispatch_error.contains("canonical app-owned draft ID"));
+        assert!(!dispatch_error.contains("/private"));
+        assert!(!dispatch_error.contains("agent-secret"));
+
         assert_eq!(
             host.authorize(
                 "media_preview_frame",
@@ -1615,6 +1685,58 @@ mod tests {
     }
 
     #[test]
+    fn project_open_preflight_rejects_invalid_ids_before_approval_side_effects() {
+        let (_tx, rx) = unbounded();
+        let pending = Arc::new(AtomicU64::new(0));
+        let allocator = Arc::new(AtomicU64::new(0));
+        let mut host = DesktopToolHost::new(
+            Autonomy::Ask,
+            test_tool_handles(JobManager::new()),
+            rx,
+            pending.clone(),
+            allocator.clone(),
+        );
+        let cancel = AtomicBool::new(false);
+
+        let private_path = "/private/agent-secret/project.cutlass";
+        let malformed = host
+            .authorize(
+                "project_open",
+                &serde_json::json!({ "draft_id": private_path }),
+                ToolTier::System,
+                &cancel,
+            )
+            .expect_err("filesystem path must fail before approval");
+        assert!(malformed.contains("canonical app-owned draft ID"));
+        assert!(!malformed.contains("/private"));
+        assert!(!malformed.contains("agent-secret"));
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("current time after epoch")
+            .as_nanos();
+        let missing_id = format!("{nanos:x}-ffffffffffffffff");
+        let missing = host
+            .authorize(
+                "project_open",
+                &serde_json::json!({ "draft_id": missing_id }),
+                ToolTier::System,
+                &cancel,
+            )
+            .expect_err("missing draft must fail before approval");
+        assert!(missing.starts_with("project_open failed:"), "{missing}");
+        assert!(
+            !missing.contains(crate::drafts::root_dir().to_string_lossy().as_ref()),
+            "{missing}"
+        );
+        assert!(!missing.contains("project.cutlass"), "{missing}");
+        assert_eq!(pending.load(Ordering::Acquire), 0);
+        assert_eq!(allocator.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn desktop_host_registers_app_project_job_and_system_tools_by_tier() {
         let (_tx, rx) = unbounded();
         let host = DesktopToolHost::new(
@@ -1625,7 +1747,7 @@ mod tests {
             Arc::new(AtomicU64::new(0)),
         );
         let specs = host.tools();
-        assert_eq!(specs.len(), 22);
+        assert_eq!(specs.len(), 23);
         assert_eq!(
             specs
                 .iter()
@@ -1649,6 +1771,7 @@ mod tests {
             vec![
                 ("project_list_drafts", ToolTier::ReadOnly),
                 ("project_save", ToolTier::Workspace),
+                ("project_open", ToolTier::System),
             ]
         );
         assert_eq!(
@@ -1677,6 +1800,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "app_close",
+                "project_open",
                 "system_reveal",
                 "system_open_external",
                 "system_cache_list",
@@ -1687,7 +1811,7 @@ mod tests {
     }
 
     #[test]
-    fn project_tools_never_enter_the_system_approval_flow() {
+    fn non_system_project_tools_never_enter_the_system_approval_flow() {
         let (tx, rx) = unbounded();
         drop(tx);
         let pending = Arc::new(AtomicU64::new(0));
@@ -1749,7 +1873,7 @@ mod tests {
     }
 
     #[test]
-    fn desktop_host_dispatches_project_tools_and_tracks_only_save_as_an_effect() {
+    fn desktop_host_dispatches_project_tools_and_tracks_mutations_as_effects() {
         let (_tx, rx) = unbounded();
         let mut host = DesktopToolHost::new(
             Autonomy::Full,
@@ -1773,6 +1897,18 @@ mod tests {
             !host.ordinary_host_call_attempted(),
             "a read-only project query is not an ordinary host effect"
         );
+
+        let private_path = "/private/agent-secret/project.cutlass";
+        let open_error = host
+            .call(
+                "project_open",
+                &serde_json::json!({ "draft_id": private_path }),
+                &cancel,
+            )
+            .expect_err("malformed project open must dispatch to strict validation");
+        assert!(open_error.contains("canonical app-owned draft ID"));
+        assert!(!open_error.contains("/private"));
+        assert!(host.ordinary_host_call_attempted());
 
         let error = host
             .call("project_save", &serde_json::json!({}), &cancel)
