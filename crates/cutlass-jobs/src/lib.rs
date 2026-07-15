@@ -14,13 +14,17 @@
 //! - **std-only.** Named threads (`std::thread::Builder`), an `Arc<Mutex<_>>`
 //!   registry, atomics for ids and cancel flags. No async runtime — this is
 //!   a std-thread app, and a job is exactly one thread.
-//! - **Cancellation is cooperative, and the flag decides.** [`JobManager::cancel`]
-//!   flips a flag; the job observes it via [`JobContext::cancelled`] or an
-//!   owned [`CancellationToken`] and returns when convenient. Whatever it
-//!   returns after that — `Ok` or `Err` — the terminal state is
-//!   [`JobState::Cancelled`], with the returned string kept as the final
-//!   detail. A job that never checks simply runs to completion and is then
-//!   marked cancelled anyway.
+//! - **Cancellation is cooperative, with an ordered commit boundary.** During
+//!   cancellable preparation, [`JobManager::cancel`] sets a flag observed via
+//!   [`JobContext::cancelled`] or an owned [`CancellationToken`]. Immediately
+//!   before its first irreversible publication step, work calls
+//!   [`JobContext::try_begin_commit`]. The request and boundary contend under
+//!   the registry mutex: if cancellation wins, the boundary returns `false`
+//!   and publication must be skipped; if the boundary wins, later requests
+//!   are rejected and the closure's result decides Done/Failed. Before that
+//!   boundary, an accepted cancellation makes either `Ok` or `Err` terminally
+//!   [`JobState::Cancelled`] (panic remains Failed), even if work never checks
+//!   the flag.
 //! - **Subscribers are called with no lock held and isolated from each
 //!   other.** Every transition collects the snapshot and subscriber list
 //!   under the lock, drops the guard, then calls — so callbacks may re-enter
@@ -30,7 +34,7 @@
 //!   The `Queued` notification runs on the spawning thread, everything after
 //!   on the job's own thread; because `Queued` is delivered before the thread
 //!   starts, a subscriber sees each job strictly in lifecycle order: Queued
-//!   → Running → progress… → terminal.
+//!   → Running → progress/boundary… → terminal.
 //! - **`Instant`, not `SystemTime`.** Timestamps exist to render elapsed
 //!   time and to order pruning — both monotonic concerns; wall-clock time
 //!   can jump under NTP. Nothing here persists across runs, so wall time
@@ -124,6 +128,13 @@ pub struct JobSnapshot {
     /// sanitized to one line and at most [`MAX_JOB_LABEL_BYTES`] UTF-8 bytes.
     pub label: String,
     pub state: JobState,
+    /// Whether [`JobManager::cancel`] still accepts cancellation for this job.
+    ///
+    /// This is `true` while a queued/running job is in cancellable preparation
+    /// (including after a request has already been accepted), and becomes
+    /// `false` when [`JobContext::try_begin_commit`] wins the ordered boundary.
+    /// Every terminal snapshot is non-cancellable.
+    pub cancellable: bool,
     /// `0.0..=1.0` when the job reports progress; `None` for indeterminate.
     /// Snaps to `Some(1.0)` on [`JobState::Done`] if the job ever reported;
     /// Failed/Cancelled keep the last reported value.
@@ -132,8 +143,9 @@ pub struct JobSnapshot {
     /// [`JobState::Failed`], or the result summary after [`JobState::Done`],
     /// sanitized to at most [`MAX_JOB_DETAIL_BYTES`] UTF-8 bytes.
     pub detail: String,
-    /// A cancel was requested but the job hasn't exited yet — render as
-    /// "cancelling…". Stays set on the terminal snapshot of cancelled jobs.
+    /// Cancellation was accepted but the job hasn't exited yet — render as
+    /// "cancelling…". Stays set on the terminal snapshot even when a panic
+    /// makes that snapshot Failed rather than Cancelled.
     pub cancel_requested: bool,
     /// When [`spawn`](JobManager::spawn) registered the job (threads start
     /// immediately, so this is run start for practical purposes).
@@ -147,7 +159,7 @@ pub struct JobSnapshot {
 /// APIs that retain `Send + Sync + 'static` callbacks. It intentionally
 /// exposes no cancellation authority. A token may outlive both the
 /// [`JobContext`] and the job: after the job reaches a terminal state it
-/// continues to report whether cancellation was ever requested.
+/// continues to report whether cancellation was ever accepted.
 #[derive(Clone)]
 pub struct CancellationToken {
     flag: Arc<AtomicBool>,
@@ -158,7 +170,9 @@ impl CancellationToken {
         Self { flag }
     }
 
-    /// True once [`JobManager::cancel`] was called for this job.
+    /// True once [`JobManager::cancel`] accepted cancellation for this job.
+    /// A request rejected after [`JobContext::try_begin_commit`] leaves this
+    /// false.
     ///
     /// This check is lock-free and uses [`Ordering::Relaxed`]. The flag is
     /// only a historical cancellation signal; it neither publishes nor
@@ -201,10 +215,30 @@ impl JobContext {
         self.cancellation.clone()
     }
 
-    /// True once [`JobManager::cancel`] was called for this job. Lock-free;
-    /// check it as often as an inner loop likes.
+    /// True once [`JobManager::cancel`] accepted cancellation for this job.
+    /// Lock-free; check it as often as an inner loop likes.
     pub fn cancelled(&self) -> bool {
         self.cancellation.cancelled()
+    }
+
+    /// Atomically leave cancellable preparation and begin irreversible commit.
+    ///
+    /// Call this immediately before the first operation that cannot safely be
+    /// rolled back (for example, a SQLite commit, file publication, or export
+    /// finalization). It is ordered against [`JobManager::cancel`] by the same
+    /// registry mutex, so exactly one side wins:
+    ///
+    /// - `false`: cancellation was already accepted, or the job is
+    ///   unexpectedly missing/terminal. The caller must skip commit.
+    /// - `true`: cancellation is closed for this job. Every later cancel
+    ///   request is rejected without changing the token or snapshot.
+    ///
+    /// Repeated calls by the same still-running job are idempotently `true`
+    /// after the first successful call and do not emit duplicate snapshots.
+    /// The first successful call publishes a snapshot with
+    /// [`JobSnapshot::cancellable`] set to `false`.
+    pub fn try_begin_commit(&self) -> bool {
+        self.shared.try_begin_commit(self.id)
     }
 }
 
@@ -226,9 +260,11 @@ impl JobManager {
     }
 
     /// Run `work` on its own named thread ("job: {label}", truncated). The
-    /// closure's `Ok(summary)` / `Err(reason)` becomes the final detail. If
-    /// the job was cancelled before it returned, the state is `Cancelled`
-    /// regardless of the return — the flag decides, not the value.
+    /// closure's `Ok(summary)` / `Err(reason)` becomes the final detail. A
+    /// cancellation accepted before the boundary makes a non-panicking return
+    /// `Cancelled` regardless of `Ok`/`Err`; after
+    /// [`JobContext::try_begin_commit`] succeeds, later cancellation is
+    /// rejected and the closure result decides the state.
     pub fn spawn(
         &self,
         label: impl Into<String>,
@@ -244,6 +280,7 @@ impl JobManager {
                 id,
                 label: label.clone(),
                 state: JobState::Queued,
+                cancellable: true,
                 progress: None,
                 detail: String::new(),
                 cancel_requested: false,
@@ -253,6 +290,7 @@ impl JobManager {
             inner.jobs.push(Job {
                 snap: snap.clone(),
                 cancel: cancel.clone(),
+                cancellation_open: true,
             });
             (snap, inner.subscribers.clone())
         };
@@ -317,26 +355,28 @@ impl JobManager {
         id
     }
 
-    /// Cooperative cancel: flips the job's flag; the job exits at its next
-    /// [`JobContext::cancelled`] check. Returns `false` for unknown or
-    /// already-finished jobs.
+    /// Cooperative cancel during a job's preparation phase. When accepted,
+    /// flips the job's flag; the job exits at its next
+    /// [`JobContext::cancelled`] check. Returns `false` for unknown, terminal,
+    /// or commit-phase jobs.
     ///
     /// No subscriber notification fires here — the request doesn't change
     /// the job's state, and an out-of-band event from the canceller's thread
     /// could be delivered after the job's own terminal event and wedge a UI
     /// on a stale "cancelling" row. The request is visible immediately via
     /// [`get`](Self::get) / [`snapshot`](Self::snapshot)
-    /// (`cancel_requested`), and to subscribers in the eventual `Cancelled`
-    /// terminal event.
+    /// (`cancel_requested`), and to subscribers in the eventual terminal
+    /// event.
     pub fn cancel(&self, id: JobId) -> bool {
         let mut inner = self.shared.inner.lock().expect("job registry lock");
         let Some(index) = inner.index_of(id) else {
             return false;
         };
         let job = &mut inner.jobs[index];
-        if job.snap.state.is_terminal() {
+        if job.snap.state.is_terminal() || !job.cancellation_open {
             return false;
         }
+        debug_assert!(job.snap.cancellable);
         job.cancel.store(true, Ordering::Relaxed);
         job.snap.cancel_requested = true;
         true
@@ -413,9 +453,50 @@ struct Inner {
 struct Job {
     snap: JobSnapshot,
     cancel: Arc<AtomicBool>,
+    /// Guarded by `Shared::inner`; the ordering point shared by cancellation
+    /// requests and `JobContext::try_begin_commit`.
+    cancellation_open: bool,
 }
 
 impl Shared {
+    /// Close cancellation under the same mutex used by `JobManager::cancel`,
+    /// then publish the boundary snapshot after dropping the guard.
+    fn try_begin_commit(&self, id: JobId) -> bool {
+        let (snapshot, subscribers) = {
+            let mut inner = self.inner.lock().expect("job registry lock");
+            let Some(index) = inner.index_of(id) else {
+                // A context should only call this while its job is registered,
+                // but missing/terminal must fail closed: never publish without
+                // winning the ordered boundary.
+                return false;
+            };
+            let job = &mut inner.jobs[index];
+            if job.snap.state.is_terminal() {
+                return false;
+            }
+
+            let flag = job.cancel.load(Ordering::Relaxed);
+            debug_assert_eq!(flag, job.snap.cancel_requested);
+            if flag || job.snap.cancel_requested {
+                return false;
+            }
+
+            debug_assert_eq!(job.cancellation_open, job.snap.cancellable);
+            if !job.cancellation_open {
+                // The same live context already won. Preserve idempotence
+                // without producing a second boundary notification.
+                return true;
+            }
+
+            job.cancellation_open = false;
+            job.snap.cancellable = false;
+            (job.snap.clone(), inner.subscribers.clone())
+        };
+
+        deliver_to_subscribers(&snapshot, &subscribers);
+        true
+    }
+
     /// Mutate one job under the lock, then deliver the resulting snapshot to
     /// every subscriber **after** the guard is dropped (callbacks may
     /// re-enter the registry freely). Terminal transitions prune — the job
@@ -429,6 +510,11 @@ impl Shared {
             };
             let job = &mut inner.jobs[index];
             mutate(job);
+            if job.snap.state.is_terminal() {
+                job.cancellation_open = false;
+                job.snap.cancellable = false;
+            }
+            debug_assert_eq!(job.cancellation_open, job.snap.cancellable);
             let snapshot = job.snap.clone();
             if snapshot.state.is_terminal() {
                 inner.prune_finished();
@@ -571,6 +657,12 @@ mod tests {
                 continue;
             }
             let terminal = snapshot.state.is_terminal();
+            if terminal {
+                assert!(
+                    !snapshot.cancellable,
+                    "terminal job {id} still accepts cancellation"
+                );
+            }
             events.push(snapshot);
             if terminal {
                 return events;
@@ -714,6 +806,320 @@ mod tests {
         drop(manager);
         assert!(!uncancelled.cancelled());
         assert!(cancelled.cancelled());
+    }
+
+    #[test]
+    fn cancellation_wins_before_commit_boundary_and_prevents_commit() {
+        let (manager, rx) = manager_with_events();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (boundary_tx, boundary_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let committed = Arc::new(AtomicBool::new(false));
+        let committed_in_job = Arc::clone(&committed);
+        let id = manager.spawn("cancel before commit", move |ctx| {
+            let token = ctx.cancellation_token();
+            ready_tx.send(()).unwrap();
+            resume_rx.recv().unwrap();
+
+            let may_commit = ctx.try_begin_commit();
+            boundary_tx
+                .send((may_commit, ctx.cancelled(), token.cancelled()))
+                .unwrap();
+            if may_commit {
+                committed_in_job.store(true, Ordering::Relaxed);
+            }
+            finish_rx.recv().unwrap();
+            Ok("preparation stopped".into())
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("job did not reach cancellable preparation");
+        let running = manager.get(id).unwrap();
+        assert_eq!(running.state, JobState::Running);
+        assert!(running.cancellable);
+        assert!(!running.cancel_requested);
+
+        assert!(manager.cancel(id));
+        let requested = manager.get(id).unwrap();
+        assert!(requested.cancellable);
+        assert!(requested.cancel_requested);
+        resume_tx.send(()).unwrap();
+
+        assert_eq!(
+            boundary_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("job did not attempt commit"),
+            (false, true, true)
+        );
+        let still_cancelled = manager.get(id).unwrap();
+        assert_eq!(still_cancelled.state, JobState::Running);
+        assert!(still_cancelled.cancellable);
+        assert!(still_cancelled.cancel_requested);
+        assert!(!committed.load(Ordering::Relaxed));
+        finish_tx.send(()).unwrap();
+
+        let history = wait_history(&rx, id);
+        let states: Vec<JobState> = history.iter().map(|event| event.state).collect();
+        assert_eq!(
+            states,
+            [JobState::Queued, JobState::Running, JobState::Cancelled]
+        );
+        let terminal = history.last().unwrap();
+        assert!(terminal.cancel_requested);
+    }
+
+    #[test]
+    fn commit_boundary_wins_before_cancel_and_preserves_false_token() {
+        let (manager, rx) = manager_with_events();
+        let (boundary_tx, boundary_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let (observed_tx, observed_rx) = mpsc::channel();
+        let committed = Arc::new(AtomicBool::new(false));
+        let committed_in_job = Arc::clone(&committed);
+        let id = manager.spawn("commit before cancel", move |ctx| {
+            let token = ctx.cancellation_token();
+            assert!(ctx.try_begin_commit());
+            boundary_tx.send(token.clone()).unwrap();
+            resume_rx.recv().unwrap();
+            observed_tx
+                .send((ctx.cancelled(), token.cancelled()))
+                .unwrap();
+            committed_in_job.store(true, Ordering::Relaxed);
+            Ok("published".into())
+        });
+
+        let token = boundary_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("job did not cross commit boundary");
+        let committing = manager.get(id).unwrap();
+        assert_eq!(committing.state, JobState::Running);
+        assert!(!committing.cancellable);
+        assert!(!committing.cancel_requested);
+        assert!(!token.cancelled());
+
+        assert!(!manager.cancel(id));
+        assert!(!manager.cancel(id));
+        assert!(!token.cancelled());
+        let after_rejection = manager.get(id).unwrap();
+        assert!(!after_rejection.cancellable);
+        assert!(!after_rejection.cancel_requested);
+
+        resume_tx.send(()).unwrap();
+        assert_eq!(
+            observed_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("job did not report post-boundary cancellation state"),
+            (false, false)
+        );
+        let terminal = wait_history(&rx, id).pop().unwrap();
+        assert_eq!(terminal.state, JobState::Done);
+        assert!(!terminal.cancel_requested);
+        assert!(committed.load(Ordering::Relaxed));
+        assert!(!token.cancelled());
+    }
+
+    #[test]
+    fn cancel_and_commit_boundary_race_has_exactly_one_winner() {
+        const ROUNDS: usize = 128;
+
+        let (manager, rx) = manager_with_events();
+        for round in 0..ROUNDS {
+            let start = Arc::new(std::sync::Barrier::new(3));
+            let worker_start = Arc::clone(&start);
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (boundary_tx, boundary_rx) = mpsc::channel();
+            let id = manager.spawn(format!("commit race {round}"), move |ctx| {
+                ready_tx.send(()).unwrap();
+                worker_start.wait();
+                let boundary_won = ctx.try_begin_commit();
+                boundary_tx.send(boundary_won).unwrap();
+                Ok(if boundary_won {
+                    "committed".into()
+                } else {
+                    "cancelled".into()
+                })
+            });
+
+            ready_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("worker did not reach race gate");
+            let cancel_manager = manager.clone();
+            let canceller_start = Arc::clone(&start);
+            let canceller = thread::spawn(move || {
+                canceller_start.wait();
+                cancel_manager.cancel(id)
+            });
+
+            start.wait();
+            let boundary_won = boundary_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("worker did not report race result");
+            let cancel_won = canceller.join().expect("canceller panicked");
+            assert_eq!(
+                boundary_won, !cancel_won,
+                "round {round}: cancel={cancel_won}, boundary={boundary_won}"
+            );
+
+            let terminal = wait_history(&rx, id).pop().unwrap();
+            assert_eq!(
+                terminal.state,
+                if boundary_won {
+                    JobState::Done
+                } else {
+                    JobState::Cancelled
+                },
+                "round {round}"
+            );
+            assert_eq!(terminal.cancel_requested, cancel_won, "round {round}");
+        }
+    }
+
+    #[test]
+    fn failure_and_panic_after_commit_boundary_remain_failed() {
+        let (manager, rx) = manager_with_events();
+
+        let (failure_ready_tx, failure_ready_rx) = mpsc::channel();
+        let (fail_tx, fail_rx) = mpsc::channel();
+        let failure_id = manager.spawn("post-commit failure", move |ctx| {
+            assert!(ctx.try_begin_commit());
+            failure_ready_tx.send(ctx.cancellation_token()).unwrap();
+            fail_rx.recv().unwrap();
+            Err("publication failed".into())
+        });
+        let failure_token = failure_ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("failure job did not cross commit boundary");
+        assert!(!manager.cancel(failure_id));
+        assert!(!failure_token.cancelled());
+        fail_tx.send(()).unwrap();
+        let failed = wait_history(&rx, failure_id).pop().unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        assert_eq!(failed.detail, "publication failed");
+        assert!(!failed.cancel_requested);
+        assert!(!failure_token.cancelled());
+
+        let (panic_ready_tx, panic_ready_rx) = mpsc::channel();
+        let (panic_tx, panic_rx) = mpsc::channel();
+        let panic_id = manager.spawn("post-commit panic", move |ctx| {
+            assert!(ctx.try_begin_commit());
+            panic_ready_tx.send(ctx.cancellation_token()).unwrap();
+            panic_rx.recv().unwrap();
+            panic!("post-commit panic");
+        });
+        let panic_token = panic_ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("panic job did not cross commit boundary");
+        assert!(!manager.cancel(panic_id));
+        assert!(!panic_token.cancelled());
+        panic_tx.send(()).unwrap();
+        let panicked = wait_history(&rx, panic_id).pop().unwrap();
+        assert_eq!(panicked.state, JobState::Failed);
+        assert_eq!(panicked.detail, "panicked: post-commit panic");
+        assert!(!panicked.cancel_requested);
+        assert!(!panic_token.cancelled());
+    }
+
+    #[test]
+    fn commit_boundary_is_idempotent_and_emits_one_exact_transition() {
+        let (manager, rx) = manager_with_events();
+        let (calls_tx, calls_rx) = mpsc::channel();
+        let id = manager.spawn("idempotent commit", move |ctx| {
+            let first = ctx.try_begin_commit();
+            let second = ctx.try_begin_commit();
+            calls_tx.send((first, second)).unwrap();
+            Ok("published".into())
+        });
+
+        assert_eq!(
+            calls_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("job did not report boundary calls"),
+            (true, true)
+        );
+        let history = wait_history(&rx, id);
+        let states: Vec<JobState> = history.iter().map(|event| event.state).collect();
+        assert_eq!(
+            states,
+            [
+                JobState::Queued,
+                JobState::Running,
+                JobState::Running,
+                JobState::Done,
+            ]
+        );
+        let cancellable: Vec<bool> = history.iter().map(|event| event.cancellable).collect();
+        assert_eq!(cancellable, [true, true, false, false]);
+        assert!(history.iter().all(|snapshot| !snapshot.cancel_requested));
+        assert_eq!(
+            history
+                .iter()
+                .filter(|snapshot| snapshot.state == JobState::Running && !snapshot.cancellable)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn commit_boundary_subscribers_are_reentrant_and_panic_isolated() {
+        let manager = JobManager::new();
+        manager.subscribe(|snapshot| {
+            if snapshot.label == "boundary subscribers"
+                && snapshot.state == JobState::Running
+                && !snapshot.cancellable
+            {
+                panic!("boundary subscriber failed");
+            }
+        });
+
+        let reentrant_manager = manager.clone();
+        let (reentrant_tx, reentrant_rx) = mpsc::channel();
+        manager.subscribe(move |snapshot| {
+            if snapshot.label == "boundary subscribers"
+                && snapshot.state == JobState::Running
+                && !snapshot.cancellable
+            {
+                let get_saw_closed = reentrant_manager
+                    .get(snapshot.id)
+                    .is_some_and(|stored| !stored.cancellable);
+                let list_saw_closed = reentrant_manager
+                    .snapshot()
+                    .iter()
+                    .any(|stored| stored.id == snapshot.id && !stored.cancellable);
+                let cancel_was_rejected = !reentrant_manager.cancel(snapshot.id);
+                let _ = reentrant_tx.send((get_saw_closed, list_saw_closed, cancel_was_rejected));
+            }
+        });
+
+        let (healthy_tx, healthy_rx) = mpsc::channel();
+        manager.subscribe(move |snapshot| {
+            let _ = healthy_tx.send(snapshot);
+        });
+
+        let id = manager.spawn("boundary subscribers", |ctx| {
+            assert!(ctx.try_begin_commit());
+            Ok("published".into())
+        });
+        assert_eq!(
+            reentrant_rx
+                .recv_timeout(Duration::from_secs(10))
+                .expect("boundary subscriber deadlocked or was suppressed"),
+            (true, true, true)
+        );
+
+        let history = wait_history(&healthy_rx, id);
+        let states: Vec<JobState> = history.iter().map(|event| event.state).collect();
+        assert_eq!(
+            states,
+            [
+                JobState::Queued,
+                JobState::Running,
+                JobState::Running,
+                JobState::Done,
+            ]
+        );
+        assert_eq!(manager.get(id).unwrap().state, JobState::Done);
     }
 
     #[test]
