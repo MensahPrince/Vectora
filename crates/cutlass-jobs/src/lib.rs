@@ -40,9 +40,10 @@
 //!   can jump under NTP. Nothing here persists across runs, so wall time
 //!   buys nothing.
 //! - **Bounded.** Labels and details are sanitized to fixed byte caps, and
-//!   finished jobs beyond the newest [`KEEP_FINISHED`] are pruned (by
-//!   *finish* time — a long export that just ended is recent news even if it
-//!   was spawned first). Running jobs are never pruned.
+//!   successful structured outputs are validated against deliberately small
+//!   count/name/value caps. Finished jobs beyond the newest [`KEEP_FINISHED`]
+//!   are pruned (by *finish* time — a long export that just ended is recent
+//!   news even if it was spawned first). Running jobs are never pruned.
 //! - **Panic containment.** A panicking job is caught (`catch_unwind`) and
 //!   becomes [`JobState::Failed`] with a `panicked: …` detail — one bad
 //!   export must not take down the app. Panic wins over cancellation: a job
@@ -74,6 +75,160 @@ pub const MAX_JOB_LABEL_BYTES: usize = 256;
 /// ellipsis within this cap. Controls and line separators are replaced with
 /// spaces so every retained detail is safe to render as one line.
 pub const MAX_JOB_DETAIL_BYTES: usize = 4096;
+
+/// Maximum number of structured outputs retained for one successful job.
+///
+/// Job-list consumers may read many jobs at once, so this count is a
+/// performance and response-size bound rather than a serialization detail.
+pub const MAX_JOB_OUTPUTS: usize = 8;
+
+/// Maximum ASCII byte length of a structured output name.
+///
+/// Names must also match `[a-z][a-z0-9_]*`.
+pub const MAX_JOB_OUTPUT_NAME_BYTES: usize = 64;
+
+/// Maximum UTF-8 byte length of a structured output value.
+///
+/// Values are exact machine-readable strings: invalid values are rejected,
+/// never sanitized or truncated.
+pub const MAX_JOB_OUTPUT_VALUE_BYTES: usize = 512;
+
+/// One validated, immutable structured result from a successful job.
+///
+/// Names match `[a-z][a-z0-9_]*`; values are one line and contain no control
+/// characters or Unicode line separators. Empty values are allowed so a
+/// producer can distinguish an intentionally empty result from an absent key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobOutput {
+    name: String,
+    value: String,
+}
+
+impl JobOutput {
+    /// Validate and construct one structured output without truncation.
+    pub fn new(
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, JobCompletionError> {
+        let name = name.into();
+        let value = value.into();
+        validate_output_name(&name)?;
+        validate_output_value(&value)?;
+        Ok(Self { name, value })
+    }
+
+    /// Stable machine-readable output name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Exact machine-readable output value.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+/// Successful job result: a human detail plus small structured outputs.
+///
+/// The detail remains unsanitized while work is running and is sanitized
+/// exactly once when the terminal snapshot is published. Outputs are
+/// validated eagerly and retained exactly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobCompletion {
+    detail: String,
+    outputs: Vec<JobOutput>,
+}
+
+impl JobCompletion {
+    /// Start a successful completion with no structured outputs.
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Add one validated output, rejecting duplicates and count overflow.
+    ///
+    /// This consuming builder supports direct chaining. Its error converts to
+    /// `String`, so `?` also works inside a [`JobManager::spawn_with_completion`]
+    /// closure.
+    pub fn with_output(
+        mut self,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Result<Self, JobCompletionError> {
+        let output = JobOutput::new(name, value)?;
+        if self
+            .outputs
+            .iter()
+            .any(|existing| existing.name == output.name)
+        {
+            return Err(JobCompletionError::DuplicateName);
+        }
+        if self.outputs.len() >= MAX_JOB_OUTPUTS {
+            return Err(JobCompletionError::TooManyOutputs);
+        }
+        self.outputs.push(output);
+        Ok(self)
+    }
+
+    /// Human-readable completion detail, sanitized only at publication.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+
+    /// Validated outputs in builder insertion order.
+    pub fn outputs(&self) -> &[JobOutput] {
+        &self.outputs
+    }
+}
+
+/// Typed validation failure while constructing a [`JobOutput`] or
+/// [`JobCompletion`].
+///
+/// Variants carry no input text, and every display message is bounded, so
+/// hostile names or values are never reflected into logs or job failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobCompletionError {
+    /// The output name was empty.
+    EmptyName,
+    /// The output name exceeded [`MAX_JOB_OUTPUT_NAME_BYTES`].
+    NameTooLong,
+    /// The output name did not match `[a-z][a-z0-9_]*`.
+    InvalidName,
+    /// The output value exceeded [`MAX_JOB_OUTPUT_VALUE_BYTES`].
+    ValueTooLong,
+    /// The output value contained a control or line-separator character.
+    InvalidValue,
+    /// The completion already contained an output with this name.
+    DuplicateName,
+    /// The completion already contained [`MAX_JOB_OUTPUTS`] outputs.
+    TooManyOutputs,
+}
+
+impl fmt::Display for JobCompletionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::EmptyName => "job output name must not be empty",
+            Self::NameTooLong => "job output name exceeds 64 ASCII bytes",
+            Self::InvalidName => "job output name must match [a-z][a-z0-9_]*",
+            Self::ValueTooLong => "job output value exceeds 512 UTF-8 bytes",
+            Self::InvalidValue => "job output value must be one line without control characters",
+            Self::DuplicateName => "job completion contains a duplicate output name",
+            Self::TooManyOutputs => "job completion exceeds 8 structured outputs",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for JobCompletionError {}
+
+impl From<JobCompletionError> for String {
+    fn from(error: JobCompletionError) -> Self {
+        error.to_string()
+    }
+}
 
 /// Registry-unique job handle. Ids come from a per-manager counter and are
 /// never reused, so a stale id (a pruned job) reads as unknown rather than
@@ -143,6 +298,12 @@ pub struct JobSnapshot {
     /// [`JobState::Failed`], or the result summary after [`JobState::Done`],
     /// sanitized to at most [`MAX_JOB_DETAIL_BYTES`] UTF-8 bytes.
     pub detail: String,
+    /// Validated machine-readable results, atomically published only on
+    /// [`JobState::Done`] from [`JobManager::spawn_with_completion`].
+    ///
+    /// Queued, Running, Failed, Cancelled, panicked, and thread-spawn-failed
+    /// snapshots always contain an empty vector.
+    pub outputs: Vec<JobOutput>,
     /// Cancellation was accepted but the job hasn't exited yet — render as
     /// "cancelling…". Stays set on the terminal snapshot even when a panic
     /// makes that snapshot Failed rather than Cancelled.
@@ -270,6 +431,21 @@ impl JobManager {
         label: impl Into<String>,
         work: impl FnOnce(&JobContext) -> Result<String, String> + Send + 'static,
     ) -> JobId {
+        self.spawn_with_completion(label, move |context| work(context).map(JobCompletion::new))
+    }
+
+    /// Run work that can return bounded structured outputs on success.
+    ///
+    /// Lifecycle, cancellation, progress, event ordering, pruning, thread
+    /// naming, and detail sanitization are identical to [`spawn`](Self::spawn).
+    /// Outputs are atomically included only in the terminal Done snapshot. An
+    /// accepted cancellation discards a returned completion's outputs; failed,
+    /// panicked, and thread-spawn-failed jobs publish none.
+    pub fn spawn_with_completion(
+        &self,
+        label: impl Into<String>,
+        work: impl FnOnce(&JobContext) -> Result<JobCompletion, String> + Send + 'static,
+    ) -> JobId {
         let label = sanitize_label(&label.into());
         let id = JobId(self.shared.next_id.fetch_add(1, Ordering::Relaxed));
         let cancel = Arc::new(AtomicBool::new(false));
@@ -283,6 +459,7 @@ impl JobManager {
                 cancellable: true,
                 progress: None,
                 detail: String::new(),
+                outputs: Vec::new(),
                 cancel_requested: false,
                 started: Instant::now(),
                 finished: None,
@@ -309,17 +486,24 @@ impl JobManager {
             .spawn(move || {
                 shared.update(id, |job| job.snap.state = JobState::Running);
                 let result = catch_unwind(AssertUnwindSafe(|| work(&context)));
-                let (base_state, detail, panicked) = match result {
+                let (base_state, detail, outputs, panicked) = match result {
                     // Panic wins over cancellation: a job that blows up on
                     // the way out is a bug to surface, not a clean stop.
                     Err(payload) => (
                         JobState::Failed,
-                        sanitize_detail(&format!("panicked: {}", panic_message(&*payload))),
+                        format!("panicked: {}", panic_message(&*payload)),
+                        Vec::new(),
                         true,
                     ),
-                    Ok(Ok(summary)) => (JobState::Done, sanitize_detail(&summary), false),
-                    Ok(Err(reason)) => (JobState::Failed, sanitize_detail(&reason), false),
+                    Ok(Ok(completion)) => {
+                        (JobState::Done, completion.detail, completion.outputs, false)
+                    }
+                    Ok(Err(reason)) => (JobState::Failed, reason, Vec::new(), false),
                 };
+                // Normalize caller-sized text before taking the global
+                // registry lock. The bounded result is still published
+                // atomically with terminal state and structured outputs.
+                let detail = sanitize_detail(&detail);
                 shared.update(id, |job| {
                     // Decide under the same registry lock as `cancel`: if
                     // cancellation wins the race before this terminal write,
@@ -333,6 +517,11 @@ impl JobManager {
                     };
                     job.snap.state = state;
                     job.snap.detail = detail;
+                    if state == JobState::Done {
+                        job.snap.outputs = outputs;
+                    } else {
+                        job.snap.outputs.clear();
+                    }
                     job.snap.finished = Some(Instant::now());
                     if state == JobState::Done {
                         // A progress-reporting job that completed is 100%
@@ -349,6 +538,7 @@ impl JobManager {
             self.shared.update(id, |job| {
                 job.snap.state = JobState::Failed;
                 job.snap.detail = detail;
+                job.snap.outputs.clear();
                 job.snap.finished = Some(Instant::now());
             });
         }
@@ -560,6 +750,37 @@ impl Inner {
 const MAX_THREAD_NAME_BYTES: usize = 32;
 const ELLIPSIS: char = '…';
 
+fn validate_output_name(name: &str) -> Result<(), JobCompletionError> {
+    if name.is_empty() {
+        return Err(JobCompletionError::EmptyName);
+    }
+    if name.len() > MAX_JOB_OUTPUT_NAME_BYTES {
+        return Err(JobCompletionError::NameTooLong);
+    }
+    let bytes = name.as_bytes();
+    if !bytes[0].is_ascii_lowercase()
+        || !bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+    {
+        return Err(JobCompletionError::InvalidName);
+    }
+    Ok(())
+}
+
+fn validate_output_value(value: &str) -> Result<(), JobCompletionError> {
+    if value.len() > MAX_JOB_OUTPUT_VALUE_BYTES {
+        return Err(JobCompletionError::ValueTooLong);
+    }
+    if value
+        .chars()
+        .any(|character| character.is_control() || matches!(character, '\u{2028}' | '\u{2029}'))
+    {
+        return Err(JobCompletionError::InvalidValue);
+    }
+    Ok(())
+}
+
 fn sanitize_label(label: &str) -> String {
     sanitize_text(label, MAX_JOB_LABEL_BYTES)
 }
@@ -692,6 +913,306 @@ mod tests {
             value.push_str("动画🦀");
         }
         value
+    }
+
+    #[test]
+    fn structured_output_boundaries_are_exact_and_values_are_not_rewritten() {
+        let max_name = format!("a{}", "z".repeat(MAX_JOB_OUTPUT_NAME_BYTES - 1));
+        let max_ascii_value = "v".repeat(MAX_JOB_OUTPUT_VALUE_BYTES);
+        let max_unicode_value = "é".repeat(MAX_JOB_OUTPUT_VALUE_BYTES / 2);
+        assert_eq!(max_unicode_value.len(), MAX_JOB_OUTPUT_VALUE_BYTES);
+
+        let empty = JobOutput::new("empty_value", "").expect("empty values are intentional");
+        assert_eq!(empty.name(), "empty_value");
+        assert_eq!(empty.value(), "");
+
+        let ascii = JobOutput::new(max_name.clone(), max_ascii_value.clone())
+            .expect("exact name/value bounds");
+        assert_eq!(ascii.name(), max_name);
+        assert_eq!(ascii.value(), max_ascii_value);
+
+        let unicode =
+            JobOutput::new("unicode", max_unicode_value.clone()).expect("exact UTF-8 byte bound");
+        assert_eq!(unicode.value(), max_unicode_value);
+
+        assert_eq!(
+            JobOutput::new(format!("{max_name}z"), "").unwrap_err(),
+            JobCompletionError::NameTooLong
+        );
+        assert_eq!(
+            JobOutput::new("value", format!("{max_ascii_value}v")).unwrap_err(),
+            JobCompletionError::ValueTooLong
+        );
+        assert_eq!(
+            JobOutput::new("value", format!("{max_unicode_value}a")).unwrap_err(),
+            JobCompletionError::ValueTooLong
+        );
+    }
+
+    #[test]
+    fn structured_output_rejects_invalid_names_and_multiline_or_control_values() {
+        assert_eq!(
+            JobOutput::new("", "").unwrap_err(),
+            JobCompletionError::EmptyName
+        );
+        for name in [
+            "0key",
+            "_key",
+            "Content_key",
+            "content-key",
+            "content.key",
+            "content key",
+            "contentKey",
+            "contenț",
+        ] {
+            assert_eq!(
+                JobOutput::new(name, "").unwrap_err(),
+                JobCompletionError::InvalidName,
+                "accepted invalid name {name:?}"
+            );
+        }
+        for name in ["a", "a0", "content_key", "analyzer_version", "z_9"] {
+            JobOutput::new(name, "").expect("valid output name");
+        }
+
+        for value in [
+            "line\nbreak",
+            "line\rbreak",
+            "tab\tvalue",
+            "nul\0value",
+            "delete\u{7f}",
+            "next\u{85}line",
+            "separator\u{2028}value",
+            "paragraph\u{2029}value",
+        ] {
+            assert_eq!(
+                JobOutput::new("value", value).unwrap_err(),
+                JobCompletionError::InvalidValue,
+                "accepted invalid value {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn completion_rejects_duplicate_names_and_output_count_overflow() {
+        let mut completion = JobCompletion::new("indexed transcript");
+        for index in 0..MAX_JOB_OUTPUTS {
+            completion = completion
+                .with_output(format!("output_{index}"), index.to_string())
+                .expect("output at count bound");
+        }
+        assert_eq!(completion.outputs().len(), MAX_JOB_OUTPUTS);
+
+        assert_eq!(
+            completion
+                .clone()
+                .with_output("output_0", "replacement")
+                .unwrap_err(),
+            JobCompletionError::DuplicateName
+        );
+        assert_eq!(
+            completion.with_output("overflow", "8").unwrap_err(),
+            JobCompletionError::TooManyOutputs
+        );
+    }
+
+    #[test]
+    fn completion_validation_errors_are_bounded_and_never_echo_input() {
+        const HOSTILE: &str = "HOSTILE_INPUT_MUST_NOT_APPEAR";
+        for error in [
+            JobCompletionError::EmptyName,
+            JobCompletionError::NameTooLong,
+            JobCompletionError::InvalidName,
+            JobCompletionError::ValueTooLong,
+            JobCompletionError::InvalidValue,
+            JobCompletionError::DuplicateName,
+            JobCompletionError::TooManyOutputs,
+        ] {
+            assert!(
+                error.to_string().len() <= 80,
+                "unbounded validation error: {error}"
+            );
+        }
+
+        let errors = [
+            JobOutput::new(format!("a{}{HOSTILE}", "x".repeat(64)), "").unwrap_err(),
+            JobOutput::new(format!("A{HOSTILE}"), "").unwrap_err(),
+            JobOutput::new("value", format!("{HOSTILE}\n")).unwrap_err(),
+            JobOutput::new("value", format!("{HOSTILE}{}", "x".repeat(512))).unwrap_err(),
+            JobCompletion::new("detail")
+                .with_output("same", "first")
+                .unwrap()
+                .with_output("same", HOSTILE)
+                .unwrap_err(),
+        ];
+
+        for error in errors {
+            let message = error.to_string();
+            assert!(message.len() <= 80, "unbounded validation error: {message}");
+            assert!(!message.contains(HOSTILE), "error reflected hostile input");
+        }
+    }
+
+    #[test]
+    fn ordinary_spawn_completes_with_empty_outputs() {
+        let (manager, rx) = manager_with_events();
+        let id = manager.spawn("ordinary", |_| Ok("complete".into()));
+        let history = wait_history(&rx, id);
+
+        assert_eq!(history.last().unwrap().state, JobState::Done);
+        assert!(history.iter().all(|snapshot| snapshot.outputs.is_empty()));
+        assert!(manager.get(id).unwrap().outputs.is_empty());
+    }
+
+    #[test]
+    fn structured_completion_outputs_appear_only_in_terminal_done_snapshot() {
+        let (manager, rx) = manager_with_events();
+        let id = manager.spawn_with_completion("structured", |context| {
+            context.set_progress(0.5, "indexing");
+            let completion = JobCompletion::new("indexed\ntranscript");
+            assert_eq!(completion.detail(), "indexed\ntranscript");
+            Ok(completion
+                .with_output("content_key", "transcript:clip-7")?
+                .with_output("segment_count", "12")?)
+        });
+        let history = wait_history(&rx, id);
+
+        assert_eq!(
+            history
+                .iter()
+                .map(|snapshot| snapshot.state)
+                .collect::<Vec<_>>(),
+            [
+                JobState::Queued,
+                JobState::Running,
+                JobState::Running,
+                JobState::Done,
+            ]
+        );
+        assert!(
+            history[..history.len() - 1]
+                .iter()
+                .all(|snapshot| snapshot.outputs.is_empty())
+        );
+        let done = history.last().unwrap();
+        assert_eq!(done.detail, "indexed transcript");
+        assert_eq!(
+            done.outputs,
+            [
+                JobOutput::new("content_key", "transcript:clip-7").unwrap(),
+                JobOutput::new("segment_count", "12").unwrap(),
+            ]
+        );
+        assert_eq!(manager.get(id).unwrap().outputs, done.outputs);
+    }
+
+    #[test]
+    fn accepted_cancellation_discards_returned_completion_outputs() {
+        let (manager, rx) = manager_with_events();
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let id = manager.spawn_with_completion("cancel outputs", move |_| {
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(JobCompletion::new("prepared").with_output("content_key", "must-not-publish")?)
+        });
+
+        ready_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("job did not reach cancellation gate");
+        assert!(manager.get(id).unwrap().outputs.is_empty());
+        assert!(manager.cancel(id));
+        release_tx.send(()).unwrap();
+
+        let history = wait_history(&rx, id);
+        let terminal = history.last().unwrap();
+        assert_eq!(terminal.state, JobState::Cancelled);
+        assert!(terminal.outputs.is_empty());
+        assert!(history.iter().all(|snapshot| snapshot.outputs.is_empty()));
+        assert!(manager.get(id).unwrap().outputs.is_empty());
+    }
+
+    #[test]
+    fn commit_boundary_and_rejected_late_cancel_preserve_outputs() {
+        let (manager, rx) = manager_with_events();
+        let (committing_tx, committing_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let id = manager.spawn_with_completion("commit outputs", move |context| {
+            assert!(context.try_begin_commit());
+            committing_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            Ok(JobCompletion::new("published").with_output("content_key", "committed")?)
+        });
+
+        committing_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("job did not cross commit boundary");
+        let committing = manager.get(id).unwrap();
+        assert_eq!(committing.state, JobState::Running);
+        assert!(!committing.cancellable);
+        assert!(committing.outputs.is_empty());
+        assert!(!manager.cancel(id));
+        release_tx.send(()).unwrap();
+
+        let history = wait_history(&rx, id);
+        assert!(
+            history[..history.len() - 1]
+                .iter()
+                .all(|snapshot| snapshot.outputs.is_empty())
+        );
+        let terminal = history.last().unwrap();
+        assert_eq!(terminal.state, JobState::Done);
+        assert_eq!(
+            terminal.outputs,
+            [JobOutput::new("content_key", "committed").unwrap()]
+        );
+    }
+
+    #[test]
+    fn structured_failure_and_panic_publish_no_outputs() {
+        let (manager, rx) = manager_with_events();
+        let failed_id = manager.spawn_with_completion("structured failure", |context| {
+            assert!(context.try_begin_commit());
+            Err("publication failed".into())
+        });
+        let failed = wait_history(&rx, failed_id);
+        assert_eq!(failed.last().unwrap().state, JobState::Failed);
+        assert!(failed.iter().all(|snapshot| snapshot.outputs.is_empty()));
+
+        let panic_id = manager.spawn_with_completion(
+            "structured panic",
+            |context| -> Result<JobCompletion, String> {
+                assert!(context.try_begin_commit());
+                panic!("publication panicked");
+            },
+        );
+        let panicked = wait_history(&rx, panic_id);
+        assert_eq!(panicked.last().unwrap().state, JobState::Failed);
+        assert!(panicked.iter().all(|snapshot| snapshot.outputs.is_empty()));
+    }
+
+    #[test]
+    fn retained_output_snapshots_are_immutable_clones() {
+        let (manager, rx) = manager_with_events();
+        let id = manager.spawn_with_completion("clone outputs", |_| {
+            Ok(JobCompletion::new("done").with_output("content_key", "stable")?)
+        });
+        let terminal = wait_history(&rx, id).pop().unwrap();
+        assert_eq!(terminal.outputs.len(), 1);
+
+        let mut fetched = manager.get(id).unwrap();
+        fetched.outputs.clear();
+        assert!(fetched.outputs.is_empty());
+        assert_eq!(manager.get(id).unwrap().outputs, terminal.outputs);
+
+        let mut listed = manager.snapshot();
+        listed
+            .iter_mut()
+            .find(|snapshot| snapshot.id == id)
+            .unwrap()
+            .outputs
+            .clear();
+        assert_eq!(manager.get(id).unwrap().outputs, terminal.outputs);
     }
 
     #[test]
