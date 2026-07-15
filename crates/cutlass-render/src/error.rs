@@ -43,8 +43,12 @@ pub enum RenderError {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
-    /// An observed export was cancelled by its progress callback. The output
-    /// file was not finalized; callers should treat it as garbage.
+    /// An observed export was cancelled by its progress callback.
+    ///
+    /// Convenience file exports clean their private staging output and leave
+    /// the requested destination untouched. Generic exports using a
+    /// caller-owned encoder do not finalize it, so that encoder's output
+    /// remains caller-managed.
     #[error("export cancelled")]
     Cancelled,
 }

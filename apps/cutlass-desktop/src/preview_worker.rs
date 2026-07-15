@@ -6408,8 +6408,6 @@ fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: E
                     }
                 }
                 Err(RenderError::Cancelled) => {
-                    // The half-written file is junk; don't leave it behind.
-                    let _ = std::fs::remove_file(&path);
                     info!(path = %path.display(), "export job cancelled");
                     ExportUiState {
                         failed: true,
@@ -6418,8 +6416,6 @@ fn start_export(engine: &Engine, ui: &UiSink, state: &ExportJobState, request: E
                     }
                 }
                 Err(e) => {
-                    // An errored output was never finalized — same junk.
-                    let _ = std::fs::remove_file(&path);
                     error!(path = %path.display(), "export job failed: {e}");
                     ExportUiState {
                         failed: true,

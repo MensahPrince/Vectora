@@ -63,7 +63,7 @@ fn run_export(
     shared: &ExportShared,
 ) -> Result<u64, RenderError> {
     let mut renderer = Renderer::new_headless()?;
-    let result = export_to_file_observed(
+    export_to_file_observed(
         &mut renderer,
         &project,
         &path,
@@ -73,13 +73,7 @@ fn run_export(
             shared.frames_total.store(total, Ordering::Relaxed);
             !shared.cancel.load(Ordering::Relaxed)
         },
-    );
-    if result.is_err() {
-        // A cancelled/failed output was never finalized — don't leave the
-        // corpse for the shell to mistake for a finished movie.
-        let _ = std::fs::remove_file(&path);
-    }
-    result
+    )
 }
 
 /// Start exporting the session's current project to the file at `path_utf8`

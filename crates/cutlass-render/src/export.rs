@@ -6,9 +6,11 @@
 //! composited [`RgbaImage`] as a packed-RGBA [`VideoFrame`], and feeds the
 //! [`cutlass_core::VideoEncoder`] trait. The codec/container is whatever encoder
 //! you pass. [`export_to_file`] is the batteries-included path: it opens the
-//! platform-native encoder (H.264→mp4 on Apple) for you. For a portable,
-//! codec-free output there is [`PngSequenceEncoder`] below, which writes one PNG
-//! per frame (handy for tests, previews, and CI).
+//! platform-native encoder (H.264→mp4 on Apple) in a sibling staging directory
+//! and atomically publishes a complete file, preserving any prior destination
+//! on failure or cancellation. For a portable, codec-free output there is
+//! [`PngSequenceEncoder`] below, which writes one PNG per frame (handy for
+//! tests, previews, and CI).
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -26,6 +28,7 @@ use crate::export_audio::{
 };
 use crate::render::Renderer;
 use crate::resolve::canvas_size;
+use crate::transactional_file::TransactionalFile;
 
 /// Output shape of an export: pixel size and frame sampling rate. The
 /// defaults ([`ExportSettings::for_project`]) reproduce the project exactly;
@@ -62,16 +65,22 @@ impl ExportSettings {
 
 /// Per-frame export observer: called with `(frames_done, frames_total)` before
 /// each frame is rendered and once more after the encoder is finalized.
-/// Returning `false` cancels the export ([`RenderError::Cancelled`]); the
-/// output is left unfinalized and should be discarded by the caller.
+/// Returning `false` cancels the export ([`RenderError::Cancelled`]).
+/// [`export_to_file_observed`] discards its private staging output and leaves
+/// the requested destination untouched. With [`export_observed`], the
+/// caller-owned encoder's unfinalized output remains caller-managed.
 pub type ExportObserver<'a> = &'a mut dyn FnMut(u64, u64) -> bool;
 
 /// Composite the whole timeline and encode it to a video file at `path`, using
 /// the platform-native encoder (H.264/mp4 on Apple). Returns the frame count.
 ///
 /// Convenience over [`export`]: builds the right [`EncoderConfig`] from the
-/// project and opens the native encoder for you. On platforms without a native
-/// encoder this returns [`RenderError::Encode`].
+/// project and opens the native encoder for you. Publication is transactional:
+/// encoding happens in a unique sibling staging directory, then a complete,
+/// synchronized file atomically replaces `path`. Cancellation or failure leaves
+/// an existing destination byte-for-byte unchanged (or an absent destination
+/// absent). On platforms without a native encoder this returns
+/// [`RenderError::Encode`].
 pub fn export_to_file(
     renderer: &mut Renderer,
     project: &Project,
@@ -87,7 +96,8 @@ pub fn export_to_file(
 }
 
 /// [`export_to_file`] with explicit output settings and a progress/cancel
-/// observer — the export-job path behind the shells' export sheets.
+/// observer — the export-job path behind the shells' export sheets. It has the
+/// same transactional destination semantics as [`export_to_file`].
 pub fn export_to_file_observed(
     renderer: &mut Renderer,
     project: &Project,
@@ -96,8 +106,15 @@ pub fn export_to_file_observed(
     observer: ExportObserver<'_>,
 ) -> Result<u64, RenderError> {
     let settings = settings.evened();
-    let mut encoder = cutlass_encoder::open_encoder(path, export_config_with(project, settings))?;
-    export_observed(renderer, project, encoder.as_mut(), settings, observer)
+    let staging = TransactionalFile::new(path)?;
+    let mut encoder = cutlass_encoder::open_encoder(
+        staging.staging_path(),
+        export_config_with(project, settings),
+    )?;
+    let frames = export_observed(renderer, project, encoder.as_mut(), settings, observer)?;
+    drop(encoder);
+    staging.publish()?;
+    Ok(frames)
 }
 
 /// Composite every frame of `project` and push it to `encoder`, returning the
@@ -131,7 +148,9 @@ pub fn export(
 /// (so `(0, total)` announces the length up front) and once more with
 /// `(total, total)` after the encoder is finalized. Returning `false` stops
 /// the export with [`RenderError::Cancelled`] *without* finalizing the
-/// encoder: a cancelled output file is garbage and the caller should delete it.
+/// encoder. Because this generic API does not own the encoder or its output,
+/// cancellation cleanup remains the caller's responsibility. The transactional
+/// staging guarantees of [`export_to_file_observed`] do not apply here.
 pub fn export_observed(
     renderer: &mut Renderer,
     project: &Project,

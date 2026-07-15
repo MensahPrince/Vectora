@@ -24,6 +24,7 @@ mod lut_pack;
 mod render;
 mod resolve;
 mod scene;
+mod transactional_file;
 
 pub use cutlass_compositor::FrameSink;
 pub use cutlass_core::RgbaImage;
