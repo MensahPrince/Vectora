@@ -1,5 +1,8 @@
 #[path = "../src/agent_vision.rs"]
 mod agent_vision;
+#[allow(dead_code)]
+#[path = "../src/timeline_map.rs"]
+mod timeline_map;
 
 use std::path::Path;
 
@@ -127,6 +130,7 @@ fn constructing_the_service_does_not_require_a_gpu() {
     let _default = AgentVision::default();
     let _project_frame = AgentVision::project_frame;
     let _asset_frame = AgentVision::asset_frame;
+    let _media_pool_sheet = AgentVision::media_pool_sheet;
 }
 
 fn assert_single_full_source_project(project: &Project, source: &MediaSource) {

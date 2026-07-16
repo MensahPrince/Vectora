@@ -6,8 +6,10 @@
 //! bridge's group markers wrap the run, failed individual commands are
 //! reported back to the model (which may correct course), and the group
 //! rolls back only when the prompt aborts (cancellation, provider error,
-//! cap exceeded). In dry-run mode nothing is applied; the validated plan
-//! comes back for the UI's preview card.
+//! turn or host-call cap exceeded). Reaching the edit cap is gentler:
+//! further edits are refused and the run ends keeping everything already
+//! applied. In dry-run mode nothing is applied; the validated plan comes
+//! back for the UI's preview card.
 //!
 //! Beyond edits, the embedder can wire a [`ToolHost`] of app tools, while
 //! the bridge can expose strictly read-only senses of its exact project
@@ -25,7 +27,9 @@ use cutlass_commands::EditOutcome;
 
 use crate::describe::{EditorContext, ProjectSummary};
 use crate::extend::AgentExtensions;
-use crate::provider::{ChatProvider, ChatRequest, FinishReason, ImagePart, Message, ProviderError};
+use crate::provider::{
+    ChatProvider, ChatRequest, FinishReason, ImagePart, Message, ProviderError, ProviderStreamEvent,
+};
 use crate::tools::{HostToolSpec, ToolHost, is_host_tool_name};
 use crate::wire::{self, WireCommand};
 
@@ -101,6 +105,8 @@ pub trait EngineBridge {
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// Hard cap on edit-tool calls per prompt (the runaway-loop fuse).
+    /// Reaching it does not fail the prompt: over-cap edits are refused
+    /// and the run completes keeping the edits already applied.
     pub max_tool_calls: usize,
     /// Hard cap on host-tool calls per prompt. A separate fuse: senses
     /// and app control must not starve editing, nor the reverse.
@@ -122,10 +128,10 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_tool_calls: 32,
-            max_host_calls: 24,
-            max_turns: 16,
-            max_images: 8,
+            max_tool_calls: 1000,
+            max_host_calls: 200,
+            max_turns: 200,
+            max_images: 25,
             max_image_bytes: 24 * 1024 * 1024,
             dry_run: false,
         }
@@ -146,6 +152,8 @@ pub struct ActionLogEntry {
 pub enum AgentEvent {
     /// Assistant text, as it streams.
     TextDelta(String),
+    /// A provider-generated reasoning summary, kept out of model history.
+    ReasoningDelta(String),
     /// An edit was applied (or validated, in dry-run).
     Action(ActionLogEntry),
     /// A host tool ran; `summary` is the first line of its output.
@@ -242,6 +250,16 @@ pub fn system_prompt(
          overlay lanes above it, text lanes on top. Put primary footage \
          on the main track and prefer reusing existing lanes over adding \
          new ones.\n\
+         - Imported media in the project state's media pool is ready to \
+         use even when no timeline clip references it. add_clip is the \
+         operation that places media-pool footage on the timeline. An \
+         empty timeline is a starting point, not a missing capability: \
+         reuse a compatible track when one exists, or call add_track first \
+         (the first video track becomes main), read the returned track id, \
+         then add clips. For open-ended creative work, inspect the media \
+         and choose the sequence, source ranges, placements, and timing \
+         yourself. Never ask the user to pre-place footage or claim that \
+         media-pool placement is unsupported.\n\
          - If a tool call is rejected, read the error and correct course; \
          do not repeat the identical call.\n\
          - The state below is a fresh snapshot of the project as it is \
@@ -257,7 +275,10 @@ pub fn system_prompt(
          and ids before any further edit that depends on them: recompute, \
          do not assume, and do not give up. Name clips and tracks by id \
          and content so answers stay checkable; if the state cannot \
-         answer a question, say what is missing instead of guessing.\n\
+         answer a question, say what is missing instead of guessing. \
+         Unknown source-footage content is not missing project state: \
+         when media inspection tools are available, use them instead of \
+         declining the task or asking the user to place footage first.\n\
          - Clips on one track can never overlap, and a clip can only grow \
          into free space. To lengthen a clip or insert into a packed \
          track, first make room: move or shift the later clips on that \
@@ -289,11 +310,19 @@ fn engine_sense_rules(specs: &[HostToolSpec]) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(
-        "\n\nRehearsal senses ({names}) inspect the current sandbox, including edits already \
-         completed in this prompt. Before finalizing visual or timing work, use the cheapest \
-         relevant sense to verify it: prefer a schematic timeline map for placement and timing, \
-         and a composited preview frame only when appearance or layering matters. Inspect source \
-         assets when their content is uncertain. Never claim a check succeeded if a sense failed."
+        "\n\nRehearsal senses ({names}) inspect the complete current project snapshot and sandbox, \
+         including edits already completed in this prompt. Source footage is available through \
+         these senses: do not claim that you cannot browse or verify it without attempting the \
+         relevant sense. Open-ended creative requests such as freestyle edits, montages, or \
+         \"make something interesting\" are fully actionable. Survey the media pool with \
+         media_pool_sheet when it is listed, inspect promising sources with media_asset_strip, \
+         then use visual evidence and editorial judgment to make concrete edits rather than \
+         declining or asking the user to choose placements and ranges. Media-pool sources need no \
+         pre-placement: when the timeline is empty, create the required tracks with add_track and \
+         build the sequence with add_clip. Before finalizing visual or timing work, use the \
+         cheapest relevant sense to verify it: prefer a schematic timeline map for placement and \
+         timing, and a composited preview frame only when appearance or layering matters. Never \
+         claim a check succeeded if a sense failed."
     )
 }
 
@@ -427,6 +456,10 @@ pub fn run_prompt_with_host(
     let mut phase_breaks: Vec<usize> = Vec::new();
     let mut edit_calls = 0usize;
     let mut host_calls = 0usize;
+    // Set when an edit call lands past `max_tool_calls`: the run ends after
+    // the current turn's calls are answered, keeping everything applied,
+    // rather than burning turns until the turn cap rolls the prompt back.
+    let mut edit_cap_tripped = false;
     let mut final_text = String::new();
     // The first image-bearing tool result is appended after the current user
     // message. Images are surfaced only after the whole request budget has run,
@@ -464,7 +497,14 @@ pub fn run_prompt_with_host(
         }
         image_event_cursor = messages.len();
         let turn = {
-            let mut forward = |delta: &str| on_event(AgentEvent::TextDelta(delta.to_string()));
+            let mut forward = |event: ProviderStreamEvent<'_>| match event {
+                ProviderStreamEvent::TextDelta(delta) => {
+                    on_event(AgentEvent::TextDelta(delta.to_string()));
+                }
+                ProviderStreamEvent::ReasoningSummaryDelta(delta) => {
+                    on_event(AgentEvent::ReasoningDelta(delta.to_string()));
+                }
+            };
             match provider.chat(
                 &ChatRequest {
                     messages: &messages,
@@ -631,14 +671,20 @@ pub fn run_prompt_with_host(
             } else {
                 edit_calls += 1;
                 if edit_calls > config.max_tool_calls {
-                    return abort(
-                        bridge,
-                        actions,
-                        format!(
-                            "exceeded the {}-edit cap for one prompt",
+                    // The runaway fuse is not a failure: edits already applied
+                    // stay, this and further edit calls are refused, and the
+                    // run ends after this turn's calls are answered.
+                    edit_cap_tripped = true;
+                    messages.push(Message::ToolResult {
+                        call_id: call.id,
+                        content: format!(
+                            "rejected: reached the {}-edit cap for one prompt; the edits \
+                             already applied are kept",
                             config.max_tool_calls
                         ),
-                    );
+                        images,
+                    });
+                    continue;
                 }
                 match WireCommand::from_tool_call(&call.name, call.arguments.clone()) {
                     Err(reason) => format!("rejected: {reason}"),
@@ -673,6 +719,16 @@ pub fn run_prompt_with_host(
                 content: result,
                 images,
             });
+        }
+
+        if edit_cap_tripped {
+            final_text = format!(
+                "Reached the {}-edit cap for one prompt; kept the {} edit{} already applied.",
+                config.max_tool_calls,
+                actions.len(),
+                if actions.len() == 1 { "" } else { "s" }
+            );
+            break;
         }
 
         if _turn + 1 == config.max_turns {
@@ -1426,6 +1482,13 @@ mod tests {
         assert!(prompt.contains("answer directly from"));
         // The re-inspect rule: after edits, read the new state, don't give up.
         assert!(prompt.contains("call describe_project to read the new"));
+        // Unknown footage content is fetchable, not grounds to refuse.
+        assert!(prompt.contains("Unknown source-footage content is not missing project state"));
+        assert!(prompt.contains("instead of declining the task"));
+        // An empty timeline can be constructed directly from media-pool items.
+        assert!(prompt.contains("add_clip is the operation that places media-pool footage"));
+        assert!(prompt.contains("An empty timeline is a starting point"));
+        assert!(prompt.contains("Never ask the user to pre-place footage"));
         // The overlap rule: make room before growing into a packed track.
         assert!(prompt.contains("Clips on one track can never overlap"));
         // No extensions ⇒ no rules or skills sections.
@@ -1458,6 +1521,32 @@ mod tests {
         assert!(prompt.contains("podcast-cleanup (Podcast cleanup): Clean up a talk recording."));
         // Only the index enters the prompt — bodies load through read_skill.
         assert!(!prompt.contains("SECRET BODY"));
+    }
+
+    #[test]
+    fn engine_sense_rules_make_open_ended_creative_work_actionable() {
+        let rules = engine_sense_rules(&[
+            HostToolSpec {
+                name: "media_pool_sheet".into(),
+                description: "Survey imported visual media.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                tier: crate::tools::ToolTier::ReadOnly,
+            },
+            HostToolSpec {
+                name: "media_asset_strip".into(),
+                description: "Inspect one source over time.".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                tier: crate::tools::ToolTier::ReadOnly,
+            },
+        ]);
+
+        assert!(rules.contains("complete current project snapshot"));
+        assert!(rules.contains("freestyle edits"));
+        assert!(rules.contains("media_pool_sheet"));
+        assert!(rules.contains("media_asset_strip"));
+        assert!(rules.contains("rather than declining"));
+        assert!(rules.contains("create the required tracks with add_track"));
+        assert!(rules.contains("build the sequence with add_clip"));
     }
 
     #[test]

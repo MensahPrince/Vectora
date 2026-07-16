@@ -156,6 +156,7 @@ fn fixture() -> (EngineHost, u64, u64, u64) {
 fn tool_turn(calls: Vec<(&str, &str, serde_json::Value)>) -> ChatTurn {
     ChatTurn {
         text: String::new(),
+        reasoning_summary: String::new(),
         tool_calls: calls
             .into_iter()
             .map(|(id, name, arguments)| ToolCall {
@@ -171,6 +172,7 @@ fn tool_turn(calls: Vec<(&str, &str, serde_json::Value)>) -> ChatTurn {
 fn text_turn(text: &str) -> ChatTurn {
     ChatTurn {
         text: text.to_string(),
+        reasoning_summary: String::new(),
         tool_calls: Vec::new(),
         finish: FinishReason::Stop,
     }
@@ -532,7 +534,7 @@ fn model_corrects_course_after_a_rejection() {
 }
 
 #[test]
-fn cap_trip_rolls_the_whole_prompt_back() {
+fn cap_trip_keeps_the_edits_already_applied() {
     let (mut host, _, _, clip) = fixture();
     let provider = ScriptedProvider::new(vec![tool_turn(vec![
         (
@@ -559,17 +561,21 @@ fn cap_trip_rolls_the_whole_prompt_back() {
         &config,
     );
 
-    match &outcome.status {
-        PromptStatus::Aborted(reason) => assert!(reason.contains("1-edit cap"), "{reason}"),
-        other => panic!("expected abort, got {other:?}"),
-    }
-    // The split that did apply was rolled back; nothing remains.
-    assert_eq!(host.engine.project().timeline().clip_count(), 1);
-    assert_eq!(host.engine.project().timeline().track_count(), 1);
-    assert!(
-        !host.engine.undo(),
-        "a rolled-back prompt leaves no history"
+    // The cap does not fail the prompt: the run completes keeping the
+    // in-cap edits, refusing the rest.
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert!(outcome.text.contains("1-edit cap"), "{}", outcome.text);
+    assert_eq!(outcome.actions.len(), 1, "only the in-cap edit applied");
+    assert_eq!(host.engine.project().timeline().clip_count(), 2);
+    assert_eq!(
+        host.engine.project().timeline().track_count(),
+        1,
+        "the over-cap add_track was refused"
     );
+    // The kept edits are one undoable history entry, like any prompt.
+    assert!(host.engine.undo());
+    assert_eq!(host.engine.project().timeline().clip_count(), 1);
+    assert!(!host.engine.undo(), "exactly one history entry per prompt");
 }
 
 #[test]
@@ -729,6 +735,90 @@ fn describe_project_feeds_state_back_without_counting_as_an_edit() {
 }
 
 #[test]
+fn reasoning_summaries_stream_across_tool_rounds_without_entering_history() {
+    let (mut host, _, _, clip) = fixture();
+    let first_summary = "I should inspect the current timeline.";
+    let second_summary = "The selected clip can be split safely.";
+    let final_summary = "The edit succeeded, so I can answer.";
+    let provider = ScriptedProvider::new(vec![
+        ChatTurn {
+            text: String::new(),
+            reasoning_summary: first_summary.into(),
+            tool_calls: vec![ToolCall {
+                id: "inspect".into(),
+                name: "describe_project".into(),
+                arguments: serde_json::json!({}),
+            }],
+            finish: FinishReason::ToolCalls,
+        },
+        ChatTurn {
+            text: String::new(),
+            reasoning_summary: second_summary.into(),
+            tool_calls: vec![ToolCall {
+                id: "edit".into(),
+                name: "split_clip".into(),
+                arguments: serde_json::json!({"clip": clip, "at": 5.0}),
+            }],
+            finish: FinishReason::ToolCalls,
+        },
+        ChatTurn {
+            text: "Split the clip at 5 seconds.".into(),
+            reasoning_summary: final_summary.into(),
+            tool_calls: Vec::new(),
+            finish: FinishReason::Stop,
+        },
+    ]);
+
+    let (outcome, events) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "split the clip after inspecting it",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 1);
+    assert_eq!(host.engine.project().timeline().clip_count(), 2);
+    let summaries = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ReasoningDelta(delta) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(summaries, [first_summary, second_summary, final_summary]);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Action(_)))
+    );
+    assert!(events.iter().any(|event| {
+        matches!(event, AgentEvent::TextDelta(delta) if delta == "Split the clip at 5 seconds.")
+    }));
+
+    let requests = provider.requests();
+    for message in requests
+        .iter()
+        .flatten()
+        .chain(outcome.turn_messages.iter())
+    {
+        let content = match message {
+            Message::System { content }
+            | Message::User { content, .. }
+            | Message::Assistant { content, .. }
+            | Message::ToolResult { content, .. } => content,
+        };
+        for summary in [first_summary, second_summary, final_summary] {
+            assert!(
+                !content.contains(summary),
+                "reasoning summary leaked into model history: {content}"
+            );
+        }
+    }
+}
+
+#[test]
 fn dry_run_collects_the_plan_without_touching_the_engine() {
     let (mut host, _, _, clip) = fixture();
     let provider = ScriptedProvider::new(vec![
@@ -783,7 +873,7 @@ impl cutlass_ai::provider::ChatProvider for TitleAddingModel {
         &self,
         request: &cutlass_ai::provider::ChatRequest<'_>,
         _cancel: &AtomicBool,
-        _on_text: &mut dyn FnMut(&str),
+        _on_event: &mut dyn FnMut(cutlass_ai::provider::ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, cutlass_ai::provider::ProviderError> {
         let last = request.messages.last().unwrap();
         Ok(match last {
@@ -869,7 +959,7 @@ impl cutlass_ai::provider::ChatProvider for AudioExtractingModel {
         &self,
         request: &cutlass_ai::provider::ChatRequest<'_>,
         _cancel: &AtomicBool,
-        _on_text: &mut dyn FnMut(&str),
+        _on_event: &mut dyn FnMut(cutlass_ai::provider::ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, cutlass_ai::provider::ProviderError> {
         let last = request.messages.last().unwrap();
         Ok(match last {
@@ -1970,7 +2060,10 @@ fn engine_sense_observes_rehearsed_edits_and_returns_images() {
     let Message::System { content } = &requests[0][0] else {
         panic!("first message should be the system prompt");
     };
-    assert!(content.contains("inspect the current sandbox"), "{content}");
+    assert!(
+        content.contains("inspect the complete current project snapshot and sandbox"),
+        "{content}"
+    );
     assert!(content.contains("schematic timeline map"), "{content}");
     assert!(content.contains("media_screenshot_preview"), "{content}");
     assert_eq!(
@@ -1996,6 +2089,69 @@ fn engine_sense_observes_rehearsed_edits_and_returns_images() {
     )));
     assert!(events.iter().any(
         |event| matches!(event, AgentEvent::Image(image) if image.label == "sandbox preview")
+    ));
+}
+
+#[test]
+fn media_pool_sheet_sense_dispatches_and_survives_the_image_budget() {
+    let (mut host, _, _, _) = fixture();
+    host.sense_specs = vec![host_spec("media_pool_sheet")];
+    host.sense_outputs.push_back(Ok(ToolOutput {
+        text: "Media-pool contact sheet page 1 of 2.".into(),
+        images: vec![ImagePart::png(
+            vec![0x89, 0x50, 0x4e, 0x47],
+            "media pool sheet page 1 of 2",
+        )],
+    }));
+    let provider = ScriptedProvider::new(vec![
+        tool_turn(vec![(
+            "call_1",
+            "media_pool_sheet",
+            serde_json::json!({ "page": 1, "max_width": 1024 }),
+        )]),
+        text_turn("I found footage for the freestyle edit."),
+    ]);
+    let config = AgentConfig {
+        max_images: 1,
+        max_image_bytes: 16,
+        ..AgentConfig::default()
+    };
+
+    let (outcome, events) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "freestyle an edit from my media library",
+        &config,
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(
+        host.sense_calls,
+        vec![(
+            "media_pool_sheet".into(),
+            serde_json::json!({ "page": 1, "max_width": 1024 })
+        )]
+    );
+    let requests = provider.requests();
+    let Message::System { content } = &requests[0][0] else {
+        panic!("first message should be the system prompt");
+    };
+    assert!(content.contains("freestyle edits"), "{content}");
+    assert!(content.contains("media_pool_sheet"), "{content}");
+    match requests[1].last().unwrap() {
+        Message::ToolResult {
+            content, images, ..
+        } => {
+            assert_eq!(content, "Media-pool contact sheet page 1 of 2.");
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].label, "media pool sheet page 1 of 2");
+            assert_eq!(*images[0].data, vec![0x89, 0x50, 0x4e, 0x47]);
+        }
+        other => panic!("expected media-pool sheet result, got {other:?}"),
+    }
+    assert!(events.iter().any(
+        |event| matches!(event, AgentEvent::Image(image) if image.label == "media pool sheet page 1 of 2")
     ));
 }
 

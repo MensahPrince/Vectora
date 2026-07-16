@@ -1,0 +1,48 @@
+---
+description: File size limits and module-splitting conventions for Rust and Slint
+alwaysApply: true
+---
+
+# File Size & Module Organization
+
+Large files are expensive to read, review, and reason about. Keep them small and split them predictably.
+
+## Limits
+
+- **Soft target: ≤ 500 lines.** Aim for this when writing new code or when a natural split presents itself.
+- **Hard ceiling: 1000 lines.** No file may cross it. If an edit would push a file past 1000 lines, split **before** adding the new code.
+- Applies to Rust (`.rs`) and Slint (`.slint`) alike. Generated code is exempt.
+
+## How to split
+
+Prefer, in order:
+
+1. **Extract tests** into a child module file. This is zero-risk and keeps private access:
+
+```
+scrub.rs          // `#[cfg(test)] mod tests;` at the bottom
+scrub/
+  tests.rs        // `use super::*;` — still a unit test, sees private items
+```
+
+2. **Split by responsibility** — pull a cohesive concern (parsing, validation, IO, wire types) into a sibling module.
+3. **Promote to a domain folder** when a module is a whole domain: keep `foo.rs` as the coordinator declaring submodules, move parts into `foo/*.rs`.
+
+Never split mechanically at a line count — every extracted module must be a coherent responsibility with a name that describes it.
+
+## Rules for split commits
+
+- A split is a **pure move**: code is relocated verbatim, no renames, no cleanup, no drive-by fixes. One file split per commit.
+- Preserve the public API of the parent module via `pub use` re-exports so callers don't churn.
+- Do not mix splits with feature work. Land the feature, then split, or vice versa.
+
+## Existing oversized files
+
+Many legacy files exceed the ceiling (worst: `preview_worker.rs`). Do **not** launch cleanup sprees. Instead:
+
+- When a task requires substantial edits to an oversized file, propose splitting it first (or extract just the region you're working in).
+- Trivial edits to oversized files are fine as-is.
+
+## Reading large files
+
+When consulting (not editing) a file known to be large, prefer targeted reads: search for the symbol first, then read only the relevant region — do not read 2k+ line files end-to-end.

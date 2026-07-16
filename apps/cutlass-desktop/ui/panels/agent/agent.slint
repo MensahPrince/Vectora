@@ -10,6 +10,7 @@ import {
     CutlassText,
     AccentButton,
     SubtleButton,
+    CutlassDropdown,
 } from "../../components/index.slint";
 import {
     AgentStore,
@@ -221,7 +222,12 @@ component PromptInput inherits Rectangle {
 component TranscriptEntry inherits VerticalLayout {
     in property <AgentEntry> entry;
     in property <bool> offer-undo: false;
+    in property <bool> live-reasoning: false;
     callback undo-clicked();
+
+    private property <bool> reasoning-manually-expanded: false;
+    private property <bool> reasoning-expanded:
+        root.live-reasoning || root.reasoning-manually-expanded;
 
     padding-top: AppStore.theme.metrics.spacing.xs;
     padding-bottom: AppStore.theme.metrics.spacing.xs;
@@ -252,6 +258,84 @@ component TranscriptEntry inherits VerticalLayout {
         wrap: word-wrap;
         style: AppStore.theme.typography.body;
         foreground: AppStore.theme.text.secondary;
+    }
+
+    if entry.kind == "reasoning": reasoning-card := Rectangle {
+        horizontal-stretch: 1;
+        background: AppStore.theme.agent.input-bg;
+        border-width: AppStore.theme.metrics.stroke.hairline;
+        border-color: AppStore.theme.text.muted.with-alpha(0.28);
+        border-radius: AppStore.theme.metrics.radius.sm;
+
+        VerticalLayout {
+            reasoning-header := Rectangle {
+                height: 38px;
+                background: reasoning-header-touch.has-hover
+                    ? AppStore.theme.text.primary.with-alpha(0.04)
+                    : transparent;
+                border-radius: AppStore.theme.metrics.radius.sm;
+
+                HorizontalLayout {
+                    padding-left: AppStore.theme.metrics.spacing.sm;
+                    padding-right: AppStore.theme.metrics.spacing.sm;
+                    spacing: AppStore.theme.metrics.spacing.sm;
+
+                    CutlassText {
+                        width: 12px;
+                        vertical-alignment: center;
+                        horizontal-alignment: center;
+                        text: root.reasoning-expanded ? "▼" : "▶";
+                        style: { size: 9px, weight: 500, italic: false };
+                        foreground: AppStore.theme.text.muted;
+                    }
+
+                    VerticalLayout {
+                        alignment: center;
+
+                        CutlassText {
+                            text: "Reasoning summary";
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+                        CutlassText {
+                            text: "Provider-generated · not raw chain-of-thought";
+                            style: { size: 9px, weight: 400, italic: false };
+                            foreground: AppStore.theme.text.muted;
+                        }
+                    }
+                }
+
+                reasoning-header-touch := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        if (!root.live-reasoning) {
+                            root.reasoning-manually-expanded =
+                                !root.reasoning-manually-expanded;
+                        }
+                    }
+                }
+            }
+
+            if root.reasoning-expanded: Rectangle {
+                height: AppStore.theme.metrics.stroke.hairline;
+                background: AppStore.theme.text.muted.with-alpha(0.18);
+            }
+
+            if root.reasoning-expanded: VerticalLayout {
+                padding-left: AppStore.theme.metrics.spacing.md;
+                padding-right: AppStore.theme.metrics.spacing.md;
+                padding-top: AppStore.theme.metrics.spacing.sm;
+                padding-bottom: AppStore.theme.metrics.spacing.md;
+
+                CutlassText {
+                    horizontal-stretch: 1;
+                    text: entry.text;
+                    wrap: word-wrap;
+                    style: AppStore.theme.typography.caption;
+                    foreground: AppStore.theme.text.secondary;
+                }
+            }
+        }
     }
 
     // Tool-produced screenshots and timeline maps stay inline with the
@@ -368,6 +452,48 @@ export component AgentPanel inherits PanelBase {
             title: "Assistant";
         }
 
+        Rectangle {
+            height: 40px;
+
+            HorizontalLayout {
+                padding-left: AppStore.theme.metrics.spacing.md;
+                padding-right: AppStore.theme.metrics.spacing.md;
+                padding-top: AppStore.theme.metrics.spacing.xs;
+                padding-bottom: AppStore.theme.metrics.spacing.xs;
+                spacing: AppStore.theme.metrics.spacing.sm;
+
+                chat-picker := Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    opacity: AgentStore.running ? 0.35 : 1.0;
+
+                    CutlassDropdown {
+                        width: parent.width;
+                        items: AgentStore.chat-labels;
+                        current: AgentStore.active-chat-label;
+                        placeholder: "Chat history";
+                        selected(label) => {
+                            if (!AgentStore.running) {
+                                AgentStore.select-chat(label);
+                            }
+                        }
+                    }
+
+                    if AgentStore.running: TouchArea {
+                        mouse-cursor: MouseCursor.default;
+                    }
+                }
+
+                SubtleButton {
+                    label: "New chat";
+                    enabled: !AgentStore.running;
+                    clicked => {
+                        AgentStore.new-chat();
+                    }
+                }
+            }
+        }
+
         // Not configured: setup instructions instead of a dead chat box.
         if !AgentStore.configured: VerticalLayout {
             padding: AppStore.theme.metrics.spacing.lg;
@@ -440,6 +566,9 @@ export component AgentPanel inherits PanelBase {
                 for e[idx] in AgentStore.transcript: TranscriptEntry {
                     entry: e;
                     offer-undo: AgentStore.undo-offered && idx == AgentStore.transcript.length - 1;
+                    live-reasoning: AgentStore.running
+                        && idx == AgentStore.transcript.length - 1
+                        && e.kind == "reasoning";
                     undo-clicked => {
                         AgentStore.undo-offered = false;
                         TimelineActions.undo();
@@ -472,12 +601,25 @@ export component AgentPanel inherits PanelBase {
                     style: AppStore.theme.typography.label;
                 }
 
-                CutlassText {
-                    text: AgentStore.approval-detail;
-                    wrap: word-wrap;
-                    mono: true;
-                    style: AppStore.theme.typography.caption;
-                    foreground: AppStore.theme.text.secondary;
+                // Cap detail height so a long shell command / path does not
+                // shove the Run / Decline buttons (or the composer) off-screen.
+                approval-detail-scroll := CutlassScrollView {
+                    height: min(
+                        approval-detail-text.preferred-height,
+                        max(80px, root.height * 25%),
+                    );
+                    viewport-width: self.width;
+                    viewport-height: approval-detail-text.preferred-height;
+                    show-horizontal-scrollbar: false;
+
+                    approval-detail-text := CutlassText {
+                        width: approval-detail-scroll.width;
+                        text: AgentStore.approval-detail;
+                        wrap: word-wrap;
+                        mono: true;
+                        style: AppStore.theme.typography.caption;
+                        foreground: AppStore.theme.text.secondary;
+                    }
                 }
 
                 CutlassText {
@@ -526,11 +668,30 @@ export component AgentPanel inherits PanelBase {
                     style: AppStore.theme.typography.label;
                 }
 
-                for action in AgentStore.plan-actions: CutlassText {
-                    text: "• " + action;
-                    wrap: word-wrap;
-                    style: AppStore.theme.typography.caption;
-                    foreground: AppStore.theme.text.secondary;
+                // Cap the action list so a large plan scrolls inside the
+                // card instead of pushing Apply / Discard and the composer
+                // below the visible panel.
+                plan-list := CutlassScrollView {
+                    height: min(
+                        plan-list-content.preferred-height,
+                        max(120px, root.height * 35%),
+                    );
+                    viewport-width: self.width;
+                    viewport-height: plan-list-content.preferred-height;
+                    show-horizontal-scrollbar: false;
+
+                    plan-list-content := VerticalLayout {
+                        width: plan-list.width;
+                        alignment: start;
+                        spacing: AppStore.theme.metrics.spacing.none;
+
+                        for action in AgentStore.plan-actions: CutlassText {
+                            text: "• " + action;
+                            wrap: word-wrap;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+                    }
                 }
 
                 HorizontalLayout {

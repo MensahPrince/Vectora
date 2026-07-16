@@ -6,6 +6,7 @@
 // One transcript row. `kind` selects the styling:
 //   "user"      — the prompt as sent
 //   "assistant" — model text (streams in)
+//   "reasoning" — provider-generated reasoning summary (display-only)
 //   "action"    — one applied/planned edit, in editor language
 //   "status"    — quiet meta line (plan discarded, …)
 //   "applied"   — edits landed; offers the one-click Undo while fresh
@@ -21,6 +22,11 @@ export struct AgentEntry {
 
 export global AgentStore {
     in-out property <[AgentEntry]> transcript: [];
+    // Parallel chat picker models. Labels are unique display strings; ids
+    // are stable disk identifiers in the matching row.
+    in-out property <[string]> chat-labels: [];
+    in-out property <[string]> chat-ids: [];
+    in-out property <string> active-chat-label: "";
 
     // True from send until the prompt completes/aborts; gates the
     // composer (one prompt at a time) and shows the Stop affordance.
@@ -62,6 +68,10 @@ export global AgentStore {
     callback discard-plan();
     callback approve-system-tool();
     callback deny-system-tool();
+    callback new-chat();
+    // The panel reports the selected display label; Rust resolves it through
+    // the parallel models before asking the worker to load the stable id.
+    callback select-chat(label: string);
     // Session replaced wholesale (open / new / restore): cancel any
     // running prompt and drop a parked plan — both rehearsed against the
     // old project. Fired from app.slint's session-epoch watcher.

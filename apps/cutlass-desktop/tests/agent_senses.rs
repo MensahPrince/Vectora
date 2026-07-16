@@ -8,7 +8,8 @@ mod timeline_map;
 use std::collections::{BTreeSet, HashSet};
 
 use agent_senses::{
-    AgentSenses, MAX_STRIP_FRAMES, parse_preview_request, parse_strip_request, strip_sample_times,
+    AgentSenses, MAX_STRIP_FRAMES, parse_pool_sheet_request, parse_preview_request,
+    parse_strip_request, strip_sample_times,
 };
 use cutlass_ai::ToolTier;
 use cutlass_models::{MediaSource, Project, Rational};
@@ -31,6 +32,7 @@ fn registry_has_exact_unique_read_only_object_specs() {
         [
             "media_timeline_map",
             "media_preview_frame",
+            "media_pool_sheet",
             "media_asset_frame",
             "media_asset_strip",
         ]
@@ -62,10 +64,14 @@ fn registry_has_exact_unique_read_only_object_specs() {
     );
     assert_eq!(
         property_names(&specs[2]),
-        BTreeSet::from(["max_height", "max_width", "media_id", "seconds"])
+        BTreeSet::from(["max_width", "page"])
     );
     assert_eq!(
         property_names(&specs[3]),
+        BTreeSet::from(["max_height", "max_width", "media_id", "seconds"])
+    );
+    assert_eq!(
+        property_names(&specs[4]),
         BTreeSet::from([
             "count",
             "end_seconds",
@@ -75,9 +81,9 @@ fn registry_has_exact_unique_read_only_object_specs() {
             "start_seconds",
         ])
     );
-    assert_eq!(specs[2].parameters["required"], json!(["media_id"]));
+    assert_eq!(specs[3].parameters["required"], json!(["media_id"]));
     assert_eq!(
-        specs[3].parameters["required"],
+        specs[4].parameters["required"],
         json!(["media_id", "start_seconds", "end_seconds"])
     );
     assert!(
@@ -107,6 +113,25 @@ fn empty_project_timeline_map_dispatches_a_labeled_valid_png() {
     assert!(output.text.contains("0 lanes"));
     assert!(output.text.contains("0 clips"));
     assert!(output.text.contains("no playhead requested"));
+}
+
+#[test]
+fn empty_media_pool_sheet_is_cpu_only_labeled_and_valid() {
+    let project = Project::new("empty", FPS);
+    let output = AgentSenses::default()
+        .call(&project, 0.0, "media_pool_sheet", &json!({}))
+        .expect("empty contact sheet needs no renderer");
+
+    assert_eq!(output.images.len(), 1);
+    let image = &output.images[0];
+    assert_eq!(image.media_type, "image/png");
+    assert_eq!(image.label, "media pool sheet page 1 of 1");
+    let decoded = cutlass_render::decode_png(image.data.as_slice()).expect("valid PNG");
+    assert_eq!(decoded.width, 1024);
+    assert!(decoded.is_well_formed());
+    assert!(output.text.contains("page 1 of 1"));
+    assert!(output.text.contains("showing 0 of 0 visual item(s)"));
+    assert!(output.text.contains("Pictured visual media: none"));
 }
 
 #[test]
@@ -173,6 +198,19 @@ fn timeline_and_frame_requests_validate_times_and_dimensions() {
     assert!(parse_preview_request(&json!({}), f64::NAN).is_err());
     assert!(parse_preview_request(&json!({}), f64::INFINITY).is_err());
     assert!(parse_preview_request(&json!({}), -0.1).is_err());
+
+    assert_eq!(parse_pool_sheet_request(&json!({})).unwrap().page, 1);
+    for arguments in [
+        json!({"page": 0}),
+        json!({"page": 1.5}),
+        json!({"max_width": 319}),
+        json!({"max_width": 1025}),
+    ] {
+        assert!(
+            parse_pool_sheet_request(&arguments).is_err(),
+            "accepted {arguments}"
+        );
+    }
 }
 
 #[test]
@@ -281,6 +319,14 @@ fn audio_only_media_is_rejected_before_decoder_or_renderer_startup() {
         strip_error.contains("audio-only"),
         "unexpected error: {strip_error}"
     );
+
+    let sheet = AgentSenses::new()
+        .call(&project, 0.0, "media_pool_sheet", &json!({}))
+        .expect("audio-only pools need no renderer");
+    assert_eq!(sheet.images.len(), 1);
+    assert!(sheet.text.contains("audio-only"));
+    assert!(sheet.text.contains("exist.wav"));
+    assert!(sheet.text.contains("not pictured"));
 }
 
 #[test]

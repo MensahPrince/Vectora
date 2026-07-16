@@ -27,6 +27,10 @@ export global SettingsBackend {
     // --- AI provider ([ai]) --------------------------------------------
     in-out property <string> ai-base-url;
     in-out property <string> ai-model;
+    // "chat_completions" | "responses".
+    in-out property <string> ai-api-protocol: "chat_completions";
+    // "auto" | "off"; only sent by the Responses protocol.
+    in-out property <string> ai-reasoning-summary: "auto";
     in-out property <string> ai-api-key;
     in-out property <string> ai-api-key-env;
     // Route the assistant through the Cutlass account (managed proxy,

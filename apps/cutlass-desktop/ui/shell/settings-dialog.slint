@@ -396,6 +396,53 @@ export component SettingsDialog inherits Rectangle {
                                     }
                                 }
                                 FieldRow {
+                                    label: "API protocol";
+                                    HorizontalLayout {
+                                        spacing: AppStore.theme.metrics.spacing.sm;
+                                        alignment: start;
+
+                                        ModeChip {
+                                            label: "Chat Completions";
+                                            active: SettingsBackend.ai-api-protocol == "chat_completions";
+                                            clicked => {
+                                                SettingsBackend.ai-api-protocol = "chat_completions";
+                                            }
+                                        }
+                                        ModeChip {
+                                            label: "Responses";
+                                            active: SettingsBackend.ai-api-protocol == "responses";
+                                            clicked => {
+                                                SettingsBackend.ai-api-protocol = "responses";
+                                            }
+                                        }
+                                    }
+                                }
+                                if SettingsBackend.ai-api-protocol == "responses": FieldRow {
+                                    label: "Reasoning";
+                                    HorizontalLayout {
+                                        spacing: AppStore.theme.metrics.spacing.sm;
+                                        alignment: start;
+
+                                        ModeChip {
+                                            label: "Show summaries";
+                                            active: SettingsBackend.ai-reasoning-summary == "auto";
+                                            clicked => {
+                                                SettingsBackend.ai-reasoning-summary = "auto";
+                                            }
+                                        }
+                                        ModeChip {
+                                            label: "Off";
+                                            active: SettingsBackend.ai-reasoning-summary == "off";
+                                            clicked => {
+                                                SettingsBackend.ai-reasoning-summary = "off";
+                                            }
+                                        }
+                                    }
+                                }
+                                if SettingsBackend.ai-api-protocol == "responses": Hint {
+                                    text: "Responses supports reasoning models with tools. Summaries are provider-generated, not raw chain-of-thought.";
+                                }
+                                FieldRow {
                                     label: "API key";
                                     CutlassLineInput {
                                         text <=> SettingsBackend.ai-api-key;

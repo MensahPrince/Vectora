@@ -7,12 +7,17 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use cutlass_ai::provider::{ImagePart, Message, ToolCall};
 use serde::{Deserialize, Serialize};
 
 const SESSION_FILE: &str = "agent-session.json";
+#[cfg(test)]
 const TEMP_FILE: &str = ".agent-session.json.tmp";
+const CHAT_DIRECTORY: &str = "agent-chats";
+const CHAT_ID_PREFIX: &str = "chat-";
+const CHAT_TITLE_CHARS: usize = 40;
 const FORMAT_VERSION: u32 = 1;
 const MAX_FILE_SIZE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_HISTORY_MESSAGES: usize = 1_000;
@@ -36,10 +41,101 @@ pub(crate) struct AgentSession {
     pub transcript: Vec<TranscriptEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ChatMeta {
+    pub id: String,
+    pub title: String,
+    pub updated_millis: u64,
+}
+
 /// Return the session sidecar beside `project`, or `None` when it has no
 /// parent directory.
 pub(crate) fn path_for_project(project: &Path) -> Option<PathBuf> {
     project.parent().map(|parent| parent.join(SESSION_FILE))
+}
+
+pub(crate) fn allocate_chat_id(project: &Path) -> Result<String, String> {
+    let directory = chat_directory(project)?;
+    let now = system_time_millis(SystemTime::now());
+    for offset in 0..10_000 {
+        let Some(timestamp) = now.checked_add(offset) else {
+            break;
+        };
+        let id = format!("{CHAT_ID_PREFIX}{timestamp}");
+        if !directory.join(format!("{id}.json")).exists() {
+            return Ok(id);
+        }
+    }
+    Err("could not allocate a unique agent chat id".to_string())
+}
+
+pub(crate) fn list_chats(project: &Path) -> Result<Vec<ChatMeta>, String> {
+    migrate_legacy_session(project)?;
+    let directory = chat_directory(project)?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(format!(
+                "failed to list agent chats '{}': {error}",
+                directory.display()
+            ));
+        }
+    };
+    let mut chats = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "failed to read an agent chat entry in '{}': {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|error| format!("failed to inspect '{}': {error}", path.display()))?
+            .is_file()
+        {
+            continue;
+        }
+        let Some(id) = chat_id_from_path(&path) else {
+            continue;
+        };
+        let metadata = entry
+            .metadata()
+            .map_err(|error| format!("failed to inspect '{}': {error}", path.display()))?;
+        let updated_millis = metadata
+            .modified()
+            .map(system_time_millis)
+            .unwrap_or_default();
+        let title = load_file(&path)
+            .map(|session| chat_title(&session))
+            .unwrap_or_else(|_| "Unreadable chat".to_string());
+        chats.push(ChatMeta {
+            id,
+            title,
+            updated_millis,
+        });
+    }
+    chats.sort_by(|left, right| {
+        right
+            .updated_millis
+            .cmp(&left.updated_millis)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    Ok(chats)
+}
+
+pub(crate) fn load_chat(project: &Path, id: &str) -> Result<AgentSession, String> {
+    migrate_legacy_session(project)?;
+    let path = chat_path(project, id)?;
+    load_file(&path)
+}
+
+pub(crate) fn save_chat(project: &Path, id: &str, session: &AgentSession) -> Result<(), String> {
+    let path = chat_path(project, id)?;
+    let temp_name = format!(".{id}.tmp");
+    save_file(&path, &temp_name, session)
 }
 
 /// Load one draft's session.
@@ -47,9 +143,14 @@ pub(crate) fn path_for_project(project: &Path) -> Option<PathBuf> {
 /// A missing sidecar is an empty session. Files larger than 4 MiB, malformed
 /// JSON, and unsupported versions are rejected. Valid oversized collections
 /// retain only their newest bounded entries.
+#[cfg(test)]
 pub(crate) fn load(project: &Path) -> Result<AgentSession, String> {
     let path = session_path(project)?;
-    let file = match fs::File::open(&path) {
+    load_file(&path)
+}
+
+fn load_file(path: &Path) -> Result<AgentSession, String> {
+    let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(AgentSession::default());
@@ -72,7 +173,7 @@ pub(crate) fn load(project: &Path) -> Result<AgentSession, String> {
         })?
         .len();
     if file_size > MAX_FILE_SIZE_BYTES {
-        return Err(oversize_error(&path, file_size));
+        return Err(oversize_error(path, file_size));
     }
 
     // The metadata check prevents preallocation from an already-large file;
@@ -82,7 +183,7 @@ pub(crate) fn load(project: &Path) -> Result<AgentSession, String> {
         .read_to_end(&mut bytes)
         .map_err(|error| format!("failed to read agent session '{}': {error}", path.display()))?;
     if bytes.len() as u64 > MAX_FILE_SIZE_BYTES {
-        return Err(oversize_error(&path, bytes.len() as u64));
+        return Err(oversize_error(path, bytes.len() as u64));
     }
 
     let header: PersistedSessionHeader = serde_json::from_slice(&bytes).map_err(|error| {
@@ -116,8 +217,13 @@ pub(crate) fn load(project: &Path) -> Result<AgentSession, String> {
 /// The draft directory is created when needed. A complete pretty-printed
 /// document is written to a fixed same-directory temporary file and then
 /// renamed over the prior sidecar.
+#[cfg(test)]
 pub(crate) fn save(project: &Path, session: &AgentSession) -> Result<(), String> {
     let path = session_path(project)?;
+    save_file(&path, TEMP_FILE, session)
+}
+
+fn save_file(path: &Path, temp_name: &str, session: &AgentSession) -> Result<(), String> {
     let parent = path.parent().ok_or_else(|| {
         format!(
             "agent session path '{}' has no parent directory",
@@ -141,7 +247,7 @@ pub(crate) fn save(project: &Path, session: &AgentSession) -> Result<(), String>
         ));
     }
 
-    let temp = parent.join(TEMP_FILE);
+    let temp = parent.join(temp_name);
     if let Err(error) = fs::write(&temp, bytes) {
         let _ = fs::remove_file(&temp);
         return Err(format!(
@@ -149,7 +255,7 @@ pub(crate) fn save(project: &Path, session: &AgentSession) -> Result<(), String>
             temp.display()
         ));
     }
-    if let Err(error) = replace_file(&temp, &path) {
+    if let Err(error) = replace_file(&temp, path) {
         let _ = fs::remove_file(&temp);
         return Err(format!(
             "failed to replace agent session '{}': {error}",
@@ -166,6 +272,89 @@ fn session_path(project: &Path) -> Result<PathBuf, String> {
             project.display()
         )
     })
+}
+
+fn chat_directory(project: &Path) -> Result<PathBuf, String> {
+    project
+        .parent()
+        .map(|parent| parent.join(CHAT_DIRECTORY))
+        .ok_or_else(|| {
+            format!(
+                "cannot locate agent chats for project path '{}': no parent directory",
+                project.display()
+            )
+        })
+}
+
+fn chat_path(project: &Path, id: &str) -> Result<PathBuf, String> {
+    if !valid_chat_id(id) {
+        return Err(format!("invalid agent chat id '{id}'"));
+    }
+    Ok(chat_directory(project)?.join(format!("{id}.json")))
+}
+
+fn valid_chat_id(id: &str) -> bool {
+    id.strip_prefix(CHAT_ID_PREFIX).is_some_and(|suffix| {
+        !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn chat_id_from_path(path: &Path) -> Option<String> {
+    (path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+        .then(|| path.file_stem().and_then(|stem| stem.to_str()))
+        .flatten()
+        .filter(|id| valid_chat_id(id))
+        .map(str::to_owned)
+}
+
+fn migrate_legacy_session(project: &Path) -> Result<(), String> {
+    let legacy = session_path(project)?;
+    let directory = chat_directory(project)?;
+    if directory.exists() || !legacy.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(&directory).map_err(|error| {
+        format!(
+            "failed to create agent chat directory '{}': {error}",
+            directory.display()
+        )
+    })?;
+    let id = allocate_chat_id(project)?;
+    let destination = chat_path(project, &id)?;
+    if let Err(error) = fs::rename(&legacy, &destination) {
+        let _ = fs::remove_dir(&directory);
+        return Err(format!(
+            "failed to migrate agent session '{}' to '{}': {error}",
+            legacy.display(),
+            destination.display()
+        ));
+    }
+    Ok(())
+}
+
+fn chat_title(session: &AgentSession) -> String {
+    let title = session
+        .transcript
+        .iter()
+        .find(|entry| entry.kind == "user")
+        .map(|entry| entry.text.split_whitespace().collect::<Vec<_>>().join(" "))
+        .filter(|title| !title.is_empty())
+        .unwrap_or_else(|| "New chat".to_string());
+    let mut chars = title.chars();
+    let abbreviated = chars.by_ref().take(CHAT_TITLE_CHARS).collect::<String>();
+    if chars.next().is_some() {
+        format!("{abbreviated}…")
+    } else {
+        abbreviated
+    }
+}
+
+fn system_time_millis(time: SystemTime) -> u64 {
+    time.duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn oversize_error(path: &Path, size: u64) -> String {
@@ -405,12 +594,112 @@ mod tests {
         fs::write(path, contents).expect("write sidecar");
     }
 
+    fn chat_session(prompt: &str) -> AgentSession {
+        AgentSession {
+            history: vec![Message::user(prompt)],
+            transcript: vec![TranscriptEntry {
+                kind: "user".to_owned(),
+                text: prompt.to_owned(),
+            }],
+        }
+    }
+
     #[test]
     fn missing_file_loads_default_session() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = project_path(&dir);
 
         assert_eq!(load(&project), Ok(AgentSession::default()));
+    }
+
+    #[test]
+    fn chat_files_round_trip_and_list_newest_first_with_titles() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = project_path(&dir);
+        let first = chat_session("First editing request");
+        let second = chat_session("Second editing request");
+
+        save_chat(&project, "chat-100", &first).expect("save first chat");
+        save_chat(&project, "chat-200", &second).expect("save second chat");
+
+        assert_eq!(load_chat(&project, "chat-100"), Ok(first));
+        assert_eq!(load_chat(&project, "chat-200"), Ok(second));
+        let chats = list_chats(&project).expect("list chats");
+        assert_eq!(
+            chats
+                .iter()
+                .map(|chat| (chat.id.as_str(), chat.title.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("chat-200", "Second editing request"),
+                ("chat-100", "First editing request"),
+            ]
+        );
+    }
+
+    #[test]
+    fn chat_titles_normalize_whitespace_truncate_and_fall_back() {
+        let long = "  make\n something   visually interesting with all of these clips please  ";
+        let title = chat_title(&chat_session(long));
+        assert!(title.ends_with('…'), "{title}");
+        assert_eq!(title.trim(), title);
+        assert!(!title.contains('\n'));
+        assert_eq!(title.chars().count(), CHAT_TITLE_CHARS + 1);
+        assert_eq!(chat_title(&AgentSession::default()), "New chat");
+    }
+
+    #[test]
+    fn legacy_sidecar_migrates_once_into_the_chat_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = project_path(&dir);
+        let legacy = chat_session("Continue my original conversation");
+        save(&project, &legacy).expect("save legacy sidecar");
+        let legacy_path = path_for_project(&project).expect("legacy path");
+        assert!(legacy_path.exists());
+
+        let chats = list_chats(&project).expect("migration and listing");
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0].title, "Continue my original conversation");
+        assert!(!legacy_path.exists(), "legacy file is removed by rename");
+        assert_eq!(load_chat(&project, &chats[0].id), Ok(legacy));
+
+        let again = list_chats(&project).expect("second listing");
+        assert_eq!(again, chats, "migration is idempotent");
+    }
+
+    #[test]
+    fn chat_ids_reject_path_traversal() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = project_path(&dir);
+        let error = load_chat(&project, "../agent-session").expect_err("invalid id");
+        assert!(error.contains("invalid agent chat id"), "{error}");
+    }
+
+    #[test]
+    fn collection_caps_apply_to_each_chat_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = project_path(&dir);
+        let session = AgentSession {
+            history: (0..MAX_HISTORY_MESSAGES + 3)
+                .map(|index| Message::user(format!("history-{index}")))
+                .collect(),
+            transcript: (0..MAX_TRANSCRIPT_ENTRIES + 5)
+                .map(|index| TranscriptEntry {
+                    kind: "user".into(),
+                    text: format!("transcript-{index}"),
+                })
+                .collect(),
+        };
+
+        save_chat(&project, "chat-42", &session).expect("save bounded chat");
+        let loaded = load_chat(&project, "chat-42").expect("load bounded chat");
+        assert_eq!(loaded.history.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(loaded.transcript.len(), MAX_TRANSCRIPT_ENTRIES);
+        assert_eq!(
+            loaded.history.first(),
+            Some(&Message::user("history-3".to_string()))
+        );
+        assert_eq!(loaded.transcript[0].text, "transcript-5");
     }
 
     #[test]
@@ -456,6 +745,10 @@ mod tests {
                     text: "Cut at the frame shown.".to_owned(),
                 },
                 TranscriptEntry {
+                    kind: "reasoning".to_owned(),
+                    text: "The requested frame is a safe split point.".to_owned(),
+                },
+                TranscriptEntry {
                     kind: "assistant".to_owned(),
                     text: "Done.".to_owned(),
                 },
@@ -467,6 +760,7 @@ mod tests {
             fs::read_to_string(path_for_project(&project).expect("session path")).expect("read");
         assert!(!raw.contains("image/png"));
         assert!(!raw.contains("image/jpeg"));
+        assert!(raw.contains("\"kind\": \"reasoning\""));
 
         let loaded = load(&project).expect("load");
         assert_eq!(

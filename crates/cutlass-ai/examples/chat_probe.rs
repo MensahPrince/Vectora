@@ -9,8 +9,8 @@
 use std::sync::atomic::AtomicBool;
 
 use cutlass_ai::config::resolve_api_key;
-use cutlass_ai::provider::{ChatProvider, ChatRequest, Message};
-use cutlass_ai::providers::OpenAiCompatProvider;
+use cutlass_ai::provider::{ChatProvider, ChatRequest, Message, ProviderStreamEvent};
+use cutlass_ai::providers::{OpenAiProtocol, OpenAiProvider, ReasoningSummary};
 
 fn main() {
     let prompt = std::env::args()
@@ -39,7 +39,21 @@ fn main() {
             eprintln!("{e}");
             std::process::exit(1);
         });
-    let provider = OpenAiCompatProvider::new(&ai.base_url, &ai.model, api_key);
+    let protocol = match ai.api_protocol {
+        cutlass_settings::AiApiProtocol::ChatCompletions => OpenAiProtocol::ChatCompletions,
+        cutlass_settings::AiApiProtocol::Responses => OpenAiProtocol::Responses,
+    };
+    let reasoning_summary = match ai.reasoning_summary {
+        cutlass_settings::ReasoningSummary::Auto => ReasoningSummary::Auto,
+        cutlass_settings::ReasoningSummary::Off => ReasoningSummary::Off,
+    };
+    let provider = OpenAiProvider::new(
+        &ai.base_url,
+        &ai.model,
+        api_key,
+        protocol,
+        reasoning_summary,
+    );
 
     let messages = vec![
         Message::system(
@@ -59,10 +73,18 @@ fn main() {
                 tools: &tools,
             },
             &cancel,
-            &mut |delta| {
-                print!("{delta}");
+            &mut |event| {
                 use std::io::Write;
-                std::io::stdout().flush().ok();
+                match event {
+                    ProviderStreamEvent::TextDelta(delta) => {
+                        print!("{delta}");
+                        std::io::stdout().flush().ok();
+                    }
+                    ProviderStreamEvent::ReasoningSummaryDelta(delta) => {
+                        eprint!("{delta}");
+                        std::io::stderr().flush().ok();
+                    }
+                }
             },
         )
         .unwrap_or_else(|e| {

@@ -10,11 +10,41 @@ use cutlass_ai::ImagePart;
 use cutlass_models::{MediaId, MediaSource, Project, Rational, RationalTime, TrackKind};
 use cutlass_render::Renderer;
 
+use crate::timeline_map::Canvas;
+
 /// Maximum width or height accepted for an agent vision frame.
 pub(crate) const MAX_VISION_EDGE: u32 = 768;
+pub(crate) const MEDIA_POOL_SHEET_PAGE_SIZE: usize = 12;
+pub(crate) const MIN_MEDIA_POOL_SHEET_WIDTH: u32 = 320;
+pub(crate) const MAX_MEDIA_POOL_SHEET_WIDTH: u32 = 1024;
 
 const MIN_VISION_EDGE: u32 = 64;
 const MAX_LABEL_FILE_NAME_CHARS: usize = 128;
+const SHEET_COLUMNS: u32 = 4;
+const SHEET_PADDING: u32 = 12;
+const SHEET_GAP: u32 = 8;
+const SHEET_HEADER_HEIGHT: u32 = 32;
+const SHEET_CAPTION_HEIGHT: u32 = 28;
+const SHEET_MIN_FRAME_HEIGHT: u32 = 48;
+const SHEET_BACKGROUND: [u8; 4] = [18, 20, 25, 255];
+const SHEET_TILE_BACKGROUND: [u8; 4] = [29, 32, 39, 255];
+const SHEET_FRAME_BACKGROUND: [u8; 4] = [11, 13, 17, 255];
+const SHEET_ERROR_BACKGROUND: [u8; 4] = [68, 37, 43, 255];
+const SHEET_PRIMARY_TEXT: [u8; 4] = [238, 240, 245, 255];
+const SHEET_SECONDARY_TEXT: [u8; 4] = [169, 176, 190, 255];
+const SHEET_ERROR_TEXT: [u8; 4] = [255, 178, 186, 255];
+
+#[derive(Debug)]
+pub(crate) struct MediaPoolSheet {
+    pub image: cutlass_render::RgbaImage,
+    pub failures: Vec<MediaPoolSheetFailure>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MediaPoolSheetFailure {
+    pub media_id: u64,
+    pub detail: String,
+}
 
 /// Reused on the agent thread: one private GPU queue + decoder cache, lazily
 /// created so non-vision prompts pay no GPU bring-up.
@@ -83,6 +113,54 @@ impl AgentVision {
         max_height: u32,
     ) -> Result<ImagePart, String> {
         let (max_width, max_height) = vision_dimensions(max_width, max_height)?;
+        let (image, frame_time) = self.render_asset_image(path, seconds, max_width, max_height)?;
+        let png = cutlass_render::encode_png(&image)
+            .map_err(|error| format!("could not encode asset frame as PNG: {error}"))?;
+
+        Ok(ImagePart::png(png, asset_label(path, frame_time)))
+    }
+
+    /// Render one midpoint thumbnail per visual source and compose them into a
+    /// single model-friendly image. Per-source failures become placeholder
+    /// tiles so one corrupt or offline asset cannot hide the rest of the pool.
+    pub(crate) fn media_pool_sheet(
+        &mut self,
+        sources: &[&MediaSource],
+        page: u32,
+        total_pages: u32,
+        max_width: u32,
+    ) -> Result<MediaPoolSheet, String> {
+        if sources.len() > MEDIA_POOL_SHEET_PAGE_SIZE {
+            return Err(format!(
+                "media-pool sheet accepts at most {MEDIA_POOL_SHEET_PAGE_SIZE} visual items"
+            ));
+        }
+        let layout = MediaPoolSheetLayout::new(max_width, sources.len())?;
+        let mut previews = Vec::with_capacity(sources.len());
+        for source in sources {
+            let preview = self
+                .render_asset_image(
+                    source.path(),
+                    sheet_sample_seconds(source),
+                    layout.cell_width,
+                    layout.frame_height,
+                )
+                .map(|(image, _)| image);
+            previews.push(SheetPreview { source, preview });
+        }
+        compose_media_pool_sheet(&previews, page, total_pages, layout)
+    }
+
+    fn render_asset_image(
+        &mut self,
+        path: &Path,
+        seconds: f64,
+        max_width: u32,
+        max_height: u32,
+    ) -> Result<(cutlass_render::RgbaImage, RationalTime), String> {
+        if max_width == 0 || max_height == 0 {
+            return Err("asset frame width and height must be greater than zero".into());
+        }
         validate_seconds(seconds)?;
         let asset_name = safe_file_name(path);
 
@@ -140,10 +218,7 @@ impl AgentVision {
                     redact_asset_path(path, &error)
                 )
             })?;
-        let png = cutlass_render::encode_png(&image)
-            .map_err(|error| format!("could not encode asset frame as PNG: {error}"))?;
-
-        Ok(ImagePart::png(png, asset_label(path, frame_time)))
+        Ok((image, frame_time))
     }
 
     fn renderer(&mut self) -> Result<&mut Renderer, String> {
@@ -164,6 +239,214 @@ impl AgentVision {
             self.media_catalog = next;
         }
         Ok(())
+    }
+}
+
+struct SheetPreview<'a> {
+    source: &'a MediaSource,
+    preview: Result<cutlass_render::RgbaImage, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MediaPoolSheetLayout {
+    width: u32,
+    height: u32,
+    cell_width: u32,
+    frame_height: u32,
+    row_height: u32,
+}
+
+impl MediaPoolSheetLayout {
+    fn new(max_width: u32, item_count: usize) -> Result<Self, String> {
+        if item_count > MEDIA_POOL_SHEET_PAGE_SIZE {
+            return Err(format!(
+                "media-pool sheet accepts at most {MEDIA_POOL_SHEET_PAGE_SIZE} visual items"
+            ));
+        }
+        let width = max_width.clamp(MIN_MEDIA_POOL_SHEET_WIDTH, MAX_MEDIA_POOL_SHEET_WIDTH);
+        let horizontal_chrome = SHEET_PADDING
+            .checked_mul(2)
+            .and_then(|padding| padding.checked_add(SHEET_GAP * (SHEET_COLUMNS - 1)))
+            .ok_or("media-pool sheet width overflow")?;
+        let cell_width = width
+            .checked_sub(horizontal_chrome)
+            .ok_or("media-pool sheet is too narrow")?
+            / SHEET_COLUMNS;
+        let frame_height = cell_width
+            .checked_mul(9)
+            .ok_or("media-pool sheet frame-height overflow")?
+            / 16;
+        let frame_height = frame_height.max(SHEET_MIN_FRAME_HEIGHT);
+        let row_height = frame_height
+            .checked_add(SHEET_CAPTION_HEIGHT)
+            .ok_or("media-pool sheet row-height overflow")?;
+        let row_count = u32::try_from(item_count.max(1))
+            .map_err(|_| "media-pool sheet item count overflow")?
+            .div_ceil(SHEET_COLUMNS);
+        let height = SHEET_HEADER_HEIGHT
+            .checked_add(
+                row_height
+                    .checked_mul(row_count)
+                    .ok_or("media-pool sheet height overflow")?,
+            )
+            .and_then(|height| height.checked_add(SHEET_GAP * row_count.saturating_sub(1)))
+            .and_then(|height| height.checked_add(SHEET_PADDING))
+            .ok_or("media-pool sheet height overflow")?;
+
+        Ok(Self {
+            width,
+            height,
+            cell_width,
+            frame_height,
+            row_height,
+        })
+    }
+
+    fn tile_origin(self, index: usize) -> Result<(i32, i32), String> {
+        let index = u32::try_from(index).map_err(|_| "media-pool sheet tile index overflow")?;
+        let column = index % SHEET_COLUMNS;
+        let row = index / SHEET_COLUMNS;
+        let x = SHEET_PADDING
+            .checked_add(
+                column
+                    .checked_mul(self.cell_width + SHEET_GAP)
+                    .ok_or("media-pool sheet tile x overflow")?,
+            )
+            .ok_or("media-pool sheet tile x overflow")?;
+        let y = SHEET_HEADER_HEIGHT
+            .checked_add(
+                row.checked_mul(self.row_height + SHEET_GAP)
+                    .ok_or("media-pool sheet tile y overflow")?,
+            )
+            .ok_or("media-pool sheet tile y overflow")?;
+        Ok((
+            i32::try_from(x).map_err(|_| "media-pool sheet tile x exceeds i32")?,
+            i32::try_from(y).map_err(|_| "media-pool sheet tile y exceeds i32")?,
+        ))
+    }
+}
+
+fn compose_media_pool_sheet(
+    previews: &[SheetPreview<'_>],
+    page: u32,
+    total_pages: u32,
+    layout: MediaPoolSheetLayout,
+) -> Result<MediaPoolSheet, String> {
+    let mut canvas = Canvas::new(layout.width, layout.height, SHEET_BACKGROUND)?;
+    canvas.draw_text_clipped(
+        &format!("MEDIA POOL  PAGE {page}/{total_pages}"),
+        SHEET_PADDING as i32,
+        9,
+        layout.width.saturating_sub(SHEET_PADDING * 2) as i32,
+        9,
+        SHEET_PRIMARY_TEXT,
+        1,
+    );
+
+    if previews.is_empty() {
+        canvas.draw_text_clipped(
+            "NO VISUAL MEDIA ON THIS PAGE",
+            SHEET_PADDING as i32,
+            SHEET_HEADER_HEIGHT as i32 + 18,
+            layout.width.saturating_sub(SHEET_PADDING * 2) as i32,
+            9,
+            SHEET_SECONDARY_TEXT,
+            1,
+        );
+        return Ok(MediaPoolSheet {
+            image: canvas.into_image(),
+            failures: Vec::new(),
+        });
+    }
+
+    let mut failures = Vec::new();
+    for (index, item) in previews.iter().enumerate() {
+        let (x, y) = layout.tile_origin(index)?;
+        let cell_width = layout.cell_width as i32;
+        let frame_height = layout.frame_height as i32;
+        canvas.fill_rect(
+            x,
+            y,
+            cell_width,
+            layout.row_height as i32,
+            SHEET_TILE_BACKGROUND,
+        );
+        canvas.fill_rect(x, y, cell_width, frame_height, SHEET_FRAME_BACKGROUND);
+
+        let render_error = match &item.preview {
+            Ok(image) if canvas.draw_image_centered(image, x, y, cell_width, frame_height) => None,
+            Ok(_) => Some("renderer returned a malformed RGBA image".to_string()),
+            Err(error) => Some(error.clone()),
+        };
+        if let Some(detail) = render_error {
+            canvas.fill_rect(x, y, cell_width, frame_height, SHEET_ERROR_BACKGROUND);
+            canvas.draw_text_clipped(
+                "UNAVAILABLE",
+                x + 6,
+                y + frame_height / 2 - 4,
+                cell_width - 12,
+                9,
+                SHEET_ERROR_TEXT,
+                1,
+            );
+            failures.push(MediaPoolSheetFailure {
+                media_id: item.source.id.raw(),
+                detail,
+            });
+        }
+
+        canvas.draw_text_clipped(
+            &format!(
+                "#{} {}",
+                item.source.id.raw(),
+                safe_file_name(item.source.path())
+            ),
+            x + 5,
+            y + frame_height + 5,
+            cell_width - 10,
+            9,
+            SHEET_PRIMARY_TEXT,
+            1,
+        );
+        canvas.draw_text_clipped(
+            &format!(
+                "{}  {}x{}",
+                format_sheet_duration(item.source.duration.seconds()),
+                item.source.width,
+                item.source.height
+            ),
+            x + 5,
+            y + frame_height + 16,
+            cell_width - 10,
+            9,
+            SHEET_SECONDARY_TEXT,
+            1,
+        );
+    }
+
+    Ok(MediaPoolSheet {
+        image: canvas.into_image(),
+        failures,
+    })
+}
+
+fn sheet_sample_seconds(source: &MediaSource) -> f64 {
+    if source.is_image {
+        return 0.0;
+    }
+    let duration = source.duration.seconds();
+    if duration.is_finite() && duration > 0.0 {
+        duration / 2.0
+    } else {
+        0.0
+    }
+}
+
+fn format_sheet_duration(seconds: f64) -> String {
+    if seconds.is_finite() && seconds >= 0.0 {
+        format!("{seconds:.1}s")
+    } else {
+        "unknown duration".to_string()
     }
 }
 
@@ -303,7 +586,7 @@ fn validate_seconds(seconds: f64) -> Result<(), String> {
     Ok(())
 }
 
-fn safe_file_name(path: &Path) -> String {
+pub(crate) fn safe_file_name(path: &Path) -> String {
     let Some(name) = path.file_name() else {
         return "asset".to_string();
     };
@@ -373,5 +656,88 @@ mod tests {
         let redacted = redact_asset_path(path, &detail);
         assert_eq!(redacted, "decoder could not open take.mov");
         assert!(!redacted.contains("customer-alpha"));
+    }
+
+    #[test]
+    fn media_pool_sheet_layout_is_bounded_and_pages_twelve_tiles() {
+        let narrow = MediaPoolSheetLayout::new(1, MEDIA_POOL_SHEET_PAGE_SIZE).unwrap();
+        assert_eq!(narrow.width, MIN_MEDIA_POOL_SHEET_WIDTH);
+        assert!(narrow.height <= 768);
+        let (last_x, last_y) = narrow.tile_origin(MEDIA_POOL_SHEET_PAGE_SIZE - 1).unwrap();
+        assert!(last_x > 0);
+        assert!(last_y > SHEET_HEADER_HEIGHT as i32);
+
+        let wide = MediaPoolSheetLayout::new(u32::MAX, 1).unwrap();
+        assert_eq!(wide.width, MAX_MEDIA_POOL_SHEET_WIDTH);
+        assert!(wide.height < narrow.height);
+        assert!(MediaPoolSheetLayout::new(768, MEDIA_POOL_SHEET_PAGE_SIZE + 1).is_err());
+    }
+
+    #[test]
+    fn media_pool_sheet_composition_keeps_failed_assets_as_placeholders() {
+        let mut available = MediaSource::new(
+            "/private/available.mov",
+            1920,
+            1080,
+            Rational::FPS_24,
+            240,
+            false,
+        );
+        available.id = MediaId::from_raw(7);
+        let mut offline = MediaSource::new(
+            "/private/offline.mov",
+            1920,
+            1080,
+            Rational::FPS_24,
+            240,
+            false,
+        );
+        offline.id = MediaId::from_raw(8);
+        let thumbnail = cutlass_render::RgbaImage::new(16, 9, vec![200; 16 * 9 * 4]);
+        let previews = [
+            SheetPreview {
+                source: &available,
+                preview: Ok(thumbnail),
+            },
+            SheetPreview {
+                source: &offline,
+                preview: Err("offline.mov could not be opened".into()),
+            },
+        ];
+        let layout = MediaPoolSheetLayout::new(768, previews.len()).unwrap();
+
+        let sheet = compose_media_pool_sheet(&previews, 1, 1, layout).unwrap();
+
+        assert!(sheet.image.is_well_formed());
+        assert_eq!(sheet.image.width, 768);
+        assert_eq!(sheet.image.height, layout.height);
+        assert_eq!(
+            sheet.failures,
+            vec![MediaPoolSheetFailure {
+                media_id: 8,
+                detail: "offline.mov could not be opened".into(),
+            }]
+        );
+        let (x, y) = layout.tile_origin(1).unwrap();
+        assert_eq!(
+            sheet.image.pixel(x as u32, y as u32),
+            SHEET_ERROR_BACKGROUND
+        );
+    }
+
+    #[test]
+    fn sheet_samples_video_midpoint_and_still_origin() {
+        let video = MediaSource::new(
+            "/private/video.mov",
+            1920,
+            1080,
+            Rational::FPS_24,
+            240,
+            false,
+        );
+        let still = MediaSource::image("/private/still.png", 800, 600);
+
+        assert!((sheet_sample_seconds(&video) - 5.0).abs() < f64::EPSILON);
+        assert_eq!(sheet_sample_seconds(&still), 0.0);
     }
 }
