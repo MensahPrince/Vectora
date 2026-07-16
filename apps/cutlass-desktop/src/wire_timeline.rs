@@ -198,20 +198,20 @@ pub(crate) fn wire_timeline(
     // `.cutlass` into a new draft. New (New card / Cmd+N / File ▸ New): a
     // fresh draft. Both flush the outgoing draft before swapping.
     let open_handle = preview_worker.handle();
-    let open_download_cache = Arc::clone(&download_cache);
+    let open_download_cache = Arc::clone(download_cache);
     editor.on_on_open_requested(move || {
         change_session(&open_handle, &open_download_cache, SessionChange::Import);
     });
 
     let new_handle = preview_worker.handle();
-    let new_download_cache = Arc::clone(&download_cache);
+    let new_download_cache = Arc::clone(download_cache);
     editor.on_on_new_requested(move || {
         change_session(&new_handle, &new_download_cache, SessionChange::New);
     });
 
     // Launch gallery card → open that draft by its project path.
     let open_draft_handle = preview_worker.handle();
-    let open_draft_download_cache = Arc::clone(&download_cache);
+    let open_draft_download_cache = Arc::clone(download_cache);
     editor.on_on_open_project_requested(move |path| {
         change_session(
             &open_draft_handle,
@@ -240,7 +240,7 @@ pub(crate) fn wire_timeline(
     });
 
     // Seed the launch gallery from the draft store.
-    refresh_projects(&app);
+    refresh_projects(app);
 
     // Window close — the title-bar ✕ and the OS close request both go through
     // the context-aware close: from the editor it flushes the draft and

@@ -522,7 +522,7 @@ pub(crate) fn wire_settings(
     {
         let app_weak = app.as_weak();
         let config_path = config_path.clone();
-        let download_cache = Arc::clone(&download_cache);
+        let download_cache = Arc::clone(download_cache);
         let preview = preview_worker.handle();
         let registry = cache_registry.clone();
         settings_backend.on_save(move || {
