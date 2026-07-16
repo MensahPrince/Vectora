@@ -393,6 +393,46 @@ fn saturation_minus_one_desaturates_red_solid() {
 }
 
 #[test]
+fn transition_with_effected_clip_renders_without_panic() {
+    // Regression: packing skipped nested transition-side effect chains, so
+    // realizing a transition whose clips carry effects indexed past the
+    // instance store and panicked.
+    let mut project = Project::new("p", FPS_24);
+    let track = project.add_track(TrackKind::Sticker, "S1");
+    let left = project
+        .add_generated(
+            track,
+            Generator::SolidColor {
+                rgba: [255, 0, 0, 255],
+            },
+            TimeRange::at_rate(0, 24, FPS_24),
+        )
+        .unwrap();
+    project
+        .add_generated(
+            track,
+            Generator::SolidColor {
+                rgba: [0, 0, 255, 255],
+            },
+            TimeRange::at_rate(24, 24, FPS_24),
+        )
+        .unwrap();
+    project.add_effect(left, "gaussian_blur").unwrap();
+    project.add_transition(left, "crossfade").unwrap();
+    project.set_transition_duration(left, 24).unwrap();
+
+    let Ok(mut renderer) = Renderer::new_headless() else {
+        eprintln!("skipping: no headless GPU available");
+        return;
+    };
+    // Midpoint of the transition window [12, 36).
+    let frame = renderer
+        .render_frame_fit(&project, rt(24), 64, 64)
+        .expect("render transition with effected clip");
+    assert!(frame.width > 0 && frame.height > 0);
+}
+
+#[test]
 fn mono_filter_at_zero_intensity_matches_no_filter() {
     let Ok(gpu) = GpuContext::new_headless_blocking() else {
         eprintln!("skipping: no headless GPU available");

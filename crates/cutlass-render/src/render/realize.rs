@@ -454,9 +454,26 @@ impl Renderer {
         }
 
         // Pack effect chains and build compositor layers with stable borrows.
+        // Transition sides are nested; pack outgoing then incoming to match
+        // the phase-1 consumption order below.
         for r in &realized {
-            if let Some(effects) = r.effects().filter(|e| !e.is_empty()) {
-                effect_store.push(pack_effects(effects));
+            match r {
+                Realized::Transition {
+                    outgoing,
+                    incoming,
+                    ..
+                } => {
+                    for side in [&**outgoing, &**incoming] {
+                        if let Some(effects) = side.effects().filter(|e| !e.is_empty()) {
+                            effect_store.push(pack_effects(effects));
+                        }
+                    }
+                }
+                other => {
+                    if let Some(effects) = other.effects().filter(|e| !e.is_empty()) {
+                        effect_store.push(pack_effects(effects));
+                    }
+                }
             }
         }
         let instance_store: Vec<Vec<PassInstance<'_>>> =
