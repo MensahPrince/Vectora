@@ -1,6 +1,10 @@
+use std::fs;
+use std::io;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
+use crate::ops::{RelocationStrategy, relocate_with_strategy};
 
 struct TestDirectory {
     path: PathBuf,
