@@ -283,36 +283,24 @@ fn parser_accepts_every_tool_and_action_branch() {
 
 #[test]
 fn parser_requires_objects_known_fields_and_required_fields() {
-    assert!(
-        parse_request("app_missing", &json!({}))
-            .unwrap_err()
-            .contains("unknown")
-    );
-    assert!(
-        parse_request(APP_STATE, &Value::Null)
-            .unwrap_err()
-            .contains("must be an object")
-    );
-    assert!(
-        parse_request(APP_STATE, &json!({ "extra": true }))
-            .unwrap_err()
-            .contains("unknown argument 'extra'")
-    );
-    assert!(
-        parse_request(APP_PLAYBACK, &json!({}))
-            .unwrap_err()
-            .contains("missing required argument 'action'")
-    );
-    assert!(
-        parse_request(APP_PLAYBACK, &json!({ "action": 1 }))
-            .unwrap_err()
-            .contains("must be a string")
-    );
-    assert!(
-        parse_request(APP_PLAYBACK, &json!({ "action": "rewind" }))
-            .unwrap_err()
-            .contains("unknown value 'rewind'")
-    );
+    assert!(parse_request("app_missing", &json!({}))
+        .unwrap_err()
+        .contains("unknown"));
+    assert!(parse_request(APP_STATE, &Value::Null)
+        .unwrap_err()
+        .contains("must be an object"));
+    assert!(parse_request(APP_STATE, &json!({ "extra": true }))
+        .unwrap_err()
+        .contains("unknown argument 'extra'"));
+    assert!(parse_request(APP_PLAYBACK, &json!({}))
+        .unwrap_err()
+        .contains("missing required argument 'action'"));
+    assert!(parse_request(APP_PLAYBACK, &json!({ "action": 1 }))
+        .unwrap_err()
+        .contains("must be a string"));
+    assert!(parse_request(APP_PLAYBACK, &json!({ "action": "rewind" }))
+        .unwrap_err()
+        .contains("unknown value 'rewind'"));
     assert!(parse_request(APP_CLOSE, &json!({ "now": true })).is_err());
 }
 
@@ -325,90 +313,72 @@ fn parser_checks_seek_zoom_and_selection_dependencies() {
     assert!(parse_request(APP_SEEK, &json!({ "seconds": -0.01 })).is_err());
     assert!(parse_request(APP_SEEK, &json!({ "seconds": "1" })).is_err());
 
-    assert!(
-        parse_request(
-            APP_LOOP_RANGE,
-            &json!({ "action": "set", "start_seconds": 1.0 })
-        )
-        .is_err()
-    );
+    assert!(parse_request(
+        APP_LOOP_RANGE,
+        &json!({ "action": "set", "start_seconds": 1.0 })
+    )
+    .is_err());
     for (start, end) in [(-1.0, 2.0), (2.0, 2.0), (3.0, 2.0)] {
-        assert!(
-            parse_request(
-                APP_LOOP_RANGE,
-                &json!({
-                    "action": "set",
-                    "start_seconds": start,
-                    "end_seconds": end
-                })
-            )
-            .is_err()
-        );
-    }
-    assert!(
-        parse_request(
+        assert!(parse_request(
             APP_LOOP_RANGE,
-            &json!({ "action": "enable", "start_seconds": 1.0 })
+            &json!({
+                "action": "set",
+                "start_seconds": start,
+                "end_seconds": end
+            })
         )
-        .is_err()
-    );
+        .is_err());
+    }
+    assert!(parse_request(
+        APP_LOOP_RANGE,
+        &json!({ "action": "enable", "start_seconds": 1.0 })
+    )
+    .is_err());
     assert!(parse_request(APP_LOOP_RANGE, &json!({ "action": "repeat" })).is_err());
 
     for value in [MIN_ZOOM, MAX_ZOOM] {
-        assert!(
-            parse_request(
-                APP_TIMELINE_ZOOM,
-                &json!({ "action": "set", "value": value })
-            )
-            .is_ok()
-        );
+        assert!(parse_request(
+            APP_TIMELINE_ZOOM,
+            &json!({ "action": "set", "value": value })
+        )
+        .is_ok());
     }
     for value in [MIN_ZOOM - 0.001, MAX_ZOOM + 0.001, f64::MAX] {
-        assert!(
-            parse_request(
-                APP_TIMELINE_ZOOM,
-                &json!({ "action": "set", "value": value })
-            )
-            .is_err()
-        );
+        assert!(parse_request(
+            APP_TIMELINE_ZOOM,
+            &json!({ "action": "set", "value": value })
+        )
+        .is_err());
     }
     assert!(parse_request(APP_TIMELINE_ZOOM, &json!({ "action": "set" })).is_err());
     assert!(parse_request(APP_TIMELINE_ZOOM, &json!({ "action": "fit", "value": 1 })).is_err());
 
     assert!(parse_request(APP_SELECT_CLIP, &json!({ "action": "select" })).is_err());
-    assert!(
-        parse_request(
-            APP_SELECT_CLIP,
-            &json!({ "action": "toggle", "clip_id": "" })
-        )
-        .is_err()
-    );
-    assert!(
-        parse_request(
-            APP_SELECT_CLIP,
-            &json!({ "action": "select", "clip_id": -1 })
-        )
-        .is_err()
-    );
-    assert!(
-        parse_request(
-            APP_SELECT_CLIP,
-            &json!({ "action": "clear", "clip_id": "42" })
-        )
-        .is_err()
-    );
+    assert!(parse_request(
+        APP_SELECT_CLIP,
+        &json!({ "action": "toggle", "clip_id": "" })
+    )
+    .is_err());
+    assert!(parse_request(
+        APP_SELECT_CLIP,
+        &json!({ "action": "select", "clip_id": -1 })
+    )
+    .is_err());
+    assert!(parse_request(
+        APP_SELECT_CLIP,
+        &json!({ "action": "clear", "clip_id": "42" })
+    )
+    .is_err());
 }
 
 #[test]
 fn parser_checks_integer_types_and_window_edge_bounds() {
     for coordinate in [MIN_WINDOW_COORD, MAX_WINDOW_COORD] {
-        assert!(
-            parse_request(
-                APP_WINDOW_MOVE,
-                &json!({ "x": coordinate, "y": coordinate })
-            )
-            .is_ok()
-        );
+        assert!(parse_request(
+            APP_WINDOW_MOVE,
+            &json!({ "x": coordinate, "y": coordinate })
+        )
+        .is_ok());
     }
     for coordinate in [MIN_WINDOW_COORD - 1, MAX_WINDOW_COORD + 1] {
         assert!(parse_request(APP_WINDOW_MOVE, &json!({ "x": coordinate, "y": 0 })).is_err());
@@ -419,13 +389,11 @@ fn parser_checks_integer_types_and_window_edge_bounds() {
         (MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT),
         (MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT),
     ] {
-        assert!(
-            parse_request(
-                APP_WINDOW_RESIZE,
-                &json!({ "width": width, "height": height })
-            )
-            .is_ok()
-        );
+        assert!(parse_request(
+            APP_WINDOW_RESIZE,
+            &json!({ "width": width, "height": height })
+        )
+        .is_ok());
     }
     for (width, height) in [
         (MIN_WINDOW_WIDTH - 1, MIN_WINDOW_HEIGHT),
@@ -433,13 +401,11 @@ fn parser_checks_integer_types_and_window_edge_bounds() {
         (MIN_WINDOW_WIDTH, MIN_WINDOW_HEIGHT - 1),
         (MIN_WINDOW_WIDTH, MAX_WINDOW_HEIGHT + 1),
     ] {
-        assert!(
-            parse_request(
-                APP_WINDOW_RESIZE,
-                &json!({ "width": width, "height": height })
-            )
-            .is_err()
-        );
+        assert!(parse_request(
+            APP_WINDOW_RESIZE,
+            &json!({ "width": width, "height": height })
+        )
+        .is_err());
     }
 }
 
