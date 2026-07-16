@@ -1,6 +1,8 @@
 use wgpu::util::DeviceExt;
 
-use cutlass_core::{FrameData, PixelFormat, RgbaImage, VideoFrame};
+#[cfg(any(target_vendor = "apple", target_os = "windows"))]
+use cutlass_core::PixelFormat;
+use cutlass_core::{FrameData, RgbaImage, VideoFrame};
 
 use crate::error::CompositorError;
 use crate::gpu::GpuContext;
