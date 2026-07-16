@@ -13,7 +13,6 @@ const BASE_EN_SPEC: ModelSpec = ModelSpec::new(
     "about 148 MB on disk and about 388 MB RAM during inference",
 );
 
-
 /// A built-in Whisper model known to Cutlass.
 ///
 /// This enum, rather than a caller-provided filename, is used by every public
@@ -319,4 +318,3 @@ pub enum ModelManagerError {
         root: PathBuf,
     },
 }
-

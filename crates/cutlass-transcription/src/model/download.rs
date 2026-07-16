@@ -110,4 +110,3 @@ impl ModelDownloader for HttpDownloader {
         Ok(response.into_reader())
     }
 }
-

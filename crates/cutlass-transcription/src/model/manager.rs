@@ -986,4 +986,3 @@ impl Drop for TemporaryDownload {
         }
     }
 }
-

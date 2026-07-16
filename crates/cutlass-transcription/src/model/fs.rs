@@ -136,7 +136,10 @@ pub(super) fn validate_spec(spec: &ModelSpec) -> Result<(), ModelManagerError> {
     Ok(())
 }
 
-pub(super) fn ensure_directory_root(root: &Path, metadata: &fs::Metadata) -> Result<(), ModelManagerError> {
+pub(super) fn ensure_directory_root(
+    root: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), ModelManagerError> {
     if metadata.file_type().is_symlink() || std_metadata_is_reparse_point(metadata) {
         return Err(ModelManagerError::UnsafeRoot {
             root: root.to_path_buf(),
@@ -301,4 +304,3 @@ pub(super) fn model_lock(path: &Path) -> Arc<Mutex<()>> {
     locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
     lock
 }
-
