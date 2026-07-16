@@ -354,8 +354,7 @@ fn import_rpc_helper_returns_canonical_dto_and_preserves_errors() {
     copy_image_fixture(&source);
     let mut engine = Engine::new(EngineConfig::default()).expect("engine");
 
-    let result =
-        import_media_rpc_and_publish(&mut engine, &source, None).expect("import result");
+    let result = import_media_rpc_and_publish(&mut engine, &source, None).expect("import result");
     assert_eq!(result.path, source.canonicalize().unwrap());
     assert_eq!(
         engine
@@ -367,9 +366,8 @@ fn import_rpc_helper_returns_canonical_dto_and_preserves_errors() {
     );
 
     let count = engine.project().media_count();
-    let error =
-        import_media_rpc_and_publish(&mut engine, &dir.path().join("missing.jpg"), None)
-            .unwrap_err();
+    let error = import_media_rpc_and_publish(&mut engine, &dir.path().join("missing.jpg"), None)
+        .unwrap_err();
     assert!(error.contains("import failed"));
     assert_eq!(engine.project().media_count(), count);
 }
@@ -548,12 +546,10 @@ fn relink_media_rpc_helper_returns_current_path_and_validation_errors() {
     copy_image_fixture(&target);
     let mut project = Project::new("relink", Rational::FPS_30);
     let media = project.add_media(cutlass_models::MediaSource::image(missing, 32, 32));
-    let mut engine =
-        Engine::with_project(EngineConfig::default(), project).expect("relink engine");
+    let mut engine = Engine::with_project(EngineConfig::default(), project).expect("relink engine");
 
-    let result =
-        relink_media_rpc_and_publish(&mut engine, &media.raw().to_string(), &target, None)
-            .expect("relink result");
+    let result = relink_media_rpc_and_publish(&mut engine, &media.raw().to_string(), &target, None)
+        .expect("relink result");
     assert_eq!(result.media_id, media.raw());
     assert_eq!(result.path, target.canonicalize().unwrap());
     assert_eq!(
@@ -593,8 +589,7 @@ fn relink_folder_rpc_helper_returns_sorted_results_and_no_candidate_error() {
         32,
         32,
     ));
-    let mut engine =
-        Engine::with_project(EngineConfig::default(), project).expect("folder engine");
+    let mut engine = Engine::with_project(EngineConfig::default(), project).expect("folder engine");
 
     let result = relink_folder_rpc_and_publish(&mut engine, replacements.clone(), None)
         .expect("folder relink result");
@@ -767,11 +762,11 @@ fn project_maintenance_pre_cancel_does_not_enqueue() {
     let handle = WorkerHandle { tx };
     let cancel = AtomicBool::new(true);
 
-    let error =
-        match handle.begin_project_maintenance_with_timeout(&cancel, Duration::from_secs(1)) {
-            Ok(_) => panic!("cancelled maintenance request was granted"),
-            Err(error) => error,
-        };
+    let error = match handle.begin_project_maintenance_with_timeout(&cancel, Duration::from_secs(1))
+    {
+        Ok(_) => panic!("cancelled maintenance request was granted"),
+        Err(error) => error,
+    };
     assert_eq!(
         error,
         "project maintenance request was cancelled before worker claim"
@@ -995,8 +990,7 @@ fn abandoned_project_maintenance_request_cannot_freeze_worker_later() {
     let (tx, rx) = unbounded();
     let handle = WorkerHandle { tx };
     let cancel = AtomicBool::new(false);
-    let result =
-        handle.begin_project_maintenance_with_timeout(&cancel, Duration::from_millis(1));
+    let result = handle.begin_project_maintenance_with_timeout(&cancel, Duration::from_millis(1));
     assert!(result.is_err());
     handle.rename_project("still runs".into());
 
@@ -1472,8 +1466,7 @@ fn ripple_head_shrink_advances_source_and_stays_anchored() {
 fn ripple_head_grow_reveals_earlier_source() {
     let (mut engine, [a, b, c], _track) = ripple_fixture();
 
-    let rippled =
-        commit_trims(&mut engine, &[(b, tr24(50, 150))], true).expect("ripple head grow");
+    let rippled = commit_trims(&mut engine, &[(b, tr24(50, 150))], true).expect("ripple head grow");
     assert!(rippled);
 
     assert_eq!(extent(&engine, b), (100, 150));
