@@ -14,7 +14,8 @@ use std::time::Duration;
 use base64::Engine as _;
 
 use crate::provider::{
-    ChatProvider, ChatRequest, ChatTurn, FinishReason, ImagePart, Message, ProviderError, ToolCall,
+    ChatProvider, ChatRequest, ChatTurn, FinishReason, ImagePart, Message, ProviderError,
+    ProviderStreamEvent, ToolCall,
 };
 
 pub struct OpenAiCompatProvider {
@@ -104,7 +105,7 @@ impl ChatProvider for OpenAiCompatProvider {
         &self,
         request: &ChatRequest<'_>,
         cancel: &AtomicBool,
-        on_text: &mut dyn FnMut(&str),
+        on_event: &mut dyn FnMut(ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, ProviderError> {
         let url = format!("{}/chat/completions", self.base_url);
         let body = self.request_body(request).to_string();
@@ -153,7 +154,9 @@ impl ChatProvider for OpenAiCompatProvider {
             }
         };
 
-        consume_sse(response.into_reader(), cancel, on_text)
+        consume_sse(response.into_reader(), cancel, &mut |delta| {
+            on_event(ProviderStreamEvent::TextDelta(delta));
+        })
     }
 }
 

@@ -128,6 +128,7 @@ fn main() {
                 use std::io::Write;
                 std::io::stdout().flush().ok();
             }
+            AgentEvent::ReasoningDelta(t) => eprintln!("  reasoning: {t}"),
             AgentEvent::Action(a) => println!("  ⚙ {}", a.description),
             AgentEvent::HostAction { name, summary } => println!("  ⚙ {name}: {summary}"),
             AgentEvent::Image(image) => println!("  ◫ {}", image.label),

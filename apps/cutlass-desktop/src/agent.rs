@@ -1345,6 +1345,8 @@ fn run_one_prompt(
     let event_store = store.clone();
     let mut on_event = move |event: AgentEvent| match event {
         AgentEvent::TextDelta(delta) => append_assistant_text(&event_store, delta),
+        // Provider summaries use their own transcript row in the UI layer.
+        AgentEvent::ReasoningDelta(_) => {}
         AgentEvent::Action(action) => push_entry(&event_store, "action", action.description),
         AgentEvent::HostAction { name, summary } => {
             push_entry(&event_store, "action", format!("{name}: {summary}"))

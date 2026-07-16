@@ -9,7 +9,7 @@
 use std::sync::atomic::AtomicBool;
 
 use cutlass_ai::config::resolve_api_key;
-use cutlass_ai::provider::{ChatProvider, ChatRequest, Message};
+use cutlass_ai::provider::{ChatProvider, ChatRequest, Message, ProviderStreamEvent};
 use cutlass_ai::providers::{OpenAiProtocol, OpenAiProvider, ReasoningSummary};
 
 fn main() {
@@ -73,10 +73,18 @@ fn main() {
                 tools: &tools,
             },
             &cancel,
-            &mut |delta| {
-                print!("{delta}");
+            &mut |event| {
                 use std::io::Write;
-                std::io::stdout().flush().ok();
+                match event {
+                    ProviderStreamEvent::TextDelta(delta) => {
+                        print!("{delta}");
+                        std::io::stdout().flush().ok();
+                    }
+                    ProviderStreamEvent::ReasoningSummaryDelta(delta) => {
+                        eprint!("{delta}");
+                        std::io::stderr().flush().ok();
+                    }
+                }
             },
         )
         .unwrap_or_else(|e| {

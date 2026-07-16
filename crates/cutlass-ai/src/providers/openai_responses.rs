@@ -16,7 +16,8 @@ use base64::Engine as _;
 use serde::Deserialize;
 
 use crate::provider::{
-    ChatProvider, ChatRequest, ChatTurn, FinishReason, ImagePart, Message, ProviderError, ToolCall,
+    ChatProvider, ChatRequest, ChatTurn, FinishReason, ImagePart, Message, ProviderError,
+    ProviderStreamEvent, ToolCall,
 };
 
 use super::openai_compat::{retry_delay, retryable_status, sleep_unless_cancelled, truncate};
@@ -190,7 +191,7 @@ impl ChatProvider for OpenAiResponsesProvider {
         &self,
         request: &ChatRequest<'_>,
         cancel: &AtomicBool,
-        on_text: &mut dyn FnMut(&str),
+        on_event: &mut dyn FnMut(ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, ProviderError> {
         let url = format!("{}/responses", self.base_url);
         let body = self.request_body(request).to_string();
@@ -250,7 +251,7 @@ impl ChatProvider for OpenAiResponsesProvider {
             }
         };
 
-        match consume_responses_sse(response.into_reader(), cancel, on_text) {
+        match consume_responses_sse(response.into_reader(), cancel, on_event) {
             Ok(parsed) => {
                 self.update_replay(request.messages, &parsed.turn, parsed.output);
                 Ok(parsed.turn)
@@ -457,13 +458,12 @@ enum Terminal {
     Incomplete(ResponseEnvelope),
 }
 
-/// Parse typed Responses events while forwarding answer text only. Reasoning
-/// summaries are accumulated separately in [`ChatTurn::reasoning_summary`]
-/// and get their own stream callback at the provider seam in the next layer.
+/// Parse typed Responses events while preserving separate answer and provider
+/// reasoning-summary channels.
 fn consume_responses_sse(
     reader: impl Read,
     cancel: &AtomicBool,
-    on_text: &mut dyn FnMut(&str),
+    on_event: &mut dyn FnMut(ProviderStreamEvent<'_>),
 ) -> Result<ParsedResponse, ProviderError> {
     let mut streamed_text = String::new();
     let mut streamed_reasoning = String::new();
@@ -493,11 +493,14 @@ fn consume_responses_sse(
             ResponsesEvent::OutputTextDelta { delta } => {
                 if !delta.is_empty() {
                     streamed_text.push_str(&delta);
-                    on_text(&delta);
+                    on_event(ProviderStreamEvent::TextDelta(&delta));
                 }
             }
             ResponsesEvent::ReasoningSummaryTextDelta { delta } => {
-                streamed_reasoning.push_str(&delta);
+                if !delta.is_empty() {
+                    streamed_reasoning.push_str(&delta);
+                    on_event(ProviderStreamEvent::ReasoningSummaryDelta(&delta));
+                }
             }
             ResponsesEvent::OutputItemAdded { output_index, item }
             | ResponsesEvent::OutputItemDone { output_index, item } => {
@@ -567,7 +570,7 @@ fn consume_responses_sse(
     let final_text = output_text(&output);
     let text = if streamed_text.is_empty() {
         if !final_text.is_empty() {
-            on_text(&final_text);
+            on_event(ProviderStreamEvent::TextDelta(&final_text));
         }
         final_text
     } else {
@@ -575,6 +578,9 @@ fn consume_responses_sse(
     };
     let final_reasoning = reasoning_summary(&output);
     let reasoning_summary = if streamed_reasoning.is_empty() {
+        if !final_reasoning.is_empty() {
+            on_event(ProviderStreamEvent::ReasoningSummaryDelta(&final_reasoning));
+        }
         final_reasoning
     } else {
         streamed_reasoning
@@ -726,14 +732,16 @@ mod tests {
         )
     }
 
-    fn run(fixture: &str) -> (ParsedResponse, String) {
+    fn run(fixture: &str) -> (ParsedResponse, String, String) {
         let cancel = AtomicBool::new(false);
-        let mut streamed = String::new();
-        let parsed = consume_responses_sse(fixture.as_bytes(), &cancel, &mut |delta| {
-            streamed.push_str(delta);
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let parsed = consume_responses_sse(fixture.as_bytes(), &cancel, &mut |event| match event {
+            ProviderStreamEvent::TextDelta(delta) => text.push_str(delta),
+            ProviderStreamEvent::ReasoningSummaryDelta(delta) => reasoning.push_str(delta),
         })
         .expect("fixture parses");
-        (parsed, streamed)
+        (parsed, text, reasoning)
     }
 
     fn read_http_request(stream: &mut TcpStream) -> String {
@@ -1036,8 +1044,9 @@ mod tests {
             "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Done.\"}]}",
             "]}}\n",
         );
-        let (parsed, streamed) = run(fixture);
+        let (parsed, streamed, reasoning) = run(fixture);
         assert_eq!(streamed, "Done.");
+        assert_eq!(reasoning, "I checked the cuts.");
         assert_eq!(parsed.turn.text, "Done.");
         assert_eq!(parsed.turn.reasoning_summary, "I checked the cuts.");
         assert_eq!(parsed.turn.finish, FinishReason::Stop);
@@ -1055,8 +1064,9 @@ mod tests {
             "{\"type\":\"function_call\",\"id\":\"fc_b\",\"call_id\":\"call_b\",\"name\":\"remove_clip\",\"arguments\":\"{\\\"clip\\\":2}\"}",
             "]}}\n",
         );
-        let (parsed, streamed) = run(fixture);
+        let (parsed, streamed, reasoning) = run(fixture);
         assert!(streamed.is_empty());
+        assert!(reasoning.is_empty());
         assert_eq!(parsed.turn.finish, FinishReason::ToolCalls);
         assert_eq!(parsed.turn.tool_calls.len(), 2);
         assert_eq!(parsed.turn.tool_calls[0].id, "call_a");
@@ -1072,21 +1082,24 @@ mod tests {
             "data: {\"type\":\"response.function_call_arguments.delta\",\"output_index\":0,\"delta\":\"{\\\"clip\\\":3}\"}\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"output\":[]}}\n",
         );
-        let (parsed, _) = run(fixture);
+        let (parsed, _, _) = run(fixture);
         assert_eq!(parsed.turn.tool_calls.len(), 1);
         assert_eq!(parsed.turn.tool_calls[0].arguments["clip"], 3);
     }
 
     #[test]
-    fn terminal_text_is_forwarded_when_delta_events_are_absent() {
+    fn terminal_display_events_are_forwarded_when_deltas_are_absent() {
         let fixture = concat!(
             "data: {\"type\":\"response.completed\",\"response\":{\"output\":[",
+            "{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"Checked the result.\"}]},",
             "{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"Complete answer\"}]}",
             "]}}\n",
         );
-        let (parsed, streamed) = run(fixture);
+        let (parsed, streamed, reasoning) = run(fixture);
         assert_eq!(streamed, "Complete answer");
+        assert_eq!(reasoning, "Checked the result.");
         assert_eq!(parsed.turn.text, streamed);
+        assert_eq!(parsed.turn.reasoning_summary, reasoning);
     }
 
     #[test]
@@ -1138,8 +1151,9 @@ mod tests {
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Partial\"}\n",
             "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"},\"output\":[]}}\n",
         );
-        let (parsed, streamed) = run(fixture);
+        let (parsed, streamed, reasoning) = run(fixture);
         assert_eq!(streamed, "Partial");
+        assert!(reasoning.is_empty());
         assert_eq!(parsed.turn.finish, FinishReason::Length);
         assert!(parsed.turn.tool_calls.is_empty());
     }
@@ -1234,7 +1248,10 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let mut streamed = String::new();
         let turn = provider
-            .chat(&request, &cancel, &mut |delta| streamed.push_str(delta))
+            .chat(&request, &cancel, &mut |event| match event {
+                ProviderStreamEvent::TextDelta(delta) => streamed.push_str(delta),
+                ProviderStreamEvent::ReasoningSummaryDelta(_) => {}
+            })
             .expect("second initial request succeeds");
         assert_eq!(turn.text, "ok");
         assert_eq!(streamed, "ok");

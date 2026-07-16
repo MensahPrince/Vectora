@@ -2,7 +2,7 @@
 
 use std::sync::atomic::AtomicBool;
 
-use crate::provider::{ChatProvider, ChatRequest, ChatTurn, ProviderError};
+use crate::provider::{ChatProvider, ChatRequest, ChatTurn, ProviderError, ProviderStreamEvent};
 
 pub mod openai_compat;
 pub mod openai_responses;
@@ -75,11 +75,11 @@ impl ChatProvider for OpenAiProvider {
         &self,
         request: &ChatRequest<'_>,
         cancel: &AtomicBool,
-        on_text: &mut dyn FnMut(&str),
+        on_event: &mut dyn FnMut(ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, ProviderError> {
         match &self.inner {
-            OpenAiProviderInner::Chat(provider) => provider.chat(request, cancel, on_text),
-            OpenAiProviderInner::Responses(provider) => provider.chat(request, cancel, on_text),
+            OpenAiProviderInner::Chat(provider) => provider.chat(request, cancel, on_event),
+            OpenAiProviderInner::Responses(provider) => provider.chat(request, cancel, on_event),
         }
     }
 }

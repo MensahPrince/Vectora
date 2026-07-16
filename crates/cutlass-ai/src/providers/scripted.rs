@@ -6,7 +6,9 @@
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 
-use crate::provider::{ChatProvider, ChatRequest, ChatTurn, Message, ProviderError};
+use crate::provider::{
+    ChatProvider, ChatRequest, ChatTurn, Message, ProviderError, ProviderStreamEvent,
+};
 
 pub struct ScriptedProvider {
     turns: Mutex<std::vec::IntoIter<ChatTurn>>,
@@ -41,7 +43,7 @@ impl ChatProvider for ScriptedProvider {
         &self,
         request: &ChatRequest<'_>,
         _cancel: &AtomicBool,
-        on_text: &mut dyn FnMut(&str),
+        on_event: &mut dyn FnMut(ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, ProviderError> {
         self.requests
             .lock()
@@ -54,8 +56,13 @@ impl ChatProvider for ScriptedProvider {
         let turn = self.turns.lock().unwrap().next().ok_or_else(|| {
             ProviderError::Protocol("scripted provider ran out of turns".to_string())
         })?;
+        if !turn.reasoning_summary.is_empty() {
+            on_event(ProviderStreamEvent::ReasoningSummaryDelta(
+                &turn.reasoning_summary,
+            ));
+        }
         if !turn.text.is_empty() {
-            on_text(&turn.text);
+            on_event(ProviderStreamEvent::TextDelta(&turn.text));
         }
         Ok(turn)
     }

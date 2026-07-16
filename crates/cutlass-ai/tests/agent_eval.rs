@@ -731,6 +731,90 @@ fn describe_project_feeds_state_back_without_counting_as_an_edit() {
 }
 
 #[test]
+fn reasoning_summaries_stream_across_tool_rounds_without_entering_history() {
+    let (mut host, _, _, clip) = fixture();
+    let first_summary = "I should inspect the current timeline.";
+    let second_summary = "The selected clip can be split safely.";
+    let final_summary = "The edit succeeded, so I can answer.";
+    let provider = ScriptedProvider::new(vec![
+        ChatTurn {
+            text: String::new(),
+            reasoning_summary: first_summary.into(),
+            tool_calls: vec![ToolCall {
+                id: "inspect".into(),
+                name: "describe_project".into(),
+                arguments: serde_json::json!({}),
+            }],
+            finish: FinishReason::ToolCalls,
+        },
+        ChatTurn {
+            text: String::new(),
+            reasoning_summary: second_summary.into(),
+            tool_calls: vec![ToolCall {
+                id: "edit".into(),
+                name: "split_clip".into(),
+                arguments: serde_json::json!({"clip": clip, "at": 5.0}),
+            }],
+            finish: FinishReason::ToolCalls,
+        },
+        ChatTurn {
+            text: "Split the clip at 5 seconds.".into(),
+            reasoning_summary: final_summary.into(),
+            tool_calls: Vec::new(),
+            finish: FinishReason::Stop,
+        },
+    ]);
+
+    let (outcome, events) = run(
+        &provider,
+        &mut host,
+        &EditorContext::default(),
+        "split the clip after inspecting it",
+        &AgentConfig::default(),
+    );
+
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert_eq!(outcome.actions.len(), 1);
+    assert_eq!(host.engine.project().timeline().clip_count(), 2);
+    let summaries = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::ReasoningDelta(delta) => Some(delta.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(summaries, [first_summary, second_summary, final_summary]);
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Action(_)))
+    );
+    assert!(events.iter().any(|event| {
+        matches!(event, AgentEvent::TextDelta(delta) if delta == "Split the clip at 5 seconds.")
+    }));
+
+    let requests = provider.requests();
+    for message in requests
+        .iter()
+        .flatten()
+        .chain(outcome.turn_messages.iter())
+    {
+        let content = match message {
+            Message::System { content }
+            | Message::User { content, .. }
+            | Message::Assistant { content, .. }
+            | Message::ToolResult { content, .. } => content,
+        };
+        for summary in [first_summary, second_summary, final_summary] {
+            assert!(
+                !content.contains(summary),
+                "reasoning summary leaked into model history: {content}"
+            );
+        }
+    }
+}
+
+#[test]
 fn dry_run_collects_the_plan_without_touching_the_engine() {
     let (mut host, _, _, clip) = fixture();
     let provider = ScriptedProvider::new(vec![
@@ -785,7 +869,7 @@ impl cutlass_ai::provider::ChatProvider for TitleAddingModel {
         &self,
         request: &cutlass_ai::provider::ChatRequest<'_>,
         _cancel: &AtomicBool,
-        _on_text: &mut dyn FnMut(&str),
+        _on_event: &mut dyn FnMut(cutlass_ai::provider::ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, cutlass_ai::provider::ProviderError> {
         let last = request.messages.last().unwrap();
         Ok(match last {
@@ -871,7 +955,7 @@ impl cutlass_ai::provider::ChatProvider for AudioExtractingModel {
         &self,
         request: &cutlass_ai::provider::ChatRequest<'_>,
         _cancel: &AtomicBool,
-        _on_text: &mut dyn FnMut(&str),
+        _on_event: &mut dyn FnMut(cutlass_ai::provider::ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, cutlass_ai::provider::ProviderError> {
         let last = request.messages.last().unwrap();
         Ok(match last {

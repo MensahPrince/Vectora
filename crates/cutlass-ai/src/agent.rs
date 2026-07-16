@@ -25,7 +25,9 @@ use cutlass_commands::EditOutcome;
 
 use crate::describe::{EditorContext, ProjectSummary};
 use crate::extend::AgentExtensions;
-use crate::provider::{ChatProvider, ChatRequest, FinishReason, ImagePart, Message, ProviderError};
+use crate::provider::{
+    ChatProvider, ChatRequest, FinishReason, ImagePart, Message, ProviderError, ProviderStreamEvent,
+};
 use crate::tools::{HostToolSpec, ToolHost, is_host_tool_name};
 use crate::wire::{self, WireCommand};
 
@@ -146,6 +148,8 @@ pub struct ActionLogEntry {
 pub enum AgentEvent {
     /// Assistant text, as it streams.
     TextDelta(String),
+    /// A provider-generated reasoning summary, kept out of model history.
+    ReasoningDelta(String),
     /// An edit was applied (or validated, in dry-run).
     Action(ActionLogEntry),
     /// A host tool ran; `summary` is the first line of its output.
@@ -485,7 +489,14 @@ pub fn run_prompt_with_host(
         }
         image_event_cursor = messages.len();
         let turn = {
-            let mut forward = |delta: &str| on_event(AgentEvent::TextDelta(delta.to_string()));
+            let mut forward = |event: ProviderStreamEvent<'_>| match event {
+                ProviderStreamEvent::TextDelta(delta) => {
+                    on_event(AgentEvent::TextDelta(delta.to_string()));
+                }
+                ProviderStreamEvent::ReasoningSummaryDelta(delta) => {
+                    on_event(AgentEvent::ReasoningDelta(delta.to_string()));
+                }
+            };
             match provider.chat(
                 &ChatRequest {
                     messages: &messages,

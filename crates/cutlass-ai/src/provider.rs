@@ -164,16 +164,23 @@ impl std::fmt::Display for ProviderError {
 
 impl std::error::Error for ProviderError {}
 
-/// Chat completion with tool calling and streamed text.
+/// One provider stream delta. Reasoning summaries stay a distinct channel so
+/// callers cannot accidentally append them to assistant text or model history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderStreamEvent<'a> {
+    TextDelta(&'a str),
+    ReasoningSummaryDelta(&'a str),
+}
+
+/// Chat completion with tool calling and streamed display events.
 ///
 /// Implementations must check `cancel` between chunks and return
-/// [`ProviderError::Cancelled`] promptly when it goes true. `on_text`
-/// receives assistant text deltas as they stream.
+/// [`ProviderError::Cancelled`] promptly when it goes true.
 pub trait ChatProvider {
     fn chat(
         &self,
         request: &ChatRequest<'_>,
         cancel: &AtomicBool,
-        on_text: &mut dyn FnMut(&str),
+        on_event: &mut dyn FnMut(ProviderStreamEvent<'_>),
     ) -> Result<ChatTurn, ProviderError>;
 }
