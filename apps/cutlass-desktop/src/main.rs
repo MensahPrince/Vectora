@@ -1803,6 +1803,8 @@ fn main() -> Result<(), slint::PlatformError> {
     settings_backend.set_config_path(config_path.display().to_string().into());
     settings_backend.set_ai_base_url(app_settings.ai.base_url.clone().into());
     settings_backend.set_ai_model(app_settings.ai.model.clone().into());
+    settings_backend.set_ai_api_protocol(app_settings.ai.api_protocol.key().into());
+    settings_backend.set_ai_reasoning_summary(app_settings.ai.reasoning_summary.key().into());
     settings_backend.set_ai_api_key(app_settings.ai.api_key.clone().unwrap_or_default().into());
     settings_backend.set_ai_api_key_env(
         app_settings
@@ -2303,6 +2305,12 @@ fn main() -> Result<(), slint::PlatformError> {
             };
             let ai_base_url = sb.get_ai_base_url().trim().to_string();
             let ai_model = sb.get_ai_model().trim().to_string();
+            let ai_api_protocol =
+                cutlass_settings::AiApiProtocol::from_key(&sb.get_ai_api_protocol())
+                    .unwrap_or_default();
+            let ai_reasoning_summary =
+                cutlass_settings::ReasoningSummary::from_key(&sb.get_ai_reasoning_summary())
+                    .unwrap_or_default();
             let ai_api_key = non_empty(&sb.get_ai_api_key());
             let ai_api_key_env = non_empty(&sb.get_ai_api_key_env());
             let ai_use_account = sb.get_ai_use_account();
@@ -2313,6 +2321,8 @@ fn main() -> Result<(), slint::PlatformError> {
                     .map_err(|error| ("load", error.to_string()))?;
                 settings.ai.base_url = ai_base_url;
                 settings.ai.model = ai_model;
+                settings.ai.api_protocol = ai_api_protocol;
+                settings.ai.reasoning_summary = ai_reasoning_summary;
                 settings.ai.api_key = ai_api_key;
                 settings.ai.api_key_env = ai_api_key_env;
                 settings.ai.use_account = ai_use_account;

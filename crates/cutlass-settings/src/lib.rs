@@ -25,6 +25,8 @@
 //! model = "qwen3:14b"
 //! # api_key = "sk-..."             # literal key, or:
 //! # api_key_env = "OPENAI_API_KEY"  # read from the environment
+//! # api_protocol = "responses"      # default: "chat_completions"
+//! # reasoning_summary = "off"       # default: "auto" in Responses mode
 //! # autonomy = "full"              # skip destructive-tool confirmations
 //!
 //! [appearance]
@@ -164,6 +166,62 @@ impl Autonomy {
     }
 }
 
+/// OpenAI-compatible HTTP protocol used by the editing agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AiApiProtocol {
+    /// Broadly supported by Ollama, LM Studio, llama.cpp, and older gateways.
+    #[default]
+    ChatCompletions,
+    /// OpenAI Responses API, required for reasoning models that call tools.
+    Responses,
+}
+
+impl AiApiProtocol {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::ChatCompletions => "chat_completions",
+            Self::Responses => "responses",
+        }
+    }
+
+    /// Parse a persisted value. Aliases tolerate hand-written configs while
+    /// keeping one canonical key on save.
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "chat_completions" | "chat-completions" | "chat" => Some(Self::ChatCompletions),
+            "responses" | "response" => Some(Self::Responses),
+            _ => None,
+        }
+    }
+}
+
+/// Whether Responses requests ask the provider for a safe reasoning summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningSummary {
+    /// Ask for the most detailed provider-supported summary.
+    #[default]
+    Auto,
+    /// Do not request or display reasoning summaries.
+    Off,
+}
+
+impl ReasoningSummary {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn from_key(value: &str) -> Option<Self> {
+        match value {
+            "auto" | "on" => Some(Self::Auto),
+            "off" | "none" => Some(Self::Off),
+            _ => None,
+        }
+    }
+}
+
 /// The `[ai]` table: how the agent reaches an OpenAI-compatible endpoint.
 /// Plain data — key *resolution* (the `api_key_env` indirection) is an
 /// AI-domain concern and lives in `cutlass_ai::config`. The default (empty
@@ -175,6 +233,10 @@ pub struct AiSettings {
     pub base_url: String,
     /// Model name as the endpoint knows it, e.g. `qwen3:14b` or `gpt-4o`.
     pub model: String,
+    /// HTTP API shape. Existing configurations remain on Chat Completions.
+    pub api_protocol: AiApiProtocol,
+    /// Provider-generated summary visibility for Responses reasoning models.
+    pub reasoning_summary: ReasoningSummary,
     /// Literal API key. Local servers usually need none.
     pub api_key: Option<String>,
     /// Name of an environment variable holding the key (preferred over a
@@ -739,6 +801,18 @@ impl Settings {
             if let Some(v) = string_at(t, "model") {
                 s.ai.model = v;
             }
+            if let Some(protocol) = string_at(t, "api_protocol")
+                .as_deref()
+                .and_then(AiApiProtocol::from_key)
+            {
+                s.ai.api_protocol = protocol;
+            }
+            if let Some(summary) = string_at(t, "reasoning_summary")
+                .as_deref()
+                .and_then(ReasoningSummary::from_key)
+            {
+                s.ai.reasoning_summary = summary;
+            }
             s.ai.api_key = string_at(t, "api_key");
             s.ai.api_key_env = string_at(t, "api_key_env");
             s.ai.use_account = t
@@ -858,6 +932,16 @@ impl Settings {
             let t = ensure_table(doc, "ai");
             set_str(t, "base_url", &self.ai.base_url);
             set_str(t, "model", &self.ai.model);
+            if self.ai.api_protocol == AiApiProtocol::default() {
+                t.remove("api_protocol");
+            } else {
+                set_str(t, "api_protocol", self.ai.api_protocol.key());
+            }
+            if self.ai.reasoning_summary == ReasoningSummary::default() {
+                t.remove("reasoning_summary");
+            } else {
+                set_str(t, "reasoning_summary", self.ai.reasoning_summary.key());
+            }
             set_optional(t, "api_key", self.ai.api_key.as_deref());
             set_optional(t, "api_key_env", self.ai.api_key_env.as_deref());
             if self.ai.use_account {
@@ -1843,6 +1927,66 @@ theme = "ember"
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(!raw.contains("autonomy"), "default left no literal: {raw}");
         assert_eq!(load(&path).unwrap().ai.autonomy, Autonomy::Ask);
+    }
+
+    #[test]
+    fn ai_protocol_and_reasoning_summary_are_tolerant() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+
+        std::fs::write(
+            &path,
+            "[ai]\napi_protocol = \"responses\"\nreasoning_summary = \"off\"\n",
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.ai.api_protocol, AiApiProtocol::Responses);
+        assert_eq!(loaded.ai.reasoning_summary, ReasoningSummary::Off);
+
+        std::fs::write(
+            &path,
+            "[ai]\napi_protocol = \"chat-completions\"\nreasoning_summary = \"on\"\n",
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.ai.api_protocol, AiApiProtocol::ChatCompletions);
+        assert_eq!(loaded.ai.reasoning_summary, ReasoningSummary::Auto);
+
+        std::fs::write(
+            &path,
+            "[ai]\napi_protocol = \"future\"\nreasoning_summary = \"verbose\"\n",
+        )
+        .unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.ai.api_protocol, AiApiProtocol::default());
+        assert_eq!(loaded.ai.reasoning_summary, ReasoningSummary::default());
+    }
+
+    #[test]
+    fn ai_protocol_and_reasoning_summary_round_trip_canonical_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "# keep me\n[ai]\nmodel = \"gpt-5\"\n").unwrap();
+
+        let mut settings = load(&path).unwrap();
+        settings.ai.api_protocol = AiApiProtocol::Responses;
+        settings.ai.reasoning_summary = ReasoningSummary::Off;
+        save(&path, &settings).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("api_protocol = \"responses\""), "{raw}");
+        assert!(raw.contains("reasoning_summary = \"off\""), "{raw}");
+        assert!(raw.contains("# keep me"), "{raw}");
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.ai.api_protocol, AiApiProtocol::Responses);
+        assert_eq!(loaded.ai.reasoning_summary, ReasoningSummary::Off);
+
+        settings.ai.api_protocol = AiApiProtocol::default();
+        settings.ai.reasoning_summary = ReasoningSummary::default();
+        save(&path, &settings).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("api_protocol"), "{raw}");
+        assert!(!raw.contains("reasoning_summary"), "{raw}");
     }
 
     #[test]
