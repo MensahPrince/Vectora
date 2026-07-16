@@ -4,11 +4,7 @@ use std::time::Duration;
 
 use super::*;
 
-fn draft(
-    id: &str,
-    name: impl Into<String>,
-    modified: SystemTime,
-) -> crate::drafts::DraftSummary {
+fn draft(id: &str, name: impl Into<String>, modified: SystemTime) -> crate::drafts::DraftSummary {
     crate::drafts::DraftSummary {
         name: name.into(),
         project: crate::drafts::project_file(&crate::drafts::root_dir().join(id)),
@@ -233,8 +229,8 @@ fn import_parser_rejects_lexical_dot_components_and_unsafe_text() {
     }
 
     let nul_path = format!("{}\0clip.mp4", temp.path().display());
-    let nul = parse_request(PROJECT_IMPORT_MEDIA, &json!({"path": nul_path}))
-        .expect_err("NUL must fail");
+    let nul =
+        parse_request(PROJECT_IMPORT_MEDIA, &json!({"path": nul_path})).expect_err("NUL must fail");
     assert!(nul.contains("must not contain NUL"), "{nul}");
 
     let relative = parse_request(PROJECT_IMPORT_MEDIA, &json!({"path": "relative/clip.mp4"}))
@@ -438,8 +434,7 @@ fn open_output_is_bounded_path_free_and_bound_to_the_requested_identity() {
         project_name: "outside".into(),
         missing_media_count: 0,
     };
-    let outside_error =
-        open_output(draft_id, &outside).expect_err("outside path must fail closed");
+    let outside_error = open_output(draft_id, &outside).expect_err("outside path must fail closed");
     assert!(outside_error.contains("current session was replaced"));
     assert!(!outside_error.contains("/private"));
     assert!(!outside_error.contains("agent-secret"));
@@ -688,9 +683,7 @@ fn import_rpc_errors_preserve_not_started_and_unknown_outcomes_without_paths() {
     assert!(!not_started.contains(private));
 
     for internal in [
-        format!(
-            "import media request timed out after worker claim; outcome unknown for {private}"
-        ),
+        format!("import media request timed out after worker claim; outcome unknown for {private}"),
         format!("import media outcome uncertain/partially committed while decoding {private}"),
         format!("import succeeded for {private} but its pool record could not be read back"),
     ] {
@@ -757,8 +750,8 @@ fn save_output_contains_only_safe_identity_and_clean_state() {
 
 #[test]
 fn unavailable_worker_is_an_honest_bounded_error() {
-    let error = call(None, PROJECT_SAVE, &json!({}), &AtomicBool::new(false))
-        .expect_err("missing worker");
+    let error =
+        call(None, PROJECT_SAVE, &json!({}), &AtomicBool::new(false)).expect_err("missing worker");
     assert_eq!(
         error,
         "project_save failed: the editor worker is unavailable"

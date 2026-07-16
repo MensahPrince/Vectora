@@ -197,13 +197,15 @@ fn valid_delete_removes_only_its_target() {
         b"keep"
     );
     assert!(!delete_checked_in_root(&root, &target).expect("repeat delete"));
-    assert!(fs::read_dir(&root)
-        .expect("read root")
-        .flatten()
-        .all(|entry| !entry
-            .file_name()
-            .to_string_lossy()
-            .starts_with(TOMBSTONE_PREFIX)));
+    assert!(
+        fs::read_dir(&root)
+            .expect("read root")
+            .flatten()
+            .all(|entry| !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(TOMBSTONE_PREFIX))
+    );
 }
 
 #[test]
@@ -230,9 +232,11 @@ fn list_ignores_tombstones_and_uses_a_stable_path_tie_break() {
     assert_eq!(drafts[0].modified, drafts[1].modified);
     assert_eq!(drafts[0].name, "First");
     assert_eq!(drafts[1].name, "Second");
-    assert!(drafts
-        .windows(2)
-        .all(|pair| pair[0].modified >= pair[1].modified));
+    assert!(
+        drafts
+            .windows(2)
+            .all(|pair| pair[0].modified >= pair[1].modified)
+    );
 }
 
 #[test]
@@ -480,10 +484,12 @@ fn symlink_metadata_destination_is_never_rewritten() {
         fs::read(&outside).expect("outside metadata remains"),
         original
     );
-    assert!(fs::symlink_metadata(meta_file(dir))
-        .expect("metadata symlink remains")
-        .file_type()
-        .is_symlink());
+    assert!(
+        fs::symlink_metadata(meta_file(dir))
+            .expect("metadata symlink remains")
+            .file_type()
+            .is_symlink()
+    );
 }
 
 #[cfg(unix)]
@@ -502,10 +508,12 @@ fn symlink_root_is_refused_without_following_it() {
     assert!(delete_checked_in_root(&root_link, &project).is_err());
     assert!(write_meta_in_root(&root_link, &project, "Outside").is_err());
     assert!(list_in_root(&root_link).is_err());
-    assert!(fs::read_dir(&actual_root)
-        .expect("read actual root")
-        .next()
-        .is_none());
+    assert!(
+        fs::read_dir(&actual_root)
+            .expect("read actual root")
+            .next()
+            .is_none()
+    );
 }
 
 #[test]
