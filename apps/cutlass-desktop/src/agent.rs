@@ -15,6 +15,7 @@
 //! With the dry-run toggle on (the default), the plan is parked here and
 //! the chat panel shows an Apply / Discard card instead of auto-applying.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -36,7 +37,7 @@ use slint::{Model, ModelRc, SharedString, VecModel};
 use tracing::{error, info, warn};
 
 use crate::agent_senses::AgentSenses;
-use crate::agent_session::{AgentSession, TranscriptEntry};
+use crate::agent_session::{AgentSession, ChatMeta, TranscriptEntry};
 use crate::cache_registry::CacheRegistry;
 use crate::preview_worker::WorkerHandle;
 use crate::{AgentEntry, AgentStore, AppWindow};
@@ -67,6 +68,10 @@ enum AgentRequest {
     },
     ApplyPlan,
     DiscardPlan,
+    NewChat,
+    SelectChat {
+        id: String,
+    },
     /// Persist the outgoing draft's conversation and restore the incoming
     /// draft. A missing path means no app-owned project is active.
     SwitchProject {
@@ -109,6 +114,14 @@ impl AgentHandle {
 
     pub fn discard_plan(&self) {
         let _ = self.tx.send(AgentRequest::DiscardPlan);
+    }
+
+    pub fn new_chat(&self) {
+        let _ = self.tx.send(AgentRequest::NewChat);
+    }
+
+    pub fn select_chat(&self, id: String) {
+        let _ = self.tx.send(AgentRequest::SelectChat { id });
     }
 
     /// Persist the outgoing session and restore the incoming draft's
@@ -416,11 +429,12 @@ fn replace_transcript(
 }
 
 fn persist_session(
-    path: Option<&Path>,
+    project: Option<&Path>,
+    chat_id: Option<&str>,
     history: &[Message],
     store: &slint::Weak<AgentStore<'static>>,
 ) {
-    let Some(path) = path else {
+    let (Some(project), Some(chat_id)) = (project, chat_id) else {
         return;
     };
     let transcript = match transcript_snapshot(store) {
@@ -434,9 +448,89 @@ fn persist_session(
         history: history.to_vec(),
         transcript,
     };
-    if let Err(error) = crate::agent_session::save(path, &session) {
-        warn!(error, project = %path.display(), "agent session was not saved");
+    if session.history.is_empty() && session.transcript.is_empty() {
+        return;
     }
+    if let Err(error) = crate::agent_session::save_chat(project, chat_id, &session) {
+        warn!(
+            error,
+            project = %project.display(),
+            chat_id,
+            "agent chat was not saved"
+        );
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ChatChoice {
+    id: String,
+    label: String,
+}
+
+fn chat_choices(mut chats: Vec<ChatMeta>, active_chat_id: Option<&str>) -> Vec<ChatChoice> {
+    if let Some(active_id) = active_chat_id {
+        if !chats.iter().any(|chat| chat.id == active_id) {
+            chats.insert(
+                0,
+                ChatMeta {
+                    id: active_id.to_string(),
+                    title: "New chat".to_string(),
+                    updated_millis: u64::MAX,
+                },
+            );
+        }
+    }
+
+    let mut used = HashSet::new();
+    chats
+        .into_iter()
+        .map(|chat| {
+            let base = chat.title;
+            let mut label = base.clone();
+            let mut suffix = 2;
+            while !used.insert(label.clone()) {
+                label = format!("{base} · {suffix}");
+                suffix += 1;
+            }
+            ChatChoice { id: chat.id, label }
+        })
+        .collect()
+}
+
+fn publish_chat_list(
+    store: &slint::Weak<AgentStore<'static>>,
+    project: Option<&Path>,
+    active_chat_id: Option<&str>,
+) {
+    let chats = match project {
+        Some(project) => match crate::agent_session::list_chats(project) {
+            Ok(chats) => chats,
+            Err(error) => {
+                warn!(error, project = %project.display(), "agent chats could not be listed");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
+    let choices = chat_choices(chats, active_chat_id);
+    let active_label = active_chat_id
+        .and_then(|active_id| {
+            choices
+                .iter()
+                .find(|choice| choice.id == active_id)
+                .map(|choice| choice.label.clone())
+        })
+        .unwrap_or_default();
+    let labels: Vec<SharedString> = choices
+        .iter()
+        .map(|choice| choice.label.as_str().into())
+        .collect();
+    let ids: Vec<SharedString> = choices.into_iter().map(|choice| choice.id.into()).collect();
+    with_store(store, move |store| {
+        store.set_chat_labels(ModelRc::new(VecModel::from(labels)));
+        store.set_chat_ids(ModelRc::new(VecModel::from(ids)));
+        store.set_active_chat_label(active_label.into());
+    });
 }
 
 fn sandbox_engine() -> Result<Engine, String> {
@@ -1067,6 +1161,7 @@ fn agent_main(
     let mut preview = Preview::default();
     let mut history: Vec<Message> = Vec::new();
     let mut current_project: Option<PathBuf> = None;
+    let mut current_chat_id: Option<String> = None;
 
     let config_path = cutlass_settings::default_config_path();
     let configured = cutlass_settings::load(&config_path)
@@ -1085,6 +1180,22 @@ fn agent_main(
                 context,
                 dry_run,
             } => {
+                if current_chat_id.is_none() {
+                    current_chat_id = current_project.as_deref().and_then(|project| {
+                        match crate::agent_session::allocate_chat_id(project) {
+                            Ok(id) => Some(id),
+                            Err(error) => {
+                                warn!(error, project = %project.display(), "agent chat id was not allocated");
+                                None
+                            }
+                        }
+                    });
+                    publish_chat_list(
+                        &store,
+                        current_project.as_deref(),
+                        current_chat_id.as_deref(),
+                    );
+                }
                 cancel.store(false, Ordering::Relaxed);
                 if dry_run {
                     if !preview.is_pending() {
@@ -1140,7 +1251,17 @@ fn agent_main(
                 );
 
                 with_store(&store, |s| s.set_running(false));
-                persist_session(current_project.as_deref(), &history, &store);
+                persist_session(
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                    &history,
+                    &store,
+                );
+                publish_chat_list(
+                    &store,
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                );
             }
             AgentRequest::ApplyPlan => {
                 let plan = std::mem::take(&mut preview.plan);
@@ -1151,7 +1272,17 @@ fn agent_main(
                     continue;
                 }
                 apply_plan_live(&worker, &store, plan, &phase_breaks);
-                persist_session(current_project.as_deref(), &history, &store);
+                persist_session(
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                    &history,
+                    &store,
+                );
+                publish_chat_list(
+                    &store,
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                );
             }
             AgentRequest::DiscardPlan => {
                 if preview.is_pending() {
@@ -1166,7 +1297,93 @@ fn agent_main(
                     );
                 }
                 with_store(&store, |s| s.set_plan_pending(false));
-                persist_session(current_project.as_deref(), &history, &store);
+                persist_session(
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                    &history,
+                    &store,
+                );
+                publish_chat_list(
+                    &store,
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                );
+            }
+            AgentRequest::NewChat => {
+                if let Some(saved) = preview.history_restore.take() {
+                    history = saved;
+                }
+                preview.clear();
+                with_store(&store, |s| s.set_plan_pending(false));
+                persist_session(
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                    &history,
+                    &store,
+                );
+
+                current_chat_id = current_project.as_deref().and_then(|project| {
+                    match crate::agent_session::allocate_chat_id(project) {
+                        Ok(id) => Some(id),
+                        Err(error) => {
+                            warn!(error, project = %project.display(), "agent chat id was not allocated");
+                            None
+                        }
+                    }
+                });
+                history.clear();
+                replace_transcript(&store, Vec::new(), None);
+                publish_chat_list(
+                    &store,
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                );
+            }
+            AgentRequest::SelectChat { id } => {
+                if current_chat_id.as_deref() == Some(id.as_str()) {
+                    publish_chat_list(
+                        &store,
+                        current_project.as_deref(),
+                        current_chat_id.as_deref(),
+                    );
+                    continue;
+                }
+                if let Some(saved) = preview.history_restore.take() {
+                    history = saved;
+                }
+                preview.clear();
+                with_store(&store, |s| s.set_plan_pending(false));
+                persist_session(
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                    &history,
+                    &store,
+                );
+
+                let loaded = current_project
+                    .as_deref()
+                    .ok_or_else(|| "no project is open".to_string())
+                    .and_then(|project| crate::agent_session::load_chat(project, &id));
+                match loaded {
+                    Ok(session) => {
+                        history = session.history;
+                        replace_transcript(&store, session.transcript, None);
+                        current_chat_id = Some(id);
+                    }
+                    Err(error) => {
+                        warn!(error, chat_id = id, "agent chat could not be restored");
+                        push_entry(
+                            &store,
+                            "error",
+                            "That chat could not be restored.".to_string(),
+                        );
+                    }
+                }
+                publish_chat_list(
+                    &store,
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                );
             }
             AgentRequest::SwitchProject { path } => {
                 // A parked dry-run conversation names edits that never
@@ -1176,18 +1393,52 @@ fn agent_main(
                     history = saved;
                 }
                 preview.clear();
-                persist_session(current_project.as_deref(), &history, &store);
+                with_store(&store, |s| s.set_plan_pending(false));
+                persist_session(
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                    &history,
+                    &store,
+                );
 
-                let (session, restore_error) = match path.as_deref() {
-                    Some(project) => match crate::agent_session::load(project) {
-                        Ok(session) => (session, None),
-                        Err(error) => (AgentSession::default(), Some(error)),
+                let (next_chat_id, session, restore_error) = match path.as_deref() {
+                    Some(project) => match crate::agent_session::list_chats(project) {
+                        Ok(chats) => match chats.first() {
+                            Some(chat) => {
+                                match crate::agent_session::load_chat(project, &chat.id) {
+                                    Ok(session) => (Some(chat.id.clone()), session, None),
+                                    Err(error) => (
+                                        Some(chat.id.clone()),
+                                        AgentSession::default(),
+                                        Some(error),
+                                    ),
+                                }
+                            }
+                            None => match crate::agent_session::allocate_chat_id(project) {
+                                Ok(id) => (Some(id), AgentSession::default(), None),
+                                Err(error) => (None, AgentSession::default(), Some(error)),
+                            },
+                        },
+                        Err(error) => match crate::agent_session::allocate_chat_id(project) {
+                            Ok(id) => (Some(id), AgentSession::default(), Some(error)),
+                            Err(allocation_error) => (
+                                None,
+                                AgentSession::default(),
+                                Some(format!("{error}; {allocation_error}")),
+                            ),
+                        },
                     },
-                    None => (AgentSession::default(), None),
+                    None => (None, AgentSession::default(), None),
                 };
                 history = session.history;
                 replace_transcript(&store, session.transcript, restore_error);
                 current_project = path;
+                current_chat_id = next_chat_id;
+                publish_chat_list(
+                    &store,
+                    current_project.as_deref(),
+                    current_chat_id.as_deref(),
+                );
             }
         }
     }
@@ -1564,6 +1815,52 @@ mod tests {
         assert_eq!(model.row_data(1).unwrap().kind, "assistant");
         assert_eq!(model.row_data(2).unwrap().kind, "reasoning");
         assert_eq!(model.row_data(2).unwrap().text, "Verifying.");
+    }
+
+    #[test]
+    fn chat_choices_keep_duplicate_titles_unique_and_include_an_unsaved_active_chat() {
+        let choices = chat_choices(
+            vec![
+                ChatMeta {
+                    id: "chat-3".into(),
+                    title: "Trim the clip".into(),
+                    updated_millis: 3,
+                },
+                ChatMeta {
+                    id: "chat-2".into(),
+                    title: "Trim the clip".into(),
+                    updated_millis: 2,
+                },
+                ChatMeta {
+                    id: "chat-1".into(),
+                    title: "Add captions".into(),
+                    updated_millis: 1,
+                },
+            ],
+            Some("chat-4"),
+        );
+
+        assert_eq!(
+            choices,
+            vec![
+                ChatChoice {
+                    id: "chat-4".into(),
+                    label: "New chat".into(),
+                },
+                ChatChoice {
+                    id: "chat-3".into(),
+                    label: "Trim the clip".into(),
+                },
+                ChatChoice {
+                    id: "chat-2".into(),
+                    label: "Trim the clip · 2".into(),
+                },
+                ChatChoice {
+                    id: "chat-1".into(),
+                    label: "Add captions".into(),
+                },
+            ]
+        );
     }
 
     #[test]

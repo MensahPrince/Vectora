@@ -13,6 +13,7 @@ use cutlass_ai::provider::{ImagePart, Message, ToolCall};
 use serde::{Deserialize, Serialize};
 
 const SESSION_FILE: &str = "agent-session.json";
+#[cfg(test)]
 const TEMP_FILE: &str = ".agent-session.json.tmp";
 const CHAT_DIRECTORY: &str = "agent-chats";
 const CHAT_ID_PREFIX: &str = "chat-";
@@ -142,6 +143,7 @@ pub(crate) fn save_chat(project: &Path, id: &str, session: &AgentSession) -> Res
 /// A missing sidecar is an empty session. Files larger than 4 MiB, malformed
 /// JSON, and unsupported versions are rejected. Valid oversized collections
 /// retain only their newest bounded entries.
+#[cfg(test)]
 pub(crate) fn load(project: &Path) -> Result<AgentSession, String> {
     let path = session_path(project)?;
     load_file(&path)
@@ -215,6 +217,7 @@ fn load_file(path: &Path) -> Result<AgentSession, String> {
 /// The draft directory is created when needed. A complete pretty-printed
 /// document is written to a fixed same-directory temporary file and then
 /// renamed over the prior sidecar.
+#[cfg(test)]
 pub(crate) fn save(project: &Path, session: &AgentSession) -> Result<(), String> {
     let path = session_path(project)?;
     save_file(&path, TEMP_FILE, session)
@@ -670,6 +673,33 @@ mod tests {
         let project = project_path(&dir);
         let error = load_chat(&project, "../agent-session").expect_err("invalid id");
         assert!(error.contains("invalid agent chat id"), "{error}");
+    }
+
+    #[test]
+    fn collection_caps_apply_to_each_chat_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = project_path(&dir);
+        let session = AgentSession {
+            history: (0..MAX_HISTORY_MESSAGES + 3)
+                .map(|index| Message::user(format!("history-{index}")))
+                .collect(),
+            transcript: (0..MAX_TRANSCRIPT_ENTRIES + 5)
+                .map(|index| TranscriptEntry {
+                    kind: "user".into(),
+                    text: format!("transcript-{index}"),
+                })
+                .collect(),
+        };
+
+        save_chat(&project, "chat-42", &session).expect("save bounded chat");
+        let loaded = load_chat(&project, "chat-42").expect("load bounded chat");
+        assert_eq!(loaded.history.len(), MAX_HISTORY_MESSAGES);
+        assert_eq!(loaded.transcript.len(), MAX_TRANSCRIPT_ENTRIES);
+        assert_eq!(
+            loaded.history.first(),
+            Some(&Message::user("history-3".to_string()))
+        );
+        assert_eq!(loaded.transcript[0].text, "transcript-5");
     }
 
     #[test]
