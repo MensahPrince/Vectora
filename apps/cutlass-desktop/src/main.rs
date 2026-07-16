@@ -468,6 +468,18 @@ fn pluralized_count(count: u64, singular: &str, plural: &str) -> String {
     }
 }
 
+fn resolve_chat_id(
+    labels: &[SharedString],
+    ids: &[SharedString],
+    selected_label: &str,
+) -> Option<String> {
+    labels
+        .iter()
+        .position(|label| label.as_str() == selected_label)
+        .and_then(|index| ids.get(index))
+        .map(ToString::to_string)
+}
+
 fn cache_item_count_label(kind: cutlass_storage::CacheKind, entries: u64, files: u64) -> String {
     match kind {
         cutlass_storage::CacheKind::Memory => pluralized_count(entries, "entry", "entries"),
@@ -1185,6 +1197,29 @@ fn main() -> Result<(), slint::PlatformError> {
     let agent_discard = agent_worker.handle();
     agent_store.on_discard_plan(move || agent_discard.discard_plan());
 
+    let agent_new_chat = agent_worker.handle();
+    agent_store.on_new_chat(move || agent_new_chat.new_chat());
+
+    let agent_select_chat = agent_worker.handle();
+    let agent_select_app = app.as_weak();
+    agent_store.on_select_chat(move |label| {
+        let Some(app) = agent_select_app.upgrade() else {
+            return;
+        };
+        let store = app.global::<AgentStore>();
+        let labels_model = store.get_chat_labels();
+        let ids_model = store.get_chat_ids();
+        let labels = (0..labels_model.row_count())
+            .filter_map(|index| labels_model.row_data(index))
+            .collect::<Vec<_>>();
+        let ids = (0..ids_model.row_count())
+            .filter_map(|index| ids_model.row_data(index))
+            .collect::<Vec<_>>();
+        if let Some(id) = resolve_chat_id(&labels, &ids, label.as_str()) {
+            agent_select_chat.select_chat(id);
+        }
+    });
+
     let agent_session = agent_worker.handle();
     let agent_session_app = app.as_weak();
     agent_store.on_session_changed(move || {
@@ -1198,6 +1233,17 @@ fn main() -> Result<(), slint::PlatformError> {
         });
         agent_session.switch_project(path);
     });
+
+    // The initial project can be restored before callback wiring, so seed the
+    // worker explicitly instead of waiting for the next session-epoch change.
+    let initial_agent_path = {
+        let path = app
+            .global::<EditorStore>()
+            .get_project_file_path()
+            .to_string();
+        (!path.is_empty()).then(|| std::path::PathBuf::from(path))
+    };
+    agent_worker.handle().switch_project(initial_agent_path);
 
     // Per-project agent rules editor (agent panel) → ProjectMetadata via
     // the engine worker; the projection publishes the saved value back to
@@ -3480,6 +3526,25 @@ fn main() -> Result<(), slint::PlatformError> {
 #[cfg(test)]
 mod settings_cache_tests {
     use super::*;
+
+    #[test]
+    fn chat_label_resolution_uses_parallel_ids_and_rejects_mismatches() {
+        let labels = vec![
+            SharedString::from("Trim the clip"),
+            SharedString::from("Trim the clip · 2"),
+        ];
+        let ids = vec![SharedString::from("chat-20"), SharedString::from("chat-10")];
+
+        assert_eq!(
+            resolve_chat_id(&labels, &ids, "Trim the clip · 2"),
+            Some("chat-10".to_string())
+        );
+        assert_eq!(
+            resolve_chat_id(&labels, &ids[..1], "Trim the clip · 2"),
+            None
+        );
+        assert_eq!(resolve_chat_id(&labels, &ids, "Missing"), None);
+    }
 
     fn snapshot(
         id: cutlass_storage::CacheId,

@@ -10,6 +10,7 @@ import {
     CutlassText,
     AccentButton,
     SubtleButton,
+    CutlassDropdown,
 } from "../../components/index.slint";
 import {
     AgentStore,
@@ -449,6 +450,48 @@ export component AgentPanel inherits PanelBase {
 
         PanelHeader {
             title: "Assistant";
+        }
+
+        Rectangle {
+            height: 40px;
+
+            HorizontalLayout {
+                padding-left: AppStore.theme.metrics.spacing.md;
+                padding-right: AppStore.theme.metrics.spacing.md;
+                padding-top: AppStore.theme.metrics.spacing.xs;
+                padding-bottom: AppStore.theme.metrics.spacing.xs;
+                spacing: AppStore.theme.metrics.spacing.sm;
+
+                chat-picker := Rectangle {
+                    horizontal-stretch: 1;
+                    height: 28px;
+                    opacity: AgentStore.running ? 0.35 : 1.0;
+
+                    CutlassDropdown {
+                        width: parent.width;
+                        items: AgentStore.chat-labels;
+                        current: AgentStore.active-chat-label;
+                        placeholder: "Chat history";
+                        selected(label) => {
+                            if (!AgentStore.running) {
+                                AgentStore.select-chat(label);
+                            }
+                        }
+                    }
+
+                    if AgentStore.running: TouchArea {
+                        mouse-cursor: MouseCursor.default;
+                    }
+                }
+
+                SubtleButton {
+                    label: "New chat";
+                    enabled: !AgentStore.running;
+                    clicked => {
+                        AgentStore.new-chat();
+                    }
+                }
+            }
         }
 
         // Not configured: setup instructions instead of a dead chat box.
