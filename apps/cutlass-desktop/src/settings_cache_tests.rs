@@ -1,5 +1,10 @@
 use super::*;
 
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use slint::SharedString;
+
 #[test]
 fn chat_label_resolution_uses_parallel_ids_and_rejects_mismatches() {
     let labels = vec![

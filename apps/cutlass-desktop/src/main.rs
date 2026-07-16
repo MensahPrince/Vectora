@@ -44,32 +44,16 @@ mod timeline_map;
 mod transport;
 mod window;
 
-use std::cell::Cell;
-use std::cell::RefCell;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::Duration;
-
-use cutlass_engine::EngineConfig;
 use slint::BackendSelector;
-use slint::Global;
-use slint::Model;
 use slint::ModelRc;
-use slint::SharedString;
 use slint::VecModel;
 use slint::wgpu_28::WGPUConfiguration;
-use slint::winit_030::EventResult;
 use slint::winit_030::WinitWindowAccessor;
-use slint::winit_030::winit::event::WindowEvent;
 
 slint::include_modules!();
 
 use bootstrap::*;
 use cache_ui::*;
-use library_helpers::*;
-use session::*;
 
 // PORT IN PROGRESS (from main's crates/cutlass-ui): Phases 0–1 of the
 // desktop-editor port are live — window chrome, launch gallery, drafts,
@@ -228,13 +212,10 @@ fn main() -> Result<(), slint::PlatformError> {
     agent_store.set_configured(app_settings.ai.is_configured());
     agent_store.set_config_path(config_path.display().to_string().into());
 
-    let _editor = app.global::<EditorStore>();
-
     // ENGINE WIRING (Phases 1–5): session flows, imports, the full edit
     // surface (drag/trim/split, inspector commits, clipboard, tracks,
     // keyframes, effects), audio playback, library/timeline tiles, and the
     // export job bind to the workers below. Still to come: live overrides (6).
-
     let engine = wire_engine(&app, storage_layout, download_quota_bytes, job_manager)?;
 
     wire_timeline(&app, &engine.preview_worker, &engine.download_cache);
