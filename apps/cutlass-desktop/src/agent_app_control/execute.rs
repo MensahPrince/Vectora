@@ -121,7 +121,7 @@ pub(super) fn wait_for_ui_response(
 }
 
 pub(super) fn execute_ui(app: &crate::AppWindow, request: Request) -> UiResponse {
-    if matches!(request, Request::State) {
+    if request == Request::State {
         return Ok(app_state_value(app));
     }
     let result = match request {
