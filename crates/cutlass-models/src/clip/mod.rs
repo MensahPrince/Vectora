@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::effects::EffectInstance;
 use crate::error::ModelError;
 use crate::ids::{ClipId, LinkId, MediaId};
-use crate::param::Param;
-use crate::time::{Rational, RationalTime, TimeRange, check_same_rate};
+use crate::param::{Easing, Keyframe, Param};
+use crate::time::{Rational, RationalTime, TimeRange, check_same_rate, resample, time_sub};
 
 mod crop;
 mod generator;
