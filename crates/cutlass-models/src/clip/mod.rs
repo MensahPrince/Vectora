@@ -3,8 +3,12 @@ use serde::{Deserialize, Serialize};
 use crate::effects::EffectInstance;
 use crate::error::ModelError;
 use crate::ids::{ClipId, LinkId, MediaId};
-use crate::param::{Easing, Keyframe, Param};
-use crate::time::{Rational, RationalTime, TimeRange, check_same_rate, resample, time_sub};
+use crate::param::Param;
+use crate::time::{Rational, RationalTime, TimeRange, check_same_rate};
+// Kept in scope for `clip/tests` (`use super::*`); not referenced by mod.rs itself.
+#[cfg(test)]
+#[allow(unused_imports)]
+use crate::param::{Easing, Keyframe};
 
 mod crop;
 mod generator;
