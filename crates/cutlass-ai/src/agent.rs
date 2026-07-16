@@ -129,8 +129,8 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             max_tool_calls: 1000,
-            max_host_calls: 100,
-            max_turns: 100,
+            max_host_calls: 200,
+            max_turns: 200,
             max_images: 25,
             max_image_bytes: 24 * 1024 * 1024,
             dry_run: false,
