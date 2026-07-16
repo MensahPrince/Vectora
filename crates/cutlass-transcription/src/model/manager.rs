@@ -1,11 +1,7 @@
-use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
-use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock, TryLockError, Weak};
-use std::time::Duration;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
 
 use cap_std::ambient_authority;
 use cap_std::fs::{
@@ -13,438 +9,20 @@ use cap_std::fs::{
 };
 use same_file::Handle as FileIdentity;
 use sha2::{Digest, Sha256};
-use thiserror::Error;
 
-const BASE_EN_SPEC: ModelSpec = ModelSpec::new(
-    "base.en",
-    "ggml-base.en.bin",
-    "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin",
-    147_964_211,
-    "a03779c86df3323075f5e796cb2ce5029f00ec8869eee3fdfb897afe36c6d002",
-    true,
-    "about 148 MB on disk and about 388 MB RAM during inference",
-);
+use super::catalog::{
+    ModelIntegrityError, ModelManagerError, ModelSpec, ModelStatus, WhisperModel,
+};
+use super::download::{HttpDownloader, ModelDownloader};
+use super::filesystem::{
+    FileVersion, TEMP_FILE_SEQUENCE, check_begin_commit, check_cancelled, digest_to_hex,
+    ensure_cap_regular_model_file, ensure_directory_root, ensure_regular_model_file,
+    integrity_error, lock_model_with_cancellation, model_lock, never_cancelled, next_read_length,
+    validate_root, validate_spec,
+};
 
-const WHISPER_MODELS: &[WhisperModel] = &[WhisperModel::BaseEn];
 const DOWNLOAD_BUFFER_BYTES: usize = 64 * 1024;
 const TEMP_FILE_ATTEMPTS: u64 = 256;
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
-const DEFAULT_TOTAL_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const MODEL_LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
-
-static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-static MODEL_LOCKS: OnceLock<Mutex<ModelLockMap>> = OnceLock::new();
-
-type ModelLockMap = HashMap<PathBuf, Weak<Mutex<()>>>;
-
-/// A built-in Whisper model known to Cutlass.
-///
-/// This enum, rather than a caller-provided filename, is used by every public
-/// [`ModelManager`] file operation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum WhisperModel {
-    /// The official English-only Whisper base model.
-    BaseEn,
-}
-
-impl WhisperModel {
-    /// Returns all models in stable catalog order.
-    #[must_use]
-    pub const fn catalog() -> &'static [Self] {
-        WHISPER_MODELS
-    }
-
-    /// Returns the immutable catalog specification for this model.
-    #[must_use]
-    pub const fn spec(self) -> &'static ModelSpec {
-        match self {
-            Self::BaseEn => &BASE_EN_SPEC,
-        }
-    }
-}
-
-/// Immutable metadata for one verified model artifact.
-///
-/// Construction is intentionally private. Public model-manager operations can
-/// therefore use only filenames compiled into this crate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ModelSpec {
-    id: &'static str,
-    filename: &'static str,
-    url: &'static str,
-    exact_bytes: u64,
-    sha256: &'static str,
-    english_only: bool,
-    resource_description: &'static str,
-}
-
-impl ModelSpec {
-    const fn new(
-        id: &'static str,
-        filename: &'static str,
-        url: &'static str,
-        exact_bytes: u64,
-        sha256: &'static str,
-        english_only: bool,
-        resource_description: &'static str,
-    ) -> Self {
-        Self {
-            id,
-            filename,
-            url,
-            exact_bytes,
-            sha256,
-            english_only,
-            resource_description,
-        }
-    }
-
-    /// Returns the stable application-facing model identifier.
-    #[must_use]
-    pub const fn id(&self) -> &'static str {
-        self.id
-    }
-
-    /// Returns the fixed local filename.
-    #[must_use]
-    pub const fn filename(&self) -> &'static str {
-        self.filename
-    }
-
-    /// Returns the official HTTPS artifact URL.
-    #[must_use]
-    pub const fn url(&self) -> &'static str {
-        self.url
-    }
-
-    /// Returns the exact accepted artifact length.
-    #[must_use]
-    pub const fn exact_bytes(&self) -> u64 {
-        self.exact_bytes
-    }
-
-    /// Returns the lowercase SHA-256 digest in hexadecimal.
-    #[must_use]
-    pub const fn sha256(&self) -> &'static str {
-        self.sha256
-    }
-
-    /// Returns whether this model can recognize only English speech.
-    #[must_use]
-    pub const fn is_english_only(&self) -> bool {
-        self.english_only
-    }
-
-    /// Returns an approximate disk and inference-memory description.
-    #[must_use]
-    pub const fn resource_description(&self) -> &'static str {
-        self.resource_description
-    }
-}
-
-/// A readable stream returned by a [`ModelDownloader`].
-pub type DownloadReader = Box<dyn Read + Send + 'static>;
-
-/// An injectable source for model bytes.
-///
-/// Tests and embedding applications can provide deterministic readers without
-/// network access. Integrity and length enforcement remain the model manager's
-/// responsibility.
-pub trait ModelDownloader: Send + Sync {
-    /// Opens a streaming response for `spec`.
-    ///
-    /// The returned stream is consumed at most through the catalogued exact
-    /// byte count plus one detecting read.
-    fn download(&self, spec: &ModelSpec) -> Result<DownloadReader, DownloadError>;
-}
-
-impl<F> ModelDownloader for F
-where
-    F: Fn(&ModelSpec) -> Result<DownloadReader, DownloadError> + Send + Sync,
-{
-    fn download(&self, spec: &ModelSpec) -> Result<DownloadReader, DownloadError> {
-        self(spec)
-    }
-}
-
-/// A failure to establish a model download stream.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum DownloadError {
-    /// The server returned a non-success HTTP status.
-    #[error("model server returned HTTP status {status}")]
-    HttpStatus {
-        /// The rejected HTTP status code.
-        status: u16,
-    },
-    /// The HTTP transport failed before a usable stream was returned.
-    #[error("model download transport failed: {message}")]
-    Transport {
-        /// A transport diagnostic without response content.
-        message: String,
-    },
-    /// One or more configured timeouts were zero.
-    #[error("model download timeouts must all be greater than zero")]
-    InvalidTimeout,
-    /// A custom downloader rejected the request.
-    #[error("model downloader failed: {message}")]
-    Custom {
-        /// A custom downloader diagnostic.
-        message: String,
-    },
-}
-
-impl DownloadError {
-    /// Creates an error for an injected downloader.
-    #[must_use]
-    pub fn custom(message: impl Into<String>) -> Self {
-        Self::Custom {
-            message: message.into(),
-        }
-    }
-}
-
-/// Blocking HTTPS model downloader backed by `ureq`.
-///
-/// The default uses a 15-second connect timeout, a 30-second read timeout, and
-/// a 30-minute whole-request deadline. Redirects are handled by `ureq`; the
-/// final response must be a 2xx status.
-#[derive(Debug, Clone)]
-pub struct HttpDownloader {
-    agent: ureq::Agent,
-}
-
-impl HttpDownloader {
-    /// Creates a downloader with explicit non-zero timeout bounds.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DownloadError::InvalidTimeout`] if any timeout is zero.
-    pub fn with_timeouts(
-        connect_timeout: Duration,
-        read_timeout: Duration,
-        total_timeout: Duration,
-    ) -> Result<Self, DownloadError> {
-        if connect_timeout.is_zero() || read_timeout.is_zero() || total_timeout.is_zero() {
-            return Err(DownloadError::InvalidTimeout);
-        }
-
-        let agent = ureq::AgentBuilder::new()
-            .https_only(true)
-            .timeout_connect(connect_timeout)
-            .timeout_read(read_timeout)
-            .timeout(total_timeout)
-            .build();
-        Ok(Self { agent })
-    }
-}
-
-impl Default for HttpDownloader {
-    fn default() -> Self {
-        Self::with_timeouts(
-            DEFAULT_CONNECT_TIMEOUT,
-            DEFAULT_READ_TIMEOUT,
-            DEFAULT_TOTAL_TIMEOUT,
-        )
-        .expect("default model download timeouts are non-zero")
-    }
-}
-
-impl ModelDownloader for HttpDownloader {
-    fn download(&self, spec: &ModelSpec) -> Result<DownloadReader, DownloadError> {
-        let response = match self
-            .agent
-            .get(spec.url())
-            .set("Accept", "application/octet-stream")
-            .set("Accept-Encoding", "identity")
-            .set(
-                "User-Agent",
-                concat!("cutlass-transcription/", env!("CARGO_PKG_VERSION")),
-            )
-            .call()
-        {
-            Ok(response) => response,
-            Err(ureq::Error::Status(status, _)) => {
-                return Err(DownloadError::HttpStatus { status });
-            }
-            Err(ureq::Error::Transport(error)) => {
-                return Err(DownloadError::Transport {
-                    message: error.to_string(),
-                });
-            }
-        };
-
-        if !(200..300).contains(&response.status()) {
-            return Err(DownloadError::HttpStatus {
-                status: response.status(),
-            });
-        }
-        Ok(response.into_reader())
-    }
-}
-
-/// Why a regular model file failed exact integrity verification.
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub enum ModelIntegrityError {
-    /// The file or stream length differed from the catalog.
-    #[error("expected exactly {expected} bytes, found {actual}")]
-    WrongSize {
-        /// Exact catalogued bytes.
-        expected: u64,
-        /// Observed bytes.
-        actual: u64,
-    },
-    /// The SHA-256 digest differed from the catalog.
-    #[error("expected SHA-256 {expected}, found {actual}")]
-    ChecksumMismatch {
-        /// Catalogued lowercase SHA-256.
-        expected: String,
-        /// Observed lowercase SHA-256.
-        actual: String,
-    },
-}
-
-/// Current integrity state of one catalogued model.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ModelStatus {
-    /// No model file exists.
-    Missing,
-    /// A regular file passed exact size and SHA-256 verification.
-    Ready {
-        /// Verified model path.
-        path: PathBuf,
-    },
-    /// A regular file exists but failed integrity verification.
-    Invalid {
-        /// Invalid model path.
-        path: PathBuf,
-        /// Exact verification failure.
-        reason: ModelIntegrityError,
-    },
-}
-
-/// A model catalog, filesystem, download, or integrity failure.
-#[derive(Debug, Error)]
-pub enum ModelManagerError {
-    /// Cooperative model installation cancellation was requested.
-    #[error("model installation cancelled")]
-    Cancelled,
-    /// The configured model root was relative.
-    #[error("model root must be absolute: `{root}`")]
-    RootNotAbsolute {
-        /// Rejected root.
-        root: PathBuf,
-    },
-    /// The configured model root was a filesystem root.
-    #[error("model root must not be a filesystem root: `{root}`")]
-    FilesystemRoot {
-        /// Rejected root.
-        root: PathBuf,
-    },
-    /// The root contained lexical traversal.
-    #[error("model root must not contain `.` or `..` traversal: `{root}`")]
-    RootTraversal {
-        /// Rejected root.
-        root: PathBuf,
-    },
-    /// A compiled catalog entry violated path or digest invariants.
-    #[error("invalid model catalog entry `{model_id}`: {detail}")]
-    InvalidCatalogEntry {
-        /// Stable catalog identifier.
-        model_id: &'static str,
-        /// Rejected invariant.
-        detail: &'static str,
-    },
-    /// The model root was a link, Windows reparse point, or non-directory.
-    #[error("unsafe model root `{root}`: {detail}")]
-    UnsafeRoot {
-        /// Rejected root path.
-        root: PathBuf,
-        /// Rejected filesystem type.
-        detail: &'static str,
-    },
-    /// The lexical root stopped naming the pinned physical directory.
-    #[error(
-        "model root mapping changed while operating on `{root}`; expected pinned directory `{pinned_root}`"
-    )]
-    RootMappingChanged {
-        /// Configured lexical root.
-        root: PathBuf,
-        /// Canonical directory pinned at operation start.
-        pinned_root: PathBuf,
-    },
-    /// A known model path was a link, Windows reparse point, or non-regular file.
-    #[error("unsafe model file `{path}`: {detail}")]
-    UnsafeModelFile {
-        /// Rejected known model path.
-        path: PathBuf,
-        /// Rejected filesystem type.
-        detail: &'static str,
-    },
-    /// A model or temporary file name changed objects during an operation.
-    #[error("{object} changed during the operation: `{path}`")]
-    FilesystemObjectChanged {
-        /// Path used for diagnostics.
-        path: PathBuf,
-        /// Kind of filesystem object that changed.
-        object: &'static str,
-    },
-    /// A required model file did not exist.
-    #[error("model file is missing: `{path}`")]
-    MissingModel {
-        /// Expected known model path.
-        path: PathBuf,
-    },
-    /// A model file or completed download failed integrity verification.
-    #[error("model integrity check failed for `{path}`: {reason}")]
-    Integrity {
-        /// Known model path.
-        path: PathBuf,
-        /// Exact verification failure.
-        #[source]
-        reason: ModelIntegrityError,
-    },
-    /// A stream exceeded the catalogued byte maximum.
-    #[error("model download exceeded {expected} bytes after observing {observed}")]
-    DownloadTooLarge {
-        /// Exact catalogued maximum.
-        expected: u64,
-        /// Bytes observed when overflow was detected.
-        observed: u64,
-    },
-    /// A downloader could not produce a stream.
-    #[error(transparent)]
-    Download(#[from] DownloadError),
-    /// A bounded filesystem or stream operation failed.
-    #[error("failed to {operation} `{path}`: {source}")]
-    Io {
-        /// Operation being attempted.
-        operation: &'static str,
-        /// Relevant filesystem path.
-        path: PathBuf,
-        /// Underlying I/O failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Installation completed, but the containing directory could not be synced.
-    #[error(
-        "verified model was installed at `{path}`, but durability confirmation for its containing directory failed; retrying ensure is safe: {source}"
-    )]
-    InstalledButDirectorySyncFailed {
-        /// Installed verified model path.
-        path: PathBuf,
-        /// Directory synchronization failure.
-        #[source]
-        source: io::Error,
-    },
-    /// Unique temporary filenames could not be allocated.
-    #[error("could not allocate a unique temporary model file in `{root}`")]
-    TemporaryNameExhausted {
-        /// Model directory containing collisions.
-        root: PathBuf,
-    },
-}
 
 /// Safe, transactional storage for built-in Whisper models.
 ///
@@ -634,7 +212,7 @@ impl ModelManager {
         self.remove_spec(model.spec())
     }
 
-    fn status_spec(&self, spec: &ModelSpec) -> Result<ModelStatus, ModelManagerError> {
+    pub(super) fn status_spec(&self, spec: &ModelSpec) -> Result<ModelStatus, ModelManagerError> {
         validate_spec(spec)?;
         let Some(snapshot) = self.capture_existing_root()? else {
             return Ok(ModelStatus::Missing);
@@ -659,7 +237,7 @@ impl ModelManager {
     }
 
     #[cfg(test)]
-    fn ensure_spec(
+    pub(super) fn ensure_spec(
         &self,
         spec: &ModelSpec,
         downloader: &dyn ModelDownloader,
@@ -668,7 +246,7 @@ impl ModelManager {
     }
 
     #[cfg(test)]
-    fn ensure_spec_with_cancellation(
+    pub(super) fn ensure_spec_with_cancellation(
         &self,
         spec: &ModelSpec,
         downloader: &dyn ModelDownloader,
@@ -678,7 +256,7 @@ impl ModelManager {
         self.ensure_spec_with_cancellation_and_commit(spec, downloader, cancelled, &begin_commit)
     }
 
-    fn ensure_spec_with_cancellation_and_commit(
+    pub(super) fn ensure_spec_with_cancellation_and_commit(
         &self,
         spec: &ModelSpec,
         downloader: &dyn ModelDownloader,
@@ -794,7 +372,7 @@ impl ModelManager {
         Ok(reported_path)
     }
 
-    fn remove_spec(&self, spec: &ModelSpec) -> Result<bool, ModelManagerError> {
+    pub(super) fn remove_spec(&self, spec: &ModelSpec) -> Result<bool, ModelManagerError> {
         validate_spec(spec)?;
         let Some(snapshot) = self.capture_existing_root()? else {
             return Ok(false);
@@ -806,7 +384,7 @@ impl ModelManager {
         self.remove_from_snapshot(spec, &snapshot)
     }
 
-    fn remove_from_snapshot(
+    pub(super) fn remove_from_snapshot(
         &self,
         spec: &ModelSpec,
         snapshot: &RootSnapshot,
@@ -840,12 +418,12 @@ impl ModelManager {
         Ok(true)
     }
 
-    fn path_for_spec(&self, spec: &ModelSpec) -> Result<PathBuf, ModelManagerError> {
+    pub(super) fn path_for_spec(&self, spec: &ModelSpec) -> Result<PathBuf, ModelManagerError> {
         validate_spec(spec)?;
         Ok(self.root.join(spec.filename()))
     }
 
-    fn inspect_path(
+    pub(super) fn inspect_path(
         &self,
         spec: &ModelSpec,
         snapshot: &RootSnapshot,
@@ -978,7 +556,7 @@ impl ModelManager {
         })
     }
 
-    fn capture_existing_root(&self) -> Result<Option<RootSnapshot>, ModelManagerError> {
+    pub(super) fn capture_existing_root(&self) -> Result<Option<RootSnapshot>, ModelManagerError> {
         let metadata = match fs::symlink_metadata(&self.root) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1004,7 +582,7 @@ impl ModelManager {
     }
 }
 
-struct RootSnapshot {
+pub(super) struct RootSnapshot {
     lexical_root: PathBuf,
     canonical_root: PathBuf,
     dir: CapabilityDir,
@@ -1067,7 +645,7 @@ impl RootSnapshot {
         Ok(snapshot)
     }
 
-    fn physical_model_path(&self, spec: &ModelSpec) -> PathBuf {
+    pub(super) fn physical_model_path(&self, spec: &ModelSpec) -> PathBuf {
         self.canonical_root.join(spec.filename())
     }
 
@@ -1107,59 +685,6 @@ impl RootSnapshot {
                 root: self.lexical_root.clone(),
                 pinned_root: self.canonical_root.clone(),
             })
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileVersion {
-    length: u64,
-    #[cfg(unix)]
-    modified_seconds: i64,
-    #[cfg(unix)]
-    modified_nanoseconds: i64,
-    #[cfg(unix)]
-    changed_seconds: i64,
-    #[cfg(unix)]
-    changed_nanoseconds: i64,
-    #[cfg(windows)]
-    creation_time: u64,
-    #[cfg(windows)]
-    last_write_time: u64,
-    #[cfg(not(any(unix, windows)))]
-    modified: Option<std::time::SystemTime>,
-}
-
-impl FileVersion {
-    fn from_metadata(metadata: &fs::Metadata) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt as _;
-
-            Self {
-                length: metadata.len(),
-                modified_seconds: metadata.mtime(),
-                modified_nanoseconds: metadata.mtime_nsec(),
-                changed_seconds: metadata.ctime(),
-                changed_nanoseconds: metadata.ctime_nsec(),
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt as _;
-
-            Self {
-                length: metadata.len(),
-                creation_time: metadata.creation_time(),
-                last_write_time: metadata.last_write_time(),
-            }
-        }
-        #[cfg(not(any(unix, windows)))]
-        {
-            Self {
-                length: metadata.len(),
-                modified: metadata.modified().ok(),
-            }
         }
     }
 }
@@ -1225,128 +750,6 @@ fn verify_model_file_unchanged(
     Ok(metadata)
 }
 
-fn validate_root(root: &Path) -> Result<PathBuf, ModelManagerError> {
-    if !root.is_absolute() {
-        return Err(ModelManagerError::RootNotAbsolute {
-            root: root.to_path_buf(),
-        });
-    }
-
-    let mut has_normal_component = false;
-    for component in root.components() {
-        match component {
-            Component::ParentDir | Component::CurDir => {
-                return Err(ModelManagerError::RootTraversal {
-                    root: root.to_path_buf(),
-                });
-            }
-            Component::Normal(_) => has_normal_component = true,
-            Component::Prefix(_) | Component::RootDir => {}
-        }
-    }
-    if !has_normal_component {
-        return Err(ModelManagerError::FilesystemRoot {
-            root: root.to_path_buf(),
-        });
-    }
-
-    Ok(root.components().collect())
-}
-
-fn validate_spec(spec: &ModelSpec) -> Result<(), ModelManagerError> {
-    let filename = spec.filename();
-    if filename.is_empty()
-        || filename == "."
-        || filename == ".."
-        || filename.contains('/')
-        || filename.contains('\\')
-    {
-        return Err(ModelManagerError::InvalidCatalogEntry {
-            model_id: spec.id(),
-            detail: "filename must be one plain path component",
-        });
-    }
-    let mut components = Path::new(filename).components();
-    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
-        return Err(ModelManagerError::InvalidCatalogEntry {
-            model_id: spec.id(),
-            detail: "filename must be one plain path component",
-        });
-    }
-    if spec.exact_bytes() == 0 {
-        return Err(ModelManagerError::InvalidCatalogEntry {
-            model_id: spec.id(),
-            detail: "exact byte count must be non-zero",
-        });
-    }
-    if spec.sha256().len() != 64
-        || !spec
-            .sha256()
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    {
-        return Err(ModelManagerError::InvalidCatalogEntry {
-            model_id: spec.id(),
-            detail: "SHA-256 must be 64 lowercase hexadecimal characters",
-        });
-    }
-    Ok(())
-}
-
-fn ensure_directory_root(root: &Path, metadata: &fs::Metadata) -> Result<(), ModelManagerError> {
-    if metadata.file_type().is_symlink() || std_metadata_is_reparse_point(metadata) {
-        return Err(ModelManagerError::UnsafeRoot {
-            root: root.to_path_buf(),
-            detail: "root is a symlink or reparse point",
-        });
-    }
-    if !metadata.is_dir() {
-        return Err(ModelManagerError::UnsafeRoot {
-            root: root.to_path_buf(),
-            detail: "root is not a directory",
-        });
-    }
-    Ok(())
-}
-
-fn ensure_regular_model_file(
-    path: &Path,
-    metadata: &fs::Metadata,
-) -> Result<(), ModelManagerError> {
-    if metadata.file_type().is_symlink() || std_metadata_is_reparse_point(metadata) {
-        return Err(ModelManagerError::UnsafeModelFile {
-            path: path.to_path_buf(),
-            detail: "model path is a symlink or reparse point",
-        });
-    }
-    if !metadata.is_file() {
-        return Err(ModelManagerError::UnsafeModelFile {
-            path: path.to_path_buf(),
-            detail: "model path is not a regular file",
-        });
-    }
-    Ok(())
-}
-
-fn ensure_cap_regular_model_file(
-    path: &Path,
-    metadata: &cap_std::fs::Metadata,
-) -> Result<(), ModelManagerError> {
-    if metadata.is_symlink() || cap_metadata_is_reparse_point(metadata) {
-        return Err(ModelManagerError::UnsafeModelFile {
-            path: path.to_path_buf(),
-            detail: "model path is a symlink or reparse point",
-        });
-    }
-    if !metadata.is_file() {
-        return Err(ModelManagerError::UnsafeModelFile {
-            path: path.to_path_buf(),
-            detail: "model path is not a regular file",
-        });
-    }
-    Ok(())
-}
-
 fn ensure_safe_replace_target(
     snapshot: &RootSnapshot,
     spec: &ModelSpec,
@@ -1365,38 +768,6 @@ fn ensure_safe_replace_target(
     };
     ensure_cap_regular_model_file(&path, &metadata)?;
     Ok(true)
-}
-
-#[cfg(windows)]
-const WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-
-#[cfg(windows)]
-fn windows_attributes_are_reparse_point(attributes: u32) -> bool {
-    attributes & WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT != 0
-}
-
-#[cfg(windows)]
-fn std_metadata_is_reparse_point(metadata: &fs::Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt as _;
-
-    windows_attributes_are_reparse_point(metadata.file_attributes())
-}
-
-#[cfg(not(windows))]
-fn std_metadata_is_reparse_point(_metadata: &fs::Metadata) -> bool {
-    false
-}
-
-#[cfg(windows)]
-fn cap_metadata_is_reparse_point(metadata: &cap_std::fs::Metadata) -> bool {
-    use cap_std::fs::MetadataExt as _;
-
-    windows_attributes_are_reparse_point(metadata.file_attributes())
-}
-
-#[cfg(not(windows))]
-fn cap_metadata_is_reparse_point(_metadata: &cap_std::fs::Metadata) -> bool {
-    false
 }
 
 #[cfg(unix)]
@@ -1428,86 +799,6 @@ fn sync_containing_directory(
     _installed_path: &Path,
 ) -> Result<(), ModelManagerError> {
     Ok(())
-}
-
-fn integrity_error(path: PathBuf, reason: ModelIntegrityError) -> ModelManagerError {
-    ModelManagerError::Integrity { path, reason }
-}
-
-fn next_read_length(expected: u64, observed: u64, buffer_capacity: usize) -> usize {
-    let remaining = expected.saturating_sub(observed);
-    remaining.min((buffer_capacity - 1) as u64) as usize + 1
-}
-
-fn digest_to_hex(digest: &[u8]) -> String {
-    let mut output = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut output, "{byte:02x}").expect("writing hexadecimal to a string cannot fail");
-    }
-    output
-}
-
-fn never_cancelled() -> bool {
-    false
-}
-
-fn check_cancelled(cancelled: &dyn Fn() -> bool) -> Result<(), ModelManagerError> {
-    let requested =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(cancelled)).unwrap_or(true);
-    if requested {
-        Err(ModelManagerError::Cancelled)
-    } else {
-        Ok(())
-    }
-}
-
-fn check_begin_commit(begin_commit: &dyn Fn() -> bool) -> Result<(), ModelManagerError> {
-    let accepted =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(begin_commit)).unwrap_or(false);
-    if accepted {
-        Ok(())
-    } else {
-        Err(ModelManagerError::Cancelled)
-    }
-}
-
-fn lock_model_with_cancellation<'a>(
-    lock: &'a Mutex<()>,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<MutexGuard<'a, ()>, ModelManagerError> {
-    loop {
-        check_cancelled(cancelled)?;
-        match lock.try_lock() {
-            Ok(guard) => {
-                check_cancelled(cancelled)?;
-                return Ok(guard);
-            }
-            Err(TryLockError::Poisoned(poisoned)) => {
-                let guard = poisoned.into_inner();
-                check_cancelled(cancelled)?;
-                return Ok(guard);
-            }
-            Err(TryLockError::WouldBlock) => {
-                std::thread::yield_now();
-                std::thread::sleep(MODEL_LOCK_RETRY_DELAY);
-            }
-        }
-    }
-}
-
-fn model_lock(path: &Path) -> Arc<Mutex<()>> {
-    let locks = MODEL_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut locks = locks
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
-        return lock;
-    }
-
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-    lock
 }
 
 struct TemporaryDownload {
@@ -1696,5 +987,3 @@ impl Drop for TemporaryDownload {
     }
 }
 
-#[cfg(test)]
-mod tests;
