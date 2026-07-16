@@ -44,8 +44,7 @@ fn project_identity_extracts_from_the_exact_owned_shape_without_io() {
     let root = sandbox.path().join("projects");
     let project = root.join("abcdef-12").join(PROJECT_FILE);
 
-    let id =
-        draft_id_from_project_in_root(&root, &project).expect("extract valid draft identity");
+    let id = draft_id_from_project_in_root(&root, &project).expect("extract valid draft identity");
     assert_eq!(id, "abcdef-12");
     assert!(
         !root.exists(),
@@ -149,8 +148,7 @@ fn draft_id_resolution_requires_an_existing_regular_project() {
 
     let non_file_project = root.join("abc-1").join(PROJECT_FILE);
     fs::create_dir(&non_file_project).expect("create non-file project entry");
-    let error =
-        resolve_draft_id_in_root(&root, "abc-1").expect_err("resolved non-file project");
+    let error = resolve_draft_id_in_root(&root, "abc-1").expect_err("resolved non-file project");
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
@@ -307,10 +305,9 @@ fn failed_metadata_setup_cleans_the_new_draft_directory() {
     let sandbox = tempfile::tempdir().expect("tempdir");
     let root = sandbox.path().join("projects");
     let mut reader = Cursor::new(b"valid project");
-    let result =
-        import_reader_in_root(&root, &mut reader, "Broken", |_root, _project, _name| {
-            Err(io::Error::other("injected metadata failure"))
-        });
+    let result = import_reader_in_root(&root, &mut reader, "Broken", |_root, _project, _name| {
+        Err(io::Error::other("injected metadata failure"))
+    });
 
     assert!(result.is_err());
     assert_root_is_empty(&root);

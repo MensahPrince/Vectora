@@ -23,8 +23,7 @@ fn entry(duration: Option<f64>, slots: Option<u32>) -> CatalogEntry {
 }
 
 fn template_layout(templates_root: &Path) -> SharedStorageLayout {
-    let mut layout =
-        StorageLayout::new(templates_root.parent().unwrap().join("default")).unwrap();
+    let mut layout = StorageLayout::new(templates_root.parent().unwrap().join("default")).unwrap();
     layout
         .set_override(CacheId::Templates, templates_root)
         .unwrap();

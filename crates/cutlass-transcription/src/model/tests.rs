@@ -684,8 +684,7 @@ fn canonical_aliases_share_one_model_lock() {
     fs::create_dir(&physical_root).expect("create physical root");
     symlink(temp.path(), &alias_parent).expect("create intermediate alias");
 
-    let direct =
-        ModelManager::new(&physical_root).expect("direct manager has a valid final root");
+    let direct = ModelManager::new(&physical_root).expect("direct manager has a valid final root");
     let aliased = ModelManager::new(alias_parent.join("physical"))
         .expect("aliased manager has a valid final root");
     let direct_snapshot = direct

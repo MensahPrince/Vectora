@@ -74,8 +74,8 @@ fn structured_output_boundaries_are_exact_and_values_are_not_rewritten() {
     assert_eq!(empty.name(), "empty_value");
     assert_eq!(empty.value(), "");
 
-    let ascii = JobOutput::new(max_name.clone(), max_ascii_value.clone())
-        .expect("exact name/value bounds");
+    let ascii =
+        JobOutput::new(max_name.clone(), max_ascii_value.clone()).expect("exact name/value bounds");
     assert_eq!(ascii.name(), max_name);
     assert_eq!(ascii.value(), max_ascii_value);
 

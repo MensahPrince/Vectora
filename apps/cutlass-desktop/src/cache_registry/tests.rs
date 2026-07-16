@@ -112,8 +112,7 @@ fn disk_clear_removes_only_the_requested_cache_and_reports_exact_usage() {
     fs::write(analysis.join("moments.sqlite"), b"1234567").unwrap();
     fs::write(catalog.join("catalog.json"), b"keep").unwrap();
 
-    let removed =
-        clear_disk_contents(&layout, CacheId::Analysis, &AtomicBool::new(false)).unwrap();
+    let removed = clear_disk_contents(&layout, CacheId::Analysis, &AtomicBool::new(false)).unwrap();
     assert_eq!(
         removed,
         CacheUsage {
@@ -153,8 +152,7 @@ fn ai_models_are_outside_download_quota_and_reference_protection() {
     assert!(model.is_file(), "download quota must not inspect AI models");
     assert!(protected_source.is_file());
 
-    let removed =
-        clear_disk_contents(&layout, CacheId::AiModels, &AtomicBool::new(false)).unwrap();
+    let removed = clear_disk_contents(&layout, CacheId::AiModels, &AtomicBool::new(false)).unwrap();
     assert_eq!(
         removed,
         CacheUsage {
@@ -590,8 +588,7 @@ fn missing_source_becomes_an_empty_relocated_cache_after_cancellation_check() {
     assert!(!destination.exists());
 
     let outcome =
-        relocate_disk_root(&old_path, &destination, &AtomicBool::new(false), |_| Ok(()))
-            .unwrap();
+        relocate_disk_root(&old_path, &destination, &AtomicBool::new(false), |_| Ok(())).unwrap();
     assert_eq!(
         outcome.report,
         cutlass_storage::RelocationReport {

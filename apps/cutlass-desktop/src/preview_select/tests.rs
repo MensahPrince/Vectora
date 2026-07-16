@@ -538,8 +538,7 @@ fn sprite_placement_is_frame_aligned_at_identity_gesture() {
         opacity: 1.0,
         ..PreviewDragResolution::default()
     };
-    let sprite =
-        sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
+    let sprite = sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
     assert!(sprite.visible);
     assert!((sprite.x - 0.0).abs() < 1e-3);
     assert!((sprite.y - 0.0).abs() < 1e-3);
@@ -568,12 +567,10 @@ fn sprite_placement_scales_with_gesture() {
         opacity: 1.0,
         ..PreviewDragResolution::default()
     };
-    let sprite =
-        sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
+    let sprite = sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
     assert!(sprite.visible);
     assert!((sprite.scale - 0.5).abs() < 1e-3);
-    let sel_box =
-        selection_box_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
+    let sel_box = selection_box_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
     assert!(sel_box.visible);
     // Scaled content sits in the centered quarter of the viewport.
     assert!((sel_box.x0 - 240.0).abs() < 1e-3);
@@ -603,8 +600,7 @@ fn sprite_placement_falls_back_to_committed_transform() {
     };
 
     let committed = sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, None);
-    let live =
-        sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
+    let live = sprite_placement_in_viewport(&seq, "A", 10, VW, VH, 1.0, 0.0, 0.0, Some(&gesture));
 
     assert!(committed.visible);
     assert!((committed.x - live.x).abs() < 1e-3);
