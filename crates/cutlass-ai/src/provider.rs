@@ -119,6 +119,9 @@ pub enum FinishReason {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChatTurn {
     pub text: String,
+    /// Provider-generated explanation of the model's reasoning. This is
+    /// display-only and must never be copied into [`Message`] history.
+    pub reasoning_summary: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish: FinishReason,
 }

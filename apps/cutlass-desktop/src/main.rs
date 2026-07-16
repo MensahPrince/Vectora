@@ -2396,6 +2396,28 @@ fn main() -> Result<(), slint::PlatformError> {
             let sb = app.global::<SettingsBackend>();
             let base_url = sb.get_ai_base_url().trim().to_string();
             let model = sb.get_ai_model().trim().to_string();
+            let protocol =
+                match cutlass_settings::AiApiProtocol::from_key(&sb.get_ai_api_protocol())
+                    .unwrap_or_default()
+                {
+                    cutlass_settings::AiApiProtocol::ChatCompletions => {
+                        cutlass_ai::providers::OpenAiProtocol::ChatCompletions
+                    }
+                    cutlass_settings::AiApiProtocol::Responses => {
+                        cutlass_ai::providers::OpenAiProtocol::Responses
+                    }
+                };
+            let reasoning_summary =
+                match cutlass_settings::ReasoningSummary::from_key(&sb.get_ai_reasoning_summary())
+                    .unwrap_or_default()
+                {
+                    cutlass_settings::ReasoningSummary::Auto => {
+                        cutlass_ai::providers::ReasoningSummary::Auto
+                    }
+                    cutlass_settings::ReasoningSummary::Off => {
+                        cutlass_ai::providers::ReasoningSummary::Off
+                    }
+                };
             let api_key = non_empty(&sb.get_ai_api_key());
             let api_key_env = non_empty(&sb.get_ai_api_key_env());
             sb.set_ai_testing(true);
@@ -2407,9 +2429,15 @@ fn main() -> Result<(), slint::PlatformError> {
                 let result =
                     cutlass_ai::config::resolve_api_key(api_key.as_deref(), api_key_env.as_deref())
                         .and_then(|key| {
-                            cutlass_ai::providers::OpenAiCompatProvider::new(&base_url, &model, key)
-                                .test_connection()
-                                .map_err(|e| e.to_string())
+                            cutlass_ai::providers::OpenAiProvider::new(
+                                &base_url,
+                                &model,
+                                key,
+                                protocol,
+                                reasoning_summary,
+                            )
+                            .test_connection()
+                            .map_err(|e| e.to_string())
                         });
                 let _ = slint::invoke_from_event_loop(move || {
                     if let Some(app) = app_weak.upgrade() {

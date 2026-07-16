@@ -9,7 +9,7 @@ use std::sync::atomic::AtomicBool;
 
 use cutlass_ai::agent::{AgentConfig, AgentEvent, EngineBridge, run_prompt};
 use cutlass_ai::config::resolve_api_key;
-use cutlass_ai::providers::OpenAiCompatProvider;
+use cutlass_ai::providers::{OpenAiProtocol, OpenAiProvider, ReasoningSummary};
 use cutlass_ai::{EditorContext, ProjectSummary, WireCommand, summarize, validate};
 use cutlass_commands::EditOutcome;
 use cutlass_engine::{ApplyOutcome, Engine, EngineConfig};
@@ -66,7 +66,21 @@ fn main() {
         std::process::exit(1);
     }
     let api_key = resolve_api_key(ai.api_key.as_deref(), ai.api_key_env.as_deref()).unwrap();
-    let provider = OpenAiCompatProvider::new(&ai.base_url, &ai.model, api_key);
+    let protocol = match ai.api_protocol {
+        cutlass_settings::AiApiProtocol::ChatCompletions => OpenAiProtocol::ChatCompletions,
+        cutlass_settings::AiApiProtocol::Responses => OpenAiProtocol::Responses,
+    };
+    let reasoning_summary = match ai.reasoning_summary {
+        cutlass_settings::ReasoningSummary::Auto => ReasoningSummary::Auto,
+        cutlass_settings::ReasoningSummary::Off => ReasoningSummary::Off,
+    };
+    let provider = OpenAiProvider::new(
+        &ai.base_url,
+        &ai.model,
+        api_key,
+        protocol,
+        reasoning_summary,
+    );
 
     // Fixture: one 10s clip (of a 60s source) on V1, currently selected.
     let mut project = Project::new("probe", R24);

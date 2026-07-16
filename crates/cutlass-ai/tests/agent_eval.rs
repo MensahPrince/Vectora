@@ -156,6 +156,7 @@ fn fixture() -> (EngineHost, u64, u64, u64) {
 fn tool_turn(calls: Vec<(&str, &str, serde_json::Value)>) -> ChatTurn {
     ChatTurn {
         text: String::new(),
+        reasoning_summary: String::new(),
         tool_calls: calls
             .into_iter()
             .map(|(id, name, arguments)| ToolCall {
@@ -171,6 +172,7 @@ fn tool_turn(calls: Vec<(&str, &str, serde_json::Value)>) -> ChatTurn {
 fn text_turn(text: &str) -> ChatTurn {
     ChatTurn {
         text: text.to_string(),
+        reasoning_summary: String::new(),
         tool_calls: Vec::new(),
         finish: FinishReason::Stop,
     }

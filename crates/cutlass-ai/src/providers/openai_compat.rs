@@ -142,7 +142,7 @@ impl ChatProvider for OpenAiCompatProvider {
                         .unwrap_or_else(|_| "<unreadable error body>".to_string());
                     return Err(ProviderError::Provider {
                         status,
-                        message: truncate(&message, 500),
+                        message: chat_error_message(status, &message),
                     });
                 }
                 Err(ureq::Error::Transport(t)) => match retry_delay(attempt) {
@@ -231,7 +231,7 @@ fn to_openai_messages(messages: &[Message]) -> Vec<serde_json::Value> {
 /// Statuses whose response is explicitly temporary. Authentication,
 /// malformed requests, and payment failures stay single-shot; retrying
 /// them only delays the actionable error.
-fn retryable_status(status: u16) -> bool {
+pub(super) fn retryable_status(status: u16) -> bool {
     status == 408 || status == 429 || (500..=599).contains(&status)
 }
 
@@ -239,7 +239,7 @@ fn retryable_status(status: u16) -> bool {
 /// failure: two retries, spaced so a briefly-napping local server
 /// (Ollama model load, sleep wake) gets a second chance without turning
 /// a dead endpoint into a long hang.
-fn retry_delay(attempt: usize) -> Option<Duration> {
+pub(super) fn retry_delay(attempt: usize) -> Option<Duration> {
     match attempt {
         0 => Some(Duration::from_millis(300)),
         1 => Some(Duration::from_millis(900)),
@@ -249,7 +249,7 @@ fn retry_delay(attempt: usize) -> Option<Duration> {
 
 /// Sleep in ~50ms slices, polling `cancel`. Returns false — retry
 /// abandoned — the moment cancellation shows up.
-fn sleep_unless_cancelled(total: Duration, cancel: &AtomicBool) -> bool {
+pub(super) fn sleep_unless_cancelled(total: Duration, cancel: &AtomicBool) -> bool {
     let slice = Duration::from_millis(50);
     let mut remaining = total;
     while !remaining.is_zero() {
@@ -437,12 +437,13 @@ pub(crate) fn consume_sse(
     }
     Ok(ChatTurn {
         text,
+        reasoning_summary: String::new(),
         tool_calls,
         finish,
     })
 }
 
-fn truncate(s: &str, max: usize) -> String {
+pub(super) fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
@@ -452,6 +453,21 @@ fn truncate(s: &str, max: usize) -> String {
         }
         format!("{}…", &s[..end])
     }
+}
+
+fn chat_error_message(status: u16, message: &str) -> String {
+    let mut message = truncate(message, 500);
+    let lower = message.to_ascii_lowercase();
+    if status == 400
+        && (lower.contains("reasoning_effort") || lower.contains("reasoning effort"))
+        && (lower.contains("tool") || lower.contains("function"))
+    {
+        message.push_str(
+            "\nThis reasoning model cannot call tools through Chat Completions. \
+             In Settings → AI provider, choose the Responses API protocol.",
+        );
+    }
+    message
 }
 
 #[cfg(test)]
@@ -731,5 +747,20 @@ mod tests {
 
         let live = AtomicBool::new(false);
         assert!(sleep_unless_cancelled(Duration::from_millis(10), &live));
+    }
+
+    #[test]
+    fn reasoning_tool_compatibility_errors_point_to_responses_setting() {
+        let message = chat_error_message(
+            400,
+            "reasoning_effort is not supported when function tools are present",
+        );
+        assert!(
+            message.contains("choose the Responses API protocol"),
+            "{message}"
+        );
+
+        let unrelated = chat_error_message(400, "invalid JSON schema");
+        assert!(!unrelated.contains("Responses API protocol"), "{unrelated}");
     }
 }

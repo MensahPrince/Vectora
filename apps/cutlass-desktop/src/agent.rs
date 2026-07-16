@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded, unbounded};
-use cutlass_ai::providers::openai_compat::OpenAiCompatProvider;
+use cutlass_ai::providers::{OpenAiProtocol, OpenAiProvider, ReasoningSummary};
 use cutlass_ai::{
     AgentConfig, AgentEvent, AgentExtensions, EditorContext, EngineBridge, HostToolSpec, Message,
     ProjectSummary, PromptStatus, ToolHost, ToolOutput, ToolTier, WireCommand, compose_rules,
@@ -1234,10 +1234,12 @@ fn run_one_prompt(
             }
         };
         with_store(store, |s| s.set_configured(true));
-        OpenAiCompatProvider::new(
+        OpenAiProvider::new(
             &format!("{}/v1/generate", crate::account::base_url()),
             "cutlass-managed",
             Some(token),
+            OpenAiProtocol::ChatCompletions,
+            ReasoningSummary::Off,
         )
     } else {
         let api_key = match cutlass_ai::config::resolve_api_key(
@@ -1251,7 +1253,21 @@ fn run_one_prompt(
             }
         };
         with_store(store, |s| s.set_configured(true));
-        OpenAiCompatProvider::new(&section.base_url, &section.model, api_key)
+        let protocol = match section.api_protocol {
+            cutlass_settings::AiApiProtocol::ChatCompletions => OpenAiProtocol::ChatCompletions,
+            cutlass_settings::AiApiProtocol::Responses => OpenAiProtocol::Responses,
+        };
+        let reasoning_summary = match section.reasoning_summary {
+            cutlass_settings::ReasoningSummary::Auto => ReasoningSummary::Auto,
+            cutlass_settings::ReasoningSummary::Off => ReasoningSummary::Off,
+        };
+        OpenAiProvider::new(
+            &section.base_url,
+            &section.model,
+            api_key,
+            protocol,
+            reasoning_summary,
+        )
     };
 
     let sandbox_existed = sandbox.is_some();
