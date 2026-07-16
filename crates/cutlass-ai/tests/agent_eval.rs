@@ -534,7 +534,7 @@ fn model_corrects_course_after_a_rejection() {
 }
 
 #[test]
-fn cap_trip_rolls_the_whole_prompt_back() {
+fn cap_trip_keeps_the_edits_already_applied() {
     let (mut host, _, _, clip) = fixture();
     let provider = ScriptedProvider::new(vec![tool_turn(vec![
         (
@@ -561,17 +561,21 @@ fn cap_trip_rolls_the_whole_prompt_back() {
         &config,
     );
 
-    match &outcome.status {
-        PromptStatus::Aborted(reason) => assert!(reason.contains("1-edit cap"), "{reason}"),
-        other => panic!("expected abort, got {other:?}"),
-    }
-    // The split that did apply was rolled back; nothing remains.
-    assert_eq!(host.engine.project().timeline().clip_count(), 1);
-    assert_eq!(host.engine.project().timeline().track_count(), 1);
-    assert!(
-        !host.engine.undo(),
-        "a rolled-back prompt leaves no history"
+    // The cap does not fail the prompt: the run completes keeping the
+    // in-cap edits, refusing the rest.
+    assert_eq!(outcome.status, PromptStatus::Completed);
+    assert!(outcome.text.contains("1-edit cap"), "{}", outcome.text);
+    assert_eq!(outcome.actions.len(), 1, "only the in-cap edit applied");
+    assert_eq!(host.engine.project().timeline().clip_count(), 2);
+    assert_eq!(
+        host.engine.project().timeline().track_count(),
+        1,
+        "the over-cap add_track was refused"
     );
+    // The kept edits are one undoable history entry, like any prompt.
+    assert!(host.engine.undo());
+    assert_eq!(host.engine.project().timeline().clip_count(), 1);
+    assert!(!host.engine.undo(), "exactly one history entry per prompt");
 }
 
 #[test]

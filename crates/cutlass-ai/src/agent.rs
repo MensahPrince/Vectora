@@ -6,8 +6,10 @@
 //! bridge's group markers wrap the run, failed individual commands are
 //! reported back to the model (which may correct course), and the group
 //! rolls back only when the prompt aborts (cancellation, provider error,
-//! cap exceeded). In dry-run mode nothing is applied; the validated plan
-//! comes back for the UI's preview card.
+//! turn or host-call cap exceeded). Reaching the edit cap is gentler:
+//! further edits are refused and the run ends keeping everything already
+//! applied. In dry-run mode nothing is applied; the validated plan comes
+//! back for the UI's preview card.
 //!
 //! Beyond edits, the embedder can wire a [`ToolHost`] of app tools, while
 //! the bridge can expose strictly read-only senses of its exact project
@@ -103,6 +105,8 @@ pub trait EngineBridge {
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// Hard cap on edit-tool calls per prompt (the runaway-loop fuse).
+    /// Reaching it does not fail the prompt: over-cap edits are refused
+    /// and the run completes keeping the edits already applied.
     pub max_tool_calls: usize,
     /// Hard cap on host-tool calls per prompt. A separate fuse: senses
     /// and app control must not starve editing, nor the reverse.
@@ -124,7 +128,7 @@ pub struct AgentConfig {
 impl Default for AgentConfig {
     fn default() -> Self {
         Self {
-            max_tool_calls: 32,
+            max_tool_calls: 1000,
             max_host_calls: 24,
             max_turns: 16,
             max_images: 8,
@@ -452,6 +456,10 @@ pub fn run_prompt_with_host(
     let mut phase_breaks: Vec<usize> = Vec::new();
     let mut edit_calls = 0usize;
     let mut host_calls = 0usize;
+    // Set when an edit call lands past `max_tool_calls`: the run ends after
+    // the current turn's calls are answered, keeping everything applied,
+    // rather than burning turns until the turn cap rolls the prompt back.
+    let mut edit_cap_tripped = false;
     let mut final_text = String::new();
     // The first image-bearing tool result is appended after the current user
     // message. Images are surfaced only after the whole request budget has run,
@@ -663,14 +671,20 @@ pub fn run_prompt_with_host(
             } else {
                 edit_calls += 1;
                 if edit_calls > config.max_tool_calls {
-                    return abort(
-                        bridge,
-                        actions,
-                        format!(
-                            "exceeded the {}-edit cap for one prompt",
+                    // The runaway fuse is not a failure: edits already applied
+                    // stay, this and further edit calls are refused, and the
+                    // run ends after this turn's calls are answered.
+                    edit_cap_tripped = true;
+                    messages.push(Message::ToolResult {
+                        call_id: call.id,
+                        content: format!(
+                            "rejected: reached the {}-edit cap for one prompt; the edits \
+                             already applied are kept",
                             config.max_tool_calls
                         ),
-                    );
+                        images,
+                    });
+                    continue;
                 }
                 match WireCommand::from_tool_call(&call.name, call.arguments.clone()) {
                     Err(reason) => format!("rejected: {reason}"),
@@ -705,6 +719,16 @@ pub fn run_prompt_with_host(
                 content: result,
                 images,
             });
+        }
+
+        if edit_cap_tripped {
+            final_text = format!(
+                "Reached the {}-edit cap for one prompt; kept the {} edit{} already applied.",
+                config.max_tool_calls,
+                actions.len(),
+                if actions.len() == 1 { "" } else { "s" }
+            );
+            break;
         }
 
         if _turn + 1 == config.max_turns {
