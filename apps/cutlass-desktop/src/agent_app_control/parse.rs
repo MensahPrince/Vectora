@@ -9,6 +9,7 @@ pub(super) const MAX_WINDOW_HEIGHT: i64 = 4_320;
 pub(super) const MIN_WINDOW_COORD: i64 = -100_000;
 pub(super) const MAX_WINDOW_COORD: i64 = 100_000;
 
+#[derive(Debug, Clone, PartialEq)]
 pub(super) enum Request {
     State,
     Playback(PlaybackAction),
