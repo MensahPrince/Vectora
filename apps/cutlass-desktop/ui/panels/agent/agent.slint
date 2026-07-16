@@ -601,12 +601,25 @@ export component AgentPanel inherits PanelBase {
                     style: AppStore.theme.typography.label;
                 }
 
-                CutlassText {
-                    text: AgentStore.approval-detail;
-                    wrap: word-wrap;
-                    mono: true;
-                    style: AppStore.theme.typography.caption;
-                    foreground: AppStore.theme.text.secondary;
+                // Cap detail height so a long shell command / path does not
+                // shove the Run / Decline buttons (or the composer) off-screen.
+                approval-detail-scroll := CutlassScrollView {
+                    height: min(
+                        approval-detail-text.preferred-height,
+                        max(80px, root.height * 25%),
+                    );
+                    viewport-width: self.width;
+                    viewport-height: approval-detail-text.preferred-height;
+                    show-horizontal-scrollbar: false;
+
+                    approval-detail-text := CutlassText {
+                        width: approval-detail-scroll.width;
+                        text: AgentStore.approval-detail;
+                        wrap: word-wrap;
+                        mono: true;
+                        style: AppStore.theme.typography.caption;
+                        foreground: AppStore.theme.text.secondary;
+                    }
                 }
 
                 CutlassText {
@@ -655,11 +668,30 @@ export component AgentPanel inherits PanelBase {
                     style: AppStore.theme.typography.label;
                 }
 
-                for action in AgentStore.plan-actions: CutlassText {
-                    text: "• " + action;
-                    wrap: word-wrap;
-                    style: AppStore.theme.typography.caption;
-                    foreground: AppStore.theme.text.secondary;
+                // Cap the action list so a large plan scrolls inside the
+                // card instead of pushing Apply / Discard and the composer
+                // below the visible panel.
+                plan-list := CutlassScrollView {
+                    height: min(
+                        plan-list-content.preferred-height,
+                        max(120px, root.height * 35%),
+                    );
+                    viewport-width: self.width;
+                    viewport-height: plan-list-content.preferred-height;
+                    show-horizontal-scrollbar: false;
+
+                    plan-list-content := VerticalLayout {
+                        width: plan-list.width;
+                        alignment: start;
+                        spacing: AppStore.theme.metrics.spacing.none;
+
+                        for action in AgentStore.plan-actions: CutlassText {
+                            text: "• " + action;
+                            wrap: word-wrap;
+                            style: AppStore.theme.typography.caption;
+                            foreground: AppStore.theme.text.secondary;
+                        }
+                    }
                 }
 
                 HorizontalLayout {
