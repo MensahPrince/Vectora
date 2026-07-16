@@ -161,8 +161,7 @@ fn cache_relocation_support_is_exactly_the_eight_disk_caches() {
     );
     assert!(supported.iter().all(|id| {
         let descriptor = id.descriptor();
-        descriptor.kind == cutlass_storage::CacheKind::Disk
-            && descriptor.default_relative.is_some()
+        descriptor.kind == cutlass_storage::CacheKind::Disk && descriptor.default_relative.is_some()
     }));
 }
 

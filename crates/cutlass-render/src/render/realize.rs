@@ -12,9 +12,9 @@ use cutlass_shapes::ShapeStyle;
 use crate::error::RenderError;
 use crate::scene::{LayerSource, ResolvedPass, Scene, SceneLut, SizeSpec};
 
-use super::effects::{layer_effects, pack_effects, EffectChain};
-use super::media_cache::{layer_lut, CubeLutState, LottieState, StickerSequence};
-use super::{FrameStats, Renderer, SeekPolicy, SLOW_FRAME_LOG_MS};
+use super::effects::{EffectChain, layer_effects, pack_effects};
+use super::media_cache::{CubeLutState, LottieState, StickerSequence, layer_lut};
+use super::{FrameStats, Renderer, SLOW_FRAME_LOG_MS, SeekPolicy};
 
 fn composite_from_realized<'a>(
     r: &'a Realized,

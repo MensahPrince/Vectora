@@ -11,7 +11,7 @@ use cutlass_shapes::{PathRaster, ShapeStyle};
 use cutlass_text::TextRenderer;
 
 use crate::error::RenderError;
-use crate::resolve::{resolve, resolve_gesture_partitions, resolve_with, ResolveOverrides};
+use crate::resolve::{ResolveOverrides, resolve, resolve_gesture_partitions, resolve_with};
 use crate::scene::{LayerSource, Scene, SizeSpec};
 
 use super::media_cache::default_decode_mode;

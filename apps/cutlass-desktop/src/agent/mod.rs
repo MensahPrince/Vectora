@@ -24,7 +24,9 @@ mod tool_host;
 mod transcript;
 mod types;
 
+#[allow(unused_imports)]
 pub use tool_host::DesktopToolHost;
+#[allow(unused_imports)]
 pub use types::{AgentCreated, AgentHandle, AgentPlanStep, AgentWorker};
 
 // Re-export submodule items so `agent::tests` (`use super::*`) keeps

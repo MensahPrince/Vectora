@@ -1,4 +1,4 @@
-use cutlass_compositor::{mask_kind, LayerChromaKey, LayerEffects, LayerMask, PassInstance};
+use cutlass_compositor::{LayerChromaKey, LayerEffects, LayerMask, PassInstance, mask_kind};
 use cutlass_models::MaskKind;
 
 use crate::scene::ResolvedPass;
