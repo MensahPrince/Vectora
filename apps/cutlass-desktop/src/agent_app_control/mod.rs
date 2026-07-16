@@ -11,13 +11,13 @@ mod specs;
 mod tests;
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError};
+use crossbeam_channel::{Receiver, RecvTimeoutError, bounded};
 use cutlass_ai::{HostToolSpec, ToolOutput, ToolTier};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use slint::{ComponentHandle, Model, SharedString};
 
 // Submodule items are imported for sibling `use super::*` visibility and for
