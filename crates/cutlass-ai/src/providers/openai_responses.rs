@@ -316,14 +316,14 @@ fn to_responses_input(messages: &[Message]) -> Vec<serde_json::Value> {
         match message {
             Message::System { .. } => {}
             Message::User { content, images } => {
-                input.push(input_message("user", content, images));
+                input.push(user_input_message(content, images));
             }
             Message::Assistant {
                 content,
                 tool_calls,
             } => {
                 if !content.is_empty() {
-                    input.push(input_message("assistant", content, &[]));
+                    input.push(assistant_output_message(content));
                 }
                 input.extend(tool_calls.iter().map(|call| {
                     serde_json::json!({
@@ -340,15 +340,25 @@ fn to_responses_input(messages: &[Message]) -> Vec<serde_json::Value> {
     input
 }
 
-fn input_message(role: &str, content: &str, images: &[ImagePart]) -> serde_json::Value {
+fn user_input_message(content: &str, images: &[ImagePart]) -> serde_json::Value {
     let mut parts = vec![serde_json::json!({
         "type": "input_text",
         "text": content,
     })];
     parts.extend(images.iter().map(input_image_part));
     serde_json::json!({
-        "role": role,
+        "role": "user",
         "content": parts,
+    })
+}
+
+fn assistant_output_message(content: &str) -> serde_json::Value {
+    serde_json::json!({
+        "role": "assistant",
+        "content": [{
+            "type": "output_text",
+            "text": content,
+        }],
     })
 }
 
@@ -822,12 +832,13 @@ mod tests {
     }
 
     #[test]
-    fn summary_off_omits_reasoning_configuration() {
+    fn mixed_history_uses_role_specific_content_parts_and_summary_off() {
         let provider = provider(false);
         let messages = [
             Message::system("system"),
+            Message::user("Prior question"),
             Message::assistant_text("Prior answer"),
-            Message::user("hello"),
+            Message::user("Current question"),
         ];
         let body = provider.request_body(&ChatRequest {
             messages: &messages,
@@ -836,8 +847,15 @@ mod tests {
         assert!(body.get("reasoning").is_none());
         assert!(body.get("tools").is_none());
         assert_eq!(body["store"], false);
-        assert_eq!(body["input"][0]["role"], "assistant");
+        assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][0]["content"][0]["text"], "Prior question");
+        assert_eq!(body["input"][1]["role"], "assistant");
+        assert_eq!(body["input"][1]["content"][0]["type"], "output_text");
+        assert_eq!(body["input"][1]["content"][0]["text"], "Prior answer");
+        assert_eq!(body["input"][2]["role"], "user");
+        assert_eq!(body["input"][2]["content"][0]["type"], "input_text");
+        assert_eq!(body["input"][2]["content"][0]["text"], "Current question");
     }
 
     #[test]
