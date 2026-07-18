@@ -1,3 +1,11 @@
+use slint::BackendSelector;
+use slint::ModelRc;
+use slint::VecModel;
+use slint::wgpu_28::WGPUConfiguration;
+use slint::winit_030::WinitWindowAccessor;
+
+slint::include_modules!();
+
 mod account;
 mod agent;
 mod agent_app_control;
@@ -43,14 +51,6 @@ mod timeline;
 mod timeline_map;
 mod transport;
 mod window;
-
-use slint::BackendSelector;
-use slint::ModelRc;
-use slint::VecModel;
-use slint::wgpu_28::WGPUConfiguration;
-use slint::winit_030::WinitWindowAccessor;
-
-slint::include_modules!();
 
 use bootstrap::*;
 use cache_ui::*;

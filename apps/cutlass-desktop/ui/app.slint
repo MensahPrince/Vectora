@@ -5,9 +5,6 @@ import {
     CutlassText,
 } from "components/index.slint";
 import {
-    AgentPanel,
-    InspectorPanel,
-    LibraryPanel,
     PreviewPanel,
     TimelinePanel,
 } from "panels/index.slint";
@@ -80,7 +77,6 @@ export { TransportBackend }from "lib/transport-backend.slint";
 export { WindowBackend }from "lib/window-backend.slint";
 export { ExportBackend }from "lib/export-backend.slint";
 export { CanvasBackend }from "lib/canvas-backend.slint";
-export { EffectsBackend }from "lib/effects-backend.slint";
 export { SettingsBackend }from "lib/settings-backend.slint";
 export { CloudBackend, StockTile }from "lib/cloud-backend.slint";
 export { TemplatesBackend, TemplateTile }from "lib/templates-backend.slint";
@@ -88,6 +84,7 @@ export { TextPresetsBackend, TextPresetTile }from "lib/text-presets-backend.slin
 export { LottieBackend, LottieTile }from "lib/lottie-backend.slint";
 export { SfxBackend, SfxTile }from "lib/sfx-backend.slint";
 export { AccountBackend }from "lib/account-backend.slint";
+export { EffectsBackend }from "lib/effects-backend.slint";
 export { AiBackend, AiItemTile }from "lib/ai-backend.slint";
 
 export component AppWindow inherits Window {
@@ -517,96 +514,10 @@ export component AppWindow inherits Window {
                 padding-top: AppStore.theme.metrics.spacing.none;
                 spacing: AppStore.theme.metrics.spacing.none;
 
-                HorizontalLayout {
+                // Simplified layout: only the preview panel remains.
+                PreviewPanel {
                     vertical-stretch: 1;
                     horizontal-stretch: 1;
-                    spacing: AppStore.theme.metrics.spacing.none;
-
-                    // Slint 1.16 can initialize a conditional component while
-                    // its parent layout cache is being evaluated. Panels that
-                    // read geometry from init/changed handlers then re-enter
-                    // that cache and panic with "Recursion detected". Keep the
-                    // layout children unconditional and put each conditional
-                    // component behind a fixed-size Rectangle boundary.
-                    Rectangle {
-                        width: AppState.library-panel-open ? root.left-pane-width : 0px;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 1;
-
-                        if AppState.library-panel-open: LibraryPanel {
-                            width: 100%;
-                            height: 100%;
-                        }
-                    }
-
-                    Rectangle {
-                        width: AppState.library-panel-open
-                            ? AppStore.theme.metrics.layout.split-grip
-                            : 0px;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 1;
-
-                        if AppState.library-panel-open: HSplitGripLead {
-                            width: 100%;
-                            height: 100%;
-                            pane-width <=> root.left-pane-width;
-                        }
-                    }
-
-                    PreviewPanel {
-                        vertical-stretch: 1;
-                        horizontal-stretch: 1;
-                    }
-
-                    Rectangle {
-                        width: AppState.inspector-panel-open
-                            ? AppStore.theme.metrics.layout.split-grip
-                            : 0px;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 1;
-
-                        if AppState.inspector-panel-open: HSplitGripTrail {
-                            width: 100%;
-                            height: 100%;
-                            pane-width <=> root.right-pane-width;
-                        }
-                    }
-
-                    Rectangle {
-                        width: AppState.inspector-panel-open ? root.right-pane-width : 0px;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 1;
-
-                        if AppState.inspector-panel-open: InspectorPanel {
-                            width: 100%;
-                            height: 100%;
-                        }
-                    }
-
-                    Rectangle {
-                        width: AppState.agent-panel-open
-                            ? AppStore.theme.metrics.layout.split-grip
-                            : 0px;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 1;
-
-                        if AppState.agent-panel-open: HSplitGripTrail {
-                            width: 100%;
-                            height: 100%;
-                            pane-width <=> root.agent-pane-width;
-                        }
-                    }
-
-                    Rectangle {
-                        width: AppState.agent-panel-open ? root.agent-pane-width : 0px;
-                        horizontal-stretch: 0;
-                        vertical-stretch: 1;
-
-                        if AppState.agent-panel-open: AgentPanel {
-                            width: 100%;
-                            height: 100%;
-                        }
-                    }
                 }
 
                 Rectangle {
